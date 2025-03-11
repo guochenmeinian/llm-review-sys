@@ -3,7 +3,7 @@
 start with setup the env:
 ```
 conda env create -f environment.yml
-conda activate paper_finetune
+conda activate llm-review-sys
 ```
 if you changed the env, do this:
 `conda env export > environment.yml`
