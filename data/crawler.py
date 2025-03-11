@@ -6,8 +6,8 @@ import time
 from datetime import datetime
 
 # 创建输出目录
-OUTPUT_DIR = "openreview_data"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+OUTPUT_DIR = "/data/openreview/"
+# os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # CONFERENCES = ["ICML.cc", "AAAI.org", "NeurIPS.cc", "aclweb.org/ACL", "ACM.org", "EMNLP", "aclweb.org/NAACL", "COLING.org", "ICLR.cc", "ACCV", "CVPR"]
 
@@ -25,9 +25,10 @@ password = os.getenv('OPENREVIEW_PASSWORD')
 
 #     print(f"✅ Saved {len(unique_review_types)} unique review types to {filename}")
 
-def save_to_txt(subgroups, filename="subgroups.txt"):
-    """将子群组列表保存到 TXT 文件"""
-    with open(filename, "w") as file:
+def save_to_txt(subgroups, conference_dir):
+    """将子群组列表保存到会议目录下的 TXT 文件"""
+    filename = os.path.join(conference_dir, "subgroups.txt")
+    with open(filename, "w", encoding="utf-8") as file:
         for group_id in subgroups:
             file.write(group_id + "\n")
     print(f"✅ 成功保存 {len(subgroups)} 个子群组到 {filename}")
@@ -37,6 +38,22 @@ def save_to_json(subgroups, filename="subgroups.json"):
     with open(filename, "w") as file:
         json.dump({"subgroups": subgroups}, file, indent=4)
     print(f"✅ 成功保存 {len(subgroups)} 个子群组到 {filename}")
+
+def save_summary_to_txt(conference, total_papers, total_reviews, conference_dir):
+    """将会议统计信息保存到会议目录下的 summary.txt"""
+    filename = os.path.join(conference_dir, "summary.txt")
+    with open(filename, "w", encoding="utf-8") as file:
+        file.write(f"Conference: {conference}\n")
+        file.write(f"Total Papers: {total_papers}\n")
+        file.write(f"Total Reviews: {total_reviews}\n")
+        file.write("-" * 40 + "\n")
+
+def save_results(results, conference_dir):
+    """保存测试结果到 JSON 文件"""
+    filename = os.path.join(conference_dir, "results.json")
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
 
 def get_all_subgroups(client, parent_group):
     """获取所有子群组"""
@@ -53,28 +70,12 @@ def get_all_subgroups(client, parent_group):
     return list(subgroups)
 
 
-def save_summary_to_txt(conference, total_papers, total_reviews, total_comments, filename="summary.txt"):
-    """将每个 Conference 的总论文数和总评审数追加保存到 TXT 文件"""
-    with open(filename, "a", encoding="utf-8") as file:  # 以追加模式写入
-        file.write(f"Venue: {conference}\n")
-        file.write(f"  Total Papers: {total_papers}\n")
-        file.write(f"  Total Reviews: {total_reviews}\n")
-        file.write(f"  Total Comments: {total_comments}\n")
-        file.write("-" * 40 + "\n")
-
-
 # def load_subgroups(json_file="subgroups.json"):
 #     """从 JSON 文件加载所有 venue_id"""
 #     with open(json_file, "r", encoding="utf-8") as f:
 #         data = json.load(f)
 #         return data.get("subgroups", [])
 
-
-
-def save_results(results, filename="test_results.json"):
-    """保存测试结果到 JSON 文件"""
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
 
 def extract_year(paper):
     """从论文 metadata 或创建时间中提取年份"""
@@ -96,95 +97,75 @@ def extract_year(paper):
 
     return None  # 如果都无法获取，则返回 None
 
+
 def process_venue(client, venue_id):
-    """处理单个 venue_id，获取论文和评审信息"""
     try:
         venue_group = client.get_group(venue_id)
 
         if not hasattr(venue_group, "content") or "submission_name" not in venue_group.content:
-            return None  # 跳过不兼容的 venue
+            return None
 
         submission_name = venue_group.content["submission_name"]["value"]
         invitation_format = f"{venue_id}/-/{submission_name}"
-
         submissions = client.get_all_notes(invitation=invitation_format, details="replies")
 
         if not submissions:
-            return None  # 没有找到论文，跳过
+            return None
 
-        max_papers = min(5, len(submissions))
         processed_papers = []
         total_reviews = 0
-        total_comments = 0
-        total_meta = 0
-        total_decision = 0
+        conference_name = venue_id.split('.')[0]
 
-        for paper_idx in range(max_papers):
-            paper = submissions[paper_idx]
-            paper_id = paper.id
-            forum_id = paper.forum if hasattr(paper, "forum") else paper.id
+        for paper in submissions:
 
-            title = "无标题"
-            if hasattr(paper, "content") and "title" in paper.content:
-                title = paper.content["title"]["value"] if isinstance(paper.content["title"], dict) else paper.content["title"]
-
-            # year = extract_year(paper)
-            # print(year)
+            # 基础论文信息
+            paper_info = {
+                "title": paper.content.get("title", {}).get("value", "") if isinstance(paper.content.get("title"), dict) else paper.content.get("title", ""),
+                "conference": conference_name,
+                "pdf_url": f"https://openreview.net/pdf?id={paper.id}",
+                "reviews": []
+            }
            
-            reviews = []
-            comments = []
-            meta = []
-            decision = []
-
+            allowed_review_types = ["Official_Review", "Official_Comment", "Meta_Review"]
             if hasattr(paper, "details") and "replies" in paper.details:
+                reviews_count = 0
                 for reply in paper.details["replies"]:
                     if "invitations" in reply and reply["invitations"]:
-                        invitation_type = reply["invitations"][0].split("/")[-1]  # Extract only the type name
+                        invitation_type = reply["invitations"][0].split("/")[-1]
                         
-                        # **Categorize into the correct review type**
-                        if invitation_type == "Official_Review":
-                            reviews.append(reply)
-                        elif invitation_type == "Official_Comment":
-                            comments.append(reply)
-                        elif invitation_type == "Meta_Review":
-                            meta.append(reply)
-                        elif invitation_type == "Decision":
-                            decision.append(reply)
+                        if invitation_type in allowed_review_types:
+                            review_data = {
+                                "type": invitation_type,
+                                "content": reply.get("content", {}),
+                                "ratings": {}
+                            }
+                            
+                            if "rating" in reply.get("content", {}):
+                                review_data["ratings"]["rating"] = reply["content"]["rating"]
+                            if "confidence" in reply.get("content", {}):
+                                review_data["ratings"]["confidence"] = reply["content"]["confidence"]
+                            
+                            paper_info["reviews"].append(review_data)
+                            reviews_count += 1
+                
+                total_reviews += reviews_count
 
-            # **Update total counts**
-            total_reviews += len(reviews)
-            total_comments += len(comments)
-            total_meta += len(meta)
-            total_decision += len(decision)
+            if total_reviews > 0:   
+                processed_papers.append(paper_info)
 
-            # **Skip the paper if it has no relevant data**
-            if not reviews and not comments and not meta and not decision:
-                continue  # ✅ Skip this paper
-            
-            total_reviews += len(reviews)
-            total_comments += len(comments)
-
-            # 添加到处理结果
-            paper_result = {
-                "id": paper_id,
-                "title": title,
-                # "year": year if year else "未知",
-                "paper_data": paper.to_json() if hasattr(paper, "to_json") else {"id": paper_id},
-                "reviews": reviews,
-                "comments": comments
+        # 只有当有处理过的论文时才返回结果
+        if processed_papers:
+            return {
+                "venue_id": venue_id,
+                "papers": processed_papers,
+                "total_papers": len(processed_papers),
+                "total_reviews": total_reviews
             }
-            processed_papers.append(paper_result)
+        return None
 
-        return {
-            "venue_id": venue_id,
-            "total_papers": len(processed_papers),
-            "total_reviews": total_reviews,
-            "total_comments": total_comments,
-            "papers": processed_papers
-        } if processed_papers else None  # 如果没有符合条件的论文，则返回 None
-
-    except Exception:
-        return None  # 访问失败的直接跳过
+    except Exception as e:
+        # print(f"处理 venue {venue_id} 时出错: {str(e)}")
+        return None
 
 def main():
     """主流程：读取所有 subgroups，获取论文和评审信息"""
@@ -196,36 +177,51 @@ def main():
 
     results = []
     all_subgroups = []
+    base_dir = os.path.join(os.path.dirname(__file__), "openreview")
 
-    CONFERENCES = openreview.tools.get_all_venues(client)
-    # CONFERENCES = ['ICML.cc']
+    # CONFERENCES = openreview.tools.get_all_venues(client)
+    CONFERENCES = ['ICML.cc']
 
     for conference in CONFERENCES:
+        
+        print(f"正在处理会议: {conference}")
+
+        # 设置会议数据文件路径
+        conf_name = conference.split('.')[0]  # 'ICML.cc' -> 'ICML'
+        conference_dir = os.path.join(base_dir, conf_name)
+
+        # 检查会议文件夹是否已存在，如果存在则跳过，否则创建并爬取数据
+        if os.path.exists(conference_dir):
+            print(f"⏩ 跳过已存在的会议文件夹: {conf_name}")
+            continue
+        os.makedirs(conference_dir, exist_ok=True)
+
         subgroups = get_all_subgroups(client, conference)
         all_subgroups.extend(subgroups)
 
         total_papers = 0
         total_reviews = 0
-        total_comments = 0
         conference_results = []
 
         for venue_id in subgroups:
+            
             result = process_venue(client, venue_id)
-
             if result:
                 conference_results.append(result)
-                results.append(result)
                 total_papers += result["total_papers"]
                 total_reviews += result["total_reviews"]
-                total_comments += result["total_comments"]
 
-        save_summary_to_txt(conference, total_papers, total_reviews, total_comments)
+        print(f"✅ 完成处理会议: {conference}")
+        # print(conference_results)
+        
+        save_summary_to_txt(conference, total_papers, total_reviews, conference_dir)
+        save_results(conference_results, conference_dir)
         
 
     # 保存子群组到文件
-    save_to_txt(all_subgroups)
-    save_to_json(all_subgroups)
-    save_results(results, os.path.join(OUTPUT_DIR, "test_results.json"))
+    #save_to_txt(all_subgroups, conference_dir)
+    # save_to_json(all_subgroups, conference_dir)
+    #save_results(results, conference_dir)
     # save_review_types(os.path.join(OUTPUT_DIR, "review_types.txt"))
 
 if __name__ == "__main__":
