@@ -14,16 +14,16 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 username = os.getenv('OPENREVIEW_USERNAME')
 password = os.getenv('OPENREVIEW_PASSWORD')
 
-unique_review_types = set()
+# unique_review_types = set()
 
 
-def save_review_types(filename="review_types.txt"):
-    """Save collected unique review types to a file"""
-    with open(filename, "w", encoding="utf-8") as file:
-        for review_type in sorted(unique_review_types):  # Sort for readability
-            file.write(review_type + "\n")
+# def save_review_types(filename="review_types.txt"):
+#     """Save collected unique review types to a file"""
+#     with open(filename, "w", encoding="utf-8") as file:
+#         for review_type in sorted(unique_review_types):  # Sort for readability
+#             file.write(review_type + "\n")
 
-    print(f"✅ Saved {len(unique_review_types)} unique review types to {filename}")
+#     print(f"✅ Saved {len(unique_review_types)} unique review types to {filename}")
 
 def save_to_txt(subgroups, filename="subgroups.txt"):
     """将子群组列表保存到 TXT 文件"""
@@ -116,6 +116,8 @@ def process_venue(client, venue_id):
         processed_papers = []
         total_reviews = 0
         total_comments = 0
+        total_meta = 0
+        total_decision = 0
 
         for paper_idx in range(max_papers):
             paper = submissions[paper_idx]
@@ -131,23 +133,33 @@ def process_venue(client, venue_id):
            
             reviews = []
             comments = []
+            meta = []
+            decision = []
 
             if hasattr(paper, "details") and "replies" in paper.details:
                 for reply in paper.details["replies"]:
                     if "invitations" in reply and reply["invitations"]:
                         invitation_type = reply["invitations"][0].split("/")[-1]  # Extract only the type name
-                        unique_review_types.add(invitation_type)  # Add to set (no duplicates)
+                        
+                        # **Categorize into the correct review type**
+                        if invitation_type == "Official_Review":
+                            reviews.append(reply)
+                        elif invitation_type == "Official_Comment":
+                            comments.append(reply)
+                        elif invitation_type == "Meta_Review":
+                            meta.append(reply)
+                        elif invitation_type == "Decision":
+                            decision.append(reply)
 
-                    if "Official_Review" in reply["invitations"][0]:
-                        reviews.append(reply)
-                    elif "Official_Comment" in reply["invitations"][0] or "Comment" in reply["invitations"][0]:
-                        comments.append(reply)
-
+            # **Update total counts**
             total_reviews += len(reviews)
             total_comments += len(comments)
+            total_meta += len(meta)
+            total_decision += len(decision)
 
-            if not reviews:
-                continue 
+            # **Skip the paper if it has no relevant data**
+            if not reviews and not comments and not meta and not decision:
+                continue  # ✅ Skip this paper
             
             total_reviews += len(reviews)
             total_comments += len(comments)
@@ -214,7 +226,7 @@ def main():
     save_to_txt(all_subgroups)
     save_to_json(all_subgroups)
     save_results(results, os.path.join(OUTPUT_DIR, "test_results.json"))
-    save_review_types(os.path.join(OUTPUT_DIR, "review_types.txt"))
+    # save_review_types(os.path.join(OUTPUT_DIR, "review_types.txt"))
 
 if __name__ == "__main__":
     main()
