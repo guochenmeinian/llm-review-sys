@@ -187,7 +187,7 @@ def main():
 
     # CONFERENCES = openreview.tools.get_all_venues(client)
     # CONFERENCES = ['ICML.cc']
-    CONFERENCES = ["ICML.cc", "AAAI.org", "ACM.org", "NeurIPS.cc", "EMNLP", "CVPR"]
+    CONFERENCES = ["ICML.cc", "AAAI.org", "ACM.org", "NeurIPS.cc", "EMNLP", "thecvf.com"]
 
     for conference in CONFERENCES:
         
