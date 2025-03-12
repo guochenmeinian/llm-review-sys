@@ -145,6 +145,8 @@ def process_venue(client, venue_id):
                                 "content": reply.get("content", {}),
                                 "ratings": {}
                             }
+
+                            print("!!", review_data["review"])
                             
                             if "rating" in reply.get("content", {}):
                                 review_data["ratings"]["rating"] = reply["content"]["rating"]
@@ -186,8 +188,8 @@ def main():
     base_dir = os.path.join(os.path.dirname(__file__), "openreview")
 
     # CONFERENCES = openreview.tools.get_all_venues(client)
-    # CONFERENCES = ['ICML.cc']
-    CONFERENCES = ["ICML.cc", "AAAI.org", "ACM.org", "NeurIPS.cc", "EMNLP", "thecvf.com"]
+    # CONFERENCES = ['ICML.cc']"ICML.cc",
+    CONFERENCES = [ "AAAI.org", "ACM.org", "NeurIPS.cc", "EMNLP", "thecvf.com"]
 
     for conference in CONFERENCES:
         
