@@ -86,28 +86,56 @@ def main():
     # 初始化解析器
     parser = PaperParser()
     
+    # 指定要处理的会议列表，如果为空列表则处理所有会议
+    TARGET_CONFERENCES = ['AAAI']  # 例如: ['ICML', 'NeurIPS', 'ICLR']
+    
+    # 获取所有会议目录
+    all_conferences = [d for d in os.listdir(pdf_dir) if os.path.isdir(os.path.join(pdf_dir, d))]
+    
+    # 如果指定了目标会议，则只处理这些会议
+    conferences_to_process = TARGET_CONFERENCES if TARGET_CONFERENCES else all_conferences
+    print(f"将处理以下会议: {conferences_to_process}")
+    
     # 处理所有PDF文件
-    for pdf_file in tqdm(os.listdir(pdf_dir)):
-        if pdf_file.endswith('.pdf'):
-            pdf_path = os.path.join(pdf_dir, pdf_file)
+    for conference in tqdm(conferences_to_process):
+        conf_pdf_dir = os.path.join(pdf_dir, conference)
+        conf_output_dir = os.path.join(output_dir, conference)
+        
+        # 跳过非目录
+        if not os.path.isdir(conf_pdf_dir):
+            print(f"会议目录不存在: {conference}")
+            continue
             
-            # 检查是否已经解析过
-            output_path = os.path.join(output_dir, f"{os.path.splitext(pdf_file)[0]}.json")
-            if os.path.exists(output_path):
-                print(f"⏩ 跳过已解析的PDF: {pdf_file}")
-                continue
+        # 如果会议输出目录已存在，跳过整个会议
+        if os.path.exists(conf_output_dir):
+            print(f"⏩ 跳过已处理的会议: {conference}")
+            continue
+            
+        # 创建新的会议输出目录
+        os.makedirs(conf_output_dir)
+        
+        # 处理该会议的所有PDF
+        for pdf_file in os.listdir(conf_pdf_dir):
+            if pdf_file.endswith('.pdf'):
+                pdf_path = os.path.join(conf_pdf_dir, pdf_file)
                 
-            try:
-                # 解析PDF
-                parsed_data = parser.parse_pdf(pdf_path)
-                
-                # 保存解析结果
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    json.dump(parsed_data, f, ensure_ascii=False, indent=2)
-                
-                print(f"✅ 成功解析: {pdf_file}")
-            except Exception as e:
-                print(f"❌ 解析 {pdf_file} 时出错: {str(e)}")
+                # 检查是否已经解析过
+                output_path = os.path.join(conf_output_dir, f"{os.path.splitext(pdf_file)[0]}.json")
+                if os.path.exists(output_path):
+                    print(f"⏩ 跳过已解析的PDF: {conference}/{pdf_file}")
+                    continue
+                    
+                try:
+                    # 解析PDF
+                    parsed_data = parser.parse_pdf(pdf_path)
+                    
+                    # 保存解析结果
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        json.dump(parsed_data, f, ensure_ascii=False, indent=2)
+                    
+                    print(f"✅ 成功解析: {conference}/{pdf_file}")
+                except Exception as e:
+                    print(f"❌ 解析 {conference}/{pdf_file} 时出错: {str(e)}")
 
 if __name__ == "__main__":
     main()

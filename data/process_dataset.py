@@ -5,16 +5,12 @@ from datetime import datetime
 
 def process_reviews(input_dir, output_dir, chunk_size=1000):
     """
-    处理所有会议数据并生成符合HuggingFace格式的分块文件
+    处理所有会议数据并生成符合HuggingFace格式的文件
     参数：
         chunk_size: 每个JSON文件包含的最大评审条目数（默认1000）
     """
-    # 确保输出目录存在且为空
-    if os.path.exists(output_dir):
-        for f in os.listdir(output_dir):
-            os.remove(os.path.join(output_dir, f))
-    else:
-        os.makedirs(output_dir, exist_ok=True)
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
     
     merged_data = []
     stats = {
@@ -40,13 +36,15 @@ def process_reviews(input_dir, output_dir, chunk_size=1000):
             for venue in data:
                 process_venue(venue, merged_data, stats)
 
-    # 分块保存数据
-    save_chunks(merged_data, chunk_size, output_dir, stats)
+    # 保存为单个文件
+    output_file = os.path.join(output_dir, "openreview_dataset.json")
+    with open(output_file, "w") as f:
+        json.dump(merged_data, f, indent=2)
     
     # 生成总结文件
-    generate_summary(input_dir, stats, len(merged_data))
+    generate_summary(output_dir, stats, len(merged_data))
     
-    print(f"✅ 成功处理 {len(merged_data)} 条数据")
+    print(f"✅ 成功处理 {len(merged_data)} 条数据，保存到 {output_file}")
 
 def process_venue(venue, merged_data, stats):
     """处理单个venue的数据"""
