@@ -11,8 +11,8 @@ OUTPUT_DIR = "/data/openreview/"
 
 # CONFERENCES = ["ICML.cc", "AAAI.org", "NeurIPS.cc", "aclweb.org/ACL", "ACM.org", "EMNLP", "aclweb.org/NAACL", "COLING.org", "ICLR.cc", "ACCV", "CVPR"]
 
-username = os.getenv('OPENREVIEW_USERNAME')
-password = os.getenv('OPENREVIEW_PASSWORD')
+username = os.getenv('OPENREVIEW_USERNAME_HH')
+password = os.getenv('OPENREVIEW_PASSWORD_HH')
 
 # unique_review_types = set()
 
@@ -117,12 +117,18 @@ def process_venue(client, venue_id):
         conference_name = venue_id.split('.')[0]
 
         for paper in submissions:
+            
+            # we only want new papers starting from 2020
+            year = extract_year(paper)
+            if year and year < 2020:
+                continue
 
             # 基础论文信息
             paper_info = {
                 "title": paper.content.get("title", {}).get("value", "") if isinstance(paper.content.get("title"), dict) else paper.content.get("title", ""),
                 "conference": conference_name,
                 "pdf_url": f"https://openreview.net/pdf?id={paper.id}",
+                "year": year,
                 "reviews": []
             }
            
@@ -180,7 +186,8 @@ def main():
     base_dir = os.path.join(os.path.dirname(__file__), "openreview")
 
     # CONFERENCES = openreview.tools.get_all_venues(client)
-    CONFERENCES = ['ICML.cc']
+    # CONFERENCES = ['ICML.cc']
+    CONFERENCES = ["ICML.cc", "AAAI.org", "ACM.org", "NeurIPS.cc", "EMNLP", "CVPR"]
 
     for conference in CONFERENCES:
         
