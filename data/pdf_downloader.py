@@ -133,7 +133,7 @@ def download_pdfs_from_data(data_dir, pdf_dir, target_conferences=None):
 def main():
     # 设置目录
     base_dir = os.path.join(os.path.dirname(__file__))
-    data_dir = os.path.join(base_dir, "openreview")
+    data_dir = os.path.join(base_dir, "raw_data")
     pdf_dir = os.path.join(base_dir, "pdfs")
     
     # 指定要处理的会议列表，如果为空列表则处理所有会议
