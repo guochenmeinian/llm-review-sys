@@ -13,9 +13,6 @@ def download_pdfs_from_data(data_dir, pdf_dir, target_conferences=None):
         pdf_dir: PDF保存目录
         target_conferences: 指定要处理的会议列表，如果为None则处理所有会议
     """
-    # 确保PDF目录存在
-    if not os.path.exists(pdf_dir):
-        os.makedirs(pdf_dir)
     
     # 获取所有会议目录
     all_conferences = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
@@ -27,20 +24,23 @@ def download_pdfs_from_data(data_dir, pdf_dir, target_conferences=None):
     # 遍历会议目录
     for conf_dir in conferences_to_process:
         conf_path = os.path.join(data_dir, conf_dir)
+        # print("conf_path", conf_path)
         if not os.path.exists(conf_path) or not os.path.isdir(conf_path):
             print(f"会议目录不存在: {conf_dir}")
             continue
         
-        # 创建会议PDF目录
-        conf_pdf_dir = os.path.join(pdf_dir, conf_dir)
-        
         # 如果会议PDF目录已存在，跳过整个会议
-        if os.path.exists(conf_pdf_dir):
-            print(f"⏩ 跳过已处理的会议: {conf_dir}")
-            continue
-            
-        # 创建新的会议PDF目录
-        os.makedirs(conf_pdf_dir)
+        # if os.path.exists(conf_pdf_dir):
+        #     print(f"⏩ 跳过已处理的会议: {conf_dir}")
+        #     continue
+
+        # 创建当前会议PDF目录
+        conf_pdf_dir = os.path.join(pdf_dir, conf_dir)
+        os.makedirs(conf_pdf_dir, exist_ok=True)
+
+        # 获取当前会议已存在的PDF文件列表
+        existing_files = set(os.listdir(conf_pdf_dir)) if os.path.exists(conf_pdf_dir) else set()
+        print("existing_files", existing_files)
         
         # 查找results.json文件
         results_file = os.path.join(conf_path, "results.json")
@@ -71,10 +71,12 @@ def download_pdfs_from_data(data_dir, pdf_dir, target_conferences=None):
                 paper_id = paper["pdf_url"].split("id=")[-1] if "id=" in paper["pdf_url"] else f"paper_{hash(paper['title'])}"
                 pdf_filename = f"{paper_id}.pdf"
                 pdf_path = os.path.join(conf_pdf_dir, pdf_filename)
+
+                print(f"处理论文: {pdf_filename}")
                 
                 # 如果PDF已存在，跳过下载
-                if os.path.exists(pdf_path):
-                    print(f"⏩ 跳过已存在的PDF: {conf_dir}/{pdf_filename}")
+                if pdf_filename in existing_files:
+                    print(f"⏩ 跳过已存在的PDF: {pdf_filename}")
                     continue
                 
                 # 下载PDF，添加重试机制
@@ -133,11 +135,11 @@ def download_pdfs_from_data(data_dir, pdf_dir, target_conferences=None):
 def main():
     # 设置目录
     base_dir = os.path.join(os.path.dirname(__file__))
-    data_dir = os.path.join(base_dir, "raw_data")
+    data_dir = os.path.join(base_dir, "openreview")
     pdf_dir = os.path.join(base_dir, "pdfs")
     
     # 指定要处理的会议列表，如果为空列表则处理所有会议
-    TARGET_CONFERENCES = ['AAAI', 'thecvf']  # 例如: ['ICML', 'NeurIPS', 'ICLR']
+    TARGET_CONFERENCES = ['AAAI']  # 例如: ['ICML', 'NeurIPS', 'ICLR', 'thecvf']
     
     # 确保目录存在
     os.makedirs(pdf_dir, exist_ok=True)
