@@ -52,22 +52,28 @@ def process_venue(venue, merged_data, stats):
         
         # 生成基础信息
         base_info = {
+            "id" : paper.get("pdf_url", "").split("id=")[-1],
             "title": paper.get("title", "Unknown"),
             "conference": paper.get("conference", "Unknown"),
             "pdf_url": paper.get("pdf_url", ""),
-            "year": paper.get("year", 0)  # 确保 year 是 int 类型
+            "year": paper.get("year", 0),  # 确保 year 是 int 类型
+            "reviews": []  # 存储评审信息
         }
         
         # 处理每个评审
         for review in paper["reviews"]:
-            entry = create_entry(base_info, review)
-            merged_data.append(entry)
+            entry = create_entry(review)
+            if entry:
+                base_info["reviews"].append(entry)
             
             # 更新统计
             stats["conferences"][paper["conference"]] += 1
             stats["review_types"][review["type"].lower()] += 1
+        
+        if base_info["reviews"]:
+            merged_data.append(base_info)
 
-def create_entry(base_info, review):
+def create_entry(review):
     """创建单个评审条目，并展开 content 结构"""
     try:
         # 确保 content 是 JSON 格式
@@ -99,7 +105,7 @@ def create_entry(base_info, review):
         elif review_type == "official_comment":
             structured_fields["review_text"] = content.get("comment", {}).get("value", "No comment")
 
-        return {**base_info, **structured_fields}
+        return structured_fields
 
     except Exception as e:
         print(f"⚠️ 解析 review 失败: {e}")
@@ -128,6 +134,6 @@ def generate_summary(output_dir, stats, total_entries):
     print(summary)
 
 if __name__ == "__main__":
-    input_dir = os.path.join(os.path.dirname(__file__), "raw_data")
+    input_dir = os.path.join(os.path.dirname(__file__), "openreview")
     output_dir = os.path.join(os.path.dirname(__file__), "openreview")
     process_reviews(input_dir=input_dir, output_dir=output_dir)
