@@ -75,14 +75,32 @@ def create_entry(base_info, review):
         if isinstance(content, str):
             content = json.loads(content)  # 解析 JSON 字符串
         
-        return {
-            **base_info,
-            "review_type": review.get("type", "unknown").lower(),
+        structured_fields = {
             "content_title": content.get("title", {}).get("value", "No title"),
-            "review_text": content.get("review", {}).get("value", "No review"),
-            "ratings": safe_number(content.get("rating", {}).get("value", -1)),  # 确保是数值
-            "confidence": safe_number(content.get("confidence", {}).get("value", -1))  # 确保是数值
+            "rating": content.get("rating", {}).get("value", -1),
+            "confidence": content.get("confidence", {}).get("value", -1),
+            "recommendation": content.get("recommendation", {}).get("value", "No recommendation"),
+            "review_type": review.get("type", "unknown").lower(),
         }
+
+        review_type = structured_fields["review_type"]
+
+        # 处理 review_text
+        if review_type == "official_review":
+            excluded_keys = {"title", "rating", "confidence", "recommendation"}
+            merged_review_text = "\n".join(
+                f"{field.replace('_', ' ').title()}: {content[field].get('value', '')}" 
+                for field in content.keys() if field not in excluded_keys and "value" in content[field]
+            ).strip()
+            structured_fields["review_text"] = merged_review_text if merged_review_text else "No review"
+        elif review_type == "meta_review":
+            # For Meta_Review, just extract `metareview`
+            structured_fields["review_text"] = content.get("metareview", {}).get("value", "No review")
+        elif review_type == "official_comment":
+            structured_fields["review_text"] = content.get("comment", {}).get("value", "No comment")
+
+        return {**base_info, **structured_fields}
+
     except Exception as e:
         print(f"⚠️ 解析 review 失败: {e}")
         return None
@@ -110,6 +128,6 @@ def generate_summary(output_dir, stats, total_entries):
     print(summary)
 
 if __name__ == "__main__":
-    input_dir = os.path.join(os.path.dirname(__file__), "raw_data")
+    input_dir = os.path.join(os.path.dirname(__file__), "openreview")
     output_dir = os.path.join(os.path.dirname(__file__), "openreview")
     process_reviews(input_dir=input_dir, output_dir=output_dir)
