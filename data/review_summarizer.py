@@ -8,32 +8,31 @@ class ReviewAggregator:
         self.client = OpenAI(api_key=api_key)
     
     def aggregate_reviews(self, reviews):
-        """使用GPT API聚合多条review"""
+        """使用统一英文prompt处理单条或多条review"""
         prompt = f"""
-        Please aggregate the following reviews into a unified format:
-        1. Summary
-        2. Strengths
-        3. Weaknesses
-        4. Suggestions for Improvement
-        5. Review Result
-
-        Important: If any of these is missing, infer from the content, but do not create a new one. Only use information from the given review. Do not make assumptions or add new content.
+        Please generate a concise summary based on the following review(s):
+        1. Key points
+        2. Strengths and weaknesses
+        3. Suggestions for improvement
         
-        Reviews:
+        Requirements:
+        - Maintain the core viewpoints of the original review(s)
+        - Do not add new information
+        - Use concise language
+        
+        Review(s):
         {json.dumps(reviews, ensure_ascii=False)}
         """
         
         response = self.client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1 # 使用低温度以保持忠实度
+            temperature=0.2
         )
-        
         return response.choices[0].message.content
-    
+
     def process_openreview_dataset(self, dataset_path):
         """处理数据集并聚合评审意见"""
-        # 读取数据集
         with open(dataset_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
@@ -41,10 +40,12 @@ class ReviewAggregator:
         paper_reviews = {}
         
         for item in data:
+            # 提取标题和评审内容
             title = item.get('title')
             review_text = item.get('review_text')
             
             if title and review_text:
+                # 如果标题不存在，创建新条目
                 if title not in paper_reviews:
                     paper_reviews[title] = []
                 
@@ -65,11 +66,8 @@ class ReviewAggregator:
             # 提取评审文本
             review_texts = [r['review_text'] for r in reviews]
             
-            # 即使只有一条评审也进行格式化处理
-            if len(review_texts) == 1:
-                processed_review = self.format_single_review(review_texts[0])
-            else:
-                processed_review = self.aggregate_reviews(review_texts)
+            # 使用统一方法处理单条或多条review
+            processed_review = self.aggregate_reviews(review_texts)
             
             results.append({
                 'title': title,
@@ -82,31 +80,6 @@ class ReviewAggregator:
             })
         
         return results
-    
-    def format_single_review(self, review):
-        """格式化单条评审为统一格式"""
-        prompt = f"""
-        Please format the following review into a clear and structured format.
-        Keep all original information and opinions, but organize them into these sections:
-        1. Summary
-        2. Strengths
-        3. Weaknesses
-        4. Suggestions for Improvement
-        5. Review Result
-        
-        Important: Only use information that exists in the original review.
-        
-        Review:
-        {review}
-        """
-        
-        response = self.client.chat.completions.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3  # 使用较低的温度以保持忠实度
-        )
-        
-        return response.choices[0].message.content
     
     def save_results(self, results, output_dir):
         """保存聚合结果到文件"""
