@@ -11,8 +11,8 @@ OUTPUT_DIR = "/data/openreview/"
 
 # CONFERENCES = ["ICML.cc", "AAAI.org", "NeurIPS.cc", "aclweb.org/ACL", "ACM.org", "EMNLP", "aclweb.org/NAACL", "COLING.org", "ICLR.cc", "ACCV", "CVPR"]
 
-username = os.getenv('OPENREVIEW_USERNAME_HH')
-password = os.getenv('OPENREVIEW_PASSWORD_HH')
+username = os.getenv('OPENREVIEW_USERNAME_GC')
+password = os.getenv('OPENREVIEW_PASSWORD_GC')
 
 # unique_review_types = set()
 
@@ -116,7 +116,11 @@ def process_venue(client, venue_id):
         total_reviews = 0
         conference_name = venue_id.split('.')[0]
 
+        print('s', submission)
+
         for paper in submissions:
+
+            # print(paper)
             
             # we only want new papers starting from 2020
             year = extract_year(paper)
@@ -131,11 +135,14 @@ def process_venue(client, venue_id):
                 "year": year,
                 "reviews": []
             }
+
+            # print("!", paper)
            
             allowed_review_types = ["Official_Review", "Official_Comment", "Meta_Review"]
             if hasattr(paper, "details") and "replies" in paper.details:
                 reviews_count = 0
                 for reply in paper.details["replies"]:
+                    # print(reply)
                     if "invitations" in reply and reply["invitations"]:
                         invitation_type = reply["invitations"][0].split("/")[-1]
                         
@@ -146,7 +153,7 @@ def process_venue(client, venue_id):
                                 "ratings": {}
                             }
 
-                            print("!!", review_data["review"])
+                            # print("!!", review_data["review"])
                             
                             if "rating" in reply.get("content", {}):
                                 review_data["ratings"]["rating"] = reply["content"]["rating"]
@@ -185,11 +192,11 @@ def main():
 
     results = []
     all_subgroups = []
-    base_dir = os.path.join(os.path.dirname(__file__), "openreview")
+    base_dir = os.path.join(os.path.dirname(__file__), "raw_data")
 
     # CONFERENCES = openreview.tools.get_all_venues(client)
-    # CONFERENCES = ['ICML.cc']"ICML.cc",
-    CONFERENCES = [ "AAAI.org", "ACM.org", "NeurIPS.cc", "EMNLP", "thecvf.com"]
+    CONFERENCES = ['ICML.cc'] # "ICML.cc",
+    # CONFERENCES = [ "AAAI.org", "ACM.org", "NeurIPS.cc", "EMNLP", "thecvf.com"]
 
     for conference in CONFERENCES:
         
