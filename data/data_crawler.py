@@ -5,14 +5,10 @@ import re
 import time
 from datetime import datetime
 
-# 创建输出目录
-OUTPUT_DIR = "/data/openreview/"
-# os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 # CONFERENCES = ["ICML.cc", "AAAI.org", "NeurIPS.cc", "aclweb.org/ACL", "ACM.org", "EMNLP", "aclweb.org/NAACL", "COLING.org", "ICLR.cc", "ACCV", "CVPR"]
 
-username = os.getenv('OPENREVIEW_USERNAME_GC')
-password = os.getenv('OPENREVIEW_PASSWORD_GC')
+username = os.getenv('OPENREVIEW_USERNAME_GC_OLD')
+password = os.getenv('OPENREVIEW_PASSWORD_GC_OLD')
 
 # unique_review_types = set()
 
@@ -120,7 +116,7 @@ def process_venue(client, venue_id):
 
         for paper in submissions:
 
-            # print(paper)
+            print(paper)
             
             # we only want new papers starting from 2020
             year = extract_year(paper)
