@@ -139,7 +139,7 @@ def main():
     pdf_dir = os.path.join(base_dir, "pdfs")
     
     # 指定要处理的会议列表，如果为空列表则处理所有会议
-    TARGET_CONFERENCES = ['thecvf']  # 例如: ['ICML', 'NeurIPS', 'ICLR', 'thecvf']
+    TARGET_CONFERENCES = ['AAAI']  # 例如: ['ICML', 'NeurIPS', 'ICLR', 'thecvf']
     
     # 确保目录存在
     os.makedirs(pdf_dir, exist_ok=True)

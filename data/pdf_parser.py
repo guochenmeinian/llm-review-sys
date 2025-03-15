@@ -60,8 +60,6 @@ def process_single_pdf(args):
             pdf_path,
             '-o', output_dir,
             '--markdown'  # 确保输出为markdown格式
-            '--batchsize', '4',  # 减少batch size
-            '--workers', '2'     # 限制线程数
         ], check=True, capture_output=True)
         
         # 验证输出文件
@@ -82,7 +80,8 @@ def main():
     output_root = os.path.join(base_dir, "parsed_texts")
     
     # 指定目标会议列表
-    TARGET_CONFERENCES = ['thecvf']  # 可自定义会议列表
+    # done: ['thecvf', ]
+    TARGET_CONFERENCES = ['AAAI']  # 可自定义会议列表
     
     # 使用过滤后的会议列表
     parse_pdfs(pdf_root, output_root, 
