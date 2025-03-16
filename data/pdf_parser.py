@@ -1,6 +1,5 @@
 import os
 import subprocess
-import logging
 from multiprocessing import Pool
 from tqdm import tqdm
 
@@ -13,11 +12,7 @@ def parse_pdfs(pdf_root_dir, output_root_dir, target_conferences=None, num_proce
         output_root_dir: 解析结果输出根目录（如parsed_mmd/）
         num_processes: 并行进程数
     """
-    # 创建日志记录器
-    logging.basicConfig(filename=os.path.join(output_root_dir, 'parser.log'), 
-                        level=logging.INFO,
-                        format='%(asctime)s - %(levelname)s - %(message)s')
-
+    
     # 收集所有需要处理的PDF文件
     tasks = []
     # 获取所有会议目录
@@ -70,7 +65,7 @@ def process_single_pdf(args):
             
         return True
     except Exception as e:
-        logging.error(f"解析失败: {pdf_path} - {str(e)}")
+        print(f"解析失败: {pdf_path} - {str(e)}")
         return False
 
 def main():
