@@ -48,17 +48,36 @@ def setup_qlora_model(model_name="meta-llama/Llama-3-8b-instruct"):
     
     return get_peft_model(model, peft_config)
 
-def prepare_dataset(data_path):
-    """准备训练数据集"""
+def prepare_dataset(data_path, parsed_texts_dir=None):
+    """准备训练数据集，结合论文全文与评审数据"""
     with open(data_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
     # 构建训练样本
     processed_data = []
     for item in data:
+        paper_id = item.get('id', '')
+        title = item.get('title', '')
+        conference = item.get('conference', '')
+        
+        # 尝试加载对应的论文全文
+        paper_content = ""
+        if parsed_texts_dir and paper_id:
+            # 查找对应会议目录下的论文文件
+            conf_dir = os.path.join(parsed_texts_dir, conference)
+            if os.path.exists(conf_dir):
+                paper_file = os.path.join(conf_dir, f"{paper_id}.mmd")
+                if os.path.exists(paper_file):
+                    with open(paper_file, 'r', encoding='utf-8') as f:
+                        paper_content = f.read()
+        
         # 构建输入输出对
-        input_text = f"Paper Title: {item['title']}\n\nWrite a comprehensive review for this paper."
-        output_text = item['review_text']  # 或 aggregated_review，取决于您的选择
+        if paper_content:
+            input_text = f"Paper Title: {title}\n\nPaper Content: {paper_content[:4000]}\n\nWrite a comprehensive review for this paper."
+        else:
+            input_text = f"Paper Title: {title}\n\nWrite a comprehensive review for this paper."
+            
+        output_text = item['review_text']  # 或 aggregated_review
         
         processed_data.append({
             "input": input_text,

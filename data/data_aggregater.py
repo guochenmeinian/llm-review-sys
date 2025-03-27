@@ -134,6 +134,6 @@ def generate_summary(output_dir, stats, total_entries):
     print(summary)
 
 if __name__ == "__main__":
-    input_dir = os.path.join(os.path.dirname(__file__), "openreview")
-    output_dir = os.path.join(os.path.dirname(__file__), "openreview")
+    input_dir = os.path.join(os.path.dirname(__file__), "draft_data")
+    output_dir = os.path.join(os.path.dirname(__file__), "draft_data")
     process_reviews(input_dir=input_dir, output_dir=output_dir)
