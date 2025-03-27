@@ -323,8 +323,8 @@ def main():
     dataset_path = os.path.join(base_dir, "draft_data", "paper_reviews.json")
     output_dir = os.path.join(base_dir, "aggregated_reviews")
 
-    # 创建ReviewAggregator实例
-    aggregator = ReviewAggregator('OPENAI_KEY_CG')
+    # 创建ReviewAggregator实例，使用环境变量名而不是硬编码的密钥
+    aggregator = ReviewAggregator('OPENAI_API_KEY')  # 使用标准环境变量名
 
     # 处理数据集并保存结果，一篇一篇处理
     processed_count = aggregator.process_openreview_dataset(dataset_path, output_dir)
