@@ -153,7 +153,14 @@ class ReviewAggregator:
             self._log_error(error_msg)
             # 如果合并失败，返回所有摘要的简单连接
             return "\n\n===== 摘要分割线 =====\n\n".join(summaries)
-        
+    
+    def _log_error(self, error_msg):
+        """记录错误信息到文件"""
+        error_log_path = os.path.join(os.path.dirname(__file__), "error_log.txt")
+        timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(error_log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {error_msg}\n")
+    
     def process_openreview_dataset(self, dataset_path, output_dir):
         """处理数据集并聚合评审意见，处理一篇保存一篇"""
     
@@ -241,6 +248,7 @@ class ReviewAggregator:
         
         # 聚合每篇论文的评审，并立即保存
         processed_count = 0
+        error_count = 0  # 添加错误计数变量初始化
         for title, reviews in tqdm(paper_reviews.items(), desc="Processing papers"):
             try:
                 # 如果已经处理过，跳过
