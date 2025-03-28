@@ -89,7 +89,12 @@ class ReviewAggregator:
         - Ensure the summary captures the full depth and nuance of the original reviews
         - Match the original review's academic tone and technical precision
         - Reduce length by 20-30% without losing critical information
-        - Use FIRST PERSON PLURAL perspective (we, our, us) when referring to reviewers. For example: "We suggest improving the method" instead of "The reviewers suggest improving the method"
+        - When making suggestions, write as if reviewers are directly addressing the authors (e.g., "We recommend that the authors improve..." rather than "The reviewers suggest..." or "We should improve...")
+        - When discussing the paper in the Key points section, use phrases like "This paper presents..." or "The authors propose..." rather than "We present..."
+
+        Format Requirements:
+        - Use "### Key Points", "### Strengths and Weaknesses", and "### Suggestions for Improvement" as section headers
+        - In the Strengths and Weaknesses section, write "Strengths:" and "Weaknesses:" on separate lines
         
         Review(s):
         {numbered_reviews}
@@ -128,7 +133,12 @@ class ReviewAggregator:
         - Ensure the final summary is logically coherent
         - Keep the original academic and technical precision
         - Do NOT introduce any new interpretations or insights
-        - Use FIRST PERSON PLURAL perspective (we, our, us) when referring to reviewers. For example: "We suggest improving the method" instead of "The reviewers suggest improving the method"
+        - When making suggestions, write as if reviewers are directly addressing the authors (e.g., "We recommend that the authors improve..." rather than "The reviewers suggest..." or "We should improve...")
+        - When discussing the paper in the Key points section, use phrases like "This paper presents..." or "The authors propose..." rather than "We present..."
+
+        Format Requirements:
+        - Use "### Key Points", "### Strengths and Weaknesses", and "### Suggestions for Improvement" as section headers
+        - In the Strengths and Weaknesses section, write "Strengths:" and "Weaknesses:" on separate lines
         
         Summaries to merge:
         {combined_summaries}
@@ -324,7 +334,7 @@ def main():
     output_dir = os.path.join(base_dir, "aggregated_reviews")
 
     # 创建ReviewAggregator实例，使用环境变量名而不是硬编码的密钥
-    aggregator = ReviewAggregator('OPENAI_API_KEY')  # 使用标准环境变量名
+    aggregator = ReviewAggregator('OPENAI_KEY_CG')  # 使用标准环境变量名
 
     # 处理数据集并保存结果，一篇一篇处理
     processed_count = aggregator.process_openreview_dataset(dataset_path, output_dir)
