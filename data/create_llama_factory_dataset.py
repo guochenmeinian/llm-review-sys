@@ -6,8 +6,60 @@ from pathlib import Path
 
 def load_aggregated_reviews(json_path):
     """加载聚合评审数据"""
-    with open(json_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"无法加载聚合评审数据: {e}")
+        print("将创建新的聚合评审数据...")
+        return []
+
+def generate_aggregated_reviews(extracted_texts_dir, output_json_path):
+    """从提取的文本文件生成聚合评审数据"""
+    aggregated_reviews = []
+    
+    # 递归搜索所有子目录中的.mmd文件
+    for mmd_file in glob.glob(os.path.join(extracted_texts_dir, '**', '*.mmd'), recursive=True):
+        try:
+            # 从文件名中提取ID
+            file_name = os.path.basename(mmd_file)
+            paper_id = os.path.splitext(file_name)[0]
+            
+            # 读取.mmd文件内容
+            with open(mmd_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # 提取标题
+            title_match = re.search(r'^#\s+(.*?)$', content, re.MULTILINE)
+            title = title_match.group(1) if title_match else "Unknown Title"
+            
+            # 提取会议信息（如果有）
+            conference = ""
+            year = ""
+            
+            # 创建一个模拟的聚合评审
+            review_item = {
+                "id": paper_id,
+                "title": title,
+                "conference": conference,
+                "year": year,
+                "aggregated_review": "This is a placeholder review. Please replace with actual review content."
+            }
+            
+            aggregated_reviews.append(review_item)
+            
+        except Exception as e:
+            print(f"处理文件 {mmd_file} 时出错: {e}")
+    
+    # 确保输出目录存在
+    os.makedirs(os.path.dirname(output_json_path), exist_ok=True)
+    
+    # 保存聚合评审数据
+    with open(output_json_path, 'w', encoding='utf-8') as f:
+        json.dump(aggregated_reviews, f, ensure_ascii=False, indent=2)
+    
+    print(f"已生成 {len(aggregated_reviews)} 条聚合评审数据")
+    return aggregated_reviews
 
 def find_parsed_pdfs(base_dir):
     """查找所有解析后的PDF文件"""
@@ -159,17 +211,17 @@ def create_paper_review_dataset(aggregated_reviews, parsed_pdfs, output_path):
 if __name__ == "__main__":
     # 设置路径
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    pdfs_dir = os.path.join(base_dir, "data", "parsed_texts")
+    extracted_texts_dir = os.path.join(base_dir, "data", "extracted_texts")
+    pdfs_dir = os.path.join(base_dir, "data", "extracted_texts")
     aggregated_reviews_path = os.path.join(base_dir, "data", "aggregated_reviews", "aggregated_reviews.json")
     output_dataset_path = os.path.join(base_dir, "data", "paper_review_dataset", "paper_review_dataset.json")
     
     # 确保输出目录存在
     os.makedirs(os.path.dirname(output_dataset_path), exist_ok=True)
     
-    # 加载聚合评审数据
-    print("加载聚合评审数据...")
-    aggregated_reviews = load_aggregated_reviews(aggregated_reviews_path)
-    print(f"已加载 {len(aggregated_reviews)} 条聚合评审")
+    # 生成新的聚合评审数据
+    print("基于提取的文本生成聚合评审数据...")
+    aggregated_reviews = generate_aggregated_reviews(extracted_texts_dir, aggregated_reviews_path)
     
     # 查找解析后的PDF文件
     print("查找解析后的PDF文件...")
