@@ -1,0 +1,203 @@
+# Grammar-Aligned Decoding
+
+Kanghee Park\({}^{1}\)1 Jiayu Wang\({}^{1*}\)  Taylor Berg-Kirkpatrick\({}^{2}\)
+
+**Nadia Polikarpova\({}^{2}\)  Loris D'Antoni\({}^{1}\)**
+
+\({}^{1}\)University of Wisconsin-Madison  \({}^{2}\)University of California San Diego
+
+{kpark247, jiwang2782, ldantoni}@wisc.edu, {tberg, npolikarpova}@ucsd.edu
+
+Equal contribution
+
+###### Abstract
+
+Large Language Models (LLMs) struggle with reliably generating highly structured outputs, such as program code, mathematical formulas, or well-formed markup. Constrained decoding approaches mitigate this problem by greedily restricting what tokens an LLM can output at each step to guarantee that the output matches a given constraint. Specifically, in _grammar-constrained decoding_ (GCD), the LLM's output must follow a given grammar. In this paper we demonstrate that GCD techniques (and in general constrained decoding techniques) can _distort the LLM's distribution_, leading to outputs that are grammatical but appear with likelihoods that are not proportional to the ones given by the LLM, and so ultimately are low-quality. We call the problem of aligning sampling with a grammar constraint, _grammar-aligned decoding_ (GAD), and propose _adaptive sampling with approximate expected futures_ (ASAp), a decoding algorithm that guarantees the output to be grammatical while provably producing outputs that match the conditional probability of the LLM's distribution conditioned on the given grammar constraint. Our algorithm uses prior sample outputs to soundly overapproximate the future grammaticality of different output prefixes. Our evaluation on code generation and structured NLP tasks shows how ASAp often produces outputs with higher likelihood (according to the LLM's distribution) than existing GCD techniques, while still enforcing the desired grammatical constraints. 2
+
+## 1 Introduction
+
+Despite their remarkable success, pre-trained Large Language Models (LLMs) often struggle with generating highly structured outputs, such as program code, configuration files, or mathematical formulas. A naive approach to enforcing structure is _rejection sampling_, which repeatedly samples strings from the LLM and checks them against a validity oracle, typically in the form of a _context-free grammar_ (CFG). Rejection sampling is highly inefficient or simply intractable for restrictive grammars and long output sequences--i.e., most generated strings will not be in the target grammar.
+
+Constrained decoding addresses the inefficiency of rejection sampling by greedily "forcing" the LLM output to satisfy the given constraint. Specifically, when the constraint is given as a grammar, _grammar-constrained decoding_ (GCD) , can build automata that allow for on-the-fly masking of tokens that will provably lead to outputs outside of the grammar during decoding.
+
+While GCD does not incur the overhead of rejection sampling--i.e., the generated output is always in the language of the grammar--we show that GCD and in general all forms of structured decoding introduce a new problem: **structured decoding distorts the LLM's learned language distribution**, effectively hindering the LLM's capabilities.
+
+This paper introduces and formalizes _grammar-aligned decoding_ (GAD), the problem of sampling from an LLM so that the outputs (1) are guaranteed to adhere to a given grammar, and (2) are unbiased _wrt_. the LLM's distribution. Although exact GAD is intractable in general (similar to rejection sampling), we propose a new adaptive decoding algorithm for _approximate_ GAD, which starts off as GCD and gradually converges to the LLM's distribution, and thus allows trading off between efficiency and accuracy. The algorithm, which we dub _Adaptive Sampling with Approximate Expected Futures_ (ASAp), is built "on top" of existing constrained decoding algorithms. Whereas GCD approaches simply mask out tokens that lead to non-grammatical sequences for a given prefix, ASAp remembers for all sampled prefixes the probability associated with masked-out tokens and uses it to upper bound the probability of grammaticality. By updating this bound when more samples are observed, the decoding algorithm converges to the desired probability distribution--i.e., it samples outputs from the LLM-induced probability conditioned on the outputs being accepted by the grammar. The idea works for any structured decoding approach and not just for GCD, but in this paper we focus our evaluation on constraints expressed via grammars.
+
+We evaluate ASAp on two structured prediction tasks: formal program synthesis and constituency parsing. Our experiments on program synthesis and NLP tasks show that GCD techniques generate outputs that are grammatical but unlikely according to the LLM, while with ASAp, the likelihood of the generated outputs improves over time, converging to the target constrained LLM--i.e., GAD better respects the LLM while still enforcing the constraints.
+
+## 2 Grammar-Aligned Decoding
+
+In this section, we formalize the problem of _grammar-aligned decoding_ (GAD) as decoding from an autoregressive language model while enforcing the output sequence to be accepted by a given context-free grammar. We also demonstrate the limitations of existing approaches to this problem.
+
+Language ModelsAn (autoregressive) language model defines a probability distribution \(P\) on the set of all strings \(w^{*}\) over a vocabulary of tokens \(\) via a product of left-to-right next-token conditional distributions \(P(w_{1} w_{n})=_{i=1}^{n}P(w_{i} w_{1:i-1})\).
+
+Context-Free GrammarsA _context-free grammar_ (CFG) is a quadruple \(=(,,S,)\), where \(\) is a vocabulary of tokens (also called terminal symbols), \(\) is a finite set of non-terminal symbols, \(S\) is the starting non-terminal, and \(\) is the set of production rules. An example CFG is shown in Fig. 1. A grammar \(\) defines a _single-step derivation_ relation on sequences of symbols \(,,()^{*}\): \( A\) if \(A\). The reflexive transitive closure of this relation is called _derivation_ and written \(^{*}\). A sequence of tokens \(w\) is a _sentence_ if it is derivable from \(S\); the set of all sentences is called the _language_ of the grammar \(\), that is, \(()=\{w^{*} S^{*}w\}\). The following example illustrates these definitions.
+
+**Example 1** (CFG Derivations).: _Given the CFG \(_{sk}\) shown in Fig. 1, the string 00000 belongs to the language \((_{sk})\) because it can be derived using the derivation \(S\). The string 10101 is also in \((_{sk})\) and can be derived as follows:_
+
+\[SA_{2}A_{3} A_{4}A_{5}\]
+
+_Each step replaces a nonterminal symbol using a production rule in \(_{sk}\)--e.g., in the string 10\(A_{3}\), the nonterminal \(A_{3}\) is rewritten as \(1A_{4}\) by applying the rule \(A_{3}A_{4}\), resulting in the string 101\(A_{4}\)._
+
+In addition, we define the _prefix language_ of \(\) as the set of all prefixes of sentences in \(()\): \(_{}()=\{w^{*} wv()\}\).
+
+Grammar-Aligned DecodingGiven a model distribution \(P\) and a CFG \(\), _grammar-aligned decoding (GAD)_ is the task of sampling from the distribution \(Q^{P,}\) that is _proportional_ to \(P\) but _restricted_ to sentences in \(\):
+
+\[Q^{P,}(w)=[w()] P(w) }{_{w^{}}[w^{}()] P(w^ {})}\]
+
+Figure 1: CFG \(_{sk}\) over tokens \(=\{0,1\}\), written in Backus-Naur form (BNF) notation. This grammar accepts the string 00000 and all length-5 strings that start with a 1.
+
+When \(P\) and \(\) are clear from context, we will write \(Q(w)\) instead of \(Q^{P,}(w)\).
+
+**Example 2** (Gad).: _Consider the distribution \(P\) that arises from prompting an LLM to "generate a binary string that ends with a \(1\)". We expect \(P\) to assign high probability to strings of the form \(( 1)^{*}1\)--i.e. those that satisfy the prompt (Mixtra1-8x7B-Instruct-v0.1 (temperature=1) generates binary strings that end with a \(1\) around 90% of the time.) A snippet of a possible distribution \(P\) is depicted in Fig. 2._
+
+_Suppose we constrain the model's output to the language of the grammar \(_{sk}\) in Fig. 1, which only accepts strings of length 5. Moreover, \(_{sk}\) only accepts one string that starts with \(\), i.e., 0000, which does not end with \(1\). In Fig. 2, the grayed out parts of the trie are tokens that lead to sequences outside of the grammar \(_{sk}\). According to the definition of GAD, the target sampling distribution \(Q^{P,_{sk}}\) should assign: (i) high probability to all eight strings of the form \(1w_{2}w_{3}w_{4}1\)--which conform both to the grammar and the prompt; (ii) low probability to the string 00000--which conforms to the grammar but not the prompt; and (iii) zero probability to all other strings._
+
+Exact GadCan one exactly sample from \(Q^{P,}\)?Rejection sampling, which repeatedly draws from \(P\) until a sample lands in \(()\), provably yields exact samples according to \(Q^{P,}\), but if \(P\) assigns most of its mass outside of \(()\), it is intractably slow, especially if the prompt is not including information about the grammar (see ). For Ex. 2, rejection sampling would be highly inefficient because the model would generate many strings that are not of length five.
+
+In contrast, exact sampling from \(P\) is efficient because its joint distribution is represented by a product of easily computed left-to-right conditionals, enabling ancestral sampling (i.e., generating tokens left to right, conditioned on already generated tokens). Can we similarly factor \(Q\) into a product of left-to-right conditionals \(Q^{P,}(w_{i}|w_{1:i-1})\), to enable ancestral sampling?
+
+For simplicity, let us assume that \(P\) is a distribution over sequences of exactly length \(n\) (although, in practice, language models can produce'stop' tokens which allow for a valid distribution on sequences of all lengths). The exact conditionals of \(Q^{P,}\) are given by:
+
+\[Q^{P,}(w_{i} w_{1:i-1})&&_{w_{i+ 1:n}}[1[w()]_{j=i}^{n}P(w_{j} w_{1: j-1})]\\ &&P(w_{i} w_{1:i-1})_{P(w_{i+1:n}|w_{1:i})}[1[w ()]] \]
+
+Thus, exact left-to-right sampling from \(Q^{P,}\) consists of sampling from model conditionals \(P(w_{i} w_{1:i-1})\), with an additional weighting term \(c(w_{1:i})=_{P(w_{i+1:n}|w_{1:i})}[1[w()]]\) that considers the grammar.
+
+We refer to \(c(w_{1:i})\) as _expected future grammaticality_ (EFG), _i.e._ the probability that a continuation of \(w_{1:i}\) sampled from \(P\) lands in \(()\). Using this notation, we can write the exact left-to-right sampling conditional explicitly as:
+
+\[Q^{P,}(w_{i} w_{1:i-1})= w_{1:i-1}) c(w_ {1:i})}{_{w^{}_{i}}P(w^{}_{i} w_{1:i-1}) c(w_{1:i-1},w^{}_{i})} \]
+
+To see why computing this conditional is intractable, consider using dynamic programming to compute \(c(w_{1:i})\) by marginalizing over a product of potential functions: the set of model conditionals and an indicator potential for the grammar. While the indicator potential can be factorized across rules in the grammar, the model's contribution generally does not factorize: in practice, the final conditional probability \(P(w_{n} w_{1:n-1})\) is a global potential function, defined by a non-linear neural network touching every variable. Thus, the main goal of this paper is to develop effective approximations to the EFG \(c(w_{1:i})\), which would enable us to compute the left-to-right conditionals of \(Q\).
+
+Figure 2: Fragment of the conditional model distribution \(P\) for Ex. 2 depicted as a trie. Each node corresponds to a prefix \(w_{1:i-1}\), and each edge is annotated with the next token \(w_{i}\) and its conditional probability \(P(w_{i} w_{1:i-1})\). Filled nodes are complete strings. Grayed out parts of the trie are outside of the grammar \(_{sk}\).
+
+Limitations of Grammar-Constrained DecodingExisting work [27; 28] has proposed _grammar-constrained decoding_ (GCD) as a way to efficiently sample from an autoregressive language model subject to grammar constraints. Although the exact details of these techniques vary depending on class of grammars they support, the common thread is that they rely on an _incremental parser_, which can efficiently check whether a given string \(w\) is a prefix of a sentence in the grammar, i.e., \(w_{}()\). When given a sentence \(w_{1:i-1}\), GCD techniques use this parser during decoding to mask out any next token \(w_{i}\) that results in a prefix \(w_{1:i}\) for which no completion will produce a sequence in the grammar. Using the trie in Fig. 2 as an example, one can think of GCD as sampling a path through the trie by selecting only among the black outgoing edges from every node, proportional to their conditional probabilities in the diagram (_e.g._ the first token is \(\) or \(1\) with equal probability).
+
+In terms of the GAD problem, we can view GCD as approximating the exact left-to-right conditionals \(Q^{P,}(w_{i} w_{1:i-1})\) by the conditional distribution \(_{}(w_{i} w_{1:i-1})\), defined as follows:
+
+\[_{}(w_{i} w_{1:i-1})= w_{1:i-1})  1[w_{1:i}_{}()]}{ _{w^{}_{i}}P(w^{}_{i} w_{1:i-1}) 1[w_{1:i-1},w^{ }_{i}_{}()]}\]
+
+Though not originally formulated in this way, we can view recent work on GCD [27; 28] as forming a binary approximation \(1[w_{1:i}_{}()]\) to the EFG \(c(w_{1:i})\). In other words, while GCD considers the _possibility_ of future grammaticality, it makes no attempt to integrate the model's likelihood to estimate _expected_ future grammaticality, which can lead to substantial bias in the sampling distribution--i.e., every EFG such that \(c(w_{1:i})>0\) will simply be approximated via the value \(1\).
+
+**Example 3** (Gcd).: _Consider again the GAD problem from Ex. 2, where our target sampling distribution \(Q^{P,_{sk}}\) assigns high probability to strings that both start and end with a \(1\) and a low probability to the string 00000. However, we observe that GCD  generates strings ending with a \(1\) only 30% of the time--i.e., GCD has effectively ruined the LLM's ability to follow the prompt by biasing sampling towards 0000, an incorrect output._
+
+_When generating the first token (\(\) or \(1\)), the GCD algorithm does not know how many grammatical strings can start with each character and, more importantly, how likely these strings are under \(P\). Since both tokens \(\) and \(1\) have the possibility of leading to a grammatical string, GCD will estimate their expected future grammaticality as 1, and choose each of them roughly half of the time (since \(P() P(1)\)). Once GCD has chosen \(\), however, it becomes "trapped" in the part of the search space where the only grammatical string is the low-probability sequence 00000._
+
+Ex. 3 illustrates how existing GCD approaches can hinder the language model's abilities to explore the space of possible outputs according to the learned distribution, thus highlighting the importance of designing a better approximation to the EFG \(c(w_{1:i})\); this is addressed in the next section.
+
+## 3 Adaptive Sampling with Approximate Expected Futures (ASAp)
+
+In this section, we propose an adaptive sampling algorithm that iteratively builds better approximations of the future grammaticality of a sequence. Our procedure operates by sampling _repeatedly_, each time bounding lost probability mass to provably ungrammatical areas of the search space in order to better guide the next sampling iteration. As a result, our algorithm converges over many iterations to exact samples from the constrained LLM distribution, allowing for a flexible trade-off between efficiency and accuracy.
+
+Overview of the AlgorithmGCD approaches poorly approximate the desired distribution because they greedily sample prefixes without worrying about the EFG. When sampling the first token in Ex. 3, GCD simply uses the likelihood for tokens \(0\) and \(1\) assigned by the LLM without considering the probability that these next tokens would result in grammatical completions if sampling were unconstrained--i.e. without incorporating the critical EFG re-weighting terms that are necessary for unbiased sampling from the constrained LLM distribution. However, if GCD ends up sampling \(\) as the first token for Ex. 3, it will necessarily sample the string 00000 since no other sequences starting with \(\) are allowed by the grammar. We can "learn" from this result: the true probability mass assigned to all grammatical sequences starting with a \(\) is not \(0.45\) as the LLM's next token probability would have us believe; instead, the total grammatical mass in this section of the search space is the joint probability of the single string 00000, which is the much lower value of as depicted in Fig. 3. In other words, simply by sampling 00000, we can better approximate (in this case, exactly) the EFG of tokens along this path.
+
+The key insight behind our algorithm, which we call ASAp, is that we can iterate this process of discovering lost grammatical probability mass by repeatedly sampling and revising transition weights after each sample is produced. More formally, we can think of this procedure as starting with GCD's over-approximation to each EFG \(c(w_{1:i})\) term, and then, through repeated sampling and discovery of mass assigned to non-grammatical completions, reducing each overapproximation to make it more accurate. In the limit, the approximations converge to exact EFG estimates and unbiased sampling.
+
+Two possible first iterations of the ASAp algorithm are depicted in Fig. 3. In the first iteration (left of Fig. 3), after sampling the sequence 00000, the algorithm directly addresses the issue that arose in Ex. 3 by attempting to better approximate the probability mass of potential grammatical completions of each prefix of 00000 (red quantities). For example, the expected future grammaticality of the prefix 00000 it is now \(0.45*10^{-8}\)--i.e., the algorithm effectively "looks ahead" to determine that only one valid (but low probability) string 0s that can follow 0000. The ideas developed in GCD allow us to efficiently compute, for a given string, the likelihood of the next tokens that will immediately result in non-grammaticality.
+
+If we only sample one string from the LLM, we cannot hope to do better than GCD in terms of sampling faithfully in a grammar-aligned way. However, if we were to now sample once more, we could now better direct our sampling strategy. In the second iteration (right of Fig. 3), the string 11111 is sampled and the expected future grammaticality is updated (red quantities). Note that at this point the probabilites assigned to the string 00000 from the earlier iteration have already been updated.
+
+By repeating the above approach multiple times (i.e., by producing more samples), the ASAp algorithm produces precise approximations of the expected future grammaticalities and thus better samples from the constrained LLM.
+
+Algorithm FormalizationThe key quantity that the algorithm approximates based on past samples is the _expected future grammaticality_ (EFG) \(c(w_{1:i})=_{p(w_{i+1:n}|w_{1:i})}[[w( )]]\). At iteration \(m+1\), our algorithm uses the set of samples \(S=\{s_{1},,s_{m}\}\) observed so far to compute an overapproximation \(_{S}(w_{1:i})\) of \(c_{S}(w_{1:i})\) for every possible string \(w_{1:i}\). The overapproximation is inductively defined:
+
+\[_{S}(w_{1:i})=[w_{1:i}_{}()]&$}\\ _{S}(w_{1:i})=_{w_{i+1}}P(w_{i+1} w_{1:i})_{S}(w _{1:i+1})& \]
+
+Intuitively, if no samples in \(S\) start with the prefix \(w_{1:i}\), then \(_{S}(w_{1:i})\), the overapproximation of EFG is simply whether the string is or is not a valid prefix in the grammar--i.e. the same overapproximation used by GCD. If, on the other hand, we _have_ encountered the prefix \(w_{1:i}\) before in previous samples in \(S\), the overapproximation uses the next token likelihoods that were computed during the previous sampling runs of the algorithm to compute a better estimate of EFG.
+
+For example, in Fig. 3, once we have sampled the sequences 00000 and 11111, we have that \(_{S}()=0.45*10^{-8}\) and \(_{S}()=1\) (i.e., we have not seen a sample with the prefix 110 yet).
+
+**Theorem 1**.: \( w_{1:i}^{*},_{S}(w_{1:i}) c(w_{1:i})\)_._
+
+Proof.: To see that \(_{S}(w_{1:i})\) is indeed an upperbound on \(c(w_{1:i})\), consider two cases: First, suppose \(w_{1:i}\) is not a prefix of any string in \(S\). In this case, \(_{S}(w_{1:i})=[w_{1:i}_{}( )]\) and, like GCD, provides a trivial upper bound. When \([w_{1:i}_{}()]=0\), there is
+
+Figure 3: Illustration of the trie built by ASAp after sampling 00000 as the first string (left) and after sampling 11111 as the second string (right). EFG updates after each iteration are shown in red.
+
+no possibility of grammaticality along this path and the EFG is therefore also zero. When \([w_{1:i}_{}()]=1\) it trivially bounds EFG, which is a probability. Second, we need to prove that \( w_{1:i}(S),_{S}(w_{1:i}) c(w_{1:i})\). where \((S)\) is the set of (finitely many) prefixes of string in \(S\). We proceed by induction, where the base case is when \(w_{1:i}\) is in \((S)\) but no \(w_{1:i+1}\) is in \((S)\) for any possible next token \(w_{i+1}\). Consequently, every \(w_{1:i+1}\) falls under the first case, leading us to the following inequality:
+
+\[_{S}(w_{1:i})=_{w_{i+1}}P(w_{i+1} w_{1:i})_{S}( w_{1:i+1})_{w_{i+1}}P(w_{i+1} w_{1:i}) c(w_{1:i+1})=c(w_{1:i}) \]
+
+Next, we move on to the inductive step where \(w_{1:i}\) is in \((S)\) and for any \(w_{i+1}\), the string \(w_{1:i+1}\) can either be a node that is not a prefix of \(S\), which falls under the first case, or it can in \((S)\), for which the property holds by induction. Therefore, the reasoning used in Eq. 4 works for the inductive case as well. 
+
+The sampling procedure itself proceeds autoregressively like GCD, but using the iteratively updated EFG estimates we have just defined, \(_{S}\). Specifically, the left-to-right sampling conditional for our procedure, \(_{S}(w_{i}|w_{1:i-1})\), after having previously sampled the strings in \(S\), is defined as follows:
+
+\[_{S}(w_{i}|w_{1:i-1})= w_{1:i-1})_{S}( w_{1:i})}{_{w^{}_{i}}P(w^{}_{i} w_{1:i-1})_{S}( w_{1:i-1},w^{}_{i})} \]
+
+Our overall algorithm, which is presented in Algorithm 1, then proceeds iteratively, using past samples to improve subsequent samples. Whenever the sample set \(S\) is updated with a new sample \(w_{1:m}\), the over-approximation \(\) is updated for the prefixes of \(w_{1:n}\). The update begins at the end of the sequence and proceeds backward toward the start, by the recursive definition in Eq. 3. In the listing, we assume that we are only interested in the final sample, but in our evaluation we will analyze whether the algorithm induces the desired distribution.
+
+Next we provide a proof that this algorithm converges to exact estimates of EFG in the limit of infinite iterations, and therefore to exact samples from the constrained LLM distribution. The theorem assumes almost sure termination of ancestral sampling in the unconstrained LLM distribution \(P\)--i.e., the LLM eventually terminates.
+
+**Theorem 2**.: _Assume that as \(L\), the distribution \(P\) assigns vanishingly small probability mass to sequences longer than length \(L\). Now, let \(S_{m}=\{s_{1},,s_{m}\}\) be the set of recorded samples up to the \(m\)th iteration of ASAp. Then, \( w_{1:i}_{}(),_{S_{m} }(w_{1:i})}{{}}c(w_{1:i})\) as \(m\)._
+
+Proof.: Let \(w_{1:i}\) be an arbitrary sequence in \(_{}()\). The approximation gap after \(m\) iterations of sampling with ASAp, \(_{m}=_{S_{m}}(w_{1:i})-c(w_{1:i})\), is equal to the marginal probability under \(P\) of all _ungrammatical_ continuations of \(w_{1:i}\) that _have not yet been encountered_ in the first \(m\) samples, \(S_{m}\). Now consider an arbitrarily small \(>0\). By assumption, there exists an \(L\) such that the probability mass \(P\) places on sequences longer than \(L\) is less than \(\). Further, ASAp samples according to \(P\), but re-weighted by an upper bound on the true EFG (Theorem 1). Thus, the probability of encountering a _previously unseen_ ungrammatical continuation of \(w_{1:i}\) no longer than \(L\) on any given iteration is at least as high as the probability of encountering the same continuation when sampling directly from \(P\). Because the number of sequences no longer than \(L\) is finite, this implies that the probability mass under \(P\) of ungrammatical continuations of \(w_{1:i}\) that are no longer than \(L\) and that _are not yet encountered in \(S_{m}\)_ becomes vanishingly small as as \(m\). The remaining unencountered ungrammatical continuations of \(w_{1:i}\) are longer than \(L\), and thus their total mass is bounded by \(\). Therefore \(P(_{m}>) 0\) as \(m\).
+
+```
+;Determineswhattermscanappear (set-logicSLLA) ;Thefunctiontosynthesize (synth-funf((nameString))String ;Thegrammarforftobesynthesizedin ((StartString(S)) (SString (name"_"_" (str.++SS) (str.atSI) (str.replaceSS) (str.substrSITI))) (IInt (@12(+II)(-II) (str.lenS) (str.indexofSIT))))
+```
+
+```
+;Specificationstosatisfy (constraint(=(f"NancyFreeHafter")"N.F.")) (constraint(=(f"AndrewCencii"A.C.")) (constraint(=(f"JanKotas"J.K.")) (constraint(=(f"MariyaSergienko"M.S.")) (a)SLIA/initials-small  Start::=S  S::=name|""|"_"|str.++SS|str.atSITr.replaceSSITr.substrSITI ::=@|1|2|+II|-I|-I|str.lenS|str.indexofSIT
+```
+
+## 4 Experiments
+
+We implemented the ASAp algorithm as an extension of the Transformers-CFG implementation of GCD . When the LLM generates a sequence \(w_{1:n}\), the ASAp algorithm keeps track of the original LLM's probability \(P(w_{i} w_{1:i-1})\) for \(1 i n\) and the set of allowed next tokens \(\{w_{i} w_{1:i-1},w^{}_{i}()\}\) determined by the incremental parser in the Transformers-CFG library. After the LLM finishes generating a sequence, our implementation of ASAp updates the overapproximation \(_{S}\) from the end of sequence by back-propagating the quantity 1 minus probability of the tokens that will for sure lead to non-grammatical sequences. The implementation of ASAp updates \(_{S}(w_{1:n-1},w^{}_{n})\) for all possible tokens \(w^{}_{n}\), and then moves on to update \(_{S}(w_{1:n-2},w^{}_{n-1})\)...,\(_{S}(w_{1},w^{}_{2})\), \(_{S}(w^{}_{1})\) using Equation (3).
+
+Datasets and Models.We consider the benchmark from Example 3 and three structured-decoding tasks. Two of our tasks involve solving Syntax-Guided Synthesis Problems (SyGuS) . SyGuS is a standardized format where one provides a logical specification and a context free grammar of first-order terms and the goal is to synthesize a term in the grammar that satisfies the specification. SyGuS is a natural fit for GAD and we consider two tasks from the standard SyGuS benchmarks where grammars vary from benchmark to benchmark: strings with linear integer arithmetic (SLIA) and loop invariant generation with bit-vector arithmetic (INV-BV). In the former, the grammar is used to restrict what constant strings one can use when building string-manipulating programs and in
+
+Figure 4: (a) A SLIA problem in which the grammar for the target function is explicitly defined. (b) INV-BV problem in which the grammar for the target function inv is implicitly defined. (c) The explicitly defined grammar for f written in BNF notation. (d) The implicitly defined grammar for inv written in BNF notation. The grammar is implicitly defined by primitives of BV logic and parameters of inv. The goal of each problem is to find an implementation for synth-fun functions that satisfies all the constraints within a specified grammar—i.e., to find implementation of f in the grammar (c) and inv in the grammar (d).
+
+the latter the grammar is used to restrict constant bit-vectors and operations used to build invariants. Fig. 4 provides examples of SLIA and INV-BV problems. For both families of benchmarks, our prompts consist of 3 in-context examples of the form (specification, solution) and the grammar is then provided as a constraint for GAD. Our third task is the constituency parsing (CP) task already used in prior GCD work  where the grammar is used to help the model produce well-parenthesized parse trees for English sentences.
+
+Due to constrained resources and needing to run inference multiple times to measure whether the distribution \(\) is faithful to \(Q\), we randomly select 15 SLIA problems, 15 INV-BV problems, and 6 CP problems. We select the open-source Mistral-7B  for evaluation due to its superior reasoning and code generation capabilities.
+
+Measures.We run both algorithms for 2,000 iterations/sample on each benchmark.
+
+To assess converge to the target distribution, we measure the Kullback-Leibler (KL) divergence between the distributions of GCD and ASAp from the target distribution \(Q\) for a given number of samples. Because the ideal GAD distribution \(Q_{P,}\) is proportional to the original LLM's distribution \(P\) for sequences allowed by a grammar \(\), we can use the LLM's distribution \(P\) on all observed samples as an estimate \(Q_{P,}\). The quantity \(KL(Q\|P)\) only differs by a constant from the KL divergence between empirical distributions and the ideal GAD distribution:
+
+\[KL(\|P){=}_{}[}{P}] {=}_{}[}{C{}Q_{P, }}]{=}_{}[}{Q_{P,}}]{-} C{=}KL(\|Q_{P,}){-} C\]
+
+where \(C=_{w}[w()]P(w)\). Thus, \(KL(\|P)\) can be used to quantify the alignment between the empirical distributions of GCD and ASAp with the ideal GAD distribution.
+
+For example, Fig. 4(a) shows convergence results for the first 75 iterations on the illustrative Ex. 3--i.e., the KL divergence for \(_{ASAp}\) quickly converges to 0 whereas the one for \(_{GCD}\) doesn't.
+
+We also compare the empirical expectations of the variables \(_{GCD}\), \(_{ASAp}\), and \(P\). For example, Fig. 5(a) shows convergence results for the first 75 iterations on the illustrative Ex. 3--i.e., \(_{ASAp}\) converges to the right expectation.
+
+Figure 5: \(KL(Q_{ASAp}\|P)\) and \(KL(Q_{GCD}\|P)\)
+
+Results.Fig. 4(b) and Fig. 5(b) illustrate a benchmark in which our ASAp algorithm quickly converges to the target distribution. Fig. 5 depicts the KL divergence of a sliding window of size 500 (e.g., the points at x=800 denote the KL divergence of the samples 800-1300). Fig. 6 depicts all the samples from the experiment, as well as how the expectations converges (a point at x=\(i\) denotes the empirical expectation on the first \(i\) samples. For this case the expecation for GCD stays very close to 0.
+
+Similarly, Fig. 4(c) and Fig. 5(c) illustrate a benchmark in which our ASAp algorithm converges slowly. In this case, bot ASAp and GCD are far from the target expectation (Fig. 5(c)), but because GCD happens to be biased towards the most likely outcome, it exhibits better KL divergence. The complete set of plots is shown in Sec. E.1.
+
+To better understand how the algorithms respectively converge, Fig. 7 plot for each benchmark category the expectations for each benchmark computed by GCD and ASAp against the target expectation of \(P\) after 2,000 iterations. The sum of least square difference between expectations computed by GCD and the expectations of \(P\) are \(2.259\) (SLIA), \(1.852\) (INV-BV4), and \(0.109\) (CP). The sum of least square difference between expectations computed by ASAp and the expectation and those of \(P\) are \(1.242\) (SLIA), \(0.802\) (INV-BV4), and \(0.159\) (CP). While we have too few points for CP to draw conclusions, the expectations computed by ASAp are much closer to the ones computed by GCD across our experiments.
+
+While our work is interested in the theoretical convergence of the ASAp algorithm, we also report how the GCD and ASAp differ for solving the SLIA and INV-BV4 tasks--i.e., how many of the sampled programs are correct solutions to the given problem. GCD and ASAp solve approximately the same set of problems (there is just one SLIA benchmark for which ASAp returns a valid solution on one sample and GCD never does so). ASAp produces correct samples 38% more often than GCD (geomean), whereas for SLIA benchmarks that both tools can solve, ASAp produces correct samples 73% less often than GCD (geomean). Detailed results can be found in Sec. E.2. These results are in line with the fact ASAp shows faster convergence on INV-BV4 benchmarks. For example, for the benchmark illustrated in Fig. 4(b), ASAp returns the correct solution for 1588 samples, whereas GCD only returns the correct solution 12 times, whereas for the benchmark in Fig. 4(c), ASAp returns the correct solution 69 times and GCD 363 times.
+
+Discussion and Limitations.As predicted by our theorems, on most benchmarks the ASAp algorithm converges to the desired distribution \(P\) whereas GCD does not improve over time (i.e., it exhibits the bias described in this paper).
+
+While ASAp has no strong effect on solving downstream tasks, we observe that on instances where the convergence is prominent, ASAp ends up sampling correct solutions more often than GCD, which is what we expect when the LLM has "learned" how to solve the given task.
+
+The key limitation of our work is the current slow convergence of the ASAp algorithm. In some benchmarks, even after 2,000 iterations the KL divergence barely improves and even though the expectation of \(_{ASAp}\) is improving, it converges very slowly.
+
+We highlight that the contributions of this paper are discovering and formalizing the bias of existing constrained decoding approaches and proposing the first converging algorithm to address this problem.
+
+Figure 7: Scatter plots of \(_{ASAp}\) (\(\)) and \(_{GCD}\) (\(\)) vs. expectations of \(P\) after 2,000 samples. Proximity to the diagonal indicates proximity to the actual expectation—e.g., a \(\) at (0.45,0.4) indicates a benchmark where the empirical expectation of \(P\) was 0.45 and \(_{ASAp}\) had converged to an expectation of 0.4 after 2,000 iterations.
+
+Now that we have identified the problem, there are many "low-hanging fruits" to improve our sampling strategy, which are great targets for future work--e.g., using forms of targeted beam search to bootstrap our sample set to better explore grammar paths and avoid sampling similar strings.
+
+## 5 Related Work
+
+Constrained DecodingPast work has extensively explored _constrained decoding_ algorithms, which modify the original decoding process of LLMs to ensure the output adheres to a user-specified regular [18; 28] or context-free language [5; 6; 7; 19; 23; 24; 25; 26] in a discrete space. Other works enforce hard output constraints using dynamic monitoring and verification methods [1; 15; 27] or by modifying beam search techniques to impose lexical constraints, which require specific keywords to appear in the generated text [4; 9; 10; 16; 17; 20]. At a high level, these methods involve running the LLM decode in parallel with a monitoring scheme (e.g., parsing algorithms for CFGs) to identify which next tokens or beams can produce valid output sequences that meet the constraints. The decoder then masks out any tokens that would lead to invalid sequences, sampling only from the permissible ones.
+
+To incorporate sequence-level soft semantic or contextual constraints, Amini et al. , Kumar et al. , Li et al. , Qin et al.  have applied gradient-based sampling techniques that relax those constraints to differentiable ones, used them as classifiers to further guide the decoding process. While these works guarantee that the decoded output meets the specified constraints (whether in the form of grammar, monitoring schemes, or differentiable functions), they often operate greedily and introduce bias into the output distribution in the way that has been discussed in this paper. Depending on the application one considers, this problem may or may not affect downstream tasks, but as we have argued in this paper, the bias can be quite prominent and sometimes affect downstream performance. Our adaptive decoding algorithm improves decoding over time by analyzing how previous samples led to nongrammaticaility.
+
+Constraint-Aligned DecodingThis paper formally defines the problem of aligning the output distribution of an LLM in the presence of a constraint. We focus our attention on constraints expressed as grammars, but our definitions and algorithm apply to any constraint for which possible satisfaction (in our case grammaticality) can be evaluated in a left-to-right manner.
+
+In some settings, one is interested in generating multiple outcomes with an LLM to approximate a distribution of interest [11; 22]--e.g., to generate a random number or a set of good test cases for a program. As we have shown, constrained decoding can heavily skew the LLMs distribution and result in biasing the model towards certain constraint-matching sequences. While our work is at this point theoretical, now that the problem of aligning an LLM's distribution with constraints has been defined, we expect advances in how sampling is performed to quickly converge to better distributions faster (e.g., using beam search to quickly explore possible paths instead of just sampling).
+
+## 6 Conclusion
+
+We have introduced a new analysis of the ideal target for constrained sampling from an LLM using a grammar, which we call grammar-aligned decoding (GAD). We proposed a new algorithm for GAD which we call ASAp that iteratively builds better approximations to the critical re-weighting term required for GAD: the expected future grammaticality. We analyzed the convergence of our proposed algorithm and demonstrated its effectiveness in relation to existing grammar-constrained decoding techniques on a set of benchmark code generation tasks. We analyzed and evaluated our approach using constraints enforced by a context-free grammar; however, extensions of our approach might be applied to more general classes of constraints for LLM decoding.
+
+While the primary goals of this work are to formalize the likelihood misalignment problem of existing grammar-constrained decoding approaches and to provide an initial solution with provable asymptotic guarantees, future work may explore faster-converging approaches, such as sampling multiple tokens simultaneously, to improve efficiency further. We hope this work lays a solid foundation for generating structured outputs from LLMs without distorting the original distribution, advancing the field toward more efficient, trustworthy, and constraint-aligned approaches in LLM-driven generation.

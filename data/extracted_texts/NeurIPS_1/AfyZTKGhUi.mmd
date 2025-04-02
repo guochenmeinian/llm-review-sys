@@ -1,0 +1,195 @@
+# Lean-STaR:
+
+Learning to Interleave Thinking and Proving
+
+ Haohan Lin\({}^{2}\)1
+
+Zhiqing Sun\({}^{1}\)
+
+Sean Welleck\({}^{1}\)
+
+Yiming Yang\({}^{1}\)
+
+\({}^{1}\)Language Technologies Institute, Carnegie Mellon University
+
+\({}^{2}\)Institute for Interdisciplinary Information Sciences, Tsinghua University
+
+{haohanl,zhiqings,yiming,swelleck}@cs.cmu.edu
+
+[https://leanstar.github.io/](https://leanstar.github.io/)
+
+###### Abstract
+
+Traditional language model-based theorem proving assumes that by training on a sufficient amount of formal proof data, a model will learn to prove theorems. Our key observation is that a wealth of _informal_ information that is not present in formal proofs can be useful for learning to prove theorems. For instance, humans think through steps of a proof, but this thought process is not visible in the resulting code. We present Lean-STaR, a framework for training language models to produce informal thoughts prior to each step of a proof, thereby boosting the model's theorem-proving capabilities. Lean-STaR uses retrospective ground-truth tactics to generate synthetic thoughts for training the language model. At inference time, the trained model directly generates the thoughts prior to the prediction of the tactics in each proof step. Building on the self-taught reasoner framework, we then apply expert iteration to further fine-tune the model on the correct proofs it samples and verifies using the Lean solver. Lean-STaR achieves better results on the miniF2F-test benchmark within the Lean theorem proving environment, significantly outperforming base models (\(\), Pass@64). We also analyze the impact of the augmented thoughts on various aspects of the theorem proving process, providing insights into their effectiveness.
+
+## 1 Introduction
+
+We introduce Lean-STaR, a framework for learning to interleave informal thoughts with steps of formal proving. Building on the Self-Taught Reasoner (STaR) framework , we enable language models to interleave step-by-step rationales (i.e., thoughts)  with formal proving in a two-stage process. In an initial phase, we prompt a sufficiently capable language model, such as GPT-4 , and generate retrospective thoughts based on a dataset of human-written proofs, such as Mathlib, the largest collection of human-written proofs in Lean . Subsequently, we fine-tune a thought-augmented tactic predictor  that, given a Lean state, can generate a thought and predict the subsequent tactic. In a second phase, we optimize this thought-augmented tactic predictor with the expert iteration algorithm , using multi-step success rate in theorem proving as the reward.
+
+We instantiate Lean-STaR by generating roughly 50,000 thought-augmented examples from Lean's Mathlib , then synthesize an additional 50k examples through two iterations of expert iteration. To the best of our knowledge, this yields the first thought-augmented dataset for theorem proving. After fine-tuning an InternLM2-7b base model  on our thought-augmented data, our final Lean-STaR model can solve \(\%\) (pass@32) or \(\%\) (pass@64) of the problems on miniF2F-test . Using stronger base model InternLM2-7b-plus, Lean-STaR can achieve \(\%\) (pass@32), significantly surpassing the previous results of \(43.4\%\) (pass@32). In summary, Lean-STaR offers a framework for teaching language models to interleave informal thoughts with formal verification, advancing the capabilities of language models in automated theorem proving.
+
+## 2 Our Method: Lean-STaR
+
+We introduce Lean-STaR, a new method for combining informal thoughts with formal theorem proving.
+
+We describe the data generation and training of the direct tactic prediction model (SFT), the thought-augmented tactic prediction model trained with synthetic data (Lean-CoT), and the final model trained with expert iteration (Lean-STaR).
+
+### Direct Tactic Prediction
+
+We define the theorem-proving problem as a _Markov Decision Process_ (MDP) \((,,P_{a},R_{a})\) where proof states serve as states in MDP and tactics serve as actions. From this perspective, a proof is a trajectory \((s_{1},a_{1},r_{1}),(s_{2},a_{2},r_{2}),\) of states \(s_{i}\), tactics \(a_{i}\), and rewards \(r_{i}\), and the ITP (e.g., Lean) provides each new state \(s_{i+1}\).
+
+In the typical setting , proving a theorem consists of providing a proof state \(s\) to the language model and then generating a tactic from the language model \(M\), i.e., \(_{M}(a|s)\). The language model can be fine-tuned for this task using a dataset of (proof state, next-tactic) pairs from successful proof trajectories, i.e. \(D=\{(s^{i},a^{i}):i=1,,M\}\), where final states have a reward of 1. We refer to a language model fine-tuned on such a dataset as a _supervised fine-tuning (SFT)_ model.
+
+### Thought-augmented Tactic Prediction
+
+Existing approaches typically train only on formal states and tactics . We hypothesize that incorporating a latent _thought_ can improve a model's ability to predict the next tactic. Formally, we
+
+Figure 1: **An example of Lean proof and thoughts generated by Lean-STaR. Note that there is a calculation error in the thought (in red), but this does not affect the correctness of the proof because the calculation task is actually completed by the interactive theorem prover (i.e., Lean’s nlinarithm) instead of the language model. This shows a benefit of combining neural and symbolic systems.**
+
+introduce a hidden "thought" variable \(t_{i}\) prior to each tactic, and then extend the model to the form \(_{M}(a_{i},t_{i}|s_{i})=_{M}(a_{i}|t_{i},s_{i})_{M}(t_{i}|s_{i})\). In thought-augmented tactic prediction, the distribution over the next tactic can then be expressed as: \(_{M}(a_{i}|s_{i})=_{t_{i}}_{M}(a_{i}|t_{i},s_{i})_{M}(t_{i} |s_{i})\).
+
+The key challenge is obtaining (state, thought, tactic) pairs for training a model. To this end, we introduce **retrospective rationale generation**. Our motivating observation is that the distribution of natural language thoughts in theorem-proving \(_{M}(t_{i}|s_{i})\) is scarce in the pre-training corpus of large language models. In turn, we find that even the most powerful GPT-4 model does not perform well in generating the correct rationale through few-shot prompting . Given a powerful large language model \(G\), which we refer to as the oracle model2, we give the oracle model the ground-truth tactic \(a_{i}\) and let the oracle model produce the thought \(t_{i}\) given the current state \(s_{i}\) and ground-truth tactic \(a_{i}\). This helps improve the pass rate and produce thought-augmented data more efficiently. Our few-shot prompt is provided in Appendix F. The design principle of the prompt is to prevent the oracle model from generating hindsight-like thoughts. With a new retrospectively annotated dataset by the oracle model \(D_{T}\), we obtained our first thought-augmented tactic prediction model, Lean-CoT, by fine-tuning from the SFT model.
+
+### Bootstrapping Thought-augmented Theorem Proving
+
+We propose to apply expert iteration to further improve the performance of Lean-CoT. Specifically, we start from the initial Lean-CoT model \(M_{0}\) and the initial dataset \(D=\{s^{i}:i=1,,M\}\), which consists of all initial states \(s^{i}\) of the theorems to be proved. In iteration \(1\), we use model \(M\) to sample \(K\) times per problem. Each time the model will produce a proof trajectory \([(s_{0},t_{0},a_{0}),(s_{1},t_{1},a_{1}),,(s_{n},t_{n},a_{n})]\). Then we create a new dataset \(D_{1}\) by filtering the generated trajectories to include only the successful ones. De-duplication is then applied to the collected trajectories. Now, we can further fine-tune the SFT model \(M\) on dataset \(D_{T} D_{1}\) to produce Lean-STaR model \(M_{1}\). Then we can similarly produce Lean-STaR model \(M_{2}\) from \(M_{1}\).
+
+## 3 Experiments
+
+We instantiate Lean-STaR using the best available open language model pre-trained on the Lean corpus (InternLM2-Math-base-7b ), and follow standard practice in using Lean's Mathlib as the underlying training set (via the Lean Dojo dataset ). Our experimental results show that both retrospective rationale generation and expert iteration significantly improve the theorem-proving capabilities of language models in this setting. We describe our setup and findings in detail below.
+
+### Experimental Setup
+
+We use _LeanDojo Benchmark 4 v9_ as the supervised fine-tuning (SFT) dataset containing \(231,240\) data examples. We fine-tune for \(1\) epoch to obtain the SFT model. For the learning rate, we use a warmup in the first \(20\%\) steps from \(0\) to \(2 10^{-5}\), followed by a cosine schedule decaying to zero.
+
+We randomly select \(17,256\) different successful proof trajectories from _LeanDojo Benchmark 4 dataset_, and use GPT-4-0125  to annotate \(52,438\) thoughts from those proof trajectories. We filtered out all proof steps (\(s^{i},a^{i}\)) for which \(a^{i}\) contains the newline symbol "\(\)" before annotating. We perform two iterations of expert iteration, and provide the details in Appendix A.1 due to space.
+
+We evaluate our method on the _MiniF2F_ benchmark . We use a similar evaluation setting as previous works [25; 24; 26], but use our sampling method instead of best-first search for the evaluation of our thought-augmented theorem proving model. We choose these settings to resemble the inference budget used in our baselines, which follow previous work [24; 4; 26].
+
+### Main Results
+
+Our main results are reported in Table 1. Lean-STaR gives a significant improvement. For instance, with a similar inference budget, Lean-STaR achieves 34.8% versus \(30.3\%\) in InternLM2  using best-first search and \(30.7\%\) in COPRA  using GPT-4. With a larger compute budget, Lean-STaR's performance improves further to 36.1%.
+
+**Thought augmentation improves theorem proving.** The first phase of Lean-STaR trains a model to interleave thoughts and tactics, by fine-tuning on a synthesized dataset of thought-augmented examples. The fine-tuned model from this phase, denoted Lean-CoT in Table 1, achieves a pass rate of \(32.8\%\), which is higher than the model prior to this phase, denoted SFT (29.5%). We conclude that the first phase of Lean-STaR can improve the theorem proving ability of a language model, even one that is already specialized for generating tactics in Lean such as the SFT model.
+
+**Bootstrapping improves thought-augmented theorem proving.** The second phase of Lean-STaR consists of generating new thoughts and tactics with the current language model, saving those that result in correct proofs, and training on the union of the initial thought-augmented dataset and the saved examples (i.e., expert iteration ). Refer to Appendix A.1 for details.
+
+We perform two iterations of expert iteration, and present the results in Table 1, denoted Lean-STaR. Each iteration improves the model's theorem proving performance, from 32.8% (the initial model) to 34% (Lean-STaR after iteration 1) to 34.8% (Lean-STAR after iteration 2). Furthermore, we find that the model is amenable to further improvement via additional sampling, achieving 36.1% by doubling the sampling budget. We conclude that Lean-STaR's second phase can further improve a model's ability to generate thoughts and tactics that lead to correct proofs. We include three qualitative examples in the Appendix, which show the model interleaving thoughts and proof steps.
+
+### Experiments with stronger base model and more data
+
+We also instantiate Lean-STaR using a stronger language model (InternLM2-Math-plus-7b ), which was released after the experiment above. Our new results are also reported in Table 1. We can
+
+   Approach & Decoding & \(N\) & \(K\) & \(S\) & Pass rate \\  GPT-3.5  (Few-Shot) & Sampling & 50 & 1 & 1 & \(2.8\%\) \\ GPT-4  (Few-Shot) & Sampling & 50 & 1 & 1 & \(11.9\%\) \\ Transformer  (w/o RL) & Search & 512 & 1 & 8 & \(24.6\%\) \\ Llemma-7b  (Few-Shot) & Search & 50 & 1 & 32 & \(26.2\%\) \\ ReProver  & Search & 50 & 1 & 64 & \(26.5\%\) \\ Transformer  (w/ RL) & Search & 512 & 1 & 8 & \(29.6\%\) \\ InternLM2-20b  (Few-Shot) & Search & 50 & 1 & 32 & \(29.5\%\) \\ COPRA (with GPT-4)  & Customized & - & 100 & 1 & \(30.7\%\) \\  InternLM2-7b  (Few-Shot) & Sampling & 50 & 32 & 1 & \(28.7\%\) \\ InternLM2-7b  (Few-Shot) & Search & 50 & 1 & 32 & \(30.3\%\) \\ SFT (InternLM2-7b) & Sampling & 50 & 32 & 1 & \(29.5\%\) \\
+**Lean-CoT** (InternLM2-7b) & Sampling & 50 & 32 & 1 & \(32.8\%\) \\
+**Lean-STaR** (**Iter-1) (InternLM2-7b) & Sampling & 50 & 32 & 1 & \(34.0\%\) \\
+**Lean-STaR** (**Iter-2) (InternLM2-7b) & Sampling & 50 & 32 & 1 & \(\) \\
+**Lean-STaR** (**Iter-2) (InternLM2-7b) & Sampling & 50 & 64 & 1 & \(\) \\  InternLM2-plus-7b  (Few-Shot) (from paper) & Search & 1000 & 1 & 32 & \(43.4\%\) \\ InternLM2-plus-7b  (Few-Shot) (reproduced) & Search & 1000 & 1 & 32 & \(42.6\%\) \\  InternLM2-plus-7b  (Few-Shot) & Sampling & 50 & 32 & 1 & \(40.9\%\) \\ SFT (InternLM2-plus-7b)  (Few-Shot) & Sampling & 50 & 32 & 1 & \(41.3\%\) \\
+**Lean-CoT** (InternLM2-plus-7b) & Sampling & 50 & 32 & 1 & \(43.4\%\) \\
+**Lean-STAR** (**Iter-1) (InternLM2-7b) & Sampling & 50 & 32 & 1 & \(45.4\%\) \\
+**Lean-STAR** (**Iter-1) (InternLM2-plus-7b) & Sampling & 50 & 64 & 1 & \(\) \\   
+
+Table 1: **Pass rates on the minif2f-test dataset with Lean.** This table shows the pass rates of previous works and our work. \(S\) is the number of tactics attempted at each expanded node (assumed to be \(1\) in sampling) and \(K\) is the total number of search or sampling attempts per problem. In sampling we use temperature 0.7, and in search we use beam search when generating the next tactic. Note that we sample \(32\) examples twice when \(K=64\) in sampling.
+
+[MISSING_PAGE_FAIL:5]
+
+* Blanchette et al.  Jasmin Christian Blanchette, Cezary Kaliszyk, Lawrence C Paulson, and Josef Urban. Hammering towards qed. _Journal of Formalized Reasoning_, 9(1):101-148, 2016.
+* Bohme and Nipkow  Sascha Bohme and Tobias Nipkow. Sledgehammer: judgement day. In _Automated Reasoning: 5th International Joint Conference, IJCAR 2010, Edinburgh, UK, July 16-19, 2010. Proceedings 5_, pages 107-121. Springer, 2010.
+* Brown et al.  Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. _Advances in neural information processing systems_, 33:1877-1901, 2020.
+* Carter and Monks  Nathan C Carter and Kenneth G Monks. Lurch: a word processor that can grade students' proofs. In _CIKM Workshops_, 2013.
+* Czajka and Kaliszyk  Lukasz Czajka and Cezary Kaliszyk. Hammer for coq: Automation for dependent type theory. _Journal of automated reasoning_, 61:423-453, 2018.
+* First  Emily First. _Automating the Formal Verification of Software_. PhD thesis, 2023. URL [https://scholarworks.umass.edu/dissertations_2/2812](https://scholarworks.umass.edu/dissertations_2/2812).
+* Gloeckle et al.  Fabian Gloeckle, Baptiste Roziere, Amaury Hayat, and Gabriel Synnaeve. Temperature-scaled large language models for lean proofstep prediction. In _The 3rd Workshop on Mathematical Reasoning and AI at NeurIPS'23_, 2023.
+* Kang et al.  Dongyeop Kang, Andrew Head, Risham Sidhu, Kyle Lo, Daniel S Weld, and Marti A Hearst. Document-level definition detection in scholarly documents: Existing models, error analyses, and future directions. _arXiv preprint arXiv:2010.05129_, 2020.
+* Lample et al.  Guillaume Lample, Timothee Lacroix, Marie-Anne Lachaux, Aurelien Rodriguez, Amaury Hayat, Thibaut Lavril, Gabriel Ebner, and Xavier Martinet. Hypertree proof search for neural theorem proving. _Advances in neural information processing systems_, 35:26337-26349, 2022.
+* Community  The mathlib Community. The lean mathematical library. In _Proceedings of the 9th ACM SIGPLAN International Conference on Certified Programs and Proofs_, CPP 2020, pages 367-381, New York, NY, USA, 2020. Association for Computing Machinery. ISBN 9781450370974. doi: 10.1145/3372885.3373824. URL [https://doi.org/10.1145/3372885.3373824](https://doi.org/10.1145/3372885.3373824).
+* Nye et al.  Maxwell Nye, Anders Johan Andreassen, Guy Gur-Ari, Henryk Michalewski, Jacob Austin, David Bieber, David Dohan, Aitor Lewkowycz, Maarten Bosma, David Luan, et al. Show your work: Scratchpads for intermediate computation with language models. _arXiv preprint arXiv:2112.00114_, 2021.
+* Academies of Sciences  National Academies of Sciences. Artificial intelligence to assist mathematical reasoning: Proceedings of a workshop, 2023.
+* OpenAI  OpenAI. OpenAI: GPT-4, 2023. URL [https://openai.com/research/gpt-4](https://openai.com/research/gpt-4).
+* Polu and Sutskever  Stanislas Polu and Ilya Sutskever. Generative language modeling for automated theorem proving. _arXiv preprint arXiv:2009.03393_, 2020.
+* Polu et al.  Stanislas Polu, Jesse Michael Han, Kunhao Zheng, Mantas Baksys, Igor Babuschkin, and Ilya Sutskever. Formal mathematics statement curriculum learning. _arXiv preprint arXiv:2202.01344_, 2022.
+* Singh et al.  Avi Singh, John D Co-Reyes, Rishabh Agarwal, Ankesh Anand, Piyush Patil, Peter J Liu, James Harrison, Jaehoon Lee, Kelvin Xu, Aaron Parisi, et al. Beyond human data: Scaling self-training for problem-solving with language models. _arXiv preprint arXiv:2312.06585_, 2023.
+* Szegedy  Christian Szegedy. A promising path towards autoformalization and general artificial intelligence. In _Intelligent Computer Mathematics: 13th International Conference, CICM 2020, Bertinoro, Italy, July 26-31, 2020, Proceedings 13_, pages 3-20. Springer, 2020.
+* Thakur et al.  Amitayush Thakur, Yeming Wen, and Swarat Chaudhuri. A language-agent approach to formal theorem-proving. _arXiv preprint arXiv:2310.04353_, 2023.
+
+*  Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed Chi, Quoc V Le, Denny Zhou, et al. Chain-of-thought prompting elicits reasoning in large language models. _Advances in neural information processing systems_, 35:24824-24837, 2022.
+*  Sean Welleck and Rahul Saha. Llmstep: Llm proofstep suggestions in lean. _arXiv preprint arXiv:2310.18457_, 2023.
+*  Kaiyu Yang, Aidan Swope, Alex Gu, Rahul Chalamala, Peiyang Song, Shixing Yu, Saad Godil, Ryan Prenger, and Anima Anandkumar. LeanDojo: Theorem proving with retrieval-augmented language models. In _Neural Information Processing Systems (NeurIPS)_, 2023.
+*  Huaiyuan Ying, Shuo Zhang, Linyang Li, Zhejian Zhou, Yunfan Shao, Zhaoye Fei, Yichuan Ma, Jiawei Hong, Kuikun Liu, Ziyi Wang, Yudong Wang, Zijian Wu, Shuaibin Li, Fengzhe Zhou, Hongwei Liu, Songyang Zhang, Wenwei Zhang, Hang Yan, Xipeng Qiu, Jiayu Wang, Kai Chen, and Dahua Lin. Internlm-math: Open math large language models toward verifiable reasoning, 2024.
+*  Eric Zelikman, Yuhuai Wu, Jesse Mu, and Noah Goodman. Star: Bootstrapping reasoning with reasoning. _Advances in Neural Information Processing Systems_, 35:15476-15488, 2022.
+*  Kunhao Zheng, Jesse Michael Han, and Stanislas Polu. Mini2F: a cross-system benchmark for formal olympiad-level mathematics. _arXiv preprint arXiv:2109.00110_, 2021.
+
+[MISSING_PAGE_FAIL:8]
+
+An Example and Explanation of A Formal Proof in Lean
+
+An example of a formal proof in Lean with its visualization is shown in Figure 2, taken from . In the proof, the tactic induction k is is applied to the initial state (\(n m n+k m+k\)) and the ITP converts the current state to subgoals case 0 \(\) case ih: \(n m n+k m+k n+(k+1) m+(k+1)\). The case 0: \(n m\) is our hypothesis \(h_{0}\) so it can be proven by case 0:exact \(h_{0}\) tactic. Then, we rewrite the case ih through the nat.succ_le_succ_iff which is a theorem in Lean library means \(n m n+1 m+1\). After tactics case 0:exact \(h_{0}\) and case ih:rw nat.succ_le_succ_iff, the goal state is converted to \(n+k m+k\) which is the hypothesis introduced by induction. Therefore, we can complete this proof using tactic exact k_ih.
+
+Figure 2: **A example proof and its visualization of \(n m n+k m+k\) in Lean, taken from .** The induction tactic reduces the initial statement to two subgoals. Then tactics case 0:exact \(h_{0}\) and case ih:rw nat.succ_le_succ_iff, case ih:exact k_ih can be applied in turn to complete the proof.
+
+[MISSING_PAGE_FAIL:10]
+
+Performance difference of joint training and continue training
+
+As shown in Table 5, the joint training method performs better using InternLM2-base but training method performs much better using InternLM2-plus. It seems that there are no difference between these two methods. Therefore, this performance can be depend on the quantity of data or the model. (We use much more data when using InternLM2-plus and the quantity of "STaR data" is relatively small.)
+
+## Appendix F Retrospective Rationale Generation Prompt of GPT-4
+
+Please act as a professional mathematician. Your goal is to accurately prove a math theorem in Lean4. You are given the first tactic that should be taken to prove the Given Theorem.
+
+# Example:
+
+Given Theorem:
+
+'lean4 X : Type u_1 Y : Type u_2 inst1 : TopologicalSpace X inst1 : TopologicalSpace Y f : X ->. Y h : PContinuous f!IsOpen (PFun.preimage f Set.univ)... Given Tactic:
+
+'lean4 exact h _isOpen_univ... Assistant Output:
+
+*** PLANNING OF REASONING Given the above goal and the given the target tactic 'exact h _isOpen_univ', I should produce a reasoning that only based on the goal, and conclude to the exact h _isOpen_univ', but not in the hindsight format.
+
+*** REASONING By directly using the hypothesis 'h : PContinuous f', we state that for any open set, its preimage via 'f' is also open, and this applies to 'Set.univ' as well.
+
+*** TACTIC
+
+   Approach & InternLM2-base-7b & InternLM2-plus-7b \\ 
+**Lean-CoT** & \(32.8\%\) & \(43.4\%\) \\
+**Lean-STaR (Iter-1)** & **34.0\%** & \(43.9\%\) \\
+**Lean-STaR (Iter-1)** & & \\ (continue training) & \(33.2\%\) & **45.5\%** \\   
+
+Table 5: Performance difference of joint training and continue training on Lean-STaR. We use sampling method with hyperparameters \(N=50\ \&\ K=32\ \&\ T=0.7\). In continue training, we further fine-tune the Lean-CoT model on "STaR data" to get Lean-STaR model and in joint training we fine-tune the SFT model on combination of GPT-4 annotated reasoning data and "STaR data".
+
+'\'lean4 exact h _ isOpen_univ '... To achieve the goal, you have three jobs.
+# Write down the planning of reasoning.
+# Write down the reasoning that can result in the selection of the Given Tactic.
+# Write down the Given Tactic. You have four principles to do this.
+# Craft reasoning that is comprehensive yet concise, contained ideally within two sentences.
+Begin reasoning with the objective of the Given Theorem, ensuring logical progression, rather than constructing it retrospectively from the Given Tactic.
+Avoid mentioning the Given Tactic and specific statement names from the Given Tactic throughout your reasoning.
+Position the conclusion of the tactic after presenting all reasons, ensuring that details regarding the Given Tactic are not introduced at the start of your reasoning. Your output should be strictly in the following format and should not contain extra content:
+### PLANNING OF REASONING
+
+Given the above goal and the given the target tactic <Given Tactic>, I should produce a reasoning that only based on the goal, and conclude to the exact < Given Tactic>, but not in the hindsight format.
+
+### REASONING
+
+<your reasoning to the Given Tactic>
+
+### TACTIC
+
+<Given Tactic>
+
+# Given Theorem: '\'lean4 {theorem["state_before"]} '...
+
+Examples of generated Lean proofs with thoughts
+
+theorem aim_1990_p4 (x : R) (h0 : 0 < x) (h1 : x ^ 2 - 10 * x - 29 \(\) 0) (h2 : x ^ 2 - 10 * x - 45 \(\) 0) (h3 : x ^ 2 - 10 * x - 69 \(\) 0) (h4 : 1 /(x ^ 2 - 10 * x - 29) + 1 / (x ^ 2 - 10 * x - 45) - 2 / (x ^ 2 - 10 * x - 69) = 0) : x = 13 :=  norm_num at h1 h2 h3 -- Reasoning: To prove '= 13', we examine the conditions under which the given equation holds, specifically focusing on the non-equality of the expressions involving '= 2 - 10 * x - 29', '= ^ 2 - 10 * x - 45', and '= 2 - 10 * x - 69'. Simplifying these expressions using properties of real numbers and algebra allows us to directly compare them with their respective values, ultimately identifying '= 13' as the unique solution that satisfies all constraints.
+
+**field_sim at * - Reasoning: To prove |(x = 13)|, we leverage the given equalities involving rational fractions of |(x2 - 10x - c|) for various constants |(c|), where |(0 <= x|) and each |(x2 - 10x - c|) is non-zero. By algebraically manipulating these expressions, we aim to derive a relationship among |(x|) and these constants, specifically focusing on |(13)|, under the given non-zero conditions for the quadratic expressions.** ring_nf at h+ - - Reasoning: To establish the equality '= 13' under the given conditions, we need to manipulate the algebraic expression given by 'h1' to reveal its dependence on '=', recognizing that the presence of '=' in the expressions may affect the equation's truth value. The application of algebraic transformations on both sides of the equation will facilitate the identification of '=' value, taking into consideration the inequality conditions provided ('h1', h2', 'h3').
+
+**nlinarith - Reasoning: To prove |(x = 13)|, we must manipulate the equation given by |(h1)| to isolate |(x|)|, using the algebraic properties of equality and the assumption |(h0|) which states |(0 <= x|)|. This requires careful rearrangement and application of algebraic identities to simplify and rearrange terms, facilitating the direct application of the properties of real numbers to reach the desired conclusion.**
+
+theorem amc12a_2002_p6 (n : N) (h0 : 0 < n) : \(\) m, m > n \(\)\(\) p, m * p \(\) m + p := **use n + 1, by linarith only [h0] -- Reasoning: To demonstrate the existence of such an '=' and 'p' that satisfy the given inequalities, we leverage the property of natural numbers that ensures an increase in '=' from '0' leads to the possibility of finding such '=' and 'p'. This approach is supported by the fundamental property of natural numbers and their arithmetic operations, suggesting that for a given '=' greater than '0', there exists a successor '=' and a number 'p' that satisfy the conditions outlined.** exact (Q, by simp ) -- Reasoning: To demonstrate that there exists an |(n |in N |) such that |((n + 1) * p |leq n + p|) holds for some |(p |in N|), we recognize that setting |(p = 0|) satisfies the inequality by the properties of zero in arithmetic. This is because |(n + 1 > 0|) by assumption, ensuring the left-hand side is non-negative and the right-hand side simplifies to |(n + 1)|, making the inequality trivially true.**theorem amine_1983_p2 (x p : R) (f : R - R) (h0 : 0 < p > p < 15) (h1 : p <= x \(\) < 15) (h2 : fx = abs (x - p) + abs (x - 15) + abs (x - p - 15)) : 15 <= fx := cases' h1 with h1 h2 -- Reasoning: Given a function |(f|) defined over the real numbers, where |(f(z)|) equals the sum of the absolute values of the differences |(z - p|), |(z - 15|), and |(z - p - 15|), along with conditions on |(p|) and |(z|) that ensure |(z|) lies between |(p|) and |(f5|) and |(p|) is positive, we aim to show that |(f(z)|geq 15|). To demonstrate this, we consider all possible cases for the position of |(z|) relative to |(p|) and |(15|), specifically at |(p|) itself, between |(p|) and |(15|), and at |(15|). By evaluating |(f(z)|) for each case, we can establish a lower bound of |(f(z)|) that is greater than or equal to |(15|). simp [h0, abs_of_nonneg (sub_nonneg.2 h1), abs_of_nonneg (sub_nonneg.2 h2), *] - Reasoning: The objective is to show that |(f(z)|) is at least 15 for |(z|) within the bounds |(p |lex |le 15|), where |(p|) is positive but less than 15. The provided expression for |(f(z)|) suggests using properties of absolute values and inequalities to simplify and analyze |(f(z)|). By applying simplification rules for absolute values and inequalities, along with the given bounds, we aim to demonstrate the desired inequality |(f(z)|ge 15|). simp only [abs_of_nonneg] at -- Reasoning: The objective is to establish an inequality involving an expression with absolute values and a sum, where all terms are functions of |(z|). By recognizing that the absolute value functions are always non-negative, we can simplify the given expression by removing the absolute value symbols, thus focusing on the arithmetic manipulation of the terms to demonstrate the inequality. simp only [abs_of_nonneg, sub_add_eq_add_sub] at * -- Reasoning: The objective is to demonstrate that the expression '15 <= - p + |z - 15| + |z - p - 15|' holds given the conditions on 'p', 'a', and the function 'f'. Since the expression in question involves absolute values which inherently involve non-negativity, manipulating these expressions to highlight their non-negativity or equality is a logical initial step. This involves recognizing that the absolute value of a difference can be rewritten as the difference of absolute values, which simplifies the manipulation of the expression to prove the inequality.
+
+**congr 1** -- Reasoning: To establish the inequality '15 <= x + |x - 15| + |x - p - 15| - p', we recognize that the left-hand side of the inequality involves a mix of additions and subtractions of real numbers. By introducing a congruence transformation that simplifies operations involving absolute values, we aim to align both sides of the inequality in a form that directly reflects the properties of real numbers under these operations. simp only [abs_of_nonpos (sub_nonpos_of_le h2), abs_of_nonneg (sub_nonneg.of_le h1)] -- Reasoning: The objective is to prove an inequality involving absolute values and subtractions that aligns the given conditions and constraints. Simplification using the properties of absolute values and the provided bounds can directly lead to the desired conclusion by expressing the absolute values in terms of their underlying expressions and applying the given constraints. simp [abs_of_pos, *] -- Reasoning: To prove the given inequality involving absolute values, simplification using algebraic properties and given hypotheses will directly lead us to the desired inequality by recognizing the algebraic manipulation and application of the known bounds 'h1' and 'h2', as well as the non-negativity of 'p'. rw [abs_of_nonpos] -- Reasoning: The objective is to demonstrate that '15 <= 15 + |z - p - 15| - p' under the given constraints on 'p' and 'z'. Given 'p < 15' and 'p <= x <= 15', it's apparent that 'p - 15' is non-positive. This observation allows us to apply the property that the absolute value of a non-positive number is equal to its negative value, thereby simplifying the expression on the right-hand side of the inequality.
+
+**all_goals linarith** -- Reasoning: The goal involves demonstrating a relationship between expressions involving inequalities and subtraction. The simplification of these expressions into a form that directly compares their numerical values can lead to a straightforward application of known inequalities and algebraic properties, demonstrating the inequality's validity under the given conditions.

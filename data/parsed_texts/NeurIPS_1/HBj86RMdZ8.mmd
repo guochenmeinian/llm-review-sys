@@ -1,0 +1,718 @@
+# The Importance of Online Data:
+
+Understanding Preference Fine-tuning via Coverage
+
+ Yuda Song
+
+Carnegie Mellon University
+
+yudas@cs.cmu.edu
+
+&Gokul Swamy
+
+Carnegie Mellon University
+
+gswamy@cs.cmu.edu
+
+&Aarti Singh
+
+Carnegie Mellon University
+
+aarti@cs.cmu.edu
+
+&J. Andrew Bagnell
+
+Aurora Innovation, Carnegie Mellon University
+
+dbagnell@aurora.tech
+
+&Wen Sun
+
+Cornell University
+
+ws455@cornell.edu
+
+###### Abstract
+
+Learning from human preference data has emerged as the dominant paradigm for fine-tuning large language models (LLMs). The two most common families of techniques - online reinforcement learning (RL) such as Proximal Policy Optimization (PPO) and offline contrastive methods such as Direct Preference Optimization (DPO) - were positioned as equivalent in prior work due to the fact that both have to start from the same offline preference dataset. To further expand our theoretical understanding of the similarities and differences between online and offline techniques for preference fine-tuning, we conduct a rigorous analysis through the lens of _dataset coverage_, a concept that captures how the training data covers the test distribution and is widely used in RL. We prove that a global coverage condition is both necessary and sufficient for offline contrastive methods to converge to the optimal policy, but a weaker partial coverage condition suffices for online RL methods. This separation provides one explanation of why online RL methods can perform better than offline methods, especially when the offline preference data is not diverse enough. Finally, motivated by our preceding theoretical observations, we derive a hybrid preference optimization (HyPO) algorithm that uses offline data for contrastive-based preference optimization and online unlabeled data for KL regularization. Theoretically and empirically, we demonstrate that HyPO is more performant than its pure offline counterpart DPO, while still preserving its computation and memory efficiency.
+
+## 1 Introduction
+
+Due to the difficulty of manually specifying reward functions for complex tasks [7], preference-based learning has emerged as a critical component in the fine-tuning procedure for large language models (LLMs) [40, 30, 45, 44]. There are two predominant flavors of preference learning for LLMs: online reinforcement learning (RL) methods such as PPO [11, 30] and offline contrastive methods like Direct Preference Optimization (DPO) [33] and Identity Preference Optimization (IPO) [3].
+
+Online RL methods usually follow the two-stage procedure prescribed in [30]: one first trains a reward model (classifier) on a fixed offline preference dataset before using it to provide reward labels for on-policy generations, which are then fed to a downstream RL algorithm like Proximal Policy Optimization (PPO) [36]. Since the reward model is learned from static offline preference data, to avoid over-optimizing the reward model [17], one typically adds a reverse KL penalty to encourage the model to stay close to some reference policy. We will refer to this procedure as reinforcement learning from human feedback (RLHF) in this paper. While empirically performant, RLHF requires repeated querying of the reward model (which is often itself an LLM) as well as sampling from the current policy. In response to the computational expense and relatively complex nature of thisprocedure, purely offline methods like DPO [33] and IPO [3] have been proposed as alternative methods for preference fine-tuning. These methods do not need to fit separate reward models, instead opting to simply train the policy directly on the offline preference dataset via a ranking loss.
+
+Offline contrastive methods like DPO are usually derived via applying a reparameterization trick to the closed-form solution of the minimum relative entropy problem [63] that RLHF techniques attempt to approximate. Thus, several authors have described these methods as equivalent (at least in theory) to the standard RLHF procedure [33, 3]. However, recent (mostly empirical) work has contradicted this perspective: [43] find that online methods out-perform offline methods and attribute this fundamentally to on-policy sampling, [55] argues that the online RL methods produce an often desirable subset of the possible DPO loss minimizers, and [42] provide empirical support for the claim that online and contrastive training provided orthogonal benefits. However, a rigorous theoretical separation is still lacking in the pre-existing literature, which motivates our key questions:
+
+_What is the statistical separation between the online RLHF method and offline contrastive methods? What causes this separation and what does it imply?_
+
+To answer these questions, we focus on the coverage of the preference dataset, a key concept that is widely used in RL [22, 28, 58] for analyzing the impact of offline or exploratory data distributions. Through the lens of coverage of the offline preference dataset, we make the following contributions:
+
+* in short, _there is no free lunch from bypassing explicit reward learning and online rollouts_. As global coverage might sometimes be violated in practice, our separation result can perhaps explain why RLHF works better than offline methods [42, 43, 56].
+* Although offline contrastive methods are derived from a reverse-KL objective, we prove that the policies trained via offline methods can still have infinite reverse-KL in the partial coverage setting. In contrast, we show that RLHF can always control the reverse KL via directly optimizing reverse KL using online samples. This means that on realistic problems, RLHF has stronger guarantees for remaining close to the reference policy than offline contrastive methods.
+* We propose Hybrid Preference Optimization (HyPO) to address the deficiencies of offline contrastive methods while maintaining some of their computational simplicity. HyPO is a hybrid RL algorithm [51, 39] where offline data is used for the DPO objective while online samples are used to explicitly control the reverse KL divergence to the reference policy. We empirically demonstrate that HyPO outperforms DPO, on the _TL;DR_ summarization task [40] on all metrics including both the GPT4 win-rate and the reverse KL divergence to the reference policy, and on general chat benchmarks such as AlpacaEval 2.0 [15], trained with the UltraFeedback dataset [14]. In addition, HyPO also mitigates the overfitting issues observed in the offline constrastive based methods [43].
+* We provide an explanation of why RLHF and offline contrastive methods decrease the probability of both preferred and rejected responses during training. In particular, under our function approximation-based global coverage condition, we show that such behavior is actually desirable for DPO and RLHF policies to extrapolate and generalize to optimal actions that do not appear in the training dataset. However, without function approximation, algorithms like DPO can mistakenly increase the likelihood of sub-optimal actions. This establishes the importance of function approximation for the success of the algorithms such as DPO.
+
+Taken together, our results establish the critical role _coverage_ plays in terms of convergence properties of preference learning algorithms as well as in the design of new, performant empirical approaches.
+
+## 2 Related Work
+
+Preference Fine-Tuning (PFT).As discussed in the introduction of our work, there are two major paradigms for preference fine-tuning of LLMs. The first one, online RL methods [30], proposes to first train a reward model (classifier) to predict human preferences, followed by running an RL method to optimize this learned reward function. While PPO [36] is the most popular RL algorithm used in the online RLHF framework by far [40, 30, 45], more recent work by [1] shows that simpler online RL algorithms like REINFORCE [48] also work well. The second class of methods, offline contrastive techniques [60, 33, 3], avoid explicit reward modeling and directly optimize their objective on the offline preference dataset. Recently there are _hybrid_ methods that combine offlinepreference data with online preference labels [52; 19; 35; 3] - we leave extending our analysis to this setting to future work. Throughout our paper, we assume for simplicity of analysis that preferences are generated by an underlying utility function and therefore contain no intransitivities [29; 41].
+
+Understanding PFT.Prior work has studied different parts of the standard RLHF recipe [17; 23; 38; 16] and the impact of preference data quality [37]. In our work, we instead take a converge-based perspective on the relationship between online RL methods and offline contrastive methods. Although derived from the same minimum relative entropy objective [63] and perceived as equivalent by some early work [33; 3], more recent work has started to unravel the distinctions between these two classes of methods. [43] repeatedly observe better performance from online rather than offline methods and after rigorously validating a variety of hypotheses, conclude that on-policy sampling is indispensable for ensuring a high quality policy. [42] perform an in-depth study of the effects of preference data, contrastive losses, and on-policy sampling and conclude that a combination of contrastive losses and interactive training is most preferable in practice. [55] also observe better performance from online PPO than from offline DPO and argue this is because the former is able to eliminate a larger set of policies that are undesirable from the perspective of the later. We supplement these mostly empirical observations with a rigorous theoretical explanation for the observed behavior through the lens of dataset coverage, as well as designing an algorithm that addresses the key weaknesses of offline contrastive approaches.
+
+We defer additional related works to Appendix A.
+
+## 3 Preliminaries
+
+Following a wide range of recent works [33; 3], we consider the RLHF problem in the contextual bandit formulation [25]. This is a reasonable simplification, as one can consider the generated sequence of tokens as one single action, due to the fact that the states are the generated tokens, and the dynamics are deterministic. We denote the context (prompt) space as \(\mathcal{X}\), and the action (response) space as \(\mathcal{Y}\). Note that due to the finiteness of the possible tokens, the action space is finite but combinatorially large. We use \(\rho\in\Delta(\mathcal{X})\) to denote the distribution of the prompts, and \(\pi:\mathcal{X}\rightarrow\Delta(\mathcal{Y})\) as policies (LLMs) that map prompts to a distribution of responses. We also consider the reward function class \(\mathcal{R}:\mathcal{X}\times\mathcal{Y}\rightarrow\mathbb{R}\), which assigns a reward to each context-response pair.
+
+We assume access to a reference policy \(\pi_{\mathsf{ref}}\), which is usually referred to as the policy learned using supervised data when training the LLM, that needs to be further fine-tuned to align with human values. An offline preference dataset is collected in the format of \(\mathcal{D}=\{x,y^{+},y^{-}\}\) triplets: given context \(x\sim\rho\), the preference policy samples two responses \(y^{1},y^{2}\sim\mu(\cdot\mid x)\), where \(\mu\) is the offline response distribution. Previous works assume either \(\mu\) to be the same distribution as \(\pi_{\mathsf{ref}}\)[33] or different offline distribution [3; 35; 18]. Then, \(y^{1}\) is labelled as \(y^{+}\) (thus \(y^{2}\) as \(y^{-}\)) with probability \(p^{*}(y^{1}\succ y^{2}\mid x)\), where \(p^{*}\) is defined by the Bradley-Terry model [6]:
+
+\[p^{*}(y^{1}\succ y^{2}\mid x)=\frac{\exp(r^{*}(x,y^{1}))}{\exp(r^{*}(x,y^{1})) +\exp(r^{*}(x,y^{2}))},\]
+
+where \(r^{*}\) is the human's implicit reward function. Note that this rules out intransitive preferences [41; 29]. Throughout the paper, we will make the following assumption on the reward function:
+
+**Assumption 3.1** (Boundedness of the reward).: \(\left\lVert r^{*}\right\rVert_{\infty}\leq R\)_._
+
+In many previous works, this formulation has been the canonical way to model the preference data in the RLHF literature [11; 33; 3]. The goal is to learn a policy \(\pi\) to maximize the objective \(J(\pi)\), where
+
+\[J(\pi)=\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\pi(\cdot\mid x)}[r^{*}(x,y)]-\beta\mathsf{KL}(\pi(\cdot\mid x)||\pi_{\mathsf{ref}}(\cdot\mid x))\big{]}, \tag{1}\]
+
+i.e., we want to both maximize the human implicit reward, and not deviate too much from the reference policy. We denote the optimal policy \(\pi^{*}\in\operatorname*{argmax}_{\pi\in\Pi}J(\pi)\). Here we call \(\mathsf{KL}(\pi(\cdot\mid x)||\pi_{\mathsf{ref}}(\cdot\mid x))\) reverse KL because \(\pi\) - the policy to be optimized, appears first. We will call \(\mathsf{KL}(\pi_{\mathsf{ref}}(\cdot\mid x)||\pi(\cdot\mid x))\) forward KL. By the definition of KL, we have
+
+\[\text{Definition of reverse KL:}\qquad\mathsf{KL}(\pi(\cdot\mid x)||\pi_{\mathsf{ ref}}(\cdot\mid x)):=\mathbb{E}_{y\sim\pi(\cdot\mid x)}[\ln(\pi(y\mid x)/\pi_{ \mathsf{ref}}(y\mid x))]. \tag{2}\]
+
+Note that the expectation in reverse KL is under \(\pi\), indicating that evaluating and optimizing reverse KL requires drawing _online samples_ from \(\pi\). In contrast, evaluating forward KL only requires _offline_samples_ drawn from \(\pi_{\mathsf{ref}}\). As we will show, this key difference between reverse KL and forward KL plays an important role of separating online RLHF and offline contrastive methods such as DPO. In this paper, we consider two types of algorithms: online RL-based algorithms, and offline contrastive-based algorithms.
+
+Online RLHF Algorithms.We consider algorithms such as [11; 1] as the online RL based methods. We abstract these algorithms as the following procedure: the algorithm performs the following two-stage procedure: one first trains a reward model \(\widehat{r}\) that minimizes the Bradley-Terry loss 1
+
+Footnote 1: We use \(\widehat{\mathbb{E}}\) to denote the empirical expectation over the dataset.
+
+\[\widehat{r}\in\operatorname*{argmax}_{r\in\mathcal{R}}\widehat{ \mathbb{E}}_{x,y^{+},y^{-}\sim\mathcal{D}}\Big{[}\log\Big{(}\frac{\exp(r(x,y^{+ }))}{\exp(r(x,y^{+}))+\exp(r(x,y^{-}))}\Big{)}\Big{]}, \tag{3}\]
+
+and perform policy optimization (such as PPO [36]) to optimize the policy with the reward model \(\widehat{r}\):
+
+\[\pi_{\mathsf{rfhf}}\in\operatorname*{argmax}_{\pi}\widehat{ \mathbb{E}}_{x\sim\mathcal{D}}\big{[}\mathbb{E}_{y\sim\pi(\cdot\mid x)}[ \widehat{r}(x,y)]-\beta\mathsf{KL}(\pi(\cdot\mid x)||\pi_{\mathsf{ref}}(\cdot \mid x))\big{]}.\]
+
+However, this policy optimization step requires extensive online sampling, and possibly training an additional critic model (e.g., PPO), in addition to the reward model and policy.
+
+Offline Contrastive Algorithms.To circumvent the above-mentioned computational burden, several purely offline contrastive-based methods (i.e., without RL) have been proposed. In this paper, we focus on the following two most representative methods. The first is Direct Preference Optimization (DPO) [33], where the objective is \(\pi_{\mathsf{dpo}}\in\operatorname*{argmax}_{r}\ell_{\mathsf{dpo}}(\pi)\) with
+
+\[\ell_{\mathsf{dpo}}(\pi)=\widehat{\mathbb{E}}_{x,y^{+},y^{-}\sim \mathcal{D}}\Bigg{[}\log\Bigg{(}\frac{\exp\Big{(}\beta\log\Big{(}\frac{\pi(y^{ +}\mid x)}{\pi_{\mathsf{ref}}(y^{+}\mid x)}\Big{)}\Big{)}}{\exp\Big{(}\beta \log\Big{(}\frac{\pi(y^{+}\mid x)}{\pi_{\mathsf{ref}}(y^{+}\mid x)}\Big{)} \Big{)}+\exp\Big{(}\beta\log\Big{(}\frac{\pi(y^{-}\mid x)}{\pi_{\mathsf{ref}}( y^{-}\mid x)}\Big{)}\Big{)}}\Bigg{)}\Bigg{]}. \tag{4}\]
+
+Another offline contrastive method we will discuss in our paper is Identity Preference Optimization [3], but we will defer its technical details to the appendix.
+
+## 4 Offline Contrastive Methods Require a Stronger Coverage Condition than Online RL Methods
+
+We start by introducing the mathematical formulation of the coverage framework. The strongest coverage condition is the following global coverage condition [28]: we say any offline distribution \(\mu\) covers a policy \(\pi\) if we have \(\max_{x,y:\rho(x)>0}\frac{\pi(y\mid x)}{\mu(y\mid x)}\leq C_{\mathsf{glo}}\). Throughout this section, we will adopt the setting where \(\mu=\pi_{\mathsf{ref}}\)[33]. Formally, we assume the following condition:
+
+**Assumption 4.1** (Global Coverage).: _For all \(\pi\), we have_
+
+\[\max_{x,y:\rho(x)>0}\frac{\pi(y\mid x)}{\pi_{\mathsf{ref}}(y\mid x)}\leq C_{ \mathsf{glo}}.\]
+
+For the coverage terms, we always adopt the convention that \(\frac{0}{0}=0\). Note that one sufficient condition for this assumption is that, for any prompt \(x\), and any token sequence \(y\), we have \(\pi_{\mathsf{ref}}(y\mid x)\geq 1/C_{\mathsf{glo}}\).
+
+As has been recognized in the offline RL literature, global coverage is a strong assumption, and efforts have been made to circumvent this assumption with more relaxed coverage conditions [46; 10; 58]. In this paper, we will consider the following partial coverage assumption that is weaker than Assumption 4.1:
+
+**Assumption 4.2** (Local KL-ball Coverage).: _For all \(\varepsilon_{\mathsf{kl}}<\infty\) and all policy \(\pi\) such that \(\mathbb{E}_{x\sim\rho}[\mathsf{KL}(\pi(\cdot\mid x)||\pi_{\mathsf{ref}}(\cdot \mid x))]\leq\varepsilon_{\mathsf{kl}}\), we have_
+
+\[\max_{x,y:\rho(x)>0}\frac{\pi(y\mid x)}{\pi_{\mathsf{ref}}(y\mid x)}\leq C_{ \varepsilon_{\mathsf{kl}}}.\]
+
+Note that \(C_{\varepsilon_{\mathsf{kl}}}\) depends on \(\varepsilon_{\mathsf{kl}}\). This coverage notion is relatively new in the RL literature and only appeared in previous analysis of RLHF algorithms [9]. We call this local coverage condition since it only requires \(\pi_{\mathsf{ref}}\) to cover the policies that is within some KL-divergence ball centered at \(\pi_{\mathsf{ref}}\). The intuition of this assumption is, for any algorithm that can control the reverse KL of the output policy, we can leverage the coverage condition to relate the error under the output policy to its error under the offline distribution, and thus guarantee its performance. Finally, we note that since the policies with bounded KL is a subset of all policies, for a fixed \(\pi_{\mathsf{ref}}\), we always have \(C_{\varepsilon_{\mathsf{kl}}}\leq C_{\mathsf{glo}}\).
+
+**Remark 4.1**.: Taking a closer look at Assumption 4.2, we can see that this assumption is always true in the sense that for any policy with \(\varepsilon_{\mathsf{kl}}<\infty\), \(\max_{x,y:\rho(x)>0}\frac{\pi(y|x)}{\pi_{\mathsf{eff}}(y|x)}<\infty\), i.e., \(C_{\varepsilon_{\mathsf{kl}}}<\infty,\) for any \(\varepsilon_{\mathsf{kl}}\). However, while being bounded, \(C_{\varepsilon_{\mathsf{kl}}}\) can be large. Indeed a simple calculation can show that \(\max_{x,y:\rho(x)>0}\frac{\pi(y|x)}{\pi_{\mathsf{eff}}(y|x)}\) can be as large as \(\max_{x,y:\pi(y|x)>0}\exp\Bigl{(}\frac{\varepsilon_{\mathsf{kl}}}{\pi(y|x)} \Bigr{)}\). This can be undesirable because this suggests bounded reverse KL itself is not enough to guarantee optimality: the error can have an _exponential_ amplification when switching from \(\pi_{\mathsf{ref}}\) to \(\pi\). Thus this motivates Assumption 4.2, which assumes that \(C_{\varepsilon_{\mathsf{kl}}}\) is reasonably small.
+
+In what follows, we will show that the global coverage assumption (Assumption 4.1) is necessary for offline contrastive-based algorithms such as DPO and IPO, but partial coverage assumption such as Assumption 4.2 is sufficient for online RL based algorithms. This establishes a separation between the two types of algorithms. We emphasize this theoretical separation explains why in practice online methods is less prone to problems such as reward hacking and producing out-of-distribution responses that are due to dataset with insufficient coverage.
+
+### Global Coverage is Necessary for Offline Contrastive Algorithms
+
+Failure of DPO Under Partial Coverage.Now we show that if the strong coverage Assumption 4.1 breaks, then DPO can not guarantee any performance with respect to the objective function Eq. (1). The intuition is based on a rather common observation of the DPO algorithm: the DPO policy \(\pi_{\mathsf{dpo}}\) may generate out of distribution responses, while in contrast, RLHF does not generate responses outside of the support of \(\pi_{\mathsf{ref}}\) due to online reverse-KL constraint. For example, [55] provides a construction where \(\pi_{\mathsf{dpo}}\) chooses a response where RLHF policy assigns 0 mass, thus proving that RLHF policies are a subset of DPO policies.
+
+However, such construction assumes that the reward learning procedure of DPO makes arbitrarily large errors. Also, previous constructions assume deterministic preference, which is only true if the underlying reward function is unbounded. This violates the natural assumption of Assumption 3.1. In the following, we relax these constraints and thus show that DPO fails to guarantee any performance in a rather strong sense. Concretely, DPO constructs the following implicit reward class with the policy class \(\Pi\): \(\mathcal{R}_{\mathsf{dpo}}=\Bigl{\{}\beta\log\Bigl{(}\frac{\pi(y|x)}{\pi_{ \mathsf{eff}}(y|x)Z(x)}\Bigr{)}\mid\pi\in\Pi\Bigr{\}}\), where \(Z(x)\) is a partition function that maps context to a real number and is independent of \(y\). Plugging this formulation into the BT loss (Eq. (3)) recovers exactly the DPO loss (Eq. (4)) as the partition functions are canceled. Now we can characterize the returned policy by DPO as exactly whose corresponding reward function is accurate _in distribution_:
+
+**Assumption 4.3** (In Distribution Reward Learning).: _We assume the DPO policy \(\pi_{\mathsf{dpo}}\) satisfies that:_
+
+\[\mathbb{E}_{x,y\sim\rho\circ\pi_{\mathsf{eff}}}\biggl{[}\biggl{(}\beta\log \biggl{(}\frac{\pi_{\mathsf{dpo}}(y\mid x)}{\pi_{\mathsf{eff}}(y\mid x)Z(x) }\biggr{)}-r^{*}(x,y)\biggr{)}^{2}\biggr{]}\leq\varepsilon_{\mathsf{dpo}}.\]
+
+Note that this is a rather strong assumption for BT loss - by Lemma B.2, at best one can only hope: for any learned reward function \(\widehat{r}\), for each context \(x\), there exists a constant \(c(x)\) such that
+
+\[\mathbb{E}_{x,y\sim\rho\circ\pi_{\mathsf{eff}}}\Bigl{[}\bigl{(}\widehat{r}(x,y)-r^{*}(x,y)-c(x)\bigr{)}^{2}\Bigr{]}\leq\varepsilon, \tag{5}\]
+
+i.e., the reward model predicts the human reward up to a gap that is independent of \(y\). This is due to the fact that BT loss only requires the reward function to capture the relative difference, or in other word, any constant shift (with respect to context) in the reward will be canceled in the BT loss. However, for the rest of the section, we will make the stronger learning assumption that the gap \(c(x)=0\) (such as in the case of Assumption 4.3). Previous counterexamples analysis violates this assumption, but we will show that even under this strong assumption, DPO still can not guarantee any performance.
+
+**Proposition 4.1**.: _Denote \(\pi_{\mathsf{ref}}\) as any reference policy such that Assumption 4.1 breaks. Let \(\Pi_{\mathsf{dpo}}\) be the set of DPO returned policies such that Assumption 4.3 holds. Then there exists policy \(\pi\in\Pi_{\mathsf{dpo}}\) such that \(J(\pi)=-\infty\)._
+
+Proof sketch.: Without loss of generality, we consider a promptless setting, and assume that the response space is \(\mathcal{Y}=\{y_{1},y_{2},y_{3}\}\). Again without loss of generality, we assume \(\pi_{\mathsf{ref}}\) only covers \(y_{1}\) and \(y_{2}\), and thus Assumption 4.1 breaks. We assume partition function \(Z=1\) for all \(\pi\) but we will berigorous in the formal proof. Then consider the following policy \(\pi\) such that
+
+\[\beta\log\biggl{(}\frac{\pi(y_{1})}{\pi_{\mathsf{ref}}(y_{1})}\biggr{)}=r^{*}(y_{ 1})-\sqrt{\varepsilon_{\mathsf{dpo}}},\quad\text{and}\quad\beta\log\biggl{(} \frac{\pi(y_{2})}{\pi_{\mathsf{ref}}(y_{2})}\biggr{)}=r^{*}(y_{2})-\sqrt{ \varepsilon_{\mathsf{dpo}}},\]
+
+One can check \(\pi\) satisfies Assumption 4.3. Now consider the optimal policy \(\pi^{*}(y_{i})=\pi_{\mathsf{ref}}(y_{i})\exp\Bigl{(}\frac{1}{\beta}r^{*}(y_{i}) \Bigr{)}\), for \(i\in\{1,2\}\), and \(\pi^{*}(y_{3})=0\). Since \(\pi^{*}(y_{1})+\pi^{*}(y_{2})=1\), combining everything we get \(\pi(y_{3})>0\), which implies \(\mathsf{KL}(\pi||\pi_{\mathsf{ref}})\) is unbounded, thus we complete the proof. 
+
+One can first relate the above construction to the partial coverage assumption Assumption 4.2: since the policy \(\pi\) considered in the proof has unbounded reverse KL with respect to \(\pi_{\mathsf{ref}}\), thus it is not in the KL-ball of \(\varepsilon_{\mathsf{kl}}\) around \(\pi_{\mathsf{ref}}\), which implies that Assumption 4.2 is not sufficient for DPO. Next we show that global coverage is necessary for the IPO algorithm.
+
+Failure of IPO Under Partial Coverage.To show that the global coverage is necessary for IPO, we can even assume a stronger in-distribution learning guarantee, that is, the returned policy achieves the smallest error on its population loss in distribution.
+
+**Proposition 4.2** (Informal).: _Denote \(\pi_{\mathsf{ref}}\) as any reference policy such that Assumption 4.1 breaks. Let \(\Pi_{\mathsf{dpo}}\) be the set of IPO returned policies such that it is the minimizer of in-distribution error on its population loss. Then there exists policy \(\pi\in\Pi_{\mathsf{dpo}}\) such that \(J(\pi)=-\infty\)._
+
+We defer the detailed setup and formal version to Appendix D, but the construction for the above proofs share the same intuition: the reverse KL term in the objective function can be unbounded. For offline contrastive-based algorithms, the KL regularization is only enforced under the data distribution, and thus the algorithm can not guarantee bounded reverse KL if the reference policy does not cover the response space well. Although we only showed counterexamples for DPO and IPO, we conjecture that the same intuition holds for other offline contrastive-based algorithms. One natural question at this point would be: how about the forward KL? Not surprisingly, the forward KL for DPO (but we conjecture for other offline constructive-based methods as well) is vacuously large, and we formalize this result in Appendix C.2.
+
+**Remark 4.2**.: The folklore that DPO is equivalent to RLHF is often based on some assumption that is much stronger than Assumption 4.3: it requires that the learned policy has a point-wise accuracy guarantee \(\beta\ln(\pi_{\mathsf{dpo}}(y|x)/\pi_{\mathsf{ref}}(y|x))=r^{*}(x,y)\) for all \(x,y\). Such a point-wise guarantee is unrealistic in reality and does not hold in general in the supervised learning sense. The in-distribution style guarantee in Assumption 4.3 is the best one could hope for from a supervised learning algorithm.
+
+### Global Coverage is Sufficient for Offline Contrastive Algorithms
+
+After showing that global coverage is necessary for DPO to guarantee any performance, we now show that it is sufficient for the performance guarantee.
+
+**Theorem 4.1**.: _Let \(\pi_{\mathsf{ref}}\) be any reference policy such that Assumption 4.1 holds. For any policy \(\pi_{\mathsf{dpo}}\) such that the event in Assumption 4.3 holds, we have that_
+
+\[J(\pi^{*})-J(\pi_{\mathsf{dpo}})=O(C_{\mathsf{glo}}\sqrt{\varepsilon_{\mathsf{ dpo}}}).\]
+
+Proof.: By Lemma B.1, we have
+
+\[J(\pi^{*})-J(\pi_{\mathsf{dpo}}) \leq\mathbb{E}_{x\sim\rho}\mathbb{E}_{y^{1}\sim\pi^{*}(\cdot|x), y^{2}\sim\pi_{\mathsf{dpo}}(\cdot|x)}\bigl{[}r^{*}(x,y^{1})-\widehat{r_{ \mathsf{dpo}}}(x,y^{1})-r^{*}(x,y^{2})+\widehat{r_{\mathsf{dpo}}}(x,y^{2}) \bigr{]}\] \[\leq\sqrt{\mathbb{E}_{x\sim\rho}\mathbb{E}_{y^{1}\sim\pi^{*}( \cdot|x),y^{2}\sim\pi_{\mathsf{dpo}}(\cdot|x)}\bigl{[}(r^{*}(x,y^{1})-\widehat {r_{\mathsf{dpo}}}(x,y^{1})-r^{*}(x,y^{2})+\widehat{r_{\mathsf{dpo}}}(x,y^{2} ))^{2}\bigr{]}}\] \[\leq\sqrt{C_{\mathsf{glo}}^{2}\mathbb{E}_{x\sim\rho}\mathbb{E}_{ y^{1},y^{2}\sim\pi_{\mathsf{ref}}(\cdot|x)}\bigl{[}(r^{*}(x,y^{1})-\widehat{r_{ \mathsf{dpo}}}(x,y^{1})-r^{*}(x,y^{2})+\widehat{r_{\mathsf{dpo}}}(x,y^{2}))^{ 2}\bigr{]}},\]
+
+and we can complete the proof by plugging in the error guarantee from Assumption 4.3. 
+
+Note that as the proof suggests, the result holds with the more general reward learning guarantee as in Lemma B.2 - one only needs to be accurate in predicting the relative rewards between response pairs.
+
+### Online RL Method Under Partial Coverage
+
+Finally, we contrast the previous negative results in Section4.1 for offline contrastive-based algorithms to a positive result for online RL-based algorithms, under the partial coverage setting. We will show that in general global coverage is not necessary for RLHF, i.e., it can guarantee performance under partial coverage. In fact, one might still be able to show an impossibility result for RLHF under partial coverage, by reusing the same counterexample as in the previous section (c.r., Proposition4.1). Concretely, as long as the learned reward \(\widehat{r}(y_{3})\to\infty\), \(\pi_{\text{rhf}}(y_{3})\) will be \(1\) and thus the reverse KL will be unbounded. However, this is a rather unrealistic scenario, as the construction requires a reward model (e.g., a neural network) to output an unbounded value. Thus this motivates the following assumption:
+
+**Assumption 4.4**.: _For all learned reward model \(\widehat{r}\) from the reward model class, we have that \(\left\lVert\widehat{r}\right\rVert_{\infty}\leq R^{\prime}\)._
+
+At this point, one might ask why a similar assumption is missing for the offline contrastive-based analysis, since in Remark4.2 we argued that a point-wise learning guarantee is unrealistic but Assumption4.4 is indeed also a point-wise boundedness assumption. The reason lies in the different construction of the model class \(\widehat{r}\) for those algorithms: for DPO and IPO, the reward model is constructed as \(\widehat{r_{\mathsf{dpo}}}=\beta\log\left(\frac{\pi}{\pi_{\mathsf{ret}}\cdot 2 }\right)\), and there is no natural function class for \(\pi\) such that point-wise assumptions such as the one in Remark4.2 or Assumption4.4 holds. In contrast, post-processing such as clipping, offline normalization and on-the-fly normalization of rewards is standard in practice, which means the policy will always witness bounded rewards [8, 9, 18, 1] during online RL training (e.g., PPO). As we will show in the following, the difference in the reward function (which is tied to the offline vs. online nature of the algorithms) can explain the different coverage requirement of the algorithms. Note that we use the same in-distribution reward learning assumption for both types of methods.
+
+To relate to Assumption4.2, we first show that the reverse KL divergence of the RLHF policy is always bounded under Assumption4.4.
+
+**Lemma 4.1**.: _Suppose that Assumption4.4 holds. Then for any RLHF policy \(\pi_{\text{rhf}}\), we have that_
+
+\[\mathsf{KL}(\pi_{\text{rhf}}||\pi_{\mathsf{ref}}):=\mathbb{E}_{x\sim\rho}\bigg{[} \mathbb{E}_{y\sim\pi_{\text{rhf}}(\cdot|x)}\bigg{[}\log\bigg{(}\frac{\pi_{\text {rhf}}(y\mid x)}{\pi_{\mathsf{ref}}(y\mid x)}\bigg{)}\bigg{]}\bigg{]}\bigg{]} \leq\frac{2R^{\prime}}{\beta}.\]
+
+Then we can show that the RLHF algorithm can guarantee performance under partial coverage:
+
+**Theorem 4.2**.: _Suppose that Assumption4.4 holds. Then for any reference policy \(\pi_{\mathsf{ref}}\) for which Assumption4.2 holds with \(\varepsilon_{\mathsf{kl}}=\frac{2R}{\beta}\), and any RLHF policy \(\pi_{\text{rhf}}\) with \(\widehat{r}\) such that (c.r. Assumption4.3) \(\mathbb{E}_{x,y\sim\rho\circ\pi_{\text{rhf}}}\big{[}(r^{\star}(x,y)-\widehat{ r}(x,y))^{2}\big{]}\leq\varepsilon_{\mathsf{reward}},\text{ we have }\)_
+
+\[J(\pi^{\star})-J(\pi_{\text{rhf}})\leq O(C_{\text{c}_{\text{c}_{\text{c}_{ \text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c} _{\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c}}}}}}}}}}}}}}}}\sqrt{ \varepsilon_{\mathsf{reward}}}).\]
+
+Conditioned on Lemma4.1, the proof of this theorem is similar to that of Theorem4.1 so we defer it to AppendixD. Similar to Theorem4.1, we note that Theorem4.2 holds under a weaker reward learning guarantee as in LemmaB.2. We also remark that as long as \(\varepsilon_{\mathsf{kl}}\) is finite, \(C_{\varepsilon_{\mathsf{kl}}}\) is finite, so the bound is never vacuous. _Since \(C_{\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c} {\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c}}}}}}}}}}}}}}\leq C_{\text{c}_ {\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c}_{\text{c} {\text{c}}_{\text{c}_{\text{c}_{\text{c}_{\text{c}}_{\text{c}_{\text{c}}_{\text{c} {\text{c}}}}}}}}}}}}}}}}\) for all \(\varepsilon_{\mathsf{kl}}\), it indicates the regret bound of RLHF is never worse and can be much better than the regret bound of DPO._ Combining Theorem4.1 and Theorem4.2, we complete the separation result between offline contrastive methods and online RL methods.
+
+A natural question at this point could be: can we further relax the local KL-ball coverage condition in Assumption4.2 to a single-policy coverage condition, i.e., just assuming \(\max_{x,y}\pi^{\star}(y|x)/\pi_{\mathsf{ref}}(y|x)\leq C\)? Prior work [59] shows that with explicit pessimism, it is possible. However, using pessimism makes the algorithm from [59] not computationally tractable and hard to scale to LLM experiments. Our conjecture is that for the RLHF policy \(\pi_{\text{rhf}}\), it is not possible to achieve meaningful regret under the single policy coverage condition, due to KL not being strong enough to induce pessimism (i.e., bounded KL between \(\pi\) and \(\pi_{\mathsf{ref}}\) can still imply exponentially large density ratio \(\pi/\pi_{\mathsf{ref}}\)). Developing a lower bound for \(\pi_{\text{rhf}}\) under single policy coverage in this case can be an interesting future work.
+
+```
+1: Pretrained LLM \(\pi_{\theta_{0}}\), reference policy \(\pi_{\text{ref}}\), offline data \(\mathcal{D}\), learning rate \(\alpha\), KL coefficient \(\lambda\).
+2:for\(t=1,\ldots,T\)do
+3: Sample a minibatch of offline data \(D_{\text{off}}:=\{x,y^{+},y^{-}\}\sim\mathcal{D}\).
+4: Compute DPO loss \(\ell_{\mathsf{dpo}}:=\sum_{x,y^{+},y^{-}\in D_{\text{off}}}\log(\sigma\bigg{(} \beta\log(\frac{\pi_{\theta_{t-1}}(y^{+}|x)}{\pi_{\mathsf{ref}}(y^{+}|x)}\bigg{)} -\beta\log(\frac{\pi_{\theta_{t-1}}(y^{-}|x)}{\pi_{\mathsf{ref}}(y^{-}|x)} \bigg{)}\bigg{)})\).
+5: Sample (unlabeled) online data \(D_{\mathsf{on}}:=\{x,y\}\) where \(x\sim\mathcal{D},y\sim\pi_{\theta_{t-1}}(x)\).
+6: Compute \(\ell_{\mathsf{d}}:=\sum_{x,y\in D_{\mathsf{on}}}\log(\pi_{\theta_{t-1}}(y|x)) \cdot\text{sg}\Big{(}\log(\frac{(\pi_{\theta_{t-1}}(y|x))}{(\pi_{\mathsf{ref}} (y|x))}\Big{)}\Big{)}\).
+7: Update \(\theta_{t}=\theta_{t-1}+\alpha\cdot\nabla_{\theta_{t-1}}(\ell_{\mathsf{dpo}}- \lambda\ell_{\mathsf{d}})\). return\(\pi_{T}\).
+```
+
+**Algorithm 1** Hybrid Preference Optimization (HyPO)
+
+## 5 Hybrid Preference Optimization: Regularizing Offline Learning with Unlabeled Online Samples
+
+In this section, we will provide a practical algorithm that bridges the gap between the offline contrastive-based algorithms and the online RL-based algorithms. As we see in the previous sections, the difference between the two types of algorithms is their reward model parametrization, and whether to perform online rollouts. In the following, we will show that these two properties are in fact tightly intervened with each other.
+
+Here we will focus on the DPO algorithm. One way to fix the issue of the unbounded reverse KL of DPO (which is caused by the unbounded reward model class) is to consider the following ideal procedure: at the beginning of the algorithm, we first go through the policy class \(\Pi\), and then we filter out all the policies such that \(\text{KL}(\pi||\pi_{\text{ref}})\geq\frac{2R^{\prime}}{\beta}\), where \(R^{\prime}\) is the boundedness of the reward function class for RLHF. Now applying the same analysis of Theorem 4.2, we can show that this revised DPO algorithm can guarantee performance under the partial coverage assumption, because now the Lemma 4.1, a sufficient condition for Theorem 4.2, is explicitly enforced by the constraints. We defer the detailed statement and analysis to Appendix F.1.
+
+However, such a filtering procedure is not possible in practice, but we can instead consider the following constrained optimization problem: we call the definition of DPO loss in Eq. (4), we want to solve
+
+\[\max_{\pi}\ell_{\mathsf{dpo}}(\pi)\quad\text{s.t.}\quad\text{KL}(\pi||\pi_{ \text{ref}})\leq\frac{2R^{\prime}}{\beta}, \tag{6}\]
+
+using the KKT conditions, we can show that the following Lagrangian form is equivalent to Eq. (6):
+
+\[\max_{\pi}\ell_{\mathsf{dpo}}(\pi)-\lambda\text{KL}(\pi||\pi_{\text{ref}}), \tag{7}\]
+
+where \(\lambda\) is the Lagrange multiplier. However, in reality, since we do not know the exact value of \(R^{\prime}\), we can consider setting \(\lambda\) to be a hyperparameter. We present the pseudocode in Algorithm 1. Note that due to the reverse KL term, the Hybrid Preference Optimization (HyPO) algorithm optimizes Eq. (7) via both offline and online samples where the offline samples are used for constructing and optimizing \(\ell_{\mathsf{dpo}}\) (here \(\sigma\) denotes the sigmoid function), and the online samples \(y\sim\pi(\cdot\mid x)\) are for KL (i.e., \(\ell_{kl}\)). Note that regularizing with reverse KL via online samples is widely used in online RLHF (e.g., PPO [40], APA [62], REBEL [18]). Here \(\text{sg}\) refers to the stop gradient operation, which is a common practice in optimizing reverse KL in the LLM fine-tuning setting [30, 47]. Finally, previous iterative RLHF methods [53] can be interpreted as hybrid methods as well, but they require labeling online samples from an additional reward model while HyPO only requires unlabeled online samples.
+
+Summarization.Our first experiment is on the TL;DR dataset [40]. Our experiment setup mostly follows [18]: we use a maximum context length of 512 and a maximum generation length of 53. We use Pythia 1.4B and Pythia 2.8B [5] as the pre-trained model. For the supervised fine-tuning (SFT) model, we train it over 1 epoch of the dataset with human reference responses as labels. We train the reward model on top of the SFT over 1 epoch of preference data. Both HyPO and DPO are trained over 1 epoch of preference data with Low-rank Adaptation (LoRA) [21]. We defer more experiment details in Appendix F.
+
+We summarize the results in Table 1: HyPO outperforms DPO in terms of GPT4 win-rage and reverse KL. Particularly, the significant reduction in reverse KL implies the impact of including a reverse KL term explicitly into the DPO objective. While comparing with PPO (e.g., Table 1 in [18]), HyPO's performance is still lower in winrate, HyPO does preserve the key advantages of DPO over PPO: we avoid training additional reward model and a value network.
+
+General Chat.In the general chat setting, the model is required to produce a response \(y\) given user instruction \(x\). We again follow the experiment setup in [18], where we finetune the Meta-Llama-3-8B-Instruct [27] model on the ultrafeedback dataset [14]. Due to the computation constrain, we follow the setup in [18] where we only train the last 4 layers of the network for both HyPO and DPO.
+
+For evaluation, we use the common metrics including AlpacaEval 2.0 [15], MT-bench [61] and Open LLM leaderboard tasks: MMLU [20], GSM8K [13], Arc [12], TruthfulQA [26] and HellaSwag [57]. We provide the results for AlpacaEval and MT-bench in Table 2, and the the results of the remaining tasks can be found in Table 3.
+
+HyPO Mitigates Overfitting in Contrastive Methods.Since the offline contrastive based methods only work with a static offline dataset, the overfitting issue has been observed [43]. In our last experiment, we show that HyPO can effectively address the overfitting issue by leveraging the unlabeled online data. We follow the setup of the summarization task with Pythia-2.8B base model. We train DPO and HyPO for 5 epochs respectively, and evaluate on the first 300 data in the validation dataset. We plot the validation KL in Figure 1: we observe that HyPO is better at preventing the deviation from the reference policy caused by overfitting from training on excessive epochs, even though the methods theoretically both have KL regularization to the reference policy.
+
+## 6 Function Approximation Coverage: Can Fine-tuned Policies Extrapolate?
+
+Our final result is a theoretical explanation of the extrapolation behavior of preference fine-tuning algorithms under the global coverage assumption in the function approximation (FA) setting. The extrapolation behavior refers to the phenomenon of RLHF algorithms (e.g., DPO) can improve SFT models despite the fact that during training the policies assign decreasing likelihood to both the preferred and rejected responses (i.e., they must increase the likelihood of responses outside of the training data) [31].
+
+A previous attempt [32] to explain this behavior is based on the assumption that the responses from the reference policy have the same distribution as the _preferred_ responses from the dataset, i.e., \(y^{+}\sim\mu\overset{d}{=}y\sim\pi_{\text{ref}}\). However, as mentioned in Section 3, more realistically, one should assume that
+
+\begin{table}
+\begin{tabular}{c c c c|c c} \hline \hline \multirow{2}{*}{Model size} & \multirow{2}{*}{Algorithm} & \multicolumn{2}{c}{MT-Bench} & \multicolumn{2}{c}{AlpacaEval 2.0} \\  & & 1st Turn & 2nd Turn & Average & LC Win Rate & Win Rate \\ \hline Meta-Llama-3-8B-Instruct [27] & 8.31 & 7.89 & 8.10 & 26.0 & 25.3 \\ DPO-Llama-3 & 8.08 & 7.41 & 7.75 & 28.4 & 30.9 \\ HyPO-Llama-3 & 8.43 & 7.75 & 8.09 & 30.7 & 32.2 \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: Results on general chat benchmarks. We evaluate the base model (Meta-Llama-3-8B-Instruct), DPO-fine-tuned model, and HyPO-fine-tuned model.
+
+Figure 1: Mean validation reverse KL to the reference policy when DPO and HyPO are trained for 5 epoch on the TL;DR dataset. We repeat the experiment for 3 random seeds and plot the median and the shaded areas denote the min and max over the 3 repetitions.
+
+\begin{table}
+\begin{tabular}{c c c c|c c} \hline \hline \multirow{2}{*}{Model} & \multirow{2}{*}{1st Turn} & \multicolumn{2}{c|}{MT-Bench} & \multicolumn{2}{c}{AlpacaEval 2.0} \\  & & 1st Turn & 2nd Turn & Average & LC Win Rate & Win Rate \\ \hline Meta-Llama-3-8B-Instruct [27] & 8.31 & 7.89 & 8.10 & 26.0 & 25.3 \\ DPO-Llama-3 & 8.08 & 7.41 & 7.75 & 28.4 & 30.9 \\ HyPO-Llama-3 & 8.43 & 7.75 & 8.09 & 30.7 & 32.2 \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: Results on TL;DR dataset. Winrate is evaluated by GPT4 and RM score is from the trained reward model. Experiments are repeated for 3 random seeds. Mean and standard deviation are reported.
+
+\(y\sim\mu\stackrel{{ d}}{{=}}y\sim\pi_{\text{ref}}\) since it is more natural to use the reference policy to generate pairs of responses to collect labels; or even more generally by considering \(\mathsf{supp}(\mathcal{D})\subset\mathsf{supp}(\pi_{\text{ref}})\). The latter is common in practice, for example, the dataset is often precollected, or the reference policy might have a small mass on some responses, so with a high probability they are not sampled during the data collection process.
+
+In the following, we illustrate this behavior using linear function approximation:
+
+**Definition 6.1** (Linear function approximation).: _Consider the promptless setting with response space \(\mathcal{Y}\). For all \(y\in\mathcal{Y}\), the ground truth reward \(r^{*}(y)=w^{\top}\phi(y)\), where \(w\in\mathbb{R}^{d}\) is a universal linear weight vector and \(\phi:\mathcal{Y}\rightarrow\mathbb{R}^{d}\) is a \(d\)-dimensional feature map. In addition, all policies are parametrized as softmax linear policies, i.e., \(\pi(y)\propto\exp(w_{\pi}^{\top}\phi(y))\). The feature map \(\phi\) is known to the learner, and \(w\) is unknown. Finally, let \(y^{*}=\operatorname*{argmax}_{y\in\mathcal{Y}}r^{*}(y)\) be the optimal action._
+
+In general, we should not expect the offline dataset to contain the optimal action \(y^{*}\) under all situations. We show that thanks to the linear function approximation and the dataset coverage, DPO has hope to extrapolate correctly, i.e., it can increase the model's likelihood of the optimal action while decreasing the likelihood of both the preferred and rejected actions from the offline data:
+
+**Proposition 6.1**.: _Under linear function approximation (Definition 6.1), there exists dataset collected from distribution \(\mu\) that does not cover \(y^{*}\), i.e., \(\mu(y^{*})=0\), but has global coverage in the linear function approximation setting [54]: let \(\Sigma_{\mu}=\mathbb{E}_{y\sim\mu}\phi(y)\phi(y)^{\top}\), then for all \(\pi\), \(\mathbb{E}_{y\sim\pi}\|\phi(y)\|_{\Sigma_{\mu}^{-1}}^{2}\leq C_{\pi}\). Then DPO will return a policy \(\pi_{\mathsf{dpo}}\) such that \(\pi_{\mathsf{dpo}}(y^{*})>0\), but \(\pi_{\mathsf{dpo}}(y)\leq\pi_{\text{ref}}(y)\) for all \(y\) in the offline data support, i.e., \(\mu(y)>0\)._
+
+We defer the proof to Appendix D.3. The above result shows when the training dataset together with the function approximation allow the learned function to generalize (e.g., learn a function that can predict well on test examples beyond the training data -- a property supervised learning can have), algorithms like DPO can extrapolate correctly, i.e., they can push up the likelihood of the optimal responses outside of the training data while pushing down the likelihood of all the responses in the training data. Although it is not possible to show that extrapolation is guaranteed to always happen: suppose in the offline dataset, there is an action \(y^{\prime}\) whose feature \(\phi(y^{\prime})\) is almost identical to \(\phi(y^{*})\), then in the finite sample case, with small learning error the final policy might increase the probability of \(y^{\prime}\) instead of extrapolate to \(y^{*}\), but in this case the policy is still near optimal. That said, our construction in the proof is general enough to explain non-edge-cases under function approximation.
+
+To validate our theory result, in Appendix E we perform a synthetic experiment on global coverage with linear function approximation.
+
+## 7 Discussion
+
+There are a few limitations of our work: 1) our theoretical analysis only considers the statistical perspective of each algorithm, but we believe our result is complementary to the other work that considers the optimization perspectives [42]. 2) we only conduct experiments on limited models and benchmarks. 3) The experiment result shows that HyPO's performance is still below the one of online RLHF: this might suggest that our theory does not fully explain the benefit of all the components of online RLHF. For example, one hypothesis is that the learn reward function may have better generalization ability. 4) It is not clear that the KL-ball coverage is necessary for online RL-based methods. However, as we discussed, since a bounded reverse KL might still induce exponential error amplification, we conjecture that at least the single policy coverage [58] is not sufficient for online RLHF-based methods that use reverse KL. We believe these limitations lead to several interesting further directions. Finally, our method may not explicitly address the potential hallucinations or toxic behavior of LLMs, which is a common shortcoming of general-purpose fine-tuning algorithms.
+
+\begin{table}
+\begin{tabular}{c|c c c c|c} \hline \hline \multirow{2}{*}{Model} & MMLU & GSM8K & Arc & TruthfulQA & HellaSwag \\  & (5-shot) & (5-shot) & (25-shot) & (0-shot) & (10-shot) & Average \\ \hline Meta-Llama-3-8B-Instruct [27] & 65.68 & 74.91 & 62.12 & 43.88 & 78.76 & 65.07 \\ DPO-Llama-3 & 65.82 & 73.62 & 63.14 & 45.02 & 79.1 & 65.34 \\ HyPO-Llama-3 & 65.74 & 73.84 & 62.71 & 45.55 & 79.74 & 65.51 \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: Results on Open LLM leaderboard. We evaluate the base model (Meta-Llama-3-8B-Instruct), DPO-fine-tuned model, and HyPO-fine-tuned model.
+
+## References
+
+* [1] A. Ahmadian, C. Cremer, M. Galle, M. Fadaee, J. Kreutzer, A. Ustun, and S. Hooker. Back to basics: Revisiting reinforce style optimization for learning from human feedback in llms. _arXiv preprint arXiv:2402.14740_, 2024.
+* [2] P. Amortila, D. J. Foster, N. Jiang, A. Sekhari, and T. Xie. Harnessing density ratios for online reinforcement learning. In _The Twelfth International Conference on Learning Representations_, 2024.
+* [3] M. G. Azar, Z. D. Guo, B. Piot, R. Munos, M. Rowland, M. Valko, and D. Calandriello. A general theoretical paradigm to understand learning from human preferences. In _International Conference on Artificial Intelligence and Statistics_, pages 4447-4455. PMLR, 2024.
+* [4] J. Bagnell, S. M. Kakade, J. Schneider, and A. Ng. Policy search by dynamic programming. _Advances in neural information processing systems_, 16, 2003.
+* [5] S. Biderman, H. Schoelkopf, Q. G. Anthony, H. Bradley, K. O'Brien, E. Hallahan, M. A. Khan, S. Purohit, U. S. Prashanth, E. Raff, et al. Pythia: A suite for analyzing large language models across training and scaling. In _International Conference on Machine Learning_, pages 2397-2430. PMLR, 2023.
+* [6] R. A. Bradley and M. E. Terry. Rank analysis of incomplete block designs: I. the method of paired comparisons. _Biometrika_, 39(3/4):324-345, 1952.
+* [7] S. Casper, X. Davies, C. Shi, T. K. Gilbert, J. Scheurer, J. Rando, R. Freedman, T. Korbak, D. Lindner, P. Freire, et al. Open problems and fundamental limitations of reinforcement learning from human feedback. _arXiv preprint arXiv:2307.15217_, 2023.
+* [8] J. D. Chang, K. Brantley, R. Ramamurthy, D. Misra, and W. Sun. Learning to generate better than your llm. _arXiv preprint arXiv:2306.11816_, 2023.
+* [9] J. D. Chang, W. Shan, O. Oertell, K. Brantley, D. Misra, J. D. Lee, and W. Sun. Dataset reset policy optimization for rhf. _arXiv preprint arXiv:2404.08495_, 2024.
+* [10] J. Chen and N. Jiang. Offline reinforcement learning under value and density-ratio realizability: the power of gaps. In _Uncertainty in Artificial Intelligence_, pages 378-388. PMLR, 2022.
+* [11] P. F. Christiano, J. Leike, T. Brown, M. Martic, S. Legg, and D. Amodei. Deep reinforcement learning from human preferences. _Advances in neural information processing systems_, 30, 2017.
+* [12] P. Clark, I. Cowhey, O. Etzioni, T. Khot, A. Sabharwal, C. Schoenick, and O. Tafjord. Think you have solved question answering? try arc, the ai2 reasoning challenge. _arXiv preprint arXiv:1803.05457_, 2018.
+* [13] K. Cobbe, V. Kosaraju, M. Bavarian, M. Chen, H. Jun, L. Kaiser, M. Plappert, J. Tworek, J. Hilton, R. Nakano, et al. Training verifiers to solve math word problems. _arXiv preprint arXiv:2110.14168_, 2021.
+* [14] G. Cui, L. Yuan, N. Ding, G. Yao, W. Zhu, Y. Ni, G. Xie, Z. Liu, and M. Sun. Ultrafeedback: Boosting language models with high-quality feedback. _arXiv preprint arXiv:2310.01377_, 2023.
+* [15] Y. Dubois, B. Galambosi, P. Liang, and T. B. Hashimoto. Length-controlled alpacaeval: A simple way to debias automatic evaluators. _arXiv preprint arXiv:2404.04475_, 2024.
+* [16] J. Eisenstein, C. Nagpal, A. Agarwal, A. Beirami, A. D'Amour, D. Dvijotham, A. Fisch, K. Heller, S. Pfohl, D. Ramachandran, et al. Helping or herding? reward model ensembles mitigate but do not eliminate reward hacking. _arXiv preprint arXiv:2312.09244_, 2023.
+* [17] L. Gao, J. Schulman, and J. Hilton. Scaling laws for reward model overoptimization. In _International Conference on Machine Learning_, pages 10835-10866. PMLR, 2023.
+
+* [18] Z. Gao, J. D. Chang, W. Zhan, O. Oertell, G. Swamy, K. Brantley, T. Joachims, J. A. Bagnell, J. D. Lee, and W. Sun. Rebel: Reinforcement learning via regressing relative rewards. _arXiv preprint arXiv:2404.16767_, 2024.
+* [19] S. Guo, B. Zhang, T. Liu, T. Liu, M. Khalman, F. Llinares, A. Rame, T. Mesnard, Y. Zhao, B. Piot, et al. Direct language model alignment from online ai feedback. _arXiv preprint arXiv:2402.04792_, 2024.
+* [20] D. Hendrycks, C. Burns, S. Basart, A. Zou, M. Mazeika, D. Song, and J. Steinhardt. Measuring massive multitask language understanding. _arXiv preprint arXiv:2009.03300_, 2020.
+* [21] E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang, and W. Chen. Lora: Low-rank adaptation of large language models. _arXiv preprint arXiv:2106.09685_, 2021.
+* [22] S. Kakade and J. Langford. Approximately optimal approximate reinforcement learning. In _Proceedings of the Nineteenth International Conference on Machine Learning_, pages 267-274, 2002.
+* [23] R. Kirk, I. Mediratta, C. Nalmpantis, J. Luketina, E. Hambro, E. Grefenstette, and R. Raileanu. Understanding the effects of rlhf on llm generalisation and diversity. _arXiv preprint arXiv:2310.06452_, 2023.
+* [24] W. Kool, H. van Hoof, and M. Welling. Buy 4 REINFORCE samples, get a baseline for free! 2019.
+* [25] J. Langford and T. Zhang. The epoch-greedy algorithm for multi-armed bandits with side information. In _Advances in neural information processing systems_, pages 817-824, 2008.
+* [26] S. Lin, J. Hilton, and O. Evans. Truthfulqa: Measuring how models mimic human falsehoods. _arXiv preprint arXiv:2109.07958_, 2021.
+* [27] Meta. Introducing meta llama 3: The most capable openly available llm to date, 2024. _URL https://ai. meta. com/blog/meta-llama-3_, 2024.
+* [28] R. Munos and C. Szepesvari. Finite-time bounds for fitted value iteration. _Journal of Machine Learning Research_, 9(5), 2008.
+* [29] R. Munos, M. Valko, D. Calandriello, M. G. Azar, M. Rowland, Z. D. Guo, Y. Tang, M. Geist, T. Mesnard, A. Michi, et al. Nash learning from human feedback. _arXiv preprint arXiv:2312.00886_, 2023.
+* [30] L. Ouyang, J. Wu, X. Jiang, D. Almeida, C. Wainwright, P. Mishkin, C. Zhang, S. Agarwal, K. Slama, A. Ray, et al. Training language models to follow instructions with human feedback. _Advances in neural information processing systems_, 35:27730-27744, 2022.
+* [31] A. Pal, D. Karkhanis, S. Dooley, M. Roberts, S. Naidu, and C. White. Smaug: Fixing failure modes of preference optimisation with dpo-positive. _arXiv preprint arXiv:2402.13228_, 2024.
+* [32] R. Rafailov, J. Hejna, R. Park, and C. Finn. From \(r\) to \(q*\): Your language model is secretly a q-function. _arXiv preprint arXiv:2404.12358_, 2024.
+* [33] R. Rafailov, A. Sharma, E. Mitchell, C. D. Manning, S. Ermon, and C. Finn. Direct preference optimization: Your language model is secretly a reward model. _Advances in Neural Information Processing Systems_, 36, 2023.
+* [34] S. Ross and J. A. Bagnell. Agnostic system identification for model-based reinforcement learning. _arXiv preprint arXiv:1203.1007_, 2012.
+* [35] C. Rosset, C.-A. Cheng, A. Mitra, M. Santacroce, A. Awadallah, and T. Xie. Direct nash optimization: Teaching language models to self-improve with general preferences. _arXiv preprint arXiv:2404.03715_, 2024.
+* [36] J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov. Proximal policy optimization algorithms. _arXiv preprint arXiv:1707.06347_, 2017.
+
+* [37] A. Sharma, S. Keh, E. Mitchell, C. Finn, K. Arora, and T. Kollar. A critical evaluation of ai feedback for aligning large language models. _arXiv preprint arXiv:2402.12366_, 2024.
+* [38] P. Singhal, T. Goyal, J. Xu, and G. Durrett. A long way to go: Investigating length correlations in rhlf. _arXiv preprint arXiv:2310.03716_, 2023.
+* [39] Y. Song, Y. Zhou, A. Sekhari, J. A. Bagnell, A. Krishnamurthy, and W. Sun. Hybrid rl: Using both offline and online data can make rl efficient. _arXiv preprint arXiv:2210.06718_, 2022.
+* [40] N. Stiennon, L. Ouyang, J. Wu, D. Ziegler, R. Lowe, C. Voss, A. Radford, D. Amodei, and P. F. Christiano. Learning to summarize with human feedback. _Advances in Neural Information Processing Systems_, 33:3008-3021, 2020.
+* [41] G. Swamy, C. Dann, R. Kidambi, Z. S. Wu, and A. Agarwal. A minimalismist approach to reinforcement learning from human feedback. _arXiv preprint arXiv:2401.04056_, 2024.
+* [42] F. Tajwar, A. Singh, A. Sharma, R. Rafailov, J. Schneider, T. Xie, S. Ermon, C. Finn, and A. Kumar. Preference fine-tuning of llms should leverage suboptimal, on-policy data. _arXiv preprint arXiv:2404.14367_, 2024.
+* [43] Y. Tang, D. Z. Guo, Z. Zheng, D. Calandriello, Y. Cao, E. Tarassov, R. Munos, B. A. Pires, M. Valko, Y. Cheng, et al. Understanding the performance gap between online and offline alignment algorithms. _arXiv preprint arXiv:2405.08448_, 2024.
+* [44] G. Team, R. Anil, S. Borgeaud, Y. Wu, J.-B. Alayrac, J. Yu, R. Soricut, J. Schalkwyk, A. M. Dai, A. Hauth, et al. Gemini: a family of highly capable multimodal models. _arXiv preprint arXiv:2312.11805_, 2023.
+* [45] H. Touvron, L. Martin, K. Stone, P. Albert, A. Almahairi, Y. Babaei, N. Bashlykov, S. Batra, P. Bhargava, S. Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models. _arXiv preprint arXiv:2307.09288_, 2023.
+* [46] M. Uehara and W. Sun. Pessimistic model-based offline reinforcement learning under partial coverage. _arXiv preprint arXiv:2107.06226_, 2021.
+* [47] L. von Werra, Y. Belkada, L. Tunstall, E. Beeching, T. Thrush, N. Lambert, and S. Huang. Trl: Transformer reinforcement learning. [https://github.com/huggingface/trl](https://github.com/huggingface/trl), 2020.
+* [48] R. J. Williams. Simple statistical gradient-following algorithms for connectionist reinforcement learning. _Machine learning_, 8:229-256, 1992.
+* [49] T. Xie, C.-A. Cheng, N. Jiang, P. Mineiro, and A. Agarwal. Bellman-consistent pessimism for offline reinforcement learning. _Advances in neural information processing systems_, 34:6683-6694, 2021.
+* [50] T. Xie, D. J. Foster, Y. Bai, N. Jiang, and S. M. Kakade. The role of coverage in online reinforcement learning. In _The Eleventh International Conference on Learning Representations_, 2023.
+* [51] T. Xie, N. Jiang, H. Wang, C. Xiong, and Y. Bai. Policy finetuning: Bridging sample-efficient offline and online reinforcement learning. _Advances in neural information processing systems_, 34:27395-27407, 2021.
+* [52] W. Xiong, H. Dong, C. Ye, Z. Wang, H. Zhong, H. Ji, N. Jiang, and T. Zhang. Iterative preference learning from human feedback: Bridging theory and practice for rlhf under kl-constraint. In _ICLR 2024 Workshop on Mathematical and Empirical Understanding of Foundation Models_, 2023.
+* [53] W. Xiong, H. Dong, C. Ye, Z. Wang, H. Zhong, H. Ji, N. Jiang, and T. Zhang. Iterative preference learning from human feedback: Bridging theory and practice for rlhf under kl-constraint. In _Forty-first International Conference on Machine Learning_, 2024.
+* [54] W. Xiong, H. Zhong, C. Shi, C. Shen, L. Wang, and T. Zhang. Nearly minimax optimal offline reinforcement learning with linear function approximation: Single-agent mdp and markov game. _arXiv preprint arXiv:2205.15512_, 2022.
+
+* [55] S. Xu, W. Fu, J. Gao, W. Ye, W. Liu, Z. Mei, G. Wang, C. Yu, and Y. Wu. Is dpo superior to ppo for llm alignment? a comprehensive study. _arXiv preprint arXiv:2404.10719_, 2024.
+* [56] L. Yuan, G. Cui, H. Wang, N. Ding, X. Wang, J. Deng, B. Shan, H. Chen, R. Xie, Y. Lin, et al. Advancing llm reasoning generalists with preference trees. _arXiv preprint arXiv:2404.02078_, 2024.
+* [57] R. Zellers, A. Holtzman, Y. Bisk, A. Farhadi, and Y. Choi. Hellaswag: Can a machine really finish your sentence? _arXiv preprint arXiv:1905.07830_, 2019.
+* [58] W. Zhan, B. Huang, A. Huang, N. Jiang, and J. Lee. Offline reinforcement learning with realizability and single-policy concentrability. In _Conference on Learning Theory_, pages 2730-2775. PMLR, 2022.
+* [59] W. Zhan, M. Uehara, N. Kallus, J. D. Lee, and W. Sun. Provable offline preference-based reinforcement learning. In _The Twelfth International Conference on Learning Representations_, 2023.
+* [60] Y. Zhao, R. Joshi, T. Liu, M. Khalman, M. Saleh, and P. J. Liu. Slic-hf: Sequence likelihood calibration with human feedback. _arXiv preprint arXiv:2305.10425_, 2023.
+* [61] L. Zheng, W.-L. Chiang, Y. Sheng, S. Zhuang, Z. Wu, Y. Zhuang, Z. Lin, Z. Li, D. Li, E. Xing, et al. Judging llm-as-a-judge with mt-bench and chatbot arena. _Advances in Neural Information Processing Systems_, 36, 2024.
+* [62] B. Zhu, H. Sharma, F. V. Frujeri, S. Dong, C. Zhu, M. I. Jordan, and J. Jiao. Fine-tuning language models with advantage-induced policy alignment. _arXiv preprint arXiv:2306.02231_, 2023.
+* [63] B. D. Ziebart, A. L. Maas, J. A. Bagnell, A. K. Dey, et al. Maximum entropy inverse reinforcement learning. In _Aaai_, volume 8, pages 1433-1438. Chicago, IL, USA, 2008.
+
+Additional Related Works
+
+Extrapolation Behavior of PFT.Recent work [56, 31, 32] has observed an interesting effect of the DPO procedure: a simultaneous decrease in the likelihood of both preferred and rejected responses. This behavior is surprising at first glance because one would expect that DPO will increase the likelihood of preferred responses and decrease the likelihood of rejected responses. We provide a rigorous statistical explanation of this behavior and show that this behavior is natural when the offline preference data only contains sub-optimal responses but the function approximation allows DPO to extrapolate and generalize to the correct optimal responses. This highlights the role of function approximation in the success of offline contrastive based methods.
+
+Coverage.We analyze online RLHF and offline contrastive-based methods via the concept of coverage. Coverage measures how well an offline (data) distribution covers the support of the policy of interest, which has been the key technical tool in offline RL [28, 49, 46, 58], offline-online RL [34, 51, 39, 2] and online RL [22, 4, 50]. The data coverage plays an important role in our analysis since both online RLHF and offline contrastive-based methods rely on an offline preference dataset for learning.
+
+## Appendix B Auxiliary Lemmas
+
+**Lemma B.1** (Objective decomposition).: _Let \(J(\pi)\) be the objective function defined in (1), and for reward function \(\hat{r}\), we let_
+
+\[\hat{\pi}\in\operatorname*{argmax}_{\pi}\mathbb{E}_{x\sim\rho} \big{[}\mathbb{E}_{y\sim\pi(\cdot\mid x)}[\hat{r}(x,y)]-\beta\mathsf{KL}(\pi( \cdot\mid x)||\pi_{\mathsf{ref}}(\cdot\mid x))\big{]}, \tag{8}\]
+
+_then we have_
+
+\[J(\pi^{*})-J(\hat{\pi})\leq\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E} _{y^{1}\sim\pi^{*}(\cdot\mid x),y^{2}\sim\hat{\pi}(\cdot\mid x)}\big{[}r^{*}(x,y^{1})-\hat{r}(x,y^{1})-r^{*}(x,y^{2})+\hat{r}(x,y^{2})\big{]}\big{]}.\]
+
+Proof.: We have
+
+\[J(\pi^{*})-J(\hat{\pi})\] \[= \mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\pi^{*}(\cdot\mid x) }[r^{*}(x,y)]-\beta\mathsf{KL}(\pi^{*}(\cdot\mid x)||\pi_{\mathsf{ref}}(\cdot \mid x))\big{]}-\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\hat{\pi}(\cdot \mid x)}[r^{*}(x,y)]+\beta\mathsf{KL}(\hat{\pi}(\cdot\mid x)||\pi_{\mathsf{ref }}(\cdot\mid x))\big{]}\] \[= \mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\pi^{*}(\cdot\mid x) }[r^{*}(x,y)]-\beta\mathsf{KL}(\pi^{*}(\cdot\mid x)||\pi_{\mathsf{ref}}(\cdot \mid x))\big{]}-\big{(}\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\hat{\pi}( \cdot\mid x)}[r^{*}(x,y)]-\beta\mathsf{KL}(\hat{\pi}(\cdot\mid x)||\pi_{ \mathsf{ref}}(\cdot\mid x))\big{]}\big{)}\] \[+\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\hat{\pi}(\cdot \mid x)}[\hat{r}(x,y)]-\beta\mathsf{KL}(\hat{\pi}(\cdot\mid x)||\pi_{\mathsf{ ref}}(\cdot\mid x))\big{]}-\big{(}\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim \hat{\pi}(\cdot\mid x)}[\hat{r}(x,y)]-\beta\mathsf{KL}(\hat{\pi}(\cdot\mid x) ||\pi_{\mathsf{ref}}(\cdot\mid x))\big{]}\big{)}\] \[\leq \mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\pi^{*}(\cdot\mid x) }[r^{*}(x,y)]-\beta\mathsf{KL}(\pi^{*}(\cdot\mid x)||\pi_{\mathsf{ref}}(\cdot \mid x))\big{]}-\big{(}\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\pi^{*}( \cdot\mid x)}[\hat{r}(x,y)]-\beta\mathsf{KL}(\pi^{*}(\cdot\mid x)||\pi_{ \mathsf{ref}}(\cdot\mid x))\big{]}\big{)}\] \[+\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\hat{\pi}(\cdot\mid x )}[\hat{r}(x,y)]-\beta\mathsf{KL}(\hat{\pi}(\cdot\mid x)||\pi_{\mathsf{ref}}( \cdot\mid x))\big{]}-\big{(}\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\hat{ \pi}(\cdot\mid x)}[r^{*}(x,y)]-\beta\mathsf{KL}(\hat{\pi}(\cdot\mid x)||\pi_{ \mathsf{ref}}(\cdot\mid x))\big{]}\big{)}\] \[= \mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\pi^{*}(\cdot\mid x )}[r^{*}(x,y)-\hat{r}(x,y)]\big{]}-\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y \sim\hat{\pi}(\cdot\mid x)}[r^{*}(x,y)-\hat{r}(x,y)]\big{]},\]
+
+where the inequality is due to Eq. (8). To complete the proof, note that
+
+\[\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y\sim\pi^{*}(\cdot\mid x )}[r^{*}(x,y)-\hat{r}(x,y)]-\mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\hat{\pi}( \cdot\mid x)}[r^{*}(x,y)-\hat{r}(x,y)]\big{]}\] \[= \mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y^{1}\sim\pi^{*}(\cdot \mid x),y^{2}\sim\hat{\pi}(\cdot\mid x)}[r^{*}(x,y^{1})-\hat{r}(x,y^{1})] \big{]}-\mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y^{1}\sim\pi^{*}(\cdot\mid x),y^{2}\sim\hat{\pi}(\cdot\mid x)}[r^{*}(x,y^{2})-\hat{r}(x,y^{2})]\big{]}\] \[= \mathbb{E}_{x\sim\rho}\big{[}\mathbb{E}_{y^{1}\sim\pi^{*}(\cdot \mid x),y^{2}\sim\hat{\pi}(\cdot\mid x)}[r^{*}(x,y^{1})-\hat{r}(x,y^{1})-r^{*}(x,y^{2})+\hat{r}(x,y^{2})\big{]}\big{]}.\]
+
+**Lemma B.2** (Lemma C.2 from [9]).: _Assume that \(r^{*}\) is bounded, let \(\mathcal{R}\) be the reward function class, and Let_
+
+\[\hat{r}=\operatorname*{argmin}_{r\in\mathcal{R}}\hat{\mathbb{E}}_{ x,y^{+},y^{-}\sim\mathcal{D}}\bigg{[}\log\bigg{(}\frac{\exp(r(x,y^{+}))}{\exp(r(x,y^{+}))+ \exp(r(x,y^{-}))}\bigg{)}\bigg{]},\]
+
+_then we have with probability at least \(1-\delta\) that_
+
+\[\mathbb{E}_{x,y^{1},y^{2}\sim\mu\circ\pi_{\mathsf{ref}}}\Big{[}\big{(}r^{*}(x,y^{1 })-r^{*}(x,y^{2})-\hat{r}(x,y^{1})+\hat{r}(x,y^{2})\big{)}^{2}\Big{]}\leq\frac{c \kappa^{2}\log(|\mathcal{R}|/\delta)}{N},\]
+
+_where \(\kappa\) measures the non-linearity of the link function, and \(c\) is a constant, \(N:=|\mathcal{D}|\) is the size of the offline dataset._Additional Results
+
+### Results for IPO
+
+In this section we give detailed technical details for IPO, and the negative results for IPO under partial coverage. Recall that the empirical objective of IPO is is \(\pi_{\mathsf{ipo}}\in\operatorname*{argmin}_{\pi}\widehat{\ell_{\mathsf{ipo}}}(\pi)\), where
+
+\[\widehat{\ell_{\mathsf{ipo}}}(\pi)=\widehat{\mathbb{E}}_{x,y^{+},y^{-}\sim \mathcal{D}}\Bigg{[}\bigg{(}\log\!\bigg{(}\frac{\pi(y^{+}\mid x)\pi_{\mathsf{ ref}}(y^{-}\mid x)}{\pi(y^{-}\mid x)\pi_{\mathsf{ref}}(y^{+}\mid x)}\bigg{)}- \frac{\beta^{-1}}{2}\bigg{)}^{2}\Bigg{]}.\]
+
+The empirical objective is derived from the following population loss
+
+\[\ell_{\mathsf{ipo}}(\pi)=\mathbb{E}_{x,y^{1},y^{2}\sim\rho\circ\pi_{\mathsf{ ref}}}\Big{[}\big{(}h_{\pi}\big{(}y^{1},y^{2}\big{)}-I\big{(}y^{1},y^{2} \big{)}/\beta\big{)}^{2}\Big{]}, \tag{9}\]
+
+where
+
+\[h_{\pi}(y^{1},y^{2})=\log\!\bigg{(}\frac{\pi(y^{1})\pi_{\mathsf{ ref}}(y_{2})}{\pi(y^{2})\pi_{\mathsf{ref}}(y_{1})}\bigg{)},\]
+
+and \(I(y^{1},y^{2})\) is a Bernoulli random variable with parameter \(p=p^{*}(y_{1}\succ y_{2})\), where here \(p^{*}\) can be any underlying human preference (that is not necessarily parametrized by the Bradley Terry model). To show the negative result, we can make the following learning assumption:
+
+**Assumption C.1** (In distribution guarantee for IPO).: _We assume that the returned policy \(\pi_{\mathsf{ipo}}\) satisfies that_
+
+\[\pi_{\mathsf{ipo}}=\operatorname*{argmin}_{\pi\in\Pi}\ell_{\mathsf{ ipo}}(\pi),\]
+
+_i.e., the returned policy \(\pi_{\mathsf{ipo}}\) induces the smallest possible in-distribution error on its population loss._
+
+With the setup, we can state and prove the formal version of the result:
+
+**Proposition C.1** (Formal version of of Proposition 4.2).: _Denote \(\pi_{\mathsf{ref}}\) as any reference policy such that Assumption 4.1 breaks. Let \(\Pi_{\mathsf{ipo}}\) be the set of IPO returned policies such that Assumption C.1 holds. Then there exists policy \(\pi\in\Pi_{\mathsf{ipo}}\) such that \(J(\pi)=-\infty\)._
+
+Proof.: Without loss of generality, we consider a promptless setting, and assume that the response space is \(\mathcal{Y}=\{y_{1},y_{2},y_{3}\}\). Again without loss of generality, we assume \(\pi_{\mathsf{ref}}\) only covers \(y_{1}\) and \(y_{2}\), and thus Assumption 4.1 breaks. Specifically, let \(\pi_{\mathsf{ref}}(y_{1})=\pi_{\mathsf{ref}}(y_{2})=1/2\). Then we have
+
+\[\pi_{\mathsf{ipo}}=\operatorname*{argmin}_{\pi\in\Pi}\mathbb{E}_ {y^{1},y^{2}\sim\pi_{\mathsf{ref}}}\Bigg{[}\bigg{(}\log\!\bigg{(}\frac{\pi(y^ {1})}{\pi(y^{2})}\bigg{)}-I\big{(}y^{1},y^{2}\big{)}/\beta\bigg{)}^{2}\Bigg{]},\]
+
+which gives
+
+\[\log\!\bigg{(}\frac{\pi_{\mathsf{ipo}}(y_{1})}{\pi_{\mathsf{ipo}}(y_{2})} \bigg{)}=p^{*}(y_{1}\succ y_{2})/\beta,\]
+
+and thus we have the relation that
+
+\[\pi_{\mathsf{ipo}}(y_{1})=\pi_{\mathsf{ipo}}(y_{2})\cdot\exp(p^{*}(y_{1} \succ y_{2})/\beta).\]
+
+Let \(\pi_{\mathsf{ipo}}(y_{2})=\alpha\in(0,1]\), then for any \(\alpha\) such that \(\pi_{\mathsf{ipo}}(y_{3})=1-(1+\exp(p^{*}(y_{1}\succ y_{2})/\beta))\alpha>0\), we will have that \(\mathsf{KL}(\pi_{\mathsf{ipo}}||\pi_{\mathsf{ref}})\) is unbounded, and thus we complete the proof. 
+
+### DPO Has Vacuous Forward KL
+
+In this section, we show that in the worst case, the forward KL of DPO is vacuously large. We first see how we can relate the forward KL divergence of the DPO policy with the reward learning guarantee. Consider any DPO policy \(\pi_{\mathsf{dpo}}\) and its corresponding reward model \(\bar{r}_{\mathsf{dpo}}\). By construction of the DPO algorithm, we have, for any \(x,y\) pair that is covered in the dataset,\(\frac{\pi_{\mathsf{ref}}(y\mid x)\exp(\widehat{r}_{\mathsf{do}}(x,y)/\beta)}{Z(x)},\) where \(Z(x)=\sum_{y}\pi_{\mathsf{ref}}(y\mid x)\exp(\widehat{r_{\mathsf{do}}}(x,y)/\beta)\). Then the forward KL divergence is
+
+\[\mathbb{E}_{x,y\sim\rho_{0}\pi_{\mathsf{ref}}}\bigg{[}\log\!\bigg{(}\frac{\pi_ {\mathsf{ref}}(y\mid x)}{\pi_{\mathsf{do}}(y\mid x)}\bigg{)}\bigg{]}=\mathbb{E }_{x,y\sim\rho_{0}\pi_{\mathsf{ref}}}\bigg{[}\log\!\bigg{(}\frac{Z(x)}{\exp( \widehat{r_{\mathsf{do}}}(x,y)/\beta)}\bigg{)}\bigg{]}=\mathbb{E}_{x,y\sim\rho _{0}\pi_{\mathsf{ref}}}\bigg{[}\frac{\widehat{r_{\mathsf{do}}}(x,y)}{\beta}+ \log(Z(x))\bigg{]}.\]
+
+Although the first term can be easily related to the reward learning guarantee, the second term (\(\mathbb{E}_{x\sim\rho}[\log(Z(x))]\)) can unfortunately be vacuous without further assumptions. We formalize in the following result:
+
+**Proposition C.2**.: _There exist \(\pi_{\mathsf{do}}\) such that Assumption 4.3 holds, but \(\mathsf{KL}(\pi_{\mathsf{ref}}||\pi_{\mathsf{do}})\) is arbitrarily large._
+
+**Proof.** First without loss of generality let us consider that \(r^{*}>0\). Now suppose there exists \(\tilde{y}\) such that \(\pi_{\mathsf{ref}}(\tilde{y}\mid x)=\frac{1}{n^{*}}\) for all \(x\), where \(n\) will be determined soon. Now suppose that for all \(x\), \(\widehat{r_{\mathsf{do}}}(x,\tilde{y})-r^{*}(x,\tilde{y})=n\) and \(\widehat{r_{\mathsf{do}}}(x,y)=r^{*}(x,y)\) for all \(y\neq\tilde{y}\). Now we can check that
+
+\[\mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_{\mathsf{ref}}(\cdot\mid x)}\bigg{[} \big{(}\widehat{r_{\mathsf{do}}}(x,y)-r^{*}(x,y)\big{)}^{2}\bigg{]}=\frac{1}{n ^{2}},\]
+
+which is diminishing if we take \(n\) to be big enough. We can also check that
+
+\[\mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_{\mathsf{ref}}(\cdot\mid x)}\bigg{[} -\frac{\widehat{r_{\mathsf{do}}}(x,y)}{\beta}\bigg{]}\geq-\frac{1}{n^{3}\beta }-\frac{R}{n^{4}\beta}\]
+
+and thus the first term will have little impact on the final bound. However, the second term can be lower bounded as follows:
+
+\[\log\!\bigg{(}\sum_{y}\pi_{\mathsf{ref}}(y\mid x)\exp(\widehat{r }(x,y)/\beta)\bigg{)} =\log\!\bigg{(}\sum_{y}\pi_{\mathsf{ref}}(y\mid x)\exp\!\bigg{(} \frac{r^{*}(x,y)+\widehat{r}(x,y)-r^{*}(x,y)}{\beta}\bigg{)}\bigg{)}\] \[\geq\log\!\bigg{(}\sum_{y}\pi_{\mathsf{ref}}(y\mid x)\exp\!\bigg{(} \frac{\widehat{r}(x,y)-r^{*}(x,y)}{\beta}\bigg{)}\bigg{)}\] \[=\log\!\bigg{(}\pi_{\mathsf{ref}}(\tilde{y}\mid x)\exp\!\bigg{(} \frac{\widehat{r}(x,\tilde{y})-r^{*}(x,\tilde{y})}{\beta}\bigg{)}\bigg{)}\] \[=\frac{n}{\beta}-4\log(n).\]
+
+Putting everything together, we have
+
+\[\mathsf{KL}(\pi_{\mathsf{ref}}||\pi_{\mathsf{do}})\geq\frac{n}{\beta}-4\log(n )-\frac{1}{n^{3}\beta}-\frac{R}{n^{4}\beta}\]
+
+and since we can take \(n\) arbitrarily big we complete the proof. 
+
+## Appendix D Omitted Proofs
+
+### Proof of Proposition 4.1
+
+**Proposition D.1** (Restatement of Proposition 4.1).: _Denote \(\pi_{\mathsf{ref}}\) as any reference policy such that Assumption 4.1 breaks. Let \(\Pi_{\mathsf{do}}\) be the set of DPO returned policies such that Assumption 4.3 holds. Then there exists policy \(\pi\in\Pi_{\mathsf{do}}\) such that \(J(\pi)=-\infty\)._
+
+**Proof.** Again as in the proof sketch, without loss of generality, we consider a promptless setting, and assume that the response space is \(\mathcal{Y}=\{y_{1},y_{2},y_{3}\}\). Again without loss of generality, we assume \(\pi_{\mathsf{ref}}\) only covers \(y_{1}\) and \(y_{2}\), and thus Assumption 4.1 breaks. Now consider the optimal policy
+
+\[\pi^{*}(y)=\frac{\pi_{\mathsf{ref}}(y\mid x)\exp(r^{*}(y)/\beta)}{Z^{*}(t)}, \forall y\in\mathcal{Y},\]where \(Z^{*}=\sum_{y\in\mathcal{Y}}\pi_{\mathsf{ref}}(y\mid x)\exp(r^{*}(y)/\beta)\), note that by construction \(\pi^{*}(y_{3})=0\).
+
+Then consider the following policy \(\pi\) such that
+
+\[\beta\log\biggl{(}\frac{\pi(y_{1})}{\pi_{\mathsf{ref}}(y_{1})\cdot Z ^{*}}\biggr{)}=r^{*}(y_{1})-\sqrt{\varepsilon_{\mathsf{dpo}}},\quad\text{and} \quad\beta\log\biggl{(}\frac{\pi(y_{2})}{\pi_{\mathsf{ref}}(y_{2})\cdot Z^{*}} \biggr{)}=r^{*}(y_{2})-\sqrt{\varepsilon_{\mathsf{dpo}}},\]
+
+Then we have
+
+\[\mathbb{E}_{y\sim\pi_{\mathsf{ref}}}\Biggl{[}\biggl{(}\beta\log \biggl{(}\frac{\pi_{\mathsf{dpo}}(y)}{\pi_{\mathsf{ref}}(y\mid x)\cdot Z^{*}} \biggr{)}-r^{*}(x,y)\biggr{)}^{2}\Biggr{]}=\varepsilon_{\mathsf{dpo}},\]
+
+thus \(\pi\) satisfies Assumption 4.3. Rearranging we can see that \(\pi(y_{1})<\pi^{*}(y_{1})\) and \(\pi(y_{2})<\pi^{*}(y_{2})\). Now since \(\pi^{*}=0\), we have
+
+\[\pi^{*}(y_{1})+\pi^{*}(y_{2})=1,\]
+
+and combine we get \(\pi(y_{3})>0\), which implies \(\mathsf{KL}(\pi||\pi_{\mathsf{ref}})\) is unbounded, since \(\pi_{\mathsf{ref}}(y_{3})=0\). 
+
+### Proof of Theorem 4.2
+
+In this section we prove Theorem 4.2:
+
+**Theorem D.1** (Restatement of Theorem 4.2).: _Suppose that Assumption 4.4 holds. Then for any reference policy \(\pi_{\mathsf{ref}}\) such that Assumption 4.2 holds with \(\varepsilon_{\mathsf{kl}}=\frac{2R^{\prime}}{\beta}\), for any RLHF policy \(\pi_{\mathsf{rhf}}\) with \(\widehat{r}\) such that (c.r. Assumption 4.3),_
+
+\[\mathbb{E}_{x,y\sim\rho\circ\pi_{\mathsf{ref}}}\Bigl{[}(r^{*}(x,y) -\widehat{r}(x,y))^{2}\Bigr{]}\leq\varepsilon_{\mathsf{reward}},\]
+
+_or more generally, the event in Lemma B.2 holds for \(\widehat{r}\), we have_
+
+\[J(\pi^{*})-J(\pi_{\mathsf{rhf}})\leq O(C_{\mathsf{cui}}\sqrt{ \varepsilon_{\mathsf{reward}}}).\]
+
+To prove this we first prove the following lemma so we can leverage Assumption 4.2:
+
+**Lemma D.1** (Restatement of Lemma 4.1).: _Suppose that Assumption 4.4 holds. Then for any RLHF policy \(\pi_{\mathsf{rhf}}\), we have that_
+
+\[\mathsf{KL}(\pi_{\mathsf{rhf}}||\pi_{\mathsf{ref}}):=\mathbb{E}_ {x\sim\rho}\mathbb{E}_{y\sim\pi_{\mathsf{rhf}}(\cdot\mid x)}\Biggl{[}\log \biggl{(}\frac{\pi_{\mathsf{rhf}}(y\mid x)}{\pi_{\mathsf{ref}}(y\mid x)} \biggr{)}\Biggr{]}\leq\frac{2R^{\prime}}{\beta}.\]
+
+**Proof.** since we have that \(\pi_{\mathsf{rhf}}(y\mid x)=\frac{\pi_{\mathsf{ref}}(y\mid x)\exp(\hat{r}(x, y)/\beta)}{Z(x)}\) for all \(x\in\mathsf{supp}(\rho),y\in\mathcal{Y}\), we have
+
+\[\mathsf{KL}(\pi_{\mathsf{rhf}}||\pi_{\mathsf{ref}})=\mathbb{E}_ {x\sim\rho}\mathbb{E}_{y\sim\pi_{\mathsf{rhf}}(\cdot\mid x)}\Biggl{[}\log \biggl{(}\frac{\exp(\hat{r}(x,y))}{\beta Z(x)}\biggr{)}\Biggr{]}=\mathbb{E}_ {x\sim\rho}\mathbb{E}_{y\sim\pi_{\mathsf{rhf}}(\cdot\mid x)}\Biggl{[}\frac{ \hat{r}(x,y)}{\beta}-\log(Z(x))\Biggr{]}.\]
+
+Plugging in the definition of \(Z(x)\) we get
+
+\[\log(Z(x))=\log\biggl{(}\mathbb{E}_{y\sim\pi_{\mathsf{rhf}}(\cdot\mid x)} \biggl{[}\exp\biggl{(}\frac{\hat{r}(x,y)}{\beta}\biggr{)}\biggr{]}\biggr{)} \geq\mathbb{E}_{y\sim\pi_{\mathsf{rhf}}(\cdot\mid x)}\Biggl{[}\frac{\hat{r}(x,y)}{\beta}\Biggr{]}\]
+
+due to Jensen's inequality. Thus we have
+
+\[\mathsf{KL}(\pi_{\mathsf{rhf}}||\pi_{\mathsf{ref}})\leq\mathbb{E}_ {x\sim\rho}\mathbb{E}_{y\sim\pi_{\mathsf{rhf}}(\cdot\mid x)}\Biggl{[}\frac{ \hat{r}(x,y)}{\beta}\Biggr{]}-\mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_{ \mathsf{rhf}}(\cdot\mid x)}\Biggl{[}\frac{\hat{r}(x,y)}{\beta}\Biggr{]}\leq \frac{2R^{\prime}}{\beta}.\]
+
+Now with Lemma 4.1, we can prove Theorem 4.2:
+
+**Proof.** By Lemma B.1, we have
+
+\[J(\pi^{*})-J(\pi_{\text{nf}})\] \[\leq\mathbb{E}_{x\sim\rho}\mathbb{E}_{y^{1}\sim\pi^{*}(\cdot|x),y^{2 }\sim\pi_{\text{nf}}(\cdot|x)}\big{[}r^{*}(x,y^{1})-\widehat{r}(x,y^{1})-r^{*} (x,y^{2})+\widehat{r}(x,y^{2})\big{]}\] \[\leq\sqrt{\mathbb{E}_{x\sim\rho}\mathbb{E}_{y^{1}\sim\pi^{*}(\cdot |x),y^{2}\sim\pi_{\text{nf}}(\cdot|x)}\Big{[}\big{(}r^{*}(x,y^{1})-\widehat{r} (x,y^{1})-r^{*}(x,y^{2})+\widehat{r}(x,y^{2})\big{)}^{2}\Big{]}}\] \[\leq\sqrt{C_{\text{glo}}^{2}\mathbb{E}_{x\sim\rho}\mathbb{E}_{y^{ 1},y^{2}\sim\pi_{\text{nf}}(\cdot|x)}\Big{[}\big{(}r^{*}(x,y^{1})-\widehat{r} (x,y^{1})-r^{*}(x,y^{2})+\widehat{r}(x,y^{2})\big{)}^{2}\Big{]}}\] (Lemma 4.1 and Assumption 4.2) \[\leq C\sqrt{\varepsilon_{\text{reward}}}.\] (Lemma B.2)
+
+### Proof of Proposition 6.1
+
+**Proposition D.2** (Restatement of Proposition 6.1).: _Under linear function approximation (Definition 6.1), there exists dataset collected from distribution \(\mu\) that does not cover \(y^{*}\), i.e., \(\mu(y^{*})=0\), but has global coverage in the linear function approximation setting [54]: let \(\Sigma_{\mu}=\mathbb{E}_{y\sim\mu}\phi(y)\phi(y)^{\top}\), then for all \(\pi\), \(\mathbb{E}_{y\sim\pi}\|\phi(y)\|_{\Sigma_{\mu}^{-1}}^{2}\leq C_{\pi}\). Then DPO will return a policy \(\pi_{\text{dpo}}\) such that \(\pi_{\text{dpo}}(y^{*})>0\), but \(\pi_{\text{dpo}}(y)\leq\pi_{\text{ref}}(y)\) for all \(y\) in the offline data support, i.e., \(\mu(y)>0\)._
+
+**Proof.** Consider a response space \(\mathcal{Y}=\{y_{1},y_{2},y_{3}\}\), with \(\phi(y_{1})=[1,0],\phi(y_{2})=[1/2,1/2],\phi(y_{3})=[0,1]\) Let \(w_{\text{ref}}=[1,1]\), then we have \(\pi_{\text{ref}}(y_{i})=1/3,\forall i\in\{1,2,3\}\). Let the ground truth reward function \(r^{*}(y)=[10,1]^{\top}\phi(y)\), and suppose \(\text{supp}(\mu)=\{y_{1},y_{2}\}\), i.e., the data only covers \(y_{1}\) and \(y_{2}\), and \(\mu(y_{3})=0\). And as always, the preference is based on the ground truth reward function under the Bradley-Terry model.
+
+We can first check that the data distribution indeed has global coverage: for all \(\pi\) we have \(\mathbb{E}_{y\sim\pi}\|\phi(y)\|_{\Sigma_{\mu}^{-1}}^{2}\leq C_{\pi}\). If we parameterize \(\widehat{r}(y)=\widehat{w}^{\top}\phi(y)\) (or in case of DPO, we can still check and see that \(\widehat{r_{\text{dpo}}}(y)=\widehat{w_{\text{dpo}}}^{\top}\phi(y)\) because of the softmax linear parametrization of the policies), for either direct reward learning or DPO, we can have the learned reward function \(\widehat{r}(y)=[10,1]^{\top}\phi(y)+c\), where \(c\) is the constant reward shift (c.r. Eq. (5)). Then a simple calculation (by \(\pi(y)\propto\pi_{\text{ref}}(y)\exp(\widehat{r}(y)/\beta)\)) shows that, as long as \(c\) is small enough, the policies will decrease the likelihood of \(y_{1}\) and \(y_{2}\) and increase the likelihood of \(y_{3}\). 
+
+## Appendix E Synthetic experiment for extrapolation
+
+### Extrapolation with function approximation
+
+We first describe our experiment setup. We consider linear function approximation setting where we have 100 responses (\(|\mathcal{Y}|=100\)). We consider a 16-dimensional feature vector \(\phi:\mathcal{Y}\rightarrow\mathbb{R}^{16}\), and we generate \(\phi(y)\) by simply sampling 99 random 16-dimensional vectors where the \(\ell_{1}\) norm of each vector is 1. We add one final \(\phi(y)=[1,0,0,\dots]\).
+
+We construct the implicit human reward \(r^{*}(y)={w^{*}}^{\top}\phi(y)\), where \(w^{*}=[5,...]\), and the rest of the entries are sampled from Unif(-2,2).
+
+We parametrize the policies as softmax linear policies, i.e., we parametrize each policy \(\pi\) with \(w^{\pi}\in\mathbb{R}^{16}\) such that \(\pi(y)=\frac{w^{\pi}\cap\phi(y)}{\sum_{y\in\mathcal{Y}}w^{\pi}\cup\phi(y)}\). One can check in this formulation the implicit reward in DPO (\(\widehat{r_{\text{dpo}}}\)) is linear in \(\phi\).
+
+We generate 10000 preference pairs, according to the BT model under \(r^{*}\), for the first 50 responses. We checked that the first responses indeed span \(\mathbb{R}^{16}\). Thus the offline data has global coverage in linear function approximation setting.
+
+For on-policy RL methods, we first train a reward model. Then we simply perform gradient descent on the KL-regularized bandit loss (we assume \(\pi_{\text{ref}}\) is uniform). For DPO, we simply perform SGDon the offline preference dataset. We track two qualities over the training: the mean log probability of a random subset of preferred responses, and the log probability of best response \(\phi(y)=[1,0,0,\dots]\). We plot the results in Figure 2. We observe that both methods have the extrapolation behavior - the probability of preferred responses decays but the probability of the optimal response goes up.
+
+### Extrapolation without function approximation
+
+Now we describe the setting where function approximation fails, and this reduces to a Multi-arm bandit setting. We set \(|\mathcal{Y}|=500\), and the offline data only covers the first half of the responses. The \(r^{*}(y)\) is set by sampling from Unif(-10,10), and we generate 10000 offline samples by uniformly sample pairs of responses from the first half of the response space, and then label them with BT model under \(r^{*}\). We train DPO with 5000 iterations, and plot the mean probability of the responses _outside_ of the data support in Figure 3: we observe that the mean probability of the out-of-distribution responses are increasing, however, this could be an undesirable behavior because the reward of the out-of-distribution responses could be arbitrarily bad.
+
+## Appendix F Details of Section 5
+
+### Theoretical guarantee
+
+In this section, we consider the constrained optimization version of HyPO (Eq. (6)). Note that the reward function class is identical to DPO, i.e., \(\mathcal{R}_{\text{hypo}}=\left\{\beta\log\Bigl{(}\frac{\pi(y|x)}{\pi_{\text{ aw}}(y|x)Z(x)}\Bigr{)}\mid\pi\in\Pi\right\}\), where \(Z(x)\) is the partition function. Then for each output policy \(\pi_{\text{hypo}}\), we can denote its implicit reward function
+
+Figure 3: Extrapolation behavior of DPO without function approximation. We plot the average probability of out-of-distribution responses along the training and DPO assigns increasing probability to out-of-distribution responses.
+
+Figure 2: Extrapolation behavior of Online RL method and DPO under linear function approximation. We plot the mean log probability of the preferred responses and the log probability of the best response, which is unseen in the training data. We see that both algorithms correctly assigns increasing probability to the best response.
+
+\(\widehat{r_{\mathsf{hypo}}}(x,y):=\beta\frac{\pi_{\mathsf{hypo}}(y|x)}{\pi_{\mathsf{ref }}(y|x)\cdot Z(x)}\), and similarly to Theorem 4.2, we can obtain the following guarantee in the partial coverage condition:
+
+**Theorem F.1**.: _For any reference policy \(\pi_{\mathsf{ref}}\) such that Assumption 4.2 holds with \(\varepsilon_{\mathsf{kl}}=\frac{2R^{\prime}}{\beta}\), for any HyPO policy \(\pi_{\mathsf{hypo}}\) such that the event in Lemma B.2 holds, i.e.,_
+
+\[\mathbb{E}_{x,y^{1},y^{2}\sim\mu\circ\pi_{\mathsf{ref}}}\Big{[} \big{(}r^{*}(x,y^{1})-r^{*}(x,y^{2})-\widehat{r_{\mathsf{hypo}}}(x,y^{1})+ \widehat{r_{\mathsf{hypo}}}(x,y^{2})\big{)}^{2}\Big{]}\leq\varepsilon_{\mathsf{ hypo}},\]
+
+_we have_
+
+\[J(\pi^{*})-J(\pi_{\mathsf{hypo}})\leq O(C_{\varepsilon_{\mathsf{kl}}}\sqrt{ \varepsilon_{\mathsf{hypo}}}).\]
+
+Proof.: The proof mostly follows the proof of Theorem 4.2. It remains to show the following two properties:
+
+1) Note that Theorem 4.2 requires Assumption 4.4, which does not hold for \(\widehat{r_{\mathsf{hypo}}}\) (note that \(\widehat{r_{\mathsf{hypo}}}\) is only bounded under \(\rho\), but not for all \(x\)), but we only use it to prove the sufficient condition in Lemma 4.1, which is satisfied by the constraint of HyPO.
+
+2) We need to check that the premise of Lemma B.1 holds, i.e.,
+
+\[\pi_{\mathsf{hypo}}\in\operatorname*{argmax}_{\pi}\mathbb{E}_{x\sim\rho}\big{[} \mathbb{E}_{y\sim\pi(\cdot|x)}[\widehat{r_{\mathsf{hypo}}}(x,y)]-\beta\mathsf{ KL}(\pi(\cdot\mid x)||\pi_{\mathsf{ref}}(\cdot\mid x))\big{]},\]
+
+note that with the reparametrization between \(\pi_{\mathsf{hypo}}\) and \(\widehat{r_{\mathsf{hypo}}}\), \(\pi_{\mathsf{hypo}}\) is always among the minimizer of the _unconstrained_ policy set, so we can still invoke Lemma B.2. The rest of the proof now follows the proof of Theorem 4.2 so we omit the details. 
+
+Finally, we remark the connection to the negative result of DPO, i.e, Proposition 4.1: note that given \(\mathsf{KL}(\pi_{\mathsf{hypo}}||\pi_{\mathsf{ref}})\leq\infty\), we have that for all \(x\) such that \(\rho(x)>0\), we have for all \(y,\beta\log\Big{(}\frac{\pi_{\mathsf{hypo}}(y|x)}{\pi_{\mathsf{ref}}(y|x)} \Big{)}<\infty\), (again with the convention that \(\frac{0}{0}=0\)), which breaks the construction of Proposition 4.1.
+
+### Experiment details
+
+#### f.2.1 Summarization
+
+In this section, we provide more details of our summarization experiment. We use the Pythia 1.4B and 2.8B model [5] with hugging face model cards: EleutherAI/pythia-1.4b-deduped and EleutherAI/pythia-2.8b-deduped. The TL;DR dataset is available at [https://github.com/openai/summarize-from-feedback](https://github.com/openai/summarize-from-feedback). The human reference dataset contains 117k training, 6.45K validation and 6.55K testing data. The preference dataset contains 92.9K training and 83.8K validation data. The reward evaluation and KL computation is performed on the whole validation data of the reference dataset. The GPT winrate is computed on a subset of 600 samples from the validation data. The GPT API checkpoint we use is gpt.4-0613. We follow the standard prompt for the winrate evaluation (e.g., see Appendix D.3 of [18]). Below we provide the hyperparameter for HyPO and DPO. Note that to optimize the online KL, we use Reinforce with Leave One Out (RLOO) [24] with two generations per prompt (\(k=2\)) and optimize trajectory-level KL.
+
+For our experiment, we run on a cluster of mixture of Nvidia A6000 and L40 GPUs with 48 GB VRAM. We use 4 GPUs in parallel for training, and for DPO the experiment time varies from 1 hour to 2 hours to finish, and for HyPO the time varies between 4 hours to 5 hours.
+
+\begin{table}
+\begin{tabular}{c c} \hline \hline Learning rate & 3e-6 \\ Batch size & 64 \\ Learning rate scheduler & cosine \\ Optimizer & Adamw \\ LoRA & False \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: RM/SFT hyperparameters.
+
+\begin{table}
+\begin{tabular}{c c} \hline \hline Learning rate & 3e-6 \\ Batch size & 64 \\ Learning rate scheduler & cosine \\ Optimizer & Adamw \\ \(\beta\) & 0.05 \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: DPO hyperparameters.
+
+#### f.2.2 General Chat
+
+For the base model of general chat experiments, we use Llama3-8B-Instruct [27] with hugging face model card: meta-llama/Meta-Llama-3-8B-Instruct. The dataset card of the Ultrafeedback dataset [14] is HuggingFaceH4/ultrafeedback_binarized. In addition to the KL penalty, in the general chat task we add an additional length penalty, and the online penalty of a generation \(y\) with context \(x\) becomes \(\log\Bigl{(}\frac{\pi(y|x)}{\pi_{\mathit{act}}(y|x)}\Bigr{)}+\alpha|y|\). We summarize the hyperparameter of each baseline below.
+
+We run the general chat experiment on a node of 8 Nvidia A100 80GB GPUs. DPO takes 3 hours to train one epoch while HyPO takes 18 hours to train one epoch.
+
+\begin{table}
+\begin{tabular}{c c} \hline \hline Learning rate & 3e-6 \\ Batch size & 8 \\ Learning rate scheduler & linear \\ Optimizer & Adamw \\ \(\beta\) & 0.05 \\ \(\lambda\) & 0.0001 \\ RLOO \(k\) & 2 \\ \hline \hline \end{tabular}
+\end{table}
+Table 6: HyPO hyperparameters.
+
+\begin{table}
+\begin{tabular}{c c} \hline \hline \(r\) & 1024 \\ \(\alpha\) & 2048 \\ Dropout & 0 \\ \hline \hline \end{tabular}
+\end{table}
+Table 7: Lora configurations.
+
+\begin{table}
+\begin{tabular}{c c} \hline \hline Learning rate & 3e-6 \\ Batch size & 8 \\ Learning rate scheduler & linear \\ Optimizer & Adamw \\ \(\beta\) & 0.05 \\ \(\lambda\) & 0.0002 \\ RLOO \(k\) & 2 \\ \(\alpha\) & 0.02 \\ \hline \hline \end{tabular}
+\end{table}
+Table 8: HyPO hyperparameters.
+
+\begin{table}
+\begin{tabular}{c c} \hline \hline Learning rate & 3e-6 \\ Batch size & 8 \\ Learning rate scheduler & linear \\ Optimizer & Adamw \\ RLOO \(k\) & 2 \\ \(\alpha\) & 0.02 \\ \hline \hline \end{tabular}
+\end{table}
+Table 9: DPO hyperparameters.
+
+### NeurIPS Paper Checklist
+
+1. **Claims** Question: Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope? Answer: [Yes] Justification: We have theoretical and empirical results supporting the claims made in the abstract and introduction. Guidelines:
+* The answer NA means that the abstract and introduction do not include the claims made in the paper.
+* The abstract and/or introduction should clearly state the claims made, including the contributions made in the paper and important assumptions and limitations. A No or NA answer to this question will not be perceived well by the reviewers.
+* The claims made should match theoretical and experimental results, and reflect how much the results can be expected to generalize to other settings.
+* It is fine to include aspirational goals as motivation as long as it is clear that these goals are not attained by the paper.
+2. **Limitations** Question: Does the paper discuss the limitations of the work performed by the authors? Answer: [Yes] Justification: We provide a discussion about the limitations of our work in the discussion section. Guidelines:
+* The answer NA means that the paper has no limitation while the answer No means that the paper has limitations, but those are not discussed in the paper.
+* The authors are encouraged to create a separate "Limitations" section in their paper.
+* The paper should point out any strong assumptions and how robust the results are to violations of these assumptions (e.g., independence assumptions, noiseless settings, model well-specification, asymptotic approximations only holding locally). The authors should reflect on how these assumptions might be violated in practice and what the implications would be.
+* The authors should reflect on the scope of the claims made, e.g., if the approach was only tested on a few datasets or with a few runs. In general, empirical results often depend on implicit assumptions, which should be articulated.
+* The authors should reflect on the factors that influence the performance of the approach. For example, a facial recognition algorithm may perform poorly when image resolution is low or images are taken in low lighting. Or a speech-to-text system might not be used reliably to provide closed captions for online lectures because it fails to handle technical jargon.
+* The authors should discuss the computational efficiency of the proposed algorithms and how they scale with dataset size.
+* If applicable, the authors should discuss possible limitations of their approach to address problems of privacy and fairness.
+* While the authors might fear that complete honesty about limitations might be used by reviewers as grounds for rejection, a worse outcome might be that reviewers discover limitations that aren't acknowledged in the paper. The authors should use their best judgment and recognize that individual actions in favor of transparency play an important role in developing norms that preserve the integrity of the community. Reviewers will be specifically instructed to not penalize honesty concerning limitations.
+3. **Theory Assumptions and Proofs** Question: For each theoretical result, does the paper provide the full set of assumptions and a complete (and correct) proof? Answer: [Yes] Justification: We clearly state all our assumptions in all theorem statements, and the proofs can be found in the appendix.
+
+Guidelines:
+
+* The answer NA means that the paper does not include theoretical results.
+* All the theorems, formulas, and proofs in the paper should be numbered and cross-referenced.
+* All assumptions should be clearly stated or referenced in the statement of any theorems.
+* The proofs can either appear in the main paper or the supplemental material, but if they appear in the supplemental material, the authors are encouraged to provide a short proof sketch to provide intuition.
+* Inversely, any informal proof provided in the core of the paper should be complemented by formal proofs provided in appendix or supplemental material.
+* Theorems and Lemmas that the proof relies upon should be properly referenced.
+4. **Experimental Result Reproducibility** Question: Does the paper fully disclose all the information needed to reproduce the main experimental results of the paper to the extent that it affects the main claims and/or conclusions of the paper (regardless of whether the code and data are provided or not)? Answer: [Yes] Justification: We provide pseudocode, hyparameter table and code in this submission. Guidelines:
+* The answer NA means that the paper does not include experiments.
+* If the paper includes experiments, a No answer to this question will not be perceived well by the reviewers: Making the paper reproducible is important, regardless of whether the code and data are provided or not.
+* If the contribution is a dataset and/or model, the authors should describe the steps taken to make their results reproducible or verifiable.
+* Depending on the contribution, reproducibility can be accomplished in various ways. For example, if the contribution is a novel architecture, describing the architecture fully might suffice, or if the contribution is a specific model and empirical evaluation, it may be necessary to either make it possible for others to replicate the model with the same dataset, or provide access to the model. In general. releasing code and data is often one good way to accomplish this, but reproducibility can also be provided via detailed instructions for how to replicate the results, access to a hosted model (e.g., in the case of a large language model), releasing of a model checkpoint, or other means that are appropriate to the research performed.
+* While NeurIPS does not require releasing code, the conference does require all submissions to provide some reasonable avenue for reproducibility, which may depend on the nature of the contribution. For example 1. If the contribution is primarily a new algorithm, the paper should make it clear how to reproduce that algorithm. 2. If the contribution is primarily a new model architecture, the paper should describe the architecture clearly and fully. 3. If the contribution is a new model (e.g., a large language model), then there should either be a way to access this model for reproducing the results or a way to reproduce the model (e.g., with an open-source dataset or instructions for how to construct the dataset). 4. We recognize that reproducibility may be tricky in some cases, in which case authors are welcome to describe the particular way they provide for reproducibility. In the case of closed-source models, it may be that access to the model is limited in some way (e.g., to registered users), but it should be possible for other researchers to have some path to reproducing or verifying the results.
+5. **Open access to data and code** Question: Does the paper provide open access to the data and code, with sufficient instructions to faithfully reproduce the main experimental results, as described in supplemental material? Answer: [Yes] Justification: We use public data on hugging face, and we submit the code for this submission. Guidelines:
+* The answer NA means that paper does not include experiments requiring code.
+
+* Please see the NeurIPS code and data submission guidelines ([https://nips.cc/public/guides/CodeSubmissionPolicy](https://nips.cc/public/guides/CodeSubmissionPolicy)) for more details.
+* While we encourage the release of code and data, we understand that this might not be possible, so "No" is an acceptable answer. Papers cannot be rejected simply for not including code, unless this is central to the contribution (e.g., for a new open-source benchmark).
+* The instructions should contain the exact command and environment needed to run to reproduce the results. See the NeurIPS code and data submission guidelines ([https://nips.cc/public/guides/CodeSubmissionPolicy](https://nips.cc/public/guides/CodeSubmissionPolicy)) for more details.
+* The authors should provide instructions on data access and preparation, including how to access the raw data, preprocessed data, intermediate data, and generated data, etc.
+* The authors should provide scripts to reproduce all experimental results for the new proposed method and baselines. If only a subset of experiments are reproducible, they should state which ones are omitted from the script and why.
+* At submission time, to preserve anonymity, the authors should release anonymized versions (if applicable).
+* Providing as much information as possible in supplemental material (appended to the paper) is recommended, but including URLs to data and code is permitted.
+6. **Experimental Setting/Details** Question: Does the paper specify all the training and test details (e.g., data splits, hyperparameters, how they were chosen, type of optimizer, etc.) necessary to understand the results? Answer: [Yes] Justification: We provide all the training details and hyperparameters. Guidelines:
+* The answer NA means that the paper does not include experiments.
+* The experimental setting should be presented in the core of the paper to a level of detail that is necessary to appreciate the results and make sense of them.
+* The full details can be provided either with the code, in appendix, or as supplemental material.
+7. **Experiment Statistical Significance** Question: Does the paper report error bars suitably and correctly defined or other appropriate information about the statistical significance of the experiments? Answer: [Yes] Justification: We repeat all our experiments over 3 seeds. Guidelines:
+* The answer NA means that the paper does not include experiments.
+* The authors should answer "Yes" if the results are accompanied by error bars, confidence intervals, or statistical significance tests, at least for the experiments that support the main claims of the paper.
+* The factors of variability that the error bars are capturing should be clearly stated (for example, train/test split, initialization, random drawing of some parameter, or overall run with given experimental conditions).
+* The method for calculating the error bars should be explained (closed form formula, call to a library function, bootstrap, etc.)
+* The assumptions made should be given (e.g., Normally distributed errors).
+* It should be clear whether the error bar is the standard deviation or the standard error of the mean.
+* It is OK to report 1-sigma error bars, but one should state it. The authors should preferably report a 2-sigma error bar than state that they have a 96% CI, if the hypothesis of Normality of errors is not verified.
+* For asymmetric distributions, the authors should be careful not to show in tables or figures symmetric error bars that would yield results that are out of range (e.g. negative error rates).
+* If error bars are reported in tables or plots, The authors should explain in the text how they were calculated and reference the corresponding figures or tables in the text.
+8. **Experiments Compute Resources**Question: For each experiment, does the paper provide sufficient information on the computer resources (type of compute workers, memory, time of execution) needed to reproduce the experiments? Answer: [Yes] Justification: We provided run time and type of GPUs we used in our experiments. Guidelines:
+* The answer NA means that the paper does not include experiments.
+* The paper should indicate the type of compute workers CPU or GPU, internal cluster, or cloud provider, including relevant memory and storage.
+* The paper should provide the amount of compute required for each of the individual experimental runs as well as estimate the total compute.
+* The paper should disclose whether the full research project required more compute than the experiments reported in the paper (e.g., preliminary or failed experiments that didn't make it into the paper).
+9. **Code Of Ethics** Question: Does the research conducted in the paper conform, in every respect, with the NeurIPS Code of Ethics [https://neurips.cc/public/EthicsGuidelines?](https://neurips.cc/public/EthicsGuidelines?) Answer: [Yes] Justification: We respect the code of conduct. Guidelines:
+* The answer NA means that the authors have not reviewed the NeurIPS Code of Ethics.
+* If the authors answer No, they should explain the special circumstances that require a deviation from the Code of Ethics.
+* The authors should make sure to preserve anonymity (e.g., if there is a special consideration due to laws or regulations in their jurisdiction).
+10. **Broader Impacts** Question: Does the paper discuss both potential positive societal impacts and negative societal impacts of the work performed? Answer: [Yes] Justification: We discuss the broader impact in the discussion section. Guidelines:
+* The answer NA means that there is no societal impact of the work performed.
+* If the authors answer NA or No, they should explain why their work has no societal impact or why the paper does not address societal impact.
+* Examples of negative societal impacts include potential malicious or unintended uses (e.g., disinformation, generating fake profiles, surveillance), fairness considerations (e.g., deployment of technologies that could make decisions that unfairly impact specific groups), privacy considerations, and security considerations.
+* The conference expects that many papers will be foundational research and not tied to particular applications, let alone deployments. However, if there is a direct path to any negative applications, the authors should point it out. For example, it is legitimate to point out that an improvement in the quality of generative models could be used to generate deepfakes for disinformation. On the other hand, it is not needed to point out that a generic algorithm for optimizing neural networks could enable people to train models that generate Deepfakes faster.
+* The authors should consider possible harms that could arise when the technology is being used as intended and functioning correctly, harms that could arise when the technology is being used as intended but gives incorrect results, and harms following from (intentional or unintentional) misuse of the technology.
+* If there are negative societal impacts, the authors could also discuss possible mitigation strategies (e.g., gated release of models, providing defenses in addition to attacks, mechanisms for monitoring misuse, mechanisms to monitor how a system learns from feedback over time, improving the efficiency and accessibility of ML).
+11. **Safeguards**Question: Does the paper describe safeguards that have been put in place for responsible release of data or models that have a high risk for misuse (e.g., pretrained language models, image generators, or scraped datasets)? Answer: [NA] Justification: We do not release data or models in this work Guidelines:
+* The answer NA means that the paper poses no such risks.
+* Released models that have a high risk for misuse or dual-use should be released with necessary safeguards to allow for controlled use of the model, for example by requiring that users adhere to usage guidelines or restrictions to access the model or implementing safety filters.
+* Datasets that have been scraped from the Internet could pose safety risks. The authors should describe how they avoided releasing unsafe images.
+* We recognize that providing effective safeguards is challenging, and many papers do not require this, but we encourage authors to take this into account and make a best faith effort.
+
+12. **Licenses for existing assets** Question: Are the creators or original owners of assets (e.g., code, data, models), used in the paper, properly credited and are the license and terms of use explicitly mentioned and properly respected? Answer: [Yes] Justification: We cited all the dataset and models used in this work.
+* The answer NA means that the paper does not use existing assets.
+* The authors should cite the original paper that produced the code package or dataset.
+* The authors should state which version of the asset is used and, if possible, include a URL. The name of the license (e.g., CC-BY 4.0) should be included for each asset.
+* For scraped data from a particular source (e.g., website), the copyright and terms of service of that source should be provided.
+* If assets are released, the license, copyright information, and terms of use in the package should be provided. For popular datasets, paperswithcode.com/datasets has curated licenses for some datasets. Their licensing guide can help determine the license of a dataset.
+* For existing datasets that are re-packaged, both the original license and the license of the derived asset (if it has changed) should be provided.
+* If this information is not available online, the authors are encouraged to reach out to the asset's creators.
+
+13. **New Assets** Question: Are new assets introduced in the paper well documented and is the documentation provided alongside the assets? Answer: [NA] Justification: We do not release any new asset. Guidelines:
+* The answer NA means that the paper does not release new assets.
+* Researchers should communicate the details of the dataset/code/model as part of their submissions via structured templates. This includes details about training, license, limitations, etc.
+* The paper should discuss whether and how consent was obtained from people whose asset is used.
+* At submission time, remember to anonymize your assets (if applicable). You can either create an anonymized URL or include an anonymized zip file.
+
+14. **Crowdsourcing and Research with Human Subjects** Question: For crowdsourcing experiments and research with human subjects, does the paper include the full text of instructions given to participants and screenshots, if applicable, as well as details about compensation (if any)? Answer: [NA]Justification: We do not have human subject.
+
+Guidelines:
+
+* The answer NA means that the paper does not involve crowdsourcing nor research with human subjects.
+* Including this information in the supplemental material is fine, but if the main contribution of the paper involves human subjects, then as much detail as possible should be included in the main paper.
+* According to the NeurIPS Code of Ethics, workers involved in data collection, curation, or other labor should be paid at least the minimum wage in the country of the data collector.
+15. **Institutional Review Board (IRB) Approvals or Equivalent for Research with Human Subjects** Question: Does the paper describe potential risks incurred by study participants, whether such risks were disclosed to the subjects, and whether Institutional Review Board (IRB) approvals (or an equivalent approval/review based on the requirements of your country or institution) were obtained? Answer: [NA] Justification: No human subject. Guidelines:
+* The answer NA means that the paper does not involve crowdsourcing nor research with human subjects.
+* Depending on the country in which research is conducted, IRB approval (or equivalent) may be required for any human subjects research. If you obtained IRB approval, you should clearly state this in the paper.
+* We recognize that the procedures for this may vary significantly between institutions and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the guidelines for their institution.
+* For initial submissions, do not include any information that would break anonymity (if applicable), such as the institution conducting the review.

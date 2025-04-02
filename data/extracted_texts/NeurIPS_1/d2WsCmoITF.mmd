@@ -1,0 +1,240 @@
+# Unbalanced Low-rank Optimal Transport Solvers
+
+Meyer Scetbon\({}^{*}\)
+
+Microsoft Research
+
+t-mscetbon@microsoft.com
+
+&Michael Klein\({}^{*}\)
+
+Apple
+
+michalk@apple.com
+
+Giovanni Palla
+
+Helmholtz Center Munich
+
+giovanni.palla@helmholtz-muenchen.de
+
+&Marco Cuturi
+
+Apple
+
+cuturi@apple.com
+
+###### Abstract
+
+Two salient limitations have long hindered the relevance of optimal transport methods to machine learning. First, the \(O(n^{3})\) computational cost of standard sample-based solvers (when used on batches of \(n\) samples) is prohibitive. Second, the mass conservation constraint makes OT solvers too rigid in practice: because they must match _all_ points from both measures, their output can be heavily influenced by outliers. A flurry of recent works has addressed these computational and modeling limitations, but has resulted in two separate strains of methods: While the computational outlook was much improved by entropic regularization, more recent \(O(n)\) linear-time _low-rank_ solvers hold the promise to scale up OT further. In terms of modeling flexibility, the rigidity of mass conservation has been eased for entropic regularized OT, thanks to unbalanced variants of OT that can penalize couplings whose marginals deviate from those specified by the source and target distributions. The goal of this paper is to merge these two strains, low-rank and unbalanced, to achieve the promise of solvers that are _both_ scalable and versatile. We propose custom algorithms to implement these extensions for the linear OT problem and its fused-Gromov-Wasserstein generalization, and demonstrate their practical relevance to challenging spatial transcriptomics matching problems. These algorithms are implemented in the ott-jax toolbox (Cuturi et al., 2022).
+
+## 1 Introduction
+
+Recent machine learning (ML) works have witnessed a flurry of activity around optimal transport (OT) methods. The OT toolbox provides convenient, intuitive and versatile ways to quantify the difference between two probability measures, either to quantify a distance (the Wasserstein and Gromov-Wasserstein distances), or, in more elaborate scenarios, by computing a push-forward map that can transform one measure into the other (Peyre and Cuturi, 2019). Recent examples include, e.g., single-cell omics (Bunne et al., 2021, 2022; Demetci et al., 2020; Nitzan et al., 2019; Cang et al., 2023; Klein et al., 2023), attention mechanisms (Tay et al., 2020; Sander et al., 2022), self-supervised learning(Caron et al., 2020; Oquab et al., 2023), and learning on graphs (Vincent-Cueaz et al., 2023).
+
+**On the challenges of using OT.** Despite their long history in ML (Rubner et al., 2000), OT methods have long suffered from various limitations, that arise from their statistical, computational, and modelling aspects. The _statistical_ argument is commonly referred to as the curse-of-dimensionality of OT estimators: the Wasserstein distance between two probability densities, and its associated optimal Monge map, is poorly approximated using samples as the dimension \(d\) of observation grows (Dudley et al., 1966; Boissard and Le Gouic, 2014). On the _computational_ side, computing OT between a pair of \(n\) samples involves solving a (generalized) matching problem, with a price of \(O(n^{3})\) and above (Kuhn, 1955; Ahuja et al., 1993). Finally, the original _model_ for OT rests on amass conservation constraint: all observations from either samples must be accounted for, including outliers that are prevalent in machine learning datasets. Combined, these weaknesses have long hindered the use of OT, until a more recent generation of solvers addressed these three crucial issues.
+
+**The Entropic Success Story.** The winning approach, so far, to carry out that agenda has been entropic regularization methods (Cuturi, 2013). The computational virtues of the Sinkhorn algorithm when solving OT (Altschuler et al., 2017; Peyre et al., 2016; Solomon et al., 2016; Le et al., 2021) come with statistical efficiency (Genevay et al., 2019; Mena and Niles-Weed, 2019; Chizat et al., 2020), and can also be seamlessly combined with _unbalanced_ formulations by penalizing - rather than constraint - mass conservation, both for the linear (Frogner et al., 2015; Chizat et al., 2018; Sjoumre et al., 2022; Fatras et al., 2021; Pham et al., 2020) and quadratic (Sejourne et al., 2021) problems. These developments have all been implemented in popular OT packages (Feydy et al., 2019; Flamary et al., 2021; Cuturi et al., 2022).
+
+**The Low-Rank Alternative.** A recent strain of solvers relies instead on _low-rank_ (LR) properties of cost and coupling matrices (Forrow et al., 2018; Sceton and Cuturi, 2020; Sceton et al., 2021). Much like entropic solvers, these LR solvers have a better statistical outlook (Sceton and Cuturi, 2022) and extend to GW problems (Sceton et al., 2022). In stark contrast to entropic solvers, however, LR solvers benefit from linear complexity \(O(nrd)\) w.r.t sample size \(n\) (using rank \(r\) and cost dimension \(d\)) that can scale to ambitious tasks where entropic solvers fail (Klein et al., 2023).
+
+**The Need for Unbalanced Low-Rank Solvers.** LR solvers do suffer, however, from a major practical limitation: their inability to handle unbalanced problems. Yet, unbalancedness is a crucial ingredient for OT to be practically relevant. This is exemplified by the fact that unbalancedness played a crucial role in the seminal reference (Schiebinger et al., 2019), where it is used to model cell birth and death.
+
+**Our Contributions** We propose in this work to lift this last limitation for LR solvers to:
+
+* Incorporate unbalanced regularizers to define a LR linear solver (SS 3.1);
+* Provide accelerated algorithms, inspired by some of the recent corrections proposed by (Sejourne et al., 2022), to isolate translation terms that appear in dual subroutines (SS 3.2);
+* Carry over and adapt these approaches to the GW (SS 3.3) and Fused-GW problems (SS 3.4);
+* Carry out an exhaustive hyperparameter selection procedure within large scale OT tasks (spatial transcriptomics, brain imaging), and demonstrate the benefits of our approach (SS 4).
+
+## 2 Reminders on Low-Rank Transport and Unbalanced Transport
+
+We consider two metric spaces \((,d_{})\) and \((,d_{})\), as well as a cost function \(c:[0,+[\). The simplex \(_{n}^{+}\) holds all positive \(n\)-vectors summing to \(1\). For \(n,m 1,a_{n}^{+}\), and \(b_{m}^{+}\), given points \(x_{1},,x_{n}\) and \(y_{1},,y_{m}\), we define two discrete probability measures \(\) and \(\) as \(:=_{j=1}^{n}a_{i}_{x_{i}}\), \(:=_{j=1}^{m}b_{j}_{y_{j}}\) where \(_{z}\) is the Dirac mass at \(z\).
+
+**Cost matrices.** For \(q 1\), consider first two square pairwise _cost_ matrices, each encoding the geometries of points _within_\(\) and \(\), and a rectangular matrix that studies that _across_ their support:
+
+\[A:=[d_{}^{q}(x_{i},x_{i^{}})]_{1 i,i^{} n},\ B: =[d_{}^{q}(y_{j},y_{j^{}})]_{1 j,j^{} m}\,,\ C: =[c(x_{i},y_{j})]_{1 i n\\ 1 j m}.\]
+
+**The Kantorovich Formulation of OT** is defined as the following parameterized linear program:
+
+\[(,):=_{P_{a,b}} C,P\,, _{a,b}:=P_{+}^{n m},\ P_{m}=a,\ P^{T}_{n}=b}\,\,. \]
+
+**The Low-Rank Formulation of OT** is best understood as a variant of (1) that rests on a low-rank _property_ for cost matrix \(C\), and low-rank _constraints_ for couplings \(P\). More precisely, Sceton et al. (2021) propose to constraint the set of admissible couplings to those, within \(_{a,b}\), that have a non-negative rank of \(r 1\). That set can be equivalently reparameterized as
+
+\[_{a,b}(r)=\{P_{+}^{n m}|P=Q(1/g)R^{T},\ Q_{a,g},\ R_{b,g},\ \ g_{r}^{+}\}.\]
+
+The low-rank optimal transport (LOT) problem simply uses that restriction in (1) to define :
+
+\[_{r}(,):=_{P_{a,b}(r)} C,P=_{Q _{a,g},R_{a,g},g_{r}^{+}} C,Q(1/g )R\,. \]Scetbon et al. (2021) propose and prove the convergence of a mirror-descent scheme to solve (2), and obtain linear time and memory complexities with respect to the number of samples, where each iteration in that descent scales as \((n+m)rd\), where \(d\) is the rank of \(C\).
+
+**The Unbalanced Formulation of OT** starts from (1) as well, but proposes to do without \(_{a,b}\) and its marginal constraints (Frogner et al., 2015; Chizat et al., 2018), and rely instead on two regularizers:
+
+\[(,):=_{P_{+}^{n m}} C,P+ _{1}(P_{m}|a)+_{2}(P^{T}_{n}|b) \]
+
+where \(_{1},_{2}>0\) and \((p|q):=_{i}p_{i}(p_{i}/q_{i})+q_{i}-p_{i}\). This formulation is solved using entropic regularization, with modified Sinkhorn updates (Frogner et al., 2015). _Proposing an efficient algorithm able to merge (2) with (3) is the first goal of this paper._
+
+**Gromov-Wasserstein (GW) Considerations.** The GW problem (Memoli, 2011) is a generalization of (1) where the energy \(_{A,B}\) is a quadratic function of \(P\) defined through inner cost matrices \(A\), \(B\):
+
+\[_{A,B}(P)\!:=\!\!\!_{i,j,i^{},j^{}}(A_{ii^{} }-B_{jj^{}})^{2}P_{ij}P_{i^{}j^{}}\!=\!_{m}^{T}P^ {T}A^{ 2}P_{m}+_{n}^{T}PB^{ 2}P^{T}_{n}-2  APB,P \]
+
+where \(\) is the Hadamard product. To minimize (4), the default approach rests on entropic regularization (Solomon et al., 2016; Peyre et al., 2016) and variants (Sato et al., 2020; Blumberg et al., 2020; Xu et al., 2019; Li et al., 2023). Scetbon et al. (2022) adapted the low-rank framework to minimize \(_{A,B}\) over low-rank matrices \(P\), achieving a linear-time complexity when \(A\) and \(B\) are themselves low-rank. Independently, (Sejourne et al., 2021) proposed an unbalanced generalization that also applies to GW and which can be implemented practically using entropic regularization. Finally, the minimization of a composite objective involving the sum of \(_{A,B}\) with \( C,\) is known as the _fused_ GW problem (Vayer et al., 2018).
+
+## 3 Unbalanced Low-Rank Transport
+
+### Unbalanced Low-rank Linear Optimal Transport
+
+We incorporate unbalancedness to low-rank solvers (Scetbon et al., 2021, 2022), moving gradually from the linear problem to the more involved GW and FGW problem. Using the framework of (Frogner et al., 2015; Chizat et al., 2018), we extend first the definition of LOT, introduced in (2), to the unbalanced case by considering the following optimization problem:
+
+\[_{r}(,):=_{P:\;_{+}(P) r} C,P +_{1}(P_{m}|a)+_{2}(P^{T}_{n}|b), \]
+
+where \(_{+}(P)\) denotes the non-negative rank of \(P\). Therefore by denoting \(_{r}:=\{(Q,R,g)_{+}^{n r}_{+}^{m r }_{+}^{r} Q^{T}_{n}=R^{T}_{m}=g\}\), and using the reparameterization of low-rank couplings, we obtain the following equivalent formulation of ULOT:
+
+\[_{r}(,)=_{(Q,R,g)_{r}}(1/g)R^{T}}_{_{C}(Q,R,g)}+ (Q_{r}|a)+_{2}(R_{r}|b)}_{_{a,b}(Q,R,g)}. \]
+
+We introduce the more compact notation \(_{a,b}(Q,R,g):=F_{_{1},a}(Q_{r})+F_{_{2},b}(R _{r}),\) where \(F_{,z}(s):=(s|z)\) for \(>0\) and \(z 0\) coordinate-wise. To solve (6), and using this split, we move away from mirror-descent and apply instead proximal gradient-descent for the KL divergence. At each iteration, we consider a linear approximation of \(_{C}\) where a KL penalization is added to the objective (as in the classical mirror descent scheme). However, we leave \(_{a,b}\) intact at each iteration. Borrowing notations from (Scetbon et al., 2021), we must solve at each iteration the convex optimization problem:
+
+\[(Q_{k+1},R_{k+1},g_{k+1}):=*{argmin}_{_{r} }}(,_{k})+_ {1}(Q_{r}|a)+_{2}(R_{r}|b)\,, \]
+
+where \((Q_{0},R_{0},g_{0})_{r}\) is the initialization, and the triplet \(_{k}:=(_{k}^{(1)},_{k}^{(2)},_{k}^{(3)})\) holds synthetic costs matrices that are re-computed at each iteration \(k\):
+
+\[_{k}^{(1)}:=Q_{k} e^{-_{k}CR_{k}\,(1/g_{k})},_{k}^ {(2)}:=R_{k} e^{-_{k}C^{T}Q_{k}\,(1/g_{k}))},_{k}^{(3 )}:=g_{k} e^{_{k}_{k}/g_{k}^{2}},\]with \([_{k}]_{i}:=[Q_{T}^{T}CR_{k}]_{i,i}^{r}\), and \((_{k})_{k 0}\) is a sequence of positive step sizes.
+
+**Reformulation using Duality.** To solve (7), we apply Dykstra's algorithm , whose iterations correspond to an alternating maximization on the dual formulation of (7):
+
+**Proposition 1**.: _The convex optimization problem defined in (7) admits the following dual:_
+
+\[_{f_{1},h_{1},f_{2},h_{2}}&_{k}(f_{1},h_{1},f_{2},h_{2}):=-F^{}_{_{1},a}(-f_{1})-} e^{_{k}(f_{1} h_{1})}-1,_{k}^{(1)}\\ &-F^{}_{_{2},b}(-f_{2})-} e^{ _{k}(f_{2} h_{2})}-1,_{k}^{(2)}-}  e^{-_{k}(h_{1}+h_{2})}-1,_{k}^{(3)} \]
+
+_where \(h_{1},h_{2}^{r}\), \(f_{1}^{n}\), \(f_{2}^{m}\), \(F^{}_{,z}():=_{y}\{ y,-F_{,z}(y)\}\) is the convex conjugate of \(F_{,z}\). In addition strong duality holds and the primal problem admits a unique minimizer._
+
+**Remark 1**.: _While we stick to KL regularizers in this work for simplicity, it is worth noting that this can be extended to more generic regularizers \(F_{_{1},a}\) and \(F_{_{2},b}\), as considered by Chizat et al. ._
+
+We use an alternating maximization scheme to solve (8). Starting from \(h_{1}^{(0)}=h_{2}^{(0)}=_{r}\), we apply for \( 0\) the following updates (dropping iteration number \(k\) in (7) for simplicity):
+
+\[ f_{1}^{(+1)}:=_{z}(z,h_{1}^{ ()},f_{2}^{()},h_{2}^{()}),\,f_{2}^{(+1)}:=_{z}(f_{1}^{(+1)},h_{1}^{()},z,h_{2}^{()}),\\ (h_{1}^{(+1)},h_{2}^{(+1)}):=_{z_{1},z_{2}}(f_{1}^{(+1)},z_{1},f_{2}^{(+1)},z_{2}).\]
+
+These maximizations can all be obtained in closed form, to result in the closed-form updates:
+
+\[&( f_{1}^{(+1)})=( ( h_{1}^{()})})^{}{_{1}+1/}}, ( f_{2}^{(+1)})=(( h_{2}^{() })})^{}{_{2}+1/}}\\ & g_{+1}:=(^{(3)}(^{(1)})^{T}( f_{1 }^{(+1)})(^{(2)})^{T}( f_{2}^{(+1)}))^{1/3}\\ &( h_{1}^{(+1)})=}{(^{(1)})^{T} ( f_{1}^{(+1)})},( h_{2}^{(+1)})=}{(^{(2)})^{T}( f_{2}^{(+1)})}\]
+
+When using "scaling" representations for these dual variables, \( 0\), \(u_{i}^{()}:=( f_{i}^{()})\) and \(v_{i}^{()}:=( h_{i}^{()})\) for \(i\{1,2\}\), we obtain a simple update, provided in the appendix (Alg. 5).
+
+**Initialization and Termination.** We use the stopping criterion proposed in [Scetbon et al., 2021] to terminate the algorithm, \((,},):= }((,})+(},))\). Finding an efficient initialization for that problem is challenging, and various choices have been implemented for instance in [Cuturi et al., 2022]. We adopt the practical choices proposed in [Scetbon and Cuturi, 2022], using either random subcoupling matrices or a \(k\)-means approach, and also follow them in adapting the choice of \(_{k}\) at each iteration \(k\) of the outer loop. We summarize our proposal in Algorithm 1, which can be seen as an extension of [Scetbon et al., 2021, Alg.2].
+
+**Convergence.** The convergence proof for Dykstra's algorithm, as implemented in Alg. 5 (see appendix), follows from [Bauschke and Combettes, 2008]. Scetbon et al.  show the convergence of their scheme towards a stationary point, w.r.t to the criterion \((,,)\), for fixed \(\). The stationary convergence of our proposed algorithm can be directly derived from their result.
+
+**Complexity.** Given \(\), solving Eq. (7) requires a time and memory complexity of \(((n+m)r)\). However computing \(\) requires in general \(((n^{2}+m^{2})r)\) time and \((n^{2}+m^{2})\) memory. Scetbon et al.  propose to consider low-rank factorizations of the cost matrix \(C\) of the form \(C C_{1}C_{2}^{T}\) where \(C_{1}^{n d}\) and \(C_{2}^{m d}\). In that case computing \(\) can be done in \(((n+m)rd)\) time and \(((n+m)(r+d))\) memory. Such factorizations are either known explicitly (e.g. when using squared-Euclidean distances) or can be obtained as approximations using the algorithm in [Indyk et al., 2019], which guarantees that for any distance matrix \(C^{n m}\) and \(>0\) it can output matrices \(C_{1}^{n d}\), \(C_{2}^{m d}\) in \(((m+n)())\) algebraic operations such that with probability at least \(0.99\), \(\|C-C_{1}C_{2}^{T}\|_{F}^{2}\|C-C_{d}\|_{F}^{2}+\|C\|_{F}^{2}\), where \(C_{d}\) denotes the best rank-\(d\) approximation to \(C\).
+
+[MISSING_PAGE_FAIL:5]
+
+```
+Inputs:\(a,b,=(^{(1)},^{(2)},^{(3)}),,_{1},_{2},\) \(v_{1}=v_{2}=_{r}\), \(u_{1}=_{n}\), \(u_{2}=_{m}\) repeat \(_{1}=v_{1},\ _{2}=v_{2},_{1}=u_{1},_{2}=u_{2}\) \(_{1},_{2}(a,b,^{(3)},u_{1},v_{ 1},u_{2},v_{2},,_{1},_{2})\) (Alg. 2) \(u_{1}=(v_{1}})^{}{1+/}} (-_{1}/_{1})^{}{1/+_{1}}}, u_{2}= (v_{2}})^{}{_{2}+1/}} (-_{2}/_{2})^{}{1/+_{2}}},\) \(_{1},_{2}(a,b,^{(3)},u_{1},v_{ 1},u_{2},v_{2},,_{1},_{2})\) (Alg. 2) \(g=((_{1}+_{2}))^{1/3}(^{(3)}(^{(1)})^{ T}u_{1}(^{(2)})^{T}u_{2})^{1/3},\ v_{1}=)^{T}u_{1}},\ v_{2}=)^{T}u_{2}}\) until\((\|(u_{i}/_{i})\|_{},\|(v_{i}/_{i})\|_{ })<;\) Result:\((u_{1})^{(1)}_{k}(v_{1}),\ \ (u_{2})^{(2)}_{k}(v_{2}),\ \ g\)
+```
+
+**Algorithm 3**ULR-TI-Dykstra\((a,b,,,_{1},_{2},)\)
+
+### Unbalanced Low-rank Gromov-Wasserstein
+
+The low-rank Gromov-Wasssertein (LGW) problem (Scetbon et al., 2022) between the two discrete metric measure spaces \((,d_{})\) and \((,d_{})\), written for compactness using \((a,A)\) and \((b,B)\), reads
+
+\[_{r}((a,A),(b,B))=_{P_{a,b}(r)}_{A,B}(P), \]
+
+Building upon SS 3.1 and leveraging the TI variant presented in SS 3.2, we introduce the unbalanced low-rank Gromov-Wasserstein (ULGW) problem. There is, however, a significant challenge that appears when introducing unbalanced regularizers in (12): When \(P\) is constrained to be in \(_{a,b}\), the first two terms of the RHS in (12) simplify to \(a^{T}A^{ 2}a+b^{T}B^{ 2}b\). Hence, they are constant and discarded when optimizing. In an unbalanced setting, these terms vary and must be accounted for:
+
+\[_{r}((a,A),(b,B)):=_{(Q,R,g)_{r}} A^{  2}Q_{r},Q_{r}+ B^{ 2}R_{r},R_{r} \] \[-2 AQ(1/g)R^{T}B,Q( 1/g)R^{T}+_{1}(Q_{r}|a)+_{2}(R_{r }|b)\]
+
+To solve the problem, we apply the same scheme as proposed for ULOT, that is a proximal gradient descent where we linearize \(_{A,B}\) and add a KL penalization while leaving the soft marginal constraints unchanged. Therefore the algorithm to solve ULGW is the same as that solving ULOT, however, the kernels \(_{k}\) now take into account the quadratic terms of the original LGW problem. More formally, at each iteration \(k\) of the outer loop, we propose to solve
+
+\[(Q_{k+1},R_{k+1},g_{k+1}):=*{argmin}_{_{r}}}(|_{k})+_{1}(Q_{r}|a )+_{2}(R_{r}|b), \]
+
+where \((Q_{0},R_{0},g_{0})_{r}\) is the initialization, \((_{k})_{k 0}\) a sequence of positive step sizes. Using notation \(P_{k}=Q_{k}(1/g_{k})R_{k}^{T}\), the synthetic cost matrices \(_{k}:=(^{(1)}_{k},^{(2)}_{k},^{(3)}_{k})\) are updated as:
+
+\[^{(1)}_{k} :=Q_{k}(-2_{k}A^{ 2}Q_{k}_{r}_{r}^{T}) (-4_{k}AP_{k}BR_{k}(1/g_{k})))\,,\] \[^{(2)}_{k} :=R_{k}(-2_{k}B^{ 2}R_{k}_{r}_{r}^{T}) (-4_{k}BP_{k}^{T}AQ_{k}(1/g_{k})))\,,\] \[^{(3)}_{k} :=g_{k}(4_{k}_{k}/g_{k}^{2}) [_{k}]_{i}:=[Q_{k}^{T}AP_{k}BR_{k}]_{i,i}^{r}\,.\]
+
+Note that (14) is the exact same optimization problem as (7), where only \(_{k}\) has changed and therefore can be solved using Algorithm 3. Algorithm 4 summarizes our strategy to solve (13).
+
+**Inputs:**\(A,B,a,b,r,_{0},_{1},_{2},\)
+
+\(Q,R,g\) Initialization as proposed in (Scetbon and Cuturi, 2022)
+
+**repeat**
+
+\(=Q,\ \ =R,\ \ =g\)
+
+\(_{Q}=4AQ(1/g)R^{T}BR(1/g)+2A^{  2}Q_{r}_{r}^{T}\),
+
+\(_{R}=4BR(1/g)Q^{T}AQ(1/g)+2B^{  2}R_{r}_{r}^{T}\),
+
+\((Q^{T}AQ(1/g)R^{T}BR),\ \ _{g}=-/g^{2}\),
+
+\(_{0}/(\|_{Q}\|_{}^{2},\|_{R}\|_{ }^{2},\|_{g}\|_{}^{2})\),
+
+\(^{(1)} Q(-_{Q})\), \(^{(2)} R(-_{R})\), \(^{(3)} g(-_{k}_{g})\),
+
+\(Q,R,g\) ULR-TI-Dykstra\((a,b,,,_{1},_{2},)\) (Alg. 3)
+
+**until**\(((Q,R,g),(,,),)<\);
+
+**Result:**\(Q,R,g\)
+
+**Convergence and Complexity.** Similarly to linear ULOT, the unbalanced Dykstra algorithm is guaranteed to converge (Bauschke and Lewis, 2000). Because we use Algorithm 5, we retain exactly the same complexity, both in terms of time of memory, to solve these inner problems. The slight variation in kernel \(\) compared to ULOT still retains the same \(((n^{2}+m^{2})r)\) time and \((n^{2}+m^{2})\) memory complexities. However, as in ULOT, we can take advantage of low-rank approximations of _both_ costs matrices \(A\) and \(B\) to reach linear complexity. Indeed, assuming \(A A_{1}A_{2}^{T}\) and \(B B_{1}B_{2}\) where \(A_{1},A_{2}^{n d_{X}}\) and \(B_{1},B_{2}^{m d_{Y}}\), then the total time and memory complexities become respectively \((mr(r+d_{Y})+nr(r+d_{X}))\) and \(((n+m)(r+d_{X}+d_{Y}))\). Again, when \(A\) and \(B\) are distance matrices, we use the algorithms from (Indyk et al., 2019).
+
+### Unbalanced Low-rank Fused-Gromov-Wasserstein
+
+We finally focus on the increasingly impactful (Klein et al., 2023) fused-Gromov-Wasserstein problem, which merges linear and quadratic objectives (Vayer et al., 2018):
+
+\[(,):=_{P_{a,b}}(C,P)+_{ A,B}(P) \]
+
+where \(\) and \(:=1-\) allows interpolating between the GW and linear OT geometries. This problem remains a GW problem, where one replaces the 4-way cost \(M[i,i^{},j,j^{}]:=(A_{i,i^{}}-B_{j,j^{}})^{2}\) appearing in (4) by a composite interpolated cost between the OT and GW geometries, redefined as \(M[i,i^{},j,j^{}]= C_{i,j}+(A_{i,i^{}}-B_{ j,j^{}})^{2}\). Our proposed unbalanced and low-rank version of the FGW problem includes \(|P|:=\|P\|_{1}\) the mass of \(P\), to homogenize linear and quadratic terms,
+
+\[_{r}(,):=_{P:\ _{k}(P) r}|P |(C,P)+_{A,B}(P)+_{1}(P_{m}|a)+ _{2}(P^{T}_{n}|b)\,, \]
+
+which is expanded through the explicit factorization of \(P\), noticing that \(|P|=|g|:=\|g\|_{1}\):
+
+\[_{r}(,):=_{(Q,R,g)_{r}}|g|_{C}(Q, R,g)+_{A,B}(Q,R,g)+_{a,b}(Q,R,g) \]
+
+Then by linearizing again \(:(Q,R,g)|g|_{C}(Q,R,g)+ _{A,B}(Q,R,g)\) with an added KL penalty and leaving \(_{a,b}\) unchanged, we obtain at each iteration, the same optimization problem as in (14) where the kernels \(_{k}\) are now defined as
+
+\[_{k} :=(_{k}^{(1)},_{k}^{(2)},_{k}^{(3)}),\] \[_{k}^{(1)} :=Q_{k}(-_{k}_{Q}_{k}),\ _{k}^{(2)}:=R_{k} (-_{k}_{Q}_{k}),\ _{k}^{(3)}:=g_{k}(-_{k} _{g}_{k})\] \[_{Q}_{k} :=|g_{k}|CR_{k}(1/g_{k})+ (2A^{ 2}Q_{k}_{r}_{r}^{T}+4AP_{k}BR_{k}(1/g_ {k}))\] \[_{R}_{k} :=|g_{k}|CR^{T}Q_{k}(1/g_{k})+(2B^{ 2}R_{k}_{r}_{r}^{T}+4BP_{k}^{T}AQ_{k} (1/g_{k}))\] \[_{g}_{k} :=((C,P_{k})_{r}-|g_{k}|_{k}^{}/g_{k}^{2})-4_{k}^{}/g_{k}^{2}\] \[[_{k}^{}]_{i} :=[Q_{k}^{T}CR_{k}]_{i,i},\ \ [_{k}^{}]_{i}:=[Q_{k}^{T}AP_{k}BR_{k}]_{i,i} \ \,i\{1,,r\}\.\]
+
+These steps are summarized in Alg. 6 (see appendix). These steps result in a quadratic complexity, both in time and memory, with respect to the number of points \(n\) and \(m\). However, these complexities become _linear_ when square matrices \(A,B\)_and_ rectangular \(C\) all admit a low-rank factorization.
+
+## 4 Experiments
+
+We focus first in **Exp. 1** on demonstrating the empirical benefits of the TI variant of our algorithm to solve linear ULOT, as implemented in Alg. 3 vs. Alg. 5; that algorithm is subsequently used as an inner routine to solve all quadratic ULR problems. We compare in **Exp. 2**_unbalanced_ low-rank (ULR) solvers to _balanced_ low-rank (LR) counterparts on a spatial transcriptomics task, and follow in **Exp. 3** by comparing ULR solvers to entropic (E) counterparts on a smaller task, to accommodate entropic solvers' quadratic complexity. We conclude in **Exp. 4** by comparing ULR solvers to [Thual et al., 2022], which can learn a sparse transport coupling, in the unbalanced FGW setting.
+
+Datasets.We consider two real-world datasets, described in B.1, and two synthetic datasets, that are large enough to showcase our solvers. The real-world datasets consist of both a shared feature space, used to compute the costs matrices for the linear term in the OT and FGW settings, as well as geometries that are specific to each source \(s\) and target \(t\) measures, and which are used to compute the costs matrices for the quadratic term in the GW and FGW settings. In **Exp. 1**, we simply consider two isotropic Gaussians in \(d=30\) to evaluate the performance of the TI variant on a liner problem. We use the mouse brain STARmap spatial transcriptomics data from [Shi et al., 2022] for **Exp. 2** and **Exp. 3**. We use data from the Individual Brain Charting dataset [Pinho et al., 2018], to replicate the settings of [Thual et al., 2022], in **Exp. 4**.
+
+Metrics.Following Klein et al. , we evaluate maps by focusing on the two following metrics: (i) **pearson correlation**\(\) computed between the (ground truth) source \(s\)_feature_ matrix \(F^{s}^{n d}\), and the barycentric projection of the target \(t\) to the source scaled by the target marginals \(b^{t}\). Writing \(P\) as the transport matrix from source to target, this can be computed as \(P(})F^{t}\); (ii) **F1 score** when assessing class transfer (among 11 possible classes), computed between the original source vector of labels \(l^{s}\), taken in \(\{1,,11\}^{n}\), and the inferred labels for the same points, predicted for each \(i\) by taking the \(*{argmax}_{j}B_{i,j}\), where \(B\) is a matrix of \(n 11\) row probabilities, each the barycentric projection of the target \(t\) one-hot encoded labels \(L^{t}\{0,1\}^{m 11}\), \(B:=P(})L^{t}\).
+
+Experiment 1: Benchmarking The Translation Invariant Variant.We evaluate the effect of the proposed TI procedure on the computational cost of ULR solvers: We compare the time taken when solving unbalanced LR problems, with or without using the TI objective. In Figure 3, we compare the execution time (using our ott-jax implementation, and a single NVIDIA GeForce RTX 2080
+
+Figure 1: **Exp. 2: Spatial visualization of two mouse brain sections, contrasting observed vs. predicted (using ULFOW) spatial distributions of expression levels, for two different genes.**
+
+Figure 2: Visualization of measured and predicted tissue regions in the mouse brain in **Exp. 2**Ti card) of unbalanced LR Sinkhorn on large and high dimensional Gaussian distributions. The results presented are averaged over 10 random seeds with error bars. We use a \(=10^{-9}\) convergence threshold and \(1000\) maximal number of iterations for Dykstra, in 64-bit precision. We observe that the use of our proposed TI objective is consistently beneficial when solving ULR problems. See also Appendix B.3 for additional experiments.
+
+Experiment 2: ULOT vs. LOT on Gene Expression / Cell Type Annotation.We evaluate the accuracy of ULOT solvers for a large-scale spatial transcriptomics task, using gene expression mapping and cell type annotation. We compare it to the balanced LR alternative using the Pearson correlation \(\) as described in the metrics section. We leverage two coronal sections of the mouse brain profiled by STARmap spatial transcriptomics by . They consist of \(n 40,000\) cells in both the source and target brain section. Each cell is described by 1000 gene features, in addition to 2D spatial coordinates. As a result \(A,B\) are \( 40k 40k\), and the fused term \(C\) is a squared-Euclidean distance matrix on 30D PCA space computed on the gene expression space. We selected 10 marker genes for the validation and test sets from the _HPF_CA cluster. We run an extensive grid search as reported in B.2, we pick the best hyperparameters combination using performance on the \(10\) validation genes as a criterion, and we report that metric on the other genes in Table 1, as well as qualitative results in Figure 1 and Figure 2. Clearly, ULFOW is the best performing solver across all metrics. Interestingly, the ULOT does not consistently outperforms its balanced version, and unbalancedness seems to hurt performance for the LGW solvers. Nevertheless, both solvers display inconsistent performance across metrics, whereas the ULFOW and LFGW are consistently superior to the rest of the solvers. These results highlight how the flexibility given by the FGW formulation to leverage common and disparate geometries, paired with the unbalancedness relaxation, can provide state of the art algorithms for matching problems in large-scale, real world biological problems.
+
+Experiment 3: ULOT vs. UEOT.We compare the performance of ULOT solvers to their unbalanced entropic alternatives (UEOT). We use the same datasets as in **Exp. 2**, but must pick a smaller subset (Olfactory bulb), to avoid OOM errors for entropic UGW solvers, since they cannot handle the \(40k\) sizes considered in **Exp. 2** (see B.1). This results in \(n 20,000\) source and \( 15,000\) target
+
+  
+**solver** & **mass \%** & **val \(\)** & **test \(\)** & **F1 mac.** & **F1 mic.** & **F1 weig.** \\  LOT & 1.000 & 0.282 & 0.386 & 0.210 & 0.411 & 0.360 \\ ULOT & 0.889 & 0.301 & 0.409 & 0.200 & 0.425 & 0.363 \\  LGW & 1.000 & 0.227 & 0.288 & 0.487 & 0.716 & 0.692 \\ ULGW & 1.001 & 0.222 & 0.287 & 0.463 & 0.701 & 0.665 \\  LFGW & 1.000 & 0.365 & 0.443 & 0.576 & 0.720 & 0.714 \\ ULFOW & 0.443 & **0.379** & **0.463** & **0.582** & **0.733** & **0.724** \\   
+
+Table 1: **Exp.2**, Results for spatial transcriptomics dataset (brain coronal section from Shi et al. ).
+
+Figure 3: Execution time of unbalanced LR Sinkhorn, with (Alg. 3) or without (Alg. 5) the TI variant. We fix the rank to \(r=10\); \(n\) points (displayed in thousands) are sampled from two Gaussian distributions in \(d=30\) of means respectively \(-1.2\) and \(1.3\), and standard deviations \(1\) and \(0.2\). (left) displays large \(\) (close to balanced), (right) is smaller \(\) (more unbalanced). We use the _same convergence threshold_ for the outer loop, for all sample sizes. As \(n\) gets bigger, this results in a relatively _looser_ threshold, explaining why timings can slightly decrease w.r.t. \(n\). What matters is, therefore, the comparative performance of TI vs non-TI for a fixed \(n\), _not the behaviour w.r.t. \(n\)_.
+
+cells, and 1000 genes. Similar to **Exp. 2**, the fused term \(C\) is a squared-Euclidean distance matrix on 30-D PCA space, computed on gene expressions. As done in **Exp. 2**, we select 10 marker genes for the validation and 10 genes for the test set, from cluster _OB_1_. We run an extensive grid search, as in **Exp. 2** and B.2. Table 2 shows that ULFGW outperforms entropic solvers w.r.t. Pearson correlation \(\), but is worse when considering F1 scores. On the other hand, ULFGW confirms its superiority compared to the balanced alternative LFGW. Taken together, these results suggest that while unbalanced LR solvers are on par with unbalanced entropic solvers in terms of performance, in small data regimes, they remain much faster and can unlock the applications of unbalanced OT to larger scales.
+
+Experiment 4: ULOT to align brain meshes.In this experiment, we compare the performance of our ULFGW solver to FUGW-sparse [Thual et al., 2022], an alternative approach to solve unbalanced FGW problems, using a two-scale (corse/fine grid) approach to handle large sample sizes. This method was demonstrated to be effective in aligning brain anatomies, encompassing both mesh structures and functional signals associated with each vertex. For their empirical analysis, they use the individual brain charting dataset [Pinho et al., 2018].
+
+In the absence of other information in the original paper, we draw inspiration from Pinho et al.'s smaller scale notebook implementations: We embed the \(n 160,000\) vertices of the fsaverage7 mesh, into a 30-d space, using an approximation of the geodesic distances with landmark multi-dimensional scaling [De Silva and Tenenbaum, 2004] where 2048 points were used as anchors. Each vertex has an associated functional signal that entails 22 features. For both the quadratic and linear terms, we compute the costs based on the squared Euclidean distance. The coarse grid for FUGW-sparse is built using one-tenth of \(n\), i.e. \( 16k\) points. We evaluate all methods by comparing the performance of the best hyperparameter combination, based on the average correlation between the barycentric projection and ground-truth value of 5 features, across a test set of 5 contrast maps. In Table 3, we observe that ULFGW and LFGW outperform FUGW-sparse. In this setting, there is no clear evidence that the unbalanced version performs better than its balanced counterpart for low-rank methods. See also Appendix B.2 for additional experimental details and results.
+
+Conclusion.The practical success of OT methods to natural sciences demonstrates the relevance of OT to their analysis pipelines. Practitioners must, however, often deal with the poor scalability of OT algorithms, as well as their rigid assumptions w.r.t. mass conservation. While Low-rank OT approaches hold the promise of scaling OT methods to large sizes, unbalanced formulations have proved useful to relax mass conservation for entropic OT solvers. We have proposed in this paper to merge these two strains, and demonstrated the practical relevance of these unbalanced low-rank solvers on various challenging alignment tasks.
+
+  
+**solver** & **mass \%** & **val \(\)** & **test \(\)** & **F1 mac.** & **F1 mic.** & **F1 weig.** \\  UEOT & 1.012 & 0.368 & 0.479 & 0.511 & 0.763 & 0.751 \\ LOT & 1.000 & 0.335 & 0.440 & 0.511 & 0.760 & 0.751 \\ ULOT & 0.998 & 0.356 & 0.461 & 0.518 & 0.770 & 0.762 \\  UEFGW & 1.015 & 0.343 & 0.475 & **0.564** & **0.839** & **0.831** \\ LFGW & 1.000 & 0.348 & 0.453 & 0.512 & 0.762 & 0.753 \\ ULFGW & 0.339 & **0.368** & **0.491** & 0.556 & 0.826 & 0.818 \\   
+
+Table 2: **Exp. 3**: Results for spatial transcriptomics dataset (Olfactory bulb section from Shi et al. ).
+
+Figure 4: Visualization of measured and predicted _right auditory click_ contrast map in **Exp.4**.

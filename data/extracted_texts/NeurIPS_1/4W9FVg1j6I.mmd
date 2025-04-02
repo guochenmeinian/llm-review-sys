@@ -1,0 +1,202 @@
+# Structured State Space Models for In-Context Reinforcement Learning
+
+Chris Lu
+
+FLAIR, University of Oxford
+
+Work done during an internship at DeepMind. Contact: christopher.lu@exeter.ox.ac.uk
+
+Yannick Schroecker
+
+DeepMind
+
+Albert Gu
+
+DeepMind
+
+Emilio Parisotto
+
+DeepMind
+
+Jakob Foerster
+
+FLAIR, University of Oxford
+
+Satinder Singh
+
+DeepMind
+
+Feryal Behbahani
+
+DeepMind
+
+###### Abstract
+
+Structured state space sequence (S4) models have recently achieved state-of-the-art performance on long-range sequence modeling tasks. These models also have fast inference speeds and parallelisable training, making them potentially useful in many reinforcement learning settings. We propose a modification to a variant of S4 that enables us to initialise and reset the hidden state in parallel, allowing us to tackle reinforcement learning tasks. We show that our modified architecture runs asymptotically faster than Transformers in sequence length and performs better than RNN's on a simple memory-based task. We evaluate our modified architecture on a set of partially-observable environments and find that, in practice, our model outperforms RNN's while also running over five times faster. Then, by leveraging the model's ability to handle long-range sequences, we achieve strong performance on a challenging meta-learning task in which the agent is given a randomly-sampled continuous control environment, combined with a randomly-sampled linear projection of the environment's observations and actions. Furthermore, we show the resulting model can adapt to out-of-distribution held-out tasks. Overall, the results presented in this paper show that structured state space models are fast and performant for in-context reinforcement learning tasks. We provide code at [https://github.com/luchris429/s5rl](https://github.com/luchris429/s5rl).
+
+## 1 Introduction
+
+Structured state space sequence (S4) models  and their variants such as S5  have recently achieved impressive results in long-range sequence modelling tasks, far outperforming other popular sequence models such as the Transformer  and LSTM  on the Long-Range Arena benchmark . Notably, S4 was the first architecture to achieve a non-trivial result on the difficult Path-X task, which requires the ability to handle extremely long-range dependencies of lengths \(16k\).
+
+Furthermore, S4 models display a number of desirable properties that are not directly tested by raw performance benchmarks. Unlike transformers, for which the per step runtime usually scales quadratically with the sequence length, S4 models have highly-scalable inference runtime performance, asymptotically using _constant_ memory and time per step with respect to the sequence length. While LSTMs and other RNNs also have this property, empirically, S4 models are far more performant while also being _parallelisable across the sequence dimension_ during training.
+
+While inference-time is normally not included when evaluating on sequence modelling benchmarks, it has a large impact on the scalability and wallclock-time for reinforcement learning (RL) becausethe agent uses inference to collect data from the environment. Thus, transformers usually have poor runtime performance in reinforcement learning . While transformers have become the default architecture for many supervised sequence-modelling tasks , RNNs are still widely-used for memory-based RL tasks .
+
+The ability to efficiently model contexts that are orders of magnitude larger may enable new possibilities in RL. This is particularly applicable in meta-reinforcement learning (Meta-RL), in which the agent is trained to adapt across _multiple_ environment episodes. One approach to Meta-RL, RL\({}^{2}\)[8; 43], uses sequence models to directly learn across these episodes, which can often result in trajectories that are thousands of steps long. Most instances of RL\({}^{2}\) approaches, however, are limited to narrow task distributions and short adaptation horizons because of their limited effective memory length and slow training speeds.
+
+Unfortunately, simply applying S4 models to reinforcement learning is challenging. This is because the most popular training paradigm in on-policy RL with multiple actors involves collecting fixed-length environment trajectories, which often cross episode boundaries. RNNs handle episode boundaries by resetting the hidden state at those transitions when performing backpropagation through time. Unlike RNNs, S4 models cannot simply reset their hidden states within the sequence because they train using a fixed convolution kernel instead of using backpropagation through time.
+
+A recent modification to S4, called Simplified Structured State Space Sequence Models (S5), replaces this convolution with a _parallel scan_ operation , which we describe in Section 2. In this paper, we propose a modification to S5 that enables resetting its hidden state within a trajectory during the training phase, which in turn allows practitioners to simply replace RNNs with S5 layers in existing frameworks. We then demonstrate S5's performance and runtime properties on the simple bsuite memory-length task , showing that S5 achieves a higher score than RNNs while also being nearly two times faster when using their provided baseline algorithm. We also re-implement and open source the recently-proposed Partially Observable Process Gym (POPGym) suite  in pure JAX, resulting in end-to-end evaluation speedups of over \(30x\). When evaluating our architecture on this suite, we show that S5 outperforms GRU's while also running over six times faster, achieving state-of-the-art results on the "Repeat Hard" task, which all other architectures previously struggled to solve. We further show that the modified S5 architecture can tackle a long-context partially-observed Meta-RL task with episode lengths of up to \(6400\). Finally, we evaluate S5 on a challenging Meta-RL task in which the environment samples a random DMControl environment  and a random linear projection of the state and action spaces at the beginning of each episode. We show that the S5 agent achieves higher returns than LSTMs in this setting. Furthermore, we demonstrate that the resulting S5 agent performs well even on random linear projections of the state and action spaces of out-of-distribution held-out tasks.
+
+## 2 Background
+
+### Structured State Space Sequence Models
+
+State Space Models (SSMs) have been widely used to model various phenomenon using first-order differential equations . At each timestep \(t\), these models take an input signal \(u(t)\). This is used to update a latent state \(x(t)\) which in turn computes the signal \(y(t)\). Some of the more widely-used
+
+  & Inference & Training & Parallel & Variable Lengths & bsuite Score \\  RNNs & **O(1)** & **O(\(L\))** & No & **Yes** & No \\ Transformers & O(\(L^{2}\)) & O(\(L^{2}\)) & **Yes** & **Yes** & **Yes** \\ S5 with \(\) & **O(1)** & **O(\(L\))** & **Yes** & No & N/A \\ S5 with \(\) & **O(1)** & **O(\(L\))** & **Yes** & **Yes** & **Yes** \\ 
+
+Table 1: The different properties of the different architectures. The asymptotic runtimes are in terms of the sequence length \(L\) assume a constant hidden size. The bsuite scores correspond to whether or not they achieve a perfect score in the median runs on the bsuite memory length environment.
+
+canonical SSMs are continuous-time linear SSMs, which are defined by the following equations:
+
+\[(t) =x(t)+u(t) \] \[y(t) =x(t)+u(t)\]
+
+where \(,,\), and \(\) are matrices of appropriate sizes. To model sequences with a fixed step size \(\), one can _discretise_ the SSM using various techniques, such as the zero-order hold method, to obtain a simple linear recurrence:
+
+\[x_{n} =}x_{n-1}+}u_{n} \] \[y_{n} =}x_{n}+}u_{n}\]
+
+where \(},},}\), and \(}\) can be calculated as functions of \(,,,\), and \(\).
+
+S4  proposed the use of SSMs for modelling long sequences and various techniques to improve its stability, performance, and training speeds when combined with deep learning. For example, S4 models use a special matrix initialisation to better preserve sequence history called HiPPO .
+
+One of the primary strengths of the S4 model is that it can be converted to both a recurrent model, which allows for fast and memory-efficient inference-time computation, and a convolutional model, which allows for efficient training that is _parallelisable across timesteps_.
+
+More recently, Smith et al.  proposed multiple simplifications to S4, called S5. One of its contributions is the use of _parallel scans_ instead of convolution, which vastly simplifies S4's complexity and enables more flexible modifications. Parallel scans take advantage of the fact that the composition of _associative_ operations can be computed in any order. Recall that for an operation \(\) to be associative, it must satisfy \((x y) z=x(y z)\).
+
+Given an associative binary operator \(\) and a sequence of length \(N\), parallel scan returns:
+
+\[[e_{1},e_{1} e_{2},,e_{1} e_{2} e_{N}] \]
+
+For example, when \(\) is addition, the parallel scan calculates the prefix-sum, which returns the running total of an input sequence. Parallel scans can be computed in \(O((N))\) time when given a sequence of length \(N\), given \(N\) parallel processors.
+
+S5's parallel scan is applied to initial elements \(e_{0:N}\) defined as:
+
+\[e_{k}=(e_{k,a},e_{k,b}):=(},}u_{k}) \]
+
+Where \(}\), \(}\), and \(u_{k}\) are defined in Equation 2. S5's parallel operator is then defined as:
+
+\[a_{i} a_{j}=(a_{j,a} a_{i,a},a_{j,a} a_{i,b}+a_{j,b}) \]
+
+where \(\) is matrix-matrix multiplication and \(\) is matrix-vector multiplication. The parallel scan then generates the recurrence in the hidden state \(x_{n}\) defined in Equation 2.
+
+\[e_{1} =(},}u_{1}) =(},x_{1}) \] \[e_{1} e_{2} =(}^{2},}x_{1}+}u_{ 2}) =(}^{2},x_{2})\] (7) \[e_{1} e_{2} e_{3} =(}^{2},}x_{2}+}u_{ 3}) =(}^{3},x_{3}) \]
+
+Note that the model assumes a hidden state initialised to \(x_{0}=0\) by initialising the scan with \(e_{0}=(,0)\).
+
+### Reinforcement Learning
+
+A Markov Decision Process (MDP)  is defined as a tuple \(,,R,P,\), which defines the environment. Here, \(\) is the set of states, \(\) the set of actions, \(R\) the reward function that maps from a given state and action to a real value \(\), \(P\) defines the distribution of next-state transitions given a state and action, and \(\) defines the discount factor. The agent's objective is to find a policy \(\) (a function which maps from a given state to a distribution over actions) which maximises the expected discounted sum of returns.
+
+\[[^{}|]=_{s_{0} d,a_{0: },s_{1:} P}_{t=0}^{}^{t}R(s_{t},a_{ t})\]
+
+In a Partially-Observed Markov Decision Process (POMDP), the agent receives an observation \(o_{t} O(s_{t})\) instead of directly observing the state. Because of this, the optimal policy \(^{*}\) does not depend just on the current observation \(o_{t}\), but (in generality) also on all previous observations \(o_{0:t}\) and actions \(a_{0:t}\).
+
+## 3 Method
+
+We first modify to S5 to handle variable-length sequences, which makes the architecture more suitable for tackling POMDPs. We then introduce a challenging new Meta-RL setting that tests for broad generalisation capabilities.
+
+### Resettable S5
+
+Implementations of on-policy policy gradient algorithms with parallel environments often collect fixed-length trajectory "rollouts" from the environment for training, despite the fact that the environment episode lengths are often far longer and vary significantly. Thus, the collected rollouts (1) often begin within an episode and (2) may contain episode boundaries. Note that there are other, more complicated, approaches to rollout collection that can be used to collect full episode trajectories .
+
+To handle trajectory rollouts that begin in the middle of an episode, sequence models must be able to access the state of memory that was present prior to the rollout's collection. Usually, this is done by storing the RNN's hidden state at the beginning of each rollout to perform truncated backpropagation through time . This is challenging to do with transformers because they do not normally have an explicit recurrent hidden state, but instead simply retain the entire history during inference time. This is similarly challenging for S4 models since they assume that all hidden states are initialised identically to perform a more efficient backwards pass.
+
+To handle episode boundaries within the trajectory rollouts, memory-based models must be able to reset their hidden state, otherwise they would be accessing memory and context from other episodes. RNNs can trivially reset their hidden state when performing backpropagation through time, and transformers can mask out the invalid transitions. However, S4 models have no such mechanism to do this.
+
+To resolve both of these issues, we modify S5's associative operator to include a reset flag that preserves the associative property, allowing S5 to efficiently train over sequences of varying lengths and hidden state initialisations. We create a new associative operator \(\) that operates on elements \(e_{k}\) defined:
+
+\[e_{k}=(e_{k,a},e_{k,b},e_{k,c}):=(},}u_{k},d_{k}) \]
+
+where \(d_{k}\{0,1\}\) is the binary "done" signal for the given transition from the environment.
+
+We define \(\) to be:
+
+\[a_{i} a_{j}:=(a_{j,a} a_{i,a},a_{j,a} a_{i,b}+a _{j,b},a_{i,c})&a_{j,c}=0\\ (a_{j,a},a_{j,b},a_{j,c})&a_{j,c}=1\]
+
+We prove that this operator is associative in Appendix A. We now show that the operator computes the desired value. Assuming \(e_{n,c}=1\) corresponds to a "done" transition while all other timesteps before it (\(e_{0:n-1,c}=0\)) and after it (\(e_{n+1:L,c}=0\)) do not, we see:
+
+\[e_{0} e_{n-1} =(}^{n-1},}x_{n-2}+ }u_{n-1},0)\] \[=(}^{n-1},x_{n-1},0)\] \[e_{0} e_{n} =(},}u_{n},1)\] \[=(},x_{n},1)\] \[e_{0} e_{n+1} =(}^{2},}x_{n}+}u_{n +1},1)\] \[=(}^{2},x_{n+1},1)\]
+
+Note that even if there are multiple "resets" within the rollout, the desired value will still be computed.
+
+### Multi-Environment Meta-Learning with Random Projections
+
+Most prior work in Meta-RL has only demonstrated the ability to _adapt_ to a small range of similar tasks . Furthermore, the action and observation spaces usually remain identical across different tasks, which severely limits the diversity of meta-learning environments. To achieve more general meta-learning, ideally the agent should learn from tasks of varying complexity and dynamics. Inspired by Kirsch et al. , we propose taking _random linear projections_ of the observation space and action space to a fixed size, allowing us to use the same model for tasks of varying observation and action space sizes. Furthermore, randomised projections _vastly_ increase the number of tasks in the meta-learning space. We can then evaluate the ability of our model to _generalise_ to unseen held-out tasks.
+
+We provide pseudocode for the environment implementation in Algorithm 1.
+
+```
+1:Initialization: \(}\), \(}\), \(}^{n}
+
+\(O((N))\) in the backwards pass during training time (given enough processors), it is still bottlenecked by rollout collection from the environment, which takes \(O(N)\) time. Because of the poor runtime performance of transformers for long sequences, we did not collect results for them in the following experiments.
+
+### POPGym Environments
+
+We evaluate our S5 architecture on environments from the Partially Observable Process Gym (POPGym)  suite, a set of simple environments designed to benchmark memory in deep RL. To increase experiment throughput on a limited compute budget, we carefully re-implemented environments from the POPGym suite entirely in JAX  by leveraging existing implementations of CartPole and Pendulum in Gymnax . PyTorch does not support the associative scan operation, so we could directly use the S5 architecture in POPGym's RLLib benchmark.
+
+Morad et al.  evaluated several architectures and found the Gated Recurrent Unit (GRU)  to be the most performant. Thus, we compare our results to the GRU architecture proposed in the original POPGym benchmark. Note that POPGym's reported results use RLLib's  implementation of PPO, which makes several non-standard code-level implementation decisions. For example, it uses a dynamic KL-divergence coefficient on top of the clipped surrogate objective of PPO  - a feature that does not appear in most PPO implementations . We instead use a recurrent PPO implementation that is more closely aligned with StableBaselines3  and CleanRL's  recurrent PPO implementations. We include more discussion and the hyperparameters in Appendix B.
+
+Figure 1: Evaluating S5, LSTM, and Self-Attention across different Bsuite memory lengths in terms of (a) memory usage, (b) runtime, and (c) return. Error bars report the standard error of the mean across 5 seeds. Runs were performed on a single NVIDIA A100.
+
+Figure 2: (a) Results across implemented environments in POPGym’s suite. Scores are normalised by the max-MMER per-environment. The shaded region represents the standard error of the mean across eight seeds. (b) The runtime for a single seed averaged across the environments for each architecture. Note that our implementation is end-to-end compiled to run entirely on a single NVIDIA A40.
+
+We show the results in Figure 2 and Appendix C. Notably, the S5 architecture performs well on the challenging "Repeat Previous Hard" task, far outperforming all architectures tested in Morad et al. . Furthermore, the S5 architecture also runs over six times faster than the GRU architecture.
+
+### Randomly-Projected CartPole In-Context
+
+We first demonstrate the long-horizon in-context learning capabilities of the modified S5 architecture by meta-learning across random projections of POPGym's Stateless CartPole (CartPole without velocity observations) task. More specifically, we perform the observation and action projections described in Section 3.2 and report the results in Figure 3.
+
+Agents are given \(16\) trials per episode on randomly-sampled linear projections of StatelessCartPole's observation and action spaces. We find that S5 with \(\) outperforms GRU's while running twice as quickly. Furthermore, we show that performance improves across trials, demonstrating in-context learning and show that the modified S5 architecture, unlike the GRU, can continue to learn even past its training horizon, which was previously shown using Transformers in Adaptive Agent Team et al. .
+
+### Multi-Environment Meta-Reinforcement Learning
+
+We run our S5 architecture, an LSTM baseline, and a memory-less fully-connected network in the environment described in Section 3.2. For these experiments, we use Muesli  as our policy optimisation algorithm. We randomly project the environment observations to a fixed size of \(12\) and randomly project from an action space of size \(2\) to the corresponding environment's action space. We selected all of the DMControl environments and tasks that had observation and action spaces of size equal to or less than those values and split them into train and test set environments.
+
+We use the S5 architecture described in Smith et al. , which consists of multiple stacked layers of S5 blocks. For both S5 and LSTM architectures, we found that setting the trajectory length equal to the maximum episode length \(1k\) achieved the best performance in this setting. We provide a more detailed description of our
+
+Figure 4: The mean of the return across all of the training environments. The shaded regions represent the range of returns reported across the three seeds. The environment observations and actions are randomly projected as described in Algorithm 1.
+
+Figure 3: (a) Performance and (b) runtime on randomly-projected StatelessCartPole across 4 seeds. The shaded region represents the standard error. (c) Shows performance at the end of training across different trials. We evaluate on \(32\) trials even though we only train on \(16\). GRU’s appear to have overfit to the training horizon while S5 models continue to perform well. The error bars represent the standard error across 4 seeds. Runs were performed on a single NVIDIA A100.
+
+architecture and hyperparameters in the supplementary material.
+
+**In-Distribution Training Results** We meta-train the model across the six DMControl environments in Figure 5 and show the mean performance across them in Figure 4. Note that while these environments are in the training distribution, they are still being evaluated on _unseen random linear projections_ of the state and action spaces and are _not given task labels_. Thus, the agent must infer from the reward and obfuscated dynamics which environment it is in. In this setting, S5 outperforms LSTMs in both sample efficiency and ultimate performance.
+
+## 5 Related Work
+
+S4 models have previously been shown to work in a number of previous settings, including audio generation  and video modeling . Concurrent work investigated S4 models in other architecture to symmetric models , loss functions , target values , or drift functions . In contrast, this work achieves generalisation by vastly increasing the task distribution _without limiting the expressivity of the underlying model_, which eliminates the need for hand-crafted restrictions.
+
+Figure 5: Results across the different environments of the training distribution. The shaded regions represent the range of returns reported across the three seeds. The environment observations and actions are randomly projected as described in Algorithm 1
+
+Figure 6: The mean of the return across all of the unseen held-out environments. The shaded regions represent the range of returns reported across the three seeds. The environment observations and actions are randomly projected as described in Algorithm 1.
+
+Some works perform long-horizon meta-reinforcement learning through the use of evolution strategies [17; 25]. This is because RNNs and Transformers have historically struggled to model very long sequences due to computational constraints and vanishing or exploding gradients . However, evolution strategies are notoriously sample inefficient and computationally expensive.
+
+Other works have investigated different sequence model architectures for memory-based reinforcement learning. Ni et al.  showed that using well-tuned RNNs can be particularly effective compared to many more complicated methods in POMDPs. Parisotto et al.  investigated the use of transformer-based models for memory-based reinforcement learning environments.
+
+Sequence models have also been used for a number of other tasks in RL. For example, Transformers have been used for offline reinforcement learning , multi-task behavioural cloning , and algorithm distillation . Concurrent work used transformers to also demonstrate out-of-distribution generalisation in meta-reinforcement learning by leveraging a large task space .
+
+## 6 Conclusion and Limitations
+
+In this paper, we investigated the performance of the recently-proposed S5 model architecture in reinforcement learning. S5 models are highly promising for reinforcement learning because of their strong performance in sequence modelling tasks and their fast and efficient runtime properties, with clear advantages over RNNs and Transformers. After identifying challenges in integrating S5 models into existing recurrent reinforcement learning implementations, we made a simple modification to the method that allowed us to reset the hidden state within a training sequence.
+
+We then showed the desirable properties S5 models in the bsuite memory length task. We demonstrated that S5 is _asymptotically_ faster than Transformers in the sequence length. Furthermore, we also showed that S5 models run nearly twice as quickly as LSTMs with the same number of parameters while outperforming them. We further evaluated our S5 architecture on environments in the POPGym suite , where we match or outperform RNNs while also running nearly five times faster. We achieve strong results in the "Repeat Previous Hard" task, which previous models struggled to solve.
+
+Finally, we proposed a new meta-learning setting in which we meta-learn across random linear projections of the observation and action spaces of randomly sampled DMControl tasks. We show that S5 outperforms LSTMs in this setting. We then evaluate the models on held-out DMControl tasks and demonstrate out-of-distribution performance to unseen tasks through in-context adaptation.
+
+There are several possible ways to further investigate S5 models for reinforcement learning in future work. For one, it may be possible to learn or distill  entire reinforcement learning algorithms within an S5 model, given its ability to scale to extremely long contexts. Another direction would be to investigate S5 models for continuous-time RL settings . While \(\), the discrete time between timesteps, is fixed for the original S4 model, S5 can in theory use a different \(\) for each timestep.
+
+Figure 7: Results when evaluating on held-out DMControl tasks. The shaded regions represent the range of returns reported across the three seeds. The environment observations and actions are randomly projected as described in Algorithm 1
+
+**Limitations:** There are several notable limitations of this architecture and analysis. Firstly, implementing the associative scan operator is currently not possible using PyTorch, limiting us to using the JAX  framework. Furthermore, on tasks where short rollouts are sufficient to achieve good performance, S5 offers limited speedups, as rolling out across time is no longer a bottleneck. Finally, it was not possible to perform a fully comprehensive hyperparameter sweep in our results in Section 4.4 because the experiments used significant amounts of compute.

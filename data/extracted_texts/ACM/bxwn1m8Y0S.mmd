@@ -1,0 +1,165 @@
+# [MISSING_PAGE_FAIL:1]
+
+[MISSING_PAGE_FAIL:1]
+
+transitioned from a stack-based to a register-based virtual machine, the execution pipeline has changed, and the memory management and GC systems have been completely overhauled.
+
+We thus propose a bespoke dynamic taint analysis framework called _PanopticChrome_, which adds roughly 7,000 lines of code to the existing V8 engine. Its novel features are as follows.
+
+It accurately captures all kinds of information flows (explicit and implicit) while supporting a variable number of sources and sinks that can be changed at runtime. It is mostly portable across Chromium versions (requires minor changes) and is platform agnostic. From a software engineering point of view, _PanopticChrome_ is fairly self-contained, where all the changes are limited to the V8 engine's ignition module (interpreter part) only. Our solution works with V8 complex garbage collection and memory relocation framework. We test the efficacy of _PanopticChrome_ for the problem of identifying fingerprinting APIs across the top 20,000 websites. We identify 164 hitherto undiscovered APIs that are potentially fingerprinting.
+
+Section 2 describes the background, Section 3 elaborates on the design of _PanopticChrome_, Section 4 shows the evaluation results, Section 5 describes the related work and finally we conclude in Section 6.
+
+## 2. Background
+
+In the following section, we begin with an overview of information flow analysis and its usage in various aspects of web privacy and security. We then present the reasons for adopting a static-dynamic taint analysis algorithm over static taint analysis approaches, Furthermore, we establish the need to instrument the runtime system, specifically the V8 engine.
+
+### Browser APIs and WebIDL
+
+Browser APIs allow a website to access certain features such as the browser type, current date and time, hardware and software configuration, screen dimensions, etc. Since different browsers might offer different capabilities with differing syntax, the WebIDL standard formalizes the interfaces and properties that need to be offered by a compliant browser. In Chromium, these APIs are implemented as a part of the Blink rendering engine: they are exposed to web applications using the standard Web IDL specification.
+
+Due to the variability in the nature of the devices that access a given site, along with geographical differences (detected from the IP address and time zone), browser APIs typically return different kinds of information for different devices. These values obtained from browser APIs, along with the meta information about the device allow the site to create a unique _fingerprint_ for each device. The site can then use this fingerprint to track the user across different sessions and websites, even if the network used to access the site changes.
+
+### Information Flow Analysis
+
+There are two kinds of information transfer channels: an explicit channel (the information is directly transferred from one object to the other via an immediate assignment) and an implicit channel (information transmission through direct and indirect control flows).
+
+JavaScript uses an asynchronous event-driven programming model, where functions are registered as event handlers and invoked when the corresponding event happens such as a "mouse hover", or a "mouse click". As a result, static analysis approaches aren't very effective and seldom generate accurate information/control flow information. Another factor that complicates static analyses is the fact that JS is a deeply object oriented language where properties (variables/functions) can be added and removed dynamically from parent classes, and functions are treated as objects. They also may take a variable number of arguments. To complicate matters, JS has the _eval_(3) function that allows the interpreter to execute strings provided at runtime as code, which makes static analysis nearly impossible. Finally, the reflection API (introduced in ES6) allows code to be self-modifying and have mutating properties of objects. Hence, dynamic analysis is required.
+
+Approaches that instrument the code instead of the runtime cannot add hooks to all the objects' properties without a priori information about the properties themselves. Further, there are multiple API calls like _documentLocation_ that a proxy object with hooks cannot wrap. Hence, all calls to the _documentLocation_ API call cannot be intercepted. Such hooks can easily be detected by an adversary.
+
+**Mystique**(Ross, 2018) is our nearest competing work that added dynamic information flow analysis (taint propagation) to the Chromium browser (in 2018). Mystique uses custom APIs that modify the underlying components of the JavaScript engine - this makes it hard to maintain it as the architecture of the web browser changes over time. Furthermore, Mystique tracks the information flow of only browser extensions and cannot track flows in the context of the hosting site or other third-party scripts. Moreover, Mystique collects variable dependencies at the granularity of functions. For explicit flows (due to assignments), an edge is created in the Data Flow Graph (DFG) from the R-value to the L-value. Implicit flows where there is data transfer from caller to callee parameters during function calls and returns are also handled in a similar manner. To handle control dependencies, all the variables in the branch path are tainted.
+
+The limitations of Mystique are that it does not handle dynamic sources and sinks, is not designed for a register-based machine,
+
+Figure 1. Overview of the Chromium architecture
+
+modifies the garbage collection and memory relocator, has extended object liveness and requires changes in the Blink rendering engine of Chromium - all of these changes reduce the portability of the design. Furthermore, because of its limited set of sinks, it misses many information leakage paths.
+
+## 3. Design of PanopticChrome
+
+### Design Overview
+
+To detect data leakage from the browser, _PanoptiChrome_ needs to identify and mark all the values obtained from a known subset of browser APIs as _tainted_. We instrument the code generated for API methods and property (variable) accesses and add hooks (callback functions). The custom **Taint** **Marking** **Engine**(**TME**) handles the marking of tainted values as these APIs get accessed. Once we have identified and marked the taint sources (browser APIs), the **Taint** **Propagation** **System (TPS)** **disseminate the taint tags via explicit and implicit flows to all the objects that somehow use the tainted value (directly or indirectly). Multiple tables that are accessed using the hash of the in-memory addresses of the tainted objects are used to disseminate taint information. On invocation of an API labeled _sink_, all the parameters passed to the API are checked for their _taint_ status. If we find a parameter to contain data from a tainted source, the source, sink and the parameters, we log this information to a file. The patches to Chromium's V8 engine developed for _PanoptiChrome_ are available here.
+
+### Code Instrumentation and Data Structures
+
+The Bytecode Generator in V8 walks the AST (Abstract Syntax Tree) generated by the JS parsing and analysis phase to emit intermediate code that the Ignition engine interprets. The Ignition engine in V8 is a register-based interpreter with handlers for around 230 bytecodes. 60 bytecode builders responsible for emitting the properly formatted bytecode along with 85 visitors that walk the AST, generate handlers for these 230 bytecodes. _PanoptiChrome_ needs to modify only three builders and eight AST visitors to track the flow of tainted information through the execution of the JavaScript code.
+
+In prior work, the taint marking was done when the rendering engine called aJS function. However, in our scheme we track dependences at a finer level and we can change the sources and sinks at runtime. Hence, in our case, the taint marking step needs to be intertwined the taint propagation step. For every JS object (defined in the source code), there is a runtime object (internal to V8). Whenever, we access a method or property in a JS object, we need to use the TME engine to find if we need to taint the status of the corresponding runtime object. The TME engine needs to check the list of current sources.
+
+#### 3.2.1. Data Structures Used. PanoptiChrome
+
+uses multiple hash tables to store the taint status of JS objects and their corresponding runtime objects. The **Object Taint Table** (OTT) stores the "taint metadata" of the runtime object and is indexed using the ptr (tagged heap pointer) data member of the runtime object. This hash table stores information about all the taint sources for the given runtime object. There is an important design decision here. Should we store a list of all methods/properties via which the taint flowed to a given object's method or property? Given that prior work considers few sources, they indeed store this information. This is not a scalable solution because references to all the objects on the path will remain live, and the GC will not be able to remove them - this results in a large memory footprint.
+
+We thus maintain two references in each OTT row: reference to the runtime object and a reference to the string encoding (runtime object) of taint sources (the runtime objects on the path are not stored). If the OTT is reachable, then all the runtime objects that it points to will also remain alive, which is something that we do not want because many objects will not have valid references to them in the original JS code left. Note that all the data structures that we add are extra ones and thus their references do not have the same degree of legitimacy as references in the JS code itself. V8 has the option of creating "weak references", which is a pointer where the destination object can be garbage collected because its reference count is not incremented due to the reference. Such weak references are used here. The **craw of the idea** here is to use two weak references: one to the runtime object and one to the string encoding of the taint sources. The _Ephemeron hash table_ ensures that
+
+Figure 2. Overview of _PanoptiChrome_
+
+if the runtime object is alive (because of references in the JS code), then the string encoding will also be alive (not garbage collected). This guarantees the existence of the string object (corresponding to the taint sources) once we reach the sink because the sink needs to be obviously alive.
+
+The **AST Taint Table** stores the taint status of the nodes in the AST parsed for the functions in the current activation stack. _PanopticChrome_ implements **AST Taint Table** in the same fashion as Mystique. It uses a multi-level HashTable in which the first level is indexed by the frame pointer of the currently executing function, while the second level is indexed using the unique location of the node in the AST.
+
+The link between the AST node and the corresponding runtime object is maintained using the SimpleNumberDictionary (internal to V8) that maps the location and type (VariableProxy, Property or Call) of the AST node to the corresponding runtime object. Like the AST Taint Table, the **AST to Object Map Table** contains multiple levels wherein the current frame pointer indexes the first level while the second level stores the actual mapping.
+
+#### 3.2.2. Liveness of Objects
+
+All the tables that we add can be garbage collected, which needs to be avoided at all costs. Mystique modifies the GC itself, which is a very invasive change and harms portability and maintainability. We start with observing that all runtime objects in V8 can be referenced with the help of Handles. These are themselves not garbage collected. The Handles are stored in a HandleScope that is responsible for deallocating the Handles when the scope is destroyed. To make sure that the Handles responsible for taint tables are not deallocated, we store them in a custom PersistentHand that is aware of the special tables and is not deallocated until the PersistentHandle is explicitly reset. The custom PersistentHandle is created at the start of the execution and is destroyed only when the execution ends. The stock V8 engine does not allow the deletion or updating of Handles added to the PersistentHandle list; hence, we introduce new interfaces that allow us to replace the unused handles with null runtime objects.
+
+### Taint Marking Engine (TME)
+
+The role of the Taint Marking Engine(**TME**) in _PanopticChrome_ is to identify the sources and sinks defined in the configuration files and taint the corresponding runtime objects. The dynamic configuration files (user-defined) contain the object's name and corresponding methods and properties to be considered as sources or sinks. _PanopticChrome_ provides the same expressiveness as OpenWPM(Sanderson, 2017) for specifying the configuration with the ability to selectively allow or deny specific properties or methods of an object. TME also filters out contexts where the sources should not be tainted. These contexts include native built-in functions (called for initial setup) and Chromium's intrinsic functionalities (like settings or a new tab). The TME receives details about the object, the API to access, values of all the parameters passed to the API and the return value. Based on the information received and the context derived from the object, TME sets the taint for the return value.
+
+A simple lookup of the object and member name (property or method) in the custom taint configuration database is insufficient since members can be references to runtime objects. Furthermore, prototypical inheritance in JavaScript allows a child object to access all the members of superclasses. To solve these problems, TME actually needs the name of the object (similar to runtime type information in C++). The constructor's name is sufficient for this purpose. Using the constructor, the TME walks up the inheritance chain and finds the object in which the member is defined (the WebIDL specification is used to speed up this process). In some cases, when only a member is provided, the default object is _Window_ (regular JS semantics). Once we find the object we check whether it is a tainted source or not. This is more elegant and generic than Myrstique, which required patching all the Blink endpoints (7000+ at the time of writing this paper) and then subsequently tracking their accesses.
+
+### Taint Propagation System (TPS)
+
+To ensure that the original execution is not affected while propagating taint information, _PanopticChrome_ follows a caller-saved scheme - store the original values in a set of virtual registers and allocate independent registers for storing taint metadata before starting the taint propagation routines. After the routines return, the original state is restored. To ensure proper taint propagation, we include vital information about object constructors (see Section 3.3) in the parameters that we pass to the taint routines as opposed to earlier frameworks like Myrstique that did not do so. Because of their restrictive nature (fixed set of sources and sinks) and limitations imposed by the stack-based Javascript VM, this wasn't easy to do.
+
+On function exit, the AST Taint Table and AST to Runtime Object Map are dropped (since every invocation requires a fresh AST Taint Table and map). In contrast, the Object Taint Table persists across invocations to further propagate the taint status.
+
+Once the TME has marked the values obtained from a select set of browser APIs as taint sources, **TPS** sends the taint tags to other objects that receive information from the labeled "tainted" sources. _PanopticChrome_ performs an order-independent, intra-procedural analysis on the source code received by the V8 engine for execution to create the flow graph (FG) (combination of the data and control flow graphs).
+
+Initially, an Abstract Syntax Tree(AST) is generated at the level of an individual function. Analysis at the function level is sound since even the top-level scope is considered a function(unnamed).
+
+Figure 3. Liveness in the Object Taint Table
+
+PanoptiChrome_ repurposes the parser and generator used by the V8 JavaScript engine to create the ASTs. Then, the generated AST is cached for future invocations. This AST is then used to construct the Flow Graph (FG) in which the vertices are nodes from the AST (56 such types in version 11.7 of V8) that represent either a property access or an API call. The FG contains directed edges between the AST nodes if there is an explicit flow of information (via the assignment operator) or an implicit flow (via conditional statements).
+
+To reduce the overhead of taint propagation, _PanoptiChrome_ does not create an FG unless at least one tainted source has been visited in the scope of the function under analysis. Once an API call has been marked tainted by the **TME**, **TPS** marks the corresponding AST node in the FG as tainted with the help of the \(object(ASTnode)\) mapping table (see Section 3.2).
+
+Taint propagation routines are invoked only when one of the following conditions is true: \(\) an API marked as a _sink_ is called, or \(\) the function returns and an object/array is created by the function. Taint propagation is then carried out by following the outgoing edges from the tainted AST node and updating the taint status of each node in the forward slice (transitive closure of nodes in the FG). Also, whenever a node is marked as tainted in the FG, the corresponding object is marked as tainted with the help of a reverse mapping table (AST node to object).
+
+### Logging Data
+
+The V8 engine utilizes the concept of an Isolate to separate different execution contexts on the same web page. These multiple execution contexts get created due to the inclusion of numerous iframes in the same web page. An iframe is a separate webpage loaded from an entirely different origin that gets embedded in the parent website (used for advertisements, videos and analytics). For every iframe, a separate Isolate is instantiated with its individual copy of the global objects and built-in functions. Distinct isolates on the same web page execute concurrently using separate threads and behave as individual sandboxed instances of the V8 runtime. Since _PanoptiChrome_ attaches all the tables required for taint marking and propagating with the Isolate, multiple runtime instances can execute in parallel without treading on each other's data. We log all the data for each isolate separately in a different file similar to Visible V8 (Selvin, 2015); hence, the problem of inter-process synchronization is solved by design.
+
+For every Isolate _PanoptiChrome_ logs all the origins (multiple sub-domains can be loaded in the same Isolate as long as they share the same origin) along with the tainted source APIs and sink APIs invoked during the execution. Additionally, the leaks are logged (along with the string-encoded list of taint sources) whenever data from a tainted source flows into a sink API.
+
+## 4. Evaluation
+
+### Setup
+
+We use an AMD EPYC 7702P powered workstation with 64 physical cores and 128 GB RAM for crawling and post-processing tasks. Log files, averaging 150KB per website, are stored on a 1 TB SSD. The crawling process utilizes the latest Chromium browser (version 117.0) compiled with our custom V8 engine (_PanoptiChrome_). Websites are loaded concurrently in independent browser windows with transient user profiles that get erased after each website visit. Additionally, navigation and website loading are facilitated through a commercial off-the-shelf ISP that is used by more than 38% of the active internet users in the country.
+
+### Crawling Methodology
+
+As discovered by VisibleV8 (Selvin, 2015) and OmniCraw(Selvin, 2015), websites frequently access various inbuilt objects and properties of the browser for various purposes such as bot detection and for optimizing their execution. Approaches that employ browser automation, like using driver frameworks such as Selenium and Chromedriver are prone to report inaccurate site statistics due to bot detection measures. To alleviate this problem, we instantiate each browser instance from the command line and pass the website URL as a parameter. Since we do not use any automation framework, our approach is virtually indistinguishable from a normal user accessing the site. The driver script to generate command line parameters and instantiate a browser is written in Python v3.7 and is responsible for closing the browser after a preset time (180 seconds).
+
+For data collection, we use the top 20,000 websites from the Tranco list (Brandt et al., 2015) as the seed URLs. We perform a connection test for each URL by requesting the HTTP header from the website. To request the HTTP header containing the website's status code, we initially attempt to connect to the website by appending HTTPS.// with the domain name from the Tranco list. If the connection succeeds, we log the schema and URL to the list of reachable URLs. If we fail to connect to the site within 15 seconds, we try with the HTTP protocol for the next 15 seconds. If we still fail, we log the URL with the corresponding error code.
+
+**Crawling results** From our network vantage point, 61.91% of the Tranco top 20,000 websites were reachable (status code 200). Around 14% returned a 404 (not found) error, and around 24% timed out with both the HTTPS and HTTP protocols. Table 1 represents the status codes for the URLs in the list. Our crawler could log 12,846 unique origins and recorded 45,942,545 API calls and 24,486 leak entries. Furthermore, the recorded origins invoked 5,673 unique APIs, where 3,426 are DOM manipulation APIs.
+
+Figure 4. Overview of the data collection pipeline
+
+### Web API Categorization
+
+Web API categorization is required to identify the DOM manipulation APIs that are used to get the static properties of elements in the web page. The values returned by these APIs is always same for a particular element across browsers and hence cannot be used to fingerprint the user. In our information flow analysis, we do not consider these APIs as the sources of sensitive information. To classify the APIs, the category was decided using the developer documentation provided by Mozilla Developer Network (MDN)(Mozilla Developer, 2019). Out of 5,673 unique API in our crawl, MDN had no categorization for 1,246 which we manually classify after analyzing the documentation. The complete list of API categories can be found here. Also, for APIs categorized in multiple categories, we give the lowest priority to the DOM category and classify the API into the higher priority bin.
+
+### Data Leakage from APIs
+
+We define _data leakage_ as the flow of information from any web API to any sink (storage, network). Every API invocation marks the returned data as tainted. An entry is logged whenever any tainted data reaches a sink. Out of the 5,673 unique web APIs that are accessed by 12,846 origins, our analysis reveals that data from a total of 675 unique APIs is leaked. We observe that on an average, 115 unique APIs are accessed on a website and data from 11 unique APIs is leaked. The maximum number of APIs accessed from a single origin is 531, whereas the maximum single origin leakage was found to be 144.
+
+DOM-related APIs (such as NodeList.length) are leaked on 33.84% of the sites, followed by the Location, the Background Tasks and the User Agent category (30.31%, 19.74% and 17.15% respectively).
+
+In the Location category the HTMLAnchorElement.hostname and the Window.location are the most commonly leaked APIs. These APIs are used to get to domain name of the page for constructing dynamic links or fetching web resources. In the Background Tasks the Window.setTimeout API is used to execute a JS function after a set amount of time. Window.navigator and Navigator.userAgent from the User Agent category are used to customize the website for different screen resolutions and sizes. The complete category wise distribution of API access and leaks for the top 15 Web API categories (based on access) is shown in Figure 5.
+
+ 
+**Status Code** & **Number of Sites** & **Percentage** \\ 
+200-299 (Success) & 12382 & 61.91\% \\ 
+300-399 (Redirection) & 5 & 0.03\% \\ 
+400-499 (Client Error) & 2770 & 13.85\% \\ 
+500-599 (Server Error) & 141 & 0.7\% \\  Exception & 4701 & 23.5\% \\  Total sites : & 20000 & \\  
+
+Table 1. Status Codes for the top 20,000 Trance URLs
+
+Figure 5. API access and leak in sites vs top 15 Web API categories (based on access)
+
+[MISSING_PAGE_FAIL:7]
+
+## 5. Related Work
+
+Dennings (Dennings, 19; 18) pioneered the formalization of static analysis approaches in 1970s. Fenton (Fenton, 2001) then studied purely dynamic monitors for managing information flows. Much of the later work has focused on adapting the work of Denning and Fenton to different languages and proposing solutions with various limitations.
+
+Dynamic analysis techniques using virtual machines (Zhou et al., 2017), source code instrumentation (Zhou et al., 2017), and runtime instrumentation (Zhou et al., 2017) have been employed for numerous use cases ranging from JS execution visualization (Zhou et al., 2017) and record/replay (Zhou et al., 2017) to privacy and security analysis of browser extensions (Zhou et al., 2017) and policy enforcement(Zhou et al., 2017). Table 2 summarizes the features and limitations of existing information flow approaches for JavaScript engines.
+
+### Augmenting Browsers with Taint Tracking Capabilities
+
+Vogt et al.(Vogt et al., 2017) supplement dynamic taint tracking with static analysis to detect DOM-XSS vulnerabilities. They use static analysis to propagate taint information along implicit flows. On the same lines, in reference (Fenton, 2001), the authors instrument the Chromium browser to track tainted strings (limited use case). Their goal was to detect and validate DOM-XSS vulnerabilities. Based on the source and context of the tainted data, they automatically generate the breakout sequence to validate the vulnerability. Like (Fenton, 2001), Domsday (Zhou et al., 2017) also instruments the Chromium browser to detect DOM-XSS vulnerabilities. The authors add one byte to each string object to keep track of the encoding and decoding functions and also the provenance of data. This is also a limited use case. Another such work is FP-Detective (Donsday, 2017) that only looks at font-related APIs.
+
+Bauer et al. (Bauer et al., 2017) treat the V8 JavaScript engine as a black box and track information flow only across the Blink-V8 boundary; this can be used to sandbox scripts based on their respective origins. Their coarse-grained information flow approach cannot handle implicit flows and cannot reason if a source API is exploited for illegitimate use. In Crowdflow (Crowdflower, 2017), the authors aim to minimize the limitations of information flow tracking by probabilistically switching between partial taint tracking and information flow monitoring in a distributed setting. The clients report a violation to an aggregator that takes appropriate action. Similar to Domsday (Zhou et al., 2017), CrowdFlow employs heavyweight instrumentation and uses fixed set of sources and sinks that are tailored to detect XSS-based vulnerabilities.
+
+_PanopticChrome_ is much more generic than all the prior work and is not meant to target taint information for any specific kind of data types (or object types). Its taint tracking is also much more fine-grained. Unlike prior work, it does not rely on any custom JS engine that only handles a subset of the language; it can handle any site that the Chromium browser can handle.
+
+### Study of Third-Party Data Exfiltration
+
+In this space, the closest approaches that are similar to _PanopticChrome_ are Mystique(Zhou et al., 2017), Jest (Jensen et al., 2017), Ichnaea (Jensen et al., 2017), and JSFlow (Zhou et al., 2017) uses a bespoke JS interpreter for a subset of JavaScript. Jest (Jensen et al., 2017) is a source-code instrumentation-based approach that converts every statement and expression to a function call, and these instrumented functions are responsible for implementing the dynamic analysis methods. Ichnaea (Jensen et al., 2017) is built on top of Jalangi (Zhou et al., 2017), which is also a source-code instrumentation-based approach. The instrumentations proposed by both Jest and Ichnaea can be detected easily by an adversary (Zhou et al., 2017).
+
+## 6. Conclusion
+
+We showed in this paper that it is indeed possible to build a comprehensive dynamic taint tracking engine that is completely generic and is portable across platforms and browser versions to a large extent. This was achieved by limiting the changes to a small part (interpreter) of the V8 engine and suggesting ingenious solutions for dynamic addition of sources/sinks, creating persistent handles to circumvent the issues caused by the GC and memory relocation engines and optimizing the process of taint propagation by using an on-demand algorithm. We used _PanopticChrome_ to perform a detailed characterization of the information leakage in the top 20,000 websites. We further use the locality information inherent in the logs generated by _PanopticChrome_ to significantly reduce the set of APIs to be considered for manual analysis. The need for having _PanopticChrome_ is attested by the fact that we discover 208 APIs that were not known to have a fingerprinting character.
+
+   Work & FGTT & Implicit flows & Custom sources & Completeness & Upgradability & Platform agnostic \\  Vogt et al.(Vogt et al., 2017) & ✓ & ✓ & ✗ & ✗ & ✗ & ✗ \\ DOMsday(Zhou et al., 2017) & ✓ & ✗ & ✗ & ✗ & ✗ & ✗ \\ WebPol(10) & ✓ & ✓ & ✓ & ✓ & ✗ & ✓ \\ Runtime monitoring(Zhou et al., 2017) & ✗ & ✗ & ✗ & ✓ & ✓ & ✓ \\ Crowdflow(Crowdflower, 2017) & ✓ & ✗ & ✗ & ✓ & ✗ & ✗ \\ FPDetective(Donsday, 2017) & ✗ & ✗ & ✗ & ✓ & ✓ & ✓ \\ JSgraph(Zhou et al., 2017) & ✗ & ✗ & ✗ & ✓ & ✓ & ✓ \\ Visible V8(Zhou et al., 2017) & ✗ & ✗ & ✗ & ✓ & ✓ & ✓ \\ Mystique(Zhou et al., 2017) & ✓ & ✓ & ✗ & ✓ & ✗ & ✗ \\
+25 million flows(Fenton, 2001) & ✓ & ✗ & ✗ & ✗ & ✗ & ✗ \\ _PanopticChrome_ & ✓ & ✓ & ✓ & ✓ & ✓ & ✓ \\   
+
+Table 2. Summary of information flow analysis in different JavaScript runtimes. FGTT stands for fine-grained taint tracking

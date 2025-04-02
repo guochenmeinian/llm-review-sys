@@ -1,0 +1,247 @@
+# Solving Minimum-Cost Reach Avoid using Reinforcement Learning
+
+Oswin So*
+
+Department of Aeronautics and Astronautics
+
+MIT
+
+oswinso@mit.edu &Cheng Ge*
+
+Department of Aeronautics and Astronautics
+
+MIT
+
+gec_mike@mit.edu &Chuchu Fan
+
+Department of Aeronautics and Astronautics
+
+MIT
+
+chuchu@mit.edu
+
+These authors contributed equally to this work
+
+###### Abstract
+
+Current reinforcement-learning methods are unable to _directly_ learn policies that solve the minimum cost reach-avoid problem to minimize cumulative costs subject to the constraints of reaching the goal and avoiding unsafe states, as the structure of this new optimization problem is incompatible with current methods. Instead, a _surrogate_ problem is solved where all objectives are combined with a weighted sum. However, this surrogate objective results in suboptimal policies that do not directly minimize the cumulative cost. In this work, we propose **RC-PPO**, a reinforcement-learning-based method for solving the minimum-cost reach-avoid problem by using connections to Hamilton-Jacobi reachability. Empirical results demonstrate that RC-PPO learns policies with comparable goal-reaching rates to while achieving up to \(57\%\) lower cumulative costs compared to existing methods on a suite of minimum-cost reach-avoid benchmarks on the Mujoco simulator. The project page can be found at [https://oswinso.xyz/rcppo/](https://oswinso.xyz/rcppo/).
+
+## 1 Introduction
+
+Many real-world tasks can be framed as a constrained optimization problem where reaching a goal at the terminal state and ensuring safety (i.e., reach-avoid) is desired while minimizing some cumulative cost as an objective function, which we term the _minimum-cost_ reach-avoid problem.
+
+The cumulative cost, which differentiates this from the traditional reach-avoid problem, can be used to model desirable aspects of a task such as minimizing energy consumption, maximizing smoothness, or any other pseudo-energy function, and allows for choosing the most desirable policy among many policies that can satisfy the reach-avoid requirements. For example, energy-efficient autonomous driving  can be seen as a task where the vehicle must reach a destination, follow traffic rules, and minimize fuel consumption. Minimizing fuel use is also a major concern for low-thrust or energy-limited systems such as spacecraft  and quadrotors . Quadrotors often have to choose limited battery life to meet the payload capacity. Hence, minimizing their energy consumption, which can be done by taking advantage of wind patterns, is crucial for keeping them airborne to complete more tasks. Other use-cases important for climate change include plasma fusion (reach a desired current, minimize the total risk of plasma disruption)  and voltage control (reach a desired voltage level, minimize the load shedding amount) .
+
+If only a single control trajectory is desired, this class of problems can be solved using numerical trajectory optimization by either optimizing the timestep between knot points  or a bilevel optimization approach that adjusts the number of knot points in an outer loop [8; 9; 10]. However, in this setting, the dynamics are assumed to be known, and only a single trajectory is obtained. Therefore, the computation will needs to be repeated when started from a different initial state. The computational complexity of trajectory optimization prevents it from being used in real time. Moreover, the use of nonlinear numerical optimization may result in poor solutions that lie in suboptimal local minima .
+
+Alternatively, to obtain a control policy, reinforcement learning (RL) can be used. However, existing methods are unable to directly solve the minimum-cost reach-avoid problem. Although RL has been used to solve many tasks where reaching a goal is desired, goal-reaching is encouraged as a _reward_ instead of as a _constraint_ via the use of either a sparse reward at the goal [12; 13; 14], or a surrogate dense reward [14; 15]1. However, posing the reach constraint as a reward then makes it difficult to optimize for the cumulative cost at the same time. In many cases, this is done via a weighted sum of the two terms [18; 19; 20]. However, the optimal policy of this new _surrogate_ objective may not necessarily be the optimal policy of the original problem. Another method of handling this is to treat the cumulative cost as a constraint and solve for a policy that maximizes the reward while keeping the cumulative cost under some fixed threshold, resulting in a new constrained optimization problem that can be solved as a constrained Markov decision process (CMDP) . However, the choice of this fixed threshold becomes key: too small and the problem is not feasible, destabilizing the training process. Too large, and the resulting policy will simply ignore the cumulative cost.
+
+To tackle this issue, we propose **Reach Constrained Proximal Policy Optimization(RC-PPO)**, a new algorithm that targets the minimum-cost reach-avoid problem. We first convert the reach-avoid problem to a reach problem on an augmented system and use the corresponding _reach_ value function to compute the optimal policy. Next, we use a novel two-step PPO-based RL-based framework to learn this value function and the corresponding optimal policy. The first step uses a PPO-inspired algorithm to solve for the optimal value function and policy, conditioned on the cost upper bound. The second step fine-tunes the value function and solves for the least upper bound on the cumulative cost to obtain the final optimal policy. Our main contributions are summarized below:
+
+* We prove that the minimum-cost reach-avoid problem can be solved by defining a set of augmented dynamics and a simplified constrained optimization problem.
+* We propose RC-PPO, a novel algorithm based on PPO that targets the minimum-cost reach-avoid problem, and prove that our algorithm converges to a locally optimal policy.
+* Simulation experiments show that RC-PPO achieves reach rates comparable with the baseline method with the highest reach rate while achieving significantly lower cumulative costs.
+
+## 2 Related Works
+
+Terminal-horizon state-constrained optimizationTerminal state constraints are quite common in the dynamic optimization literature. For the finite-horizon case, for example, one method of guaranteeing the stability of model predictive control (MPC) is with the use of a terminal state constraint . Since MPC is implemented as a discrete-time finite-horizon numerical optimization problem, the terminal state constraints can be easily implemented in an optimization program as a normal state constraint. The case of a flexible-horizon constrained optimization is not as common but can still be found. For example, one method of time-optimal control is to treat the integration timestep as a control variable while imposing state constraints on the initial and final knot points . Another method is to consider a bilevel optimization problem, where the number of knot points is optimized for in the outer loop [8; 9; 10].
+
+Goal-conditioned Reinforcement LearningThere have been many works on goal-conditioned reinforcement learning. These works mainly focus on the challenges of tackling sparse rewards [12; 14; 23; 15] or even learning without rewards completely, either via representation learning objectives [24; 25; 26; 27; 28; 29; 30; 31; 32; 33] or by using contrastive learning to learn reward functions [34; 35; 36; 37; 38; 39; 40; 41; 42; 43], often in imitation learning settings [44; 45]. However,the _manner_ in which these goals are reached is not considered, and it is difficult to extend these works to additionally minimize some cumulative cost.
+
+Constrained Reinforcement LearningOne way of using existing techniques to approximately tackle the minimum-cost reach-avoid problem is to flip the role of the cumulative-cost objective and the goal-reaching constraint by treating the goal-reaching constraint as an objective via a (sparse or dense) reward and the cumulative-cost objective as a constraint with a cost threshold, turning the problem into a CMDP . In recent year, there has been significant interest in deep RL methods for solving CMDPs [46; 47; 48]. While these methods are effective at solving the transformed CMDP problem, the optimal policy to the CMDP may not be the optimal policy to the original minimum-cost reach-constrained problem, depending on the choice of the cost constraint.
+
+State Augmentation in Constrained Reinforcement LearningTo improve reward structures in constrained reinforcement learning, especially in safety-critical systems, one effective approach is state augmentation. This technique integrates constraints, such as safety or energy costs, into the augmented state representation, allowing for more effective constraint management through the reward mechanism [49; 50; 51]. While these methods enhance the reward structure for solving the transformed CMDP problems, they still face the inherent limitation of the CMDP framework: the optimal policy for the transformed CMDP may not always correspond to the optimal solution for the original problem.
+
+Reachability AnalysisReachability analysis looks for solutions to the reach-avoid problem. That is, to solve for the set of initial conditions and an appropriate control policy to drive a system to a desired goal set while avoiding undesireable states. Hamilton-Jacobi (HJ) reachability analysis [52; 53; 54; 55; 56] provides a methodology for the case of dynamics in _continuous-time_ via the solution of a partial differential equation (PDE) and is conventionally solved via numerical PDE techniques that use state-space discretization . This has been extended recently to the case of discrete-time dynamics and solved using off-policy [57; 58] and on-policy [59; 60] reinforcement learning. While reachability analysis concerns itself with the reach-avoid problem, we are instead interested in solutions to the _minimum-cost_ reach-avoid problem.
+
+## 3 Problem Formulation
+
+In this paper, we consider a class of _minimum-cost_ reach-avoid problems defined by the tuple \(,,f,c,g,h\). Here, \(^{n}\) is the state space and \(^{m}\) is the action space. The system states \(x_{t}\) evolves under the _deterministic_ discrete dynamics \(f:\) as
+
+\[x_{t+1}=f(x_{t},u_{t}). \]
+
+The control objective for the system states \(x_{t}\) is to reach the goal region \(\) and avoid the unsafe set \(\) while minimizing the cumulative cost \(_{t=0}^{T-1}c(x_{t},(x_{t}))\) under control input \(u_{t}=(x_{t})\) for a designed control policy \(:\). Here, \(T\) denotes the first timestep that the agent reaches the goal \(\). The sets \(\) and \(\) are given as the \(0\)-sublevel and strict \(0\)-superlevel sets \(g:\) and \(h:\) respectively, i.e.,
+
+\[\{x g(x) 0\}, \{x h(x)>0\} \]
+
+This can be formulated formally as finding a policy \(\) that solves the following constrained _flexible_ final-time optimization problem for a given initial state \(x_{0}\):
+
+\[_{,T} _{t=0}^{T-1}cx_{t},(x_{t}) \] \[ x_{T},\] (3b) \[x_{t} t\{0,,T\},\] (3c) \[x_{t+1}=fx_{t},(x_{t}). \]
+
+Note that as opposed to either traditional finite-horizon constrained optimization problems where \(T\) is fixed or infinite-horizon problems where \(T=\), the time horizon \(T\) is also a decision variable. Moreover, the goal constraint (3b) is only enforced at the terminal timestep \(T\). These two differences prevent the straightforward application of existing RL methods to solve (3).
+
+### Reachability Analysis for Reach-Avoid Problems
+
+In discrete time, the set of initial states that can reach the goal \(\) without entering the avoid set \(\) can be represented by the \(0\)-sublevel set of a reach-avoid value function \(V^{}_{g,h}\). Given functions \(g\), \(h\) describing \(\) and \(\) and a policy \(\), the reach-avoid value function \(V^{}_{g,h}:\) is defined as
+
+\[V^{}_{g,h}(x_{0})=_{T}g(x_{T}^{}),\ _{t\{0,,T\}}h(x_{t}^{})}, \]
+
+where \(x_{t}^{}\) denote the system state at time \(t\) under a policy \(\) starting from an initial state \(x_{0}^{}=x_{0}\). In the rest of the paper, we suppress the argument \(x_{0}\) for brevity whenever clear from the context. It can be shown that the reach-avoid value function satisfies the following recursive relationship via the reach-avoid Bellman equation (RABE) 
+
+\[V^{}_{g,h}(x_{t}^{})=h(x_{t}^{}),\ \{g(x_{t}^{}),\,V^{}_{g,h}(x_{t+1}^{})\}}, t 0. \]
+
+The Bellman equation (5) can then be used in a reinforcement learning framework (e.g., via a modification of soft actor-critic) as done in  to solve the reach-avoid problem.
+
+Note that existing methods of solving reach-avoid problems through this formulation focus on minimizing the value function \(V^{}_{g,h}\). This is not necessary as any policy that results in \(V^{}_{g,h} 0\) solves the reach-avoid problem, albeit without any cost considerations. However, it is often the case that we wish to minimize a cumulative cost (e.g., (3a)) on top of the reach-avoid constraints (3b)-(3c) for a _minimum-cost_ reach-avoid problem. To address this class of problems, we next present a modification to the reach-avoid framework that additionally enables the minimization of the cumulative cost.
+
+### Reachability Analysis for Minimum-cost Reach-Avoid Problems
+
+We now provide a new framework to solve the minimum-cost reach-avoid by lifting the original system to a higher dimensional space and designing a set of augmented dynamics that allow us to convert the original problem into a reachability problem on the augmented system.
+
+Let \(\) denote the shifted indicator function defined as
+
+\[_{b B}+1&b B,\\ -1&b B. \]
+
+Define the _augmented_ state as \(=(x,y,z)}\{-1,1\} \). We now define a corresponding augmented dynamics function \(f^{}:}}\) as
+
+\[x_{t},y_{t},z_{t},u_{t}=f(x_{t}),\ \{_{f(x_{t})},\,y_{t}\},\ z_{t}-c(x_{t},\ u_{t}), \]
+
+where \(y_{0}=_{x_{0}}\). Note that \(y_{t}=1\) if the state has entered the avoid set \(\) at some timestep from \(0\) to \(t\) and is _unsafe_, and \(y_{t}=0\) if the state has not entered the avoid set \(\) at any timestep from \(0\) to \(t\) and is _safe_. Moreover, \(z_{t}\) is equal to \(z_{0}\) minus the cost-to-come, i.e., for state trajectory \(x_{0:t}\) and action trajectory \(u_{0:t}\), i.e.,
+
+\[z_{t+1}=z_{0}-_{k=0}^{t}c(x_{t},u_{t}). \]
+
+Under the augmented dynamics, we now define the following augmented goal function \(:}\) as
+
+\[(x,y,z)\{g(x),\,Cy,\,-z\}, \]
+
+where \(C>0\) is an arbitrary constant.2 With this definition of \(\), an augmented goal region \(}\) can be defined as
+
+\[}\{\ |\ () 0\}=\{(x,y,z)\ |\ x ,\ y=-1,\ z 0\}. \]
+
+In other words, starting from initial condition \(_{0}=(x_{0},y_{0},z_{0})\), reaching the goal on the augmented system \(_{T}\) at timestep \(T\) implies that 1) the goal is reached at \(x_{T}\) for the original system, 2) the state trajectory remains safe and does not enter the avoid set \(\), and 3) \(z_{0}\) is an upper-bound on the total cost-to-come: \(_{t=0}^{T-1}c(x_{t},u_{t}) z_{0}\). We call this the upper-bound property. The above intuition on the newly defined augmented system is formalized in the following theorem, whose proof is provided in Appendix D.1.
+
+**Theorem 1**.: For given initial conditions \(x_{0}\), \(z_{0}\) and control policy \(\), consider the trajectory for the original system \(\{x_{0}, x_{T}\}\) and its corresponding trajectory for the augmented system \(\{(x_{0},y_{0},z_{0}),(x_{T},y_{T},z_{T})\}\) for some \(T>0\). Then, the reach constraint \(x_{T}\) (3b), avoid constraint \(x_{t}\)\( t\{0,1,,T\}\) (3c) and the upper-bound property \(z_{0}_{k=0}^{T-1}cx_{k},(x_{k})\) hold if and only if the augmented state reaches the augmented goal at time \(T\), i.e., \((x_{T},y_{T},z_{T})}\).
+
+With this construction, we have folded the avoid constraints \(x_{t}\) (3c) into the reach specification on the augmented system. In other words, solving the reach problem on the augmented system results in a reach-avoid solution of the original system. As a result, we can simplify the value function (4) and Bellman equation (5), resulting in the following definition of the reach value function \(_{}:}\)
+
+\[_{}^{}(_{0})=_{t}(_{t }^{}). \]
+
+Similar to (4), the \(0\)-sublevel set of \(_{}\) describes the set of augmented states \(\) that can reach the augmented goal \(}\). We can also similarly obtain a recursive definition of the reach value function \(_{}\) given by the reachability Bellman equation (RBE)
+
+\[_{}^{}(x_{t}^{},y_{t}^{},z_{t}^{})= (x_{t}^{},\ y_{t}^{},z_{t}^{}),_{}^{}(x_{t+ 1}^{},y_{t+1}^{},z_{t+1}^{})} t 0, \]
+
+whose proof we provide in Appendix D.2.
+
+We now solve the minimum-cost reach-avoid problem using this augmented system. By Theorem 1, the \(z_{0}\) is an upper bound on the cumulative cost to reach the goal while avoiding the unsafe set if and only if the augmented state \(\) reaches the augmented goal. Since this upper bound is tight, the least upper bound \(z_{0}\) that still reaches the augmented goal thus corresponds to the minimum-cost policy that satisfies the reach-avoid constraints. In other words, the minimum-cost reach-avoid problem for a given initial state \(x_{0}\) can be reformulated as the following optimization problem.
+
+\[_{,z_{0}} z_{0} \] \[ _{}^{}(x_{0},_{x_{0}}, z_{0}) 0. \]
+
+We refer to Appendix B for a detailed derivation of the equivalence between the transformed Problem 13 and the original minimum-cost reach-avoid Problem 3.
+
+_Remark 1_ (Connections to the epigraph form in constrained optimization).: The resulting optimization problem (13) can be interpreted as an epigraph reformulation  of the minimum-cost reach-avoid problem (3). The epigraph reformulation results in a problem with _linear_ objective but yields the same solution as the original problem . The construction we propose in this work can be seen as a _dynamic_ version of this epigraph reformulation technique originally developed for static problems and is similar to recent results that also make use of the epigraph form for solving infinite-horizon constrained optimization problems .
+
+## 4 Solving with Reinforcement Learning
+
+In the previous section, we reformulated the minimum-cost reach-avoid problem by constructing an augmented system and used its reach value function (11) in a new constrained optimization problem (13) over the cost upper-bound \(z_{0}\). In this section, we propose Reachability Constrained Proximal Policy Optimization (RC-PPO), a two-phase RL-based method for solving (13) (see Figure 1).
+
+### Phase 1: Learn \(z\)-conditioned policy and value function
+
+In the first step, we learn the optimal policy \(\) and value function \(_{}^{}\), as functions of the cost upper-bound \(z_{0}\), using RL. To do so, we consider the policy gradient framework . However, since the policy gradient requires a stochastic policy in the case of deterministic dynamics , we consider an analog of the developments made in the previous section but for the case of a stochastic policy. To this end, we redefine the reach value function \(_{}^{}\) using a similar Bellman equation under a stochastic policy as follows.
+
+**Definition 1** (Stochastic Reachability Bellman Equation).: Given function \(\) in (9), a stochastic policy \(\), and initial conditions \(x_{0},z_{0}\), the stochastic reach value function \(_{}^{}\) is defined as the solution to the following stochastic reachability Bellman equation (SRBE):
+
+\[_{}^{}(_{t})=_{}[\{(_{t}),_{}^{}(_{t+1})\}] t 0, \]
+
+where \(_{0}=(x_{0},y_{0},z_{0})\) with \(y_{0}=_{x_{0}}\).
+
+For this stochastic Bellman equation, the Q function  is defined as
+
+\[_{}^{}(_{t},u_{t})=\{(_{t}), _{g}(_{t+1})\}. \]
+
+We next define the dynamics of our problem with stochastic policy below.
+
+**Definition 2** (Reachability Markov Decision Process).: The Reachability Markov Decision Process is defined on the augmented dynamic in Equation (7) with an added absorbing state \(s_{0}\). We define the transition function \(f_{r}^{}\) with the absorbing state as
+
+\[f_{r}^{}(,u)=(,u),&_{ }^{}()>((,u)),\\ s_{0},&_{}^{}()((,u)).  \]
+
+Denote by \(d_{}^{}()\) the stationary distribution under stochastic policy \(\) starting at \(\{-1,1\}\).
+
+We now derive a policy gradient theorem for the Reachability MDP in Definition 2 which yields an almost identical expression for the policy gradient.
+
+**Theorem 2**.: (Policy Gradient Theorem) For policy \(_{}\) parameterized by \(\), the gradient of the policy value function \(_{}^{_{}}\) satisfies
+
+\[_{}_{}^{_{}}() _{^{} d_{}^{}(),u_{}} [^{_{}}(^{},u)_{} _{}(u^{})], \]
+
+under the stationary distribution \(d_{}^{}()\) for Reachability MDP in Definition 2
+
+The proof of this new policy gradient theorem (Theorem 2) follows the proof of the normal policy gradient theorem , differing only in the expression of the stationary distribution. We provide the proof in Appendix D.3.
+
+Since the stationary distribution \(d_{}^{}()\) in Definition 2 is hard to simulate during the learning process, we instead consider the stationary distribution under the original augmented dynamic system. Note that Definition 1 does not induce a contraction map, which harms performance. To fix this, we apply the same trick as  by introducing an additional discount factor \(\) into the Bellman equation (12):
+
+\[_{}^{}(_{t})=(1-)(_{t})+ _{_{t+1}}[\{(_{t}), _{}^{}(_{t+1})\}]. \]
+
+Figure 1: **Summary of the RC-PPO algorithm.** In phase one, the original dynamic system is transformed into the augmented dynamic system defined in (7). Then RL is used to optimize value function \(_{}^{}\) and learn a stochastic policy \(\). In phase two, we fine-tune \(_{}^{}\) on a deterministic version of \(\) and compute the optimal upper-bound \(z^{*}\) to obtain the optimal deterministic policy \(^{*}\).
+
+This provides us with a contraction map (proved in ) and we leave the discussion of choosing \(\) in Appendix C. The Q-function corresponding to (18) is then given as
+
+\[_{}^{}(_{t},u_{t})=(1-)(_{t})+ \{(_{t}),_{}^{}(_{t+1})\}. \]
+
+Following proximal policy optimization (PPO) , we use generalized advantage estimation (GAE)  to compute a variance-reduced advantage function \(_{}^{}=_{}^{}-_{}^{}\) for the policy gradient (Theorem 2) using the \(\)-return . We refer to Appendix A for the definition of \(_{}^{()}\) and denote the loss function when \(=_{l}\) as
+
+\[_{}() =_{,u_{_{l}}}[\,}}(,u)}\,], \] \[}}}(,u) =(-(u\,|\,)}{_{_{l}}(u \,|\,)}_{}^{_{_{l}}(GAE)}(,u),\,\,(,-_{}^{_{_{l}}(GAE)}(,u)) ). \]
+
+We wish to obtain the optimal policy \(\) and the value function \(_{}^{_{}}\) conditioned on \(z_{0}\). Hence, at the beginning of each rollout, we uniformly sample \(z_{0}\) within a user-specified range \([z_{},z_{}]\). Since the optimal \(z_{0}\) is the cumulative cost of the policy that solves the minimum-cost reach-avoid problem, \(z_{}\) and \(z_{}\) are user-specified bounds on the optimal cost. In particular, when the cost-function is bounded and the optimal cost is non-negative, we can choose \(z_{}\) to be some negative number and \(z_{}\) to be the maximum possible discounted cost.
+
+### Phase 2: Solving for the optimal \(z\)
+
+In the second phase, we first compute a deterministic version \(^{*}\) of the stochastic policy \(\) from phase 1 by taking the mode. Next, we fine-tune \(V_{}^{}\) based on the now deterministic \(^{*}\) to obtain \(_{}^{*}\).
+
+Given any state \(x\), the final policy is then obtained by solving for the optimal cost upper-bound \(z^{*}\) from Equation (13), which is a 1D root-finding problem and can be easily solved using bisection. Note that Equation (13) must be solved online for \(z^{*}\) at each state \(x\). Alternatively, to avoid performing bisection online, we can instead learn the map \((x,y) z^{*}\)_offline_ using regression with randomly sampled \((x,y)\) pairs and \(z^{*}\) labels obtained from bisection offline.
+
+We provide a convergence proof of an actor-critic version of our method without the GAE estimator in Appendix E.
+
+## 5 Experiments
+
+BaselinesWe consider two categories of RL baselines. The first is goal-conditioned reinforcement learning which focuses on goal-reaching but does not consider minimization of the cost. For this category, we consider the Contrastive Reinforcement Learning (CRL)  method. We also compare against safe RL methods that solve CMDPs. As the minimum-cost reach-avoid problem (3) cannot be posed as a CMDP, we reformulate (3) into the following _surrogate_ CMDP:
+
+\[ _{x_{t},u_{t} d_{}}_{t}-^{t}r(x _{t},u_{t}) \] \[ _{x_{t},u_{t} d_{}}_{t}^{t} _{x_{t}} C_{} 0,\] (22b) \[_{x_{t},u_{t} d_{}}_{t}^{t}c(x _{t},u_{t})_{}. \]
+
+where the reward \(r\) incentives goal-reaching, \(C_{}\) is a term balancing two constraint terms, and \(_{}\) is a hyperparameter on the cumulative cost. For this category, we consider the CPPO  and RESPO . Note that RESPO also incorporates reachability analysis to adapt the Lagrange multipliers for each constraint term. We implement the above CMDP-based baselines with three different choices of \(_{}\): \(_{}\), \(_{}\) and \(_{}\). For RESPO, we found \(_{}\) to outperform both \(_{}\) and \(_{}\) and thus only report results for \(_{}\).
+
+We also consider the static Lagrangian multiplier case. In this setting, the reward function becomes \(r(x_{t})-(_{x_{t}} C_{}+c(x _{t},u_{t}))\) for a constant Lagrange multiplier \(\). We consider two different levels of \(\) (\(_{}\), \(_{}\)) in our experiments, resulting in the baselines \(}}\), \(}}\), \(}}\), \(}}\). More details are provided in Appendix F.
+
+BenchmarksWe compare RC-PPO with baseline methods on several minimum-cost reach-avoid environments. We consider an inverted pendulum (Pendulum), an environment from Safety Gym  (PointGoal) and two custom environments from MuJoCo , (Safety Hopper, SafetyHalfCheetah) with added hazard regions and goal regions. We also consider a 3D quadrotor navigation task in a simulated wind field for an urban environment  (WindField) and an Fixed-Wing avoid task from  with an additional goal region (FixedWing). More details on the benchmark can be found in Appendix G.
+
+Evaluation MetricsSince the goal of RC-PPO is minimizing cost consumption while reaching goal without entering the unsafe region \(\). We evaluate algorithm performance based on (i) reach rate, (ii) cost. The **reach rate** is the ratio of trajectories that enter goal region \(\) without violating safety along the trajectory. The **cost** denotes the cumulative cost over the trajectory \(_{k=0}^{T}c(x_{k},(x_{k}))\).
+
+### Sparse Reward Setting
+
+We first compare our algorithm with other baseline algorithms under a sparse reward setting (Figure 3). In all environments, the reach rate for the baseline algorithms is very low. Also, there is a general trend between the reach rate and the Lagrangian coefficient. CPPO_\(_{}\), PPO_\(_{}\) and SAC_\(_{}\) have higher Lagrangian coefficients which lead to a lower reach rate.
+
+### Comparison under Reward Shaping
+
+Reward shaping is a common method that can be used to improve the performance of RL algorithms, especially in the sparse reward setting . To see whether the same conclusions still hold even in the presence of reward shaping, we retrain the baseline methods but with reward shaping using a distance function-based potential function (see Appendix F for more details).
+
+The results in Figure 4 demonstrate that RC-PPO remains competitive against the best baseline algorithms in reach rate while achieving significantly lower cumulative costs. The baseline methods (PPO_\(_{}\), SAC_\(_{}\), CPPO_\(_{}\)) fail to achieve a high reach rate due to the large weights placed on minimizing the cumulative cost. CRL can reach the goal for simpler environments (Pendulum) but struggles with more complex environments. However, since goal-conditioned methods do not consider minimize cumulative cost, it achieves a higher cumulative cost relative to other methods.
+
+Figure 3: **Reach rates under the sparse reward setting. RC-PPO consistently achieves the highest reach rates in all benchmark tasks. Error bars denote the standard error.**
+
+Figure 2: **Illustrations of the benchmark tasks. In each picture, red denotes the unsafe region to be avoided, while green denotes the goal region to be reached.**
+
+Other baselines focus more on goal-reaching tasks while putting less emphasis on the cost part. As a result, they suffer from higher costs than RC-PPO. We can also observe that RESPO achieves lower cumulative cost compared to CPPO_\(_{}\) which shares the same \(_{}\). This is due to RESPO making use of reachability analysis to better satisfy constraints.
+
+To see how RC-PPO achieves lower cumulative costs, we visualize the resulting trajectories for Pendulum and WindField in Figure 5. For Pendulum, we see that RC-PPO learns to perform energy pumping to reach the goal in more time but with a smaller cumulative cost. The optimal behavior is opposite in the case of WindField, which contains an additional constant term in the cost to model the energy draw of quadcopters (see Appendix G). Here, we see that RC-PPO takes advantage of the wind at the beginning by moving _downwind_, arriving at the goal faster and with less cumulative cost.
+
+We also visualize the learned RC-PPO policy for different values of \(z\) on the Pendulum benchmark (see Appendix H.2). For small values of \(z\), the policy learns to minimize the cost, but at the expense of not reaching the goal. For large values of \(z\), the policy reaches the goal quickly but at the expense of a large cost. The optimal \(z_{}\) found using the learned value function \(_{}^{_{}}\) finds the \(z\) that minimizes the cumulative cost but is still able to reach the goal.
+
+### Optimal solution of minimum-cost reach-avoid cannot be obtained using CMDP
+
+Though the previous subsections show the performance benefits of RC-PPO over existing methods, this may be due to badly chosen hyperparameters for the baseline methods, particularly in the formulation of the _surrogate_ CMDP (22). We thus pose the following question: **Can CMDP methods perform well under the right parameters of the surrogate CMDP problem** (22)?
+
+Figure 4: **Cumulative cost (IQM) and reach rates under reward shaping on four selected benchmarks. RC-PPO achieves significantly lower cumulative costs while retaining comparable reach rates even when compared with baseline methods that use reward shaping.**
+
+Figure 5: **Trajectory comparisons. On Pendulum, RC-PPO learns to perform an extensive energy pumping strategy to reach the goal upright position (green line), resulting in vastly lower cumulative energy. On WindField, RC-PPO takes advantage instead of fighting against the wind field, resulting in a faster trajectory to the goal region (green box) that uses lower cumulative energy. The start of the trajectory is marked by \(\).**
+
+**Empirical Study.** To answer this question, we first perform an extensive grid search over both the different coefficients in (22) and the static Lagrange multiplier for PPO (see Appendix H.3) and plot the result in Figure 6. RC-PPO outperforms the entire Pareto front formed from this grid search, providing experimental evidence that the performance improvements of RC-PPO stem from having a better problem formulation as opposed to badly chosen hyperparameters for the baselines.
+
+**Theoretical Analysis on Simple Example.** To complement the empirical study, we provide an example of a simple minimum-cost reach-avoid problem where we prove that no choice of hyperparameter leads to the optimal solution in Appendix I.
+
+### Robustness to Noise
+
+Finally, we investigate the robustness to varying levels of control noise in Appendix H.4. Even with the added noise, RC-PPO achieves the lowest cumulative cost while maintaining a comparable reach rate to other methods.
+
+## 6 Conclusion and Limitations
+
+We have proposed RC-PPO, a novel reinforcement learning algorithm for solving minimum-cost reach-avoid problems. We have demonstrated the strong capabilities of RC-PPO over prior methods in solving a multitude of challenging benchmark problems, where RC-PPO learns policies that match the reach rates of existing methods while achieving significantly lower cumulative costs.
+
+However, it should be noted that RC-PPO is not without limitations. First, the use of augmented dynamics enables folding the safety constraints within the goal specifications through an additional binary state variable. While this reduces the complexity of the resulting algorithm, it also means that two policies that are both unable to reach the goal can have the same value \(_{q^{}}^{}\) even if one is unsafe, which can be undesirable. Next, the theoretical developments of RC-PPO are dependent on the assumptions of deterministic dynamics, which can be quite restrictive as it precludes the use of commonly used techniques for real-world deployment such as domain randomization. We acknowledge these limitations and leave resolving these challenges as future work.

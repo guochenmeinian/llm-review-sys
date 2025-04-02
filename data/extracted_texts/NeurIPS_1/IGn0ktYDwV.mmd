@@ -1,0 +1,218 @@
+# SAMPa: Sharpness-aware Minimization Parallelized
+
+Wanyun Xie
+
+EPFL (LIONS)
+
+wanyun.xie@epfl.ch &Thomas Pethick
+
+EPFL (LIONS)
+
+thomas.pethick@epfl.ch &Volkan Cevher
+
+EPFL (LIONS)
+
+volkan.cevher@epfl.ch
+
+###### Abstract
+
+Sharpness-aware minimization (SAM) has been shown to improve the generalization of neural networks. However, each SAM update requires _sequentially_ computing two gradients, effectively doubling the per-iteration cost compared to base optimizers like SGD. We propose a simple modification of SAM, termed SAMPa, which allows us to fully parallelize the two gradient computations. SAMPa achieves a twofold speedup of SAM under the assumption that communication costs between devices are negligible. Empirical results show that SAMPa ranks among the most efficient variants of SAM in terms of computational time. Additionally, our method consistently outperforms SAM across both vision and language tasks. Notably, SAMPa theoretically maintains convergence guarantees even for _fixed_ perturbation sizes, which is established through a novel Lyapunov function. We in fact arrive at SAMPa by treating this convergence guarantee as a hard requirement--an approach we believe is promising for developing SAM-based methods in general. Our code is available at [https://github.com/LIONS-EPFL/SAMPa](https://github.com/LIONS-EPFL/SAMPa).
+
+## 1 Introduction
+
+The rise in deep neural network (DNN) usage has spurred a resource examination of training optimization methods, particularly focusing on bolstering their _generalization ability_. Generalization refers to a DNN's proficiency in effectively processing and responding to new, previously unseen data originating from the same distribution as the training dataset. A DNN with robust generalizability can reliably perform well on real-world tasks, when confronted with novel data instances or when quantized.
+
+Improving generalization poses a significant challenge in machine learning. Recent studies suggest that smoother loss landscapes lead to better generalization . Motivated by this concept, _Sharpness-Aware Minimization (SAM)_ has emerged as a promising optimization approach . It is the current state-of-the-art to seek flat minima by solving a min-max optimization problem, in which the inner maximizer quantifies the sharpness as the maximized change of training loss and the minimizer both the vanilla training loss and the sharpness. As a result, SAM significantly improves the generalization ability of the trained DNNs which has been observed across various supervised learning tasks in both vision and language domains . Moreover, some variants of SAM improve its generalization further .
+
+Although SAM and some variants achieve remarkable generalization improvement, they increase the computational overhead of the given base optimizers. In SAM algorithm , each update consists of two forward-backward computations: one for computing the perturbation and the other for computing the update direction. Since these two computations are not parallelizable, SAM doubles the training time compared to the standard empirical risk minimization (ERM).
+
+Several variants of SAM have been proposed to improve its efficiency. A common strategy involves integrating SAM with base optimizers in an alternating fashion like RST , LookSAM , and AE-SAM . Moreover, ESAM uses fewer samples and updates fewer parameters to decrease the computational cost. However, some of these algorithms are suboptimal and their computational time overhead cannot be ignored completely. Du et al. (2022) utilize loss trajectory instead of a single ascent step to estimate sharpness, albeit at the expense of memory consumption due to the storage of historical outputs or past models.
+
+Since the runtime of SAM critically depends on the sequential computation of its gradients, we ask
+
+_Can we perform these two gradient computations in parallel?_
+
+In the sequel, we will answer this question in the affirmative. Note that since the second gradient computation highly depends on the first one seeking the worst case around the neighborhood, it is challenging to break the sequential relationship between two gradients in one update.
+
+To this end, we introduce a new optimization sequence that allows us to parallelize these two gradient computations completely. Furthermore, we also integrate the optimistic gradient descent method with our parallelized version of SAM. Our final algorithm, named SAMPa, not only allows for a theoretical speedup up to \(2\) when there is no communication overhead but also improves the generalization further. Specifically, we make the following contributions:
+
+* **Parallelized formulation of SAM.** We propose a novel parallelized solution for SAM, which breaks the sequential nature of two gradient computations in each SAM's update. It enables the simultaneous calculation of both gradients, potentially halving the computational time compared to vanilla SAM. We also integrate this parallelized method with the optimistic gradient descent method, known for its stabilizing properties, finalized to SAMPa.
+* **Convergence guarantees.** Our theoretical analysis establishes a novel Lyapunov function, through which we prove convergence guarantees of SAMPa even with a _fixed_ perturbation size. We arrive at SAMPa by treating this convergence guarantee as a hard requirement, which we believe is promising for developing other SAM-based methods.
+* **Improved generalization and efficiency.** Our numerical evidence shows that SAMPa significantly reduces overall computational time even with a basic implementation while achieving superior generalization performance. Indeed, SAMPa requires the least computational time compared to the other four efficient SAM variants while enhancing generalization across different tasks. Notably, the relative improvement from SAM to SAMPa is \(62.07\%\) on CIFAR-10 and \(32.65\%\) on CIFAR-100, comparable to the gains from SGD to SAM. SAMPa also shows benefits on a large-scale dataset (ImageNet-1K), image and NLP fine-tuning tasks, as well as noisy label tasks, with the capability to integrate with other SAM variants.
+
+## 2 Background and Challenge of SAM
+
+This section starts with a brief introduction to SAM and its sequential nature of gradient computations. Subsequently, we discuss naive attempts including an approach from existing literature and our initial attempt which serve as essential motivation for constructing our final algorithm in the next section.
+
+### SAM and its challenge
+
+Motivated by the concept of minimizing sharpness to enhance generalization, SAM attempts to enforce small loss around the neighborhood in the parameter space (Foret et al., 2021). It is formalized by a minimax problem
+
+\[_{x}_{:\|\|}f(x+) \]
+
+where \(f\) is a model parametrized by a weight vector \(x\), and \(\) is the radius of considered neighborhood.
+
+The inner maximization of Equation (1) seeks for maxima around the neighborhood. To address the inner maximization problem, Foret et al. (2021) employ a first-order Taylor expansion of \(f(x+)\) with respect to \(\) in proximity to \(0\). This approximation yields:
+
+\[^{}=*{arg\,max}_{:\|\|}f(x+ )*{arg\,max}_{:\|\|}f(x)+  f(x),= \]SAM first obtains the perturbed weight \(=x+^{*}\) by this approximated worst-case perturbation and then adopts the gradient of \(\) to update the original weight \(x\). Consequently, the updating rule at each iteration \(t\) during practical training is delineated as follows:
+
+\[_{t}=x_{t}+)}{\| f(x_{t})\|}, x_ {t+1}=x_{t}-_{t} f(_{t})\] (SAM)
+
+It is apparent from SAM, that the update requires two gradient computations for each iteration, which are on the clean weight \(x_{t}\) and the perturbed weight \(_{t}\) respectively. These two computations are _not parallelizable_ because the gradient at the perturbed point \( f(_{t})\) highly depends on the gradient \( f(x_{t})\) through the computation of the perturbation \(_{t}\). Therefore, SAM doubles the computational overhead as well as the training time compared to base optimizers _e.g.,_ SGD.
+
+### Naive attempts
+
+The computational overhead of SAM is primarily due to the first gradient for computing the perturbation as discussed in Section 2.1. _Can we avoid this additional gradient computation?_ Random perturbation offers an alternative to the worst-case perturbation in SAM, as made precise below:
+
+\[_{t} =x_{t}+}{\|e_{t}\|} e_{t} (0,I)\] (RandSAM) \[x^{t+1} =x^{t}-_{t} f(_{t})\]
+
+Unfortunately, it has been demonstrated empirically that RandSAM does not perform as well as SAM (Foret et al., 2021; Andriushchenko and Flammarion, 2022). The poor performance of RandSAM is maybe not surprising, considering that RandSAM does not converge even for simple convex quadratics as demonstrated in Figure 1.
+
+We argue that the algorithm we construct should at least be able to solve the original minimization problem. Recently, Si and Yun (2024, Thm. 3.3) very interestingly proved that SAM converges for convex and smooth objectives even with a _fixed_ perturbation size \(\). Fixed \(\) is interesting to study, firstly, because it is commonly used and successful in practice (Foret et al., 2021; Kwon et al., 2021). Secondly, convergence results relying on decreasing perturbation size are usually agnostic to the direction of the perturbation (Nam et al., 2023; Khan et al., 2024), so the results cannot distinguish between RandSAM and SAM, which behaves strikingly different in practice.
+
+The fact that SAM uses the gradient direction \( f(x_{t})\) in the perturbation update, turns out to play an important role when showing convergence. It is thus natural to ask whether another gradient could be used instead. Inspired by the reuse of past gradients in the optimistic gradient method (Popov, 1980; Rakhlin and Sridharan, 2013; Daskalakis et al., 2017), an intuitive attempt is using the previous gradient at the perturbed model, such that \( f(y_{t})= f(_{t-1})\), as outlined in the following update:
+
+\[_{t}=x_{t}+_{t-1})}{\| f( _{t-1})\|}, x_{t+1}=x_{t}-_{t} f(_{ t})\] (OptSAM)
+
+Notice that only one gradient computation is needed for each update. However, the empirical findings detailed in Appendix B.1 reveal that OptSAM fails to match SAM and even performs worse than SGD. In fact, such failure is already apparent in a simple toy example demonstrated in Figure 1, where OptSAM fails to converge. It is not surprising to see its failure. To be specific, in contrast with the optimistic gradient method, \(_{t}\) in OptSAM represents an ascent step from \(x_{t}\) while \(x_{t+1}\) denotes a descent step from \(x_{t}\), making \( f(_{t})\) a poor estimate of \( f(x_{t+1})\). In the subsequent Section 3 we detail a principled way of correcting this issue by developing SAMPa.
+
+**Toy example.** We use a toy example \(f(x)=\|x\|^{2}\) to test if an algorithm can be optimized. We show the convergent performance of SAM, two naive attempts in this section, and SAMPa-\(\) that is our algorithm proposed in Section 3. The results in Figure 1 demonstrate that RandSAM and OptSAM fail to converge, whereas SAM and SAMPa-\(\) converge successfully.
+
+```
+Input: Initialization \(x_{0}^{d}\), initialization \(y_{0}=x_{0}\) and \(g_{0}= f(y_{0},_{0})\), iterations \(T\), step sizes \(\{_{t}\}_{t=0}^{T-1}\), neighborhood size \(>0\), interpolation ratio \(\).
+1for\(t=0\)to\(T-1\)do
+2 Keep minibatch \(_{t}\) and sample minibatch \(_{t+1}\).
+3 Compute perturbed weight \(_{t}=x_{t}+}{\|g_{t}\|}\).
+4 Compute the auxiliary sequence \(y_{t+1}=x_{t}-_{t}g_{t}\).
+5 Compute gradients \(_{t}= f(_{t},_{t})\) and \(g_{t+1}= f(y_{t+1},_{t+1})\) in parallel.
+6 Obtain the final gradient \(G_{t}=(1-)_{t}+ g_{t+1}\).
+7 Update weights \(x_{t+1}=x_{t}-_{t}G_{t}\).
+```
+
+**Algorithm 1** SAM Parallelized (SAMPa)
+
+## 3 SAM Parallelized (SAMPa)
+
+As discussed in Section 2.2, we wish to ensure that our developed (parallelizable) SAM variant maintains convergence in convex smooth problems even when using a _fixed_ perturbation size. To break the sequential nature of SAM, we seek to replace the gradient \( f(x_{t})\) with another gradient \( f(y_{t})\) computed at some auxiliary sequence \((y_{t})_{t}\). Provided the importance of the gradient direction \( f(x_{t})\) in the convergence proof of SAM, we are interested in picking the sequence \((y_{t})_{t}\) such that the difference \(\| f(x_{t})- f(y_{t})\|\) can be controlled. Additionally, we need to ensure that \( f(_{t})\) and \( f(y_{t+1})\) can be computed in parallel.
+
+Considering these design constraints, we arrive at the SAMPa method that is similar to SAM apart from the gradient used in perturbation calculation is computed at the auxiliary sequence \((y_{t})_{t}\), as illustrated in the following update:
+
+\[_{t} =x_{t}+)}{\| f(y_{t})\|}\] (SAMPa) \[y_{t+1} =x_{t}-_{t} f(y_{t})\] \[x_{t+1} =x_{t}-_{t} f(_{t})\]
+
+where the particular choice \(y_{t+1}\) is a direct consequence of the analysis, as discussed in Appendix C. Importantly, \( f(_{t})\) and \( f(y_{t+1})\) can be computed in parallel in this case. Intuitively, if \( f(y_{t})\) and \( f(x_{t})\) are not too different then the scheme will behave like SAM. This intuition will be made precise by our potential function used in the analysis of Section 4.
+
+In SAMPa the gradient at the auxiliary sequence \( f(y_{t+1})\) is only used for the perturbation update. It is reasonable to ask whether the gradient can be reused elsewhere in the update. As \(y_{t+1}\) can be viewed as an extrapolated sequence of \(x_{t}\), it is directly related to the optimistic gradient descent method (Popov, 1980; Rakhlin and Sridharan, 2013; Daskalakis et al., 2017) as outlined below:
+
+\[y_{t+1}=x_{t}-_{t} f(y_{t}), x_{t+1}=x_{t}-_{t} f(y_{ t+1})\] (OptGD)
+
+This celebrated scheme is known for its stabilizing properties as made precise through its ability to converge even for minimax problems. By simply taking a convex combination of these two convergent schemes, \(x_{t+1}=(1-)(x_{t})+(x_ {t})\), we arrive at the following update rule:
+
+\[_{t} =x_{t}+)}{\| f(y_{t})\|}\] (SAMPa- \[\] ) \[y_{t+1} =x_{t}-_{t} f(y_{t})\] \[x_{t+1} =x_{t}-_{t}(1-) f(_{t})-_{t}  f(y_{t+1})\]
+
+where \(\). Notice that SAMPa is obtained as the special case SAMPa-\(0\) whereas SAMPa-\(1\) recovers OptSAM. Importantly, SAMPa-\(\) still admits parallel gradient computations and requires the same number of gradient computations as SAMPa.
+
+SAMPa with stochasticity.An interesting observation in the SAM implementation is that both gradients for perturbation and correction steps have to be computed on the same batch; otherwise, SAM's performance may deteriorate compared to the base optimizer. This is validated by our empirical observation in Appendix B.2 and supported by (Li and Giannakis, 2024; Li et al., 2024). Therefore, we need to be careful when deploying SAMPa in practice.
+
+Considering the stochastic setting, we present the finalized algorithm named SAMPa in Algorithm 1. Note that \(_{t}= f(_{t},_{t})\) represents the stochastic gradient estimate of the model \(_{t}\) on mini-batch \(_{t}\), and similarly \(g_{t+1}= f(y_{t+1},_{t+1})\) is the gradient of the model \(y_{t+1}\) on mini-batch \(_{t+1}\). This ensures that the gradient \(g_{t}\), used to calculate the perturbed weight \(_{t}\) (line 3), is computed on the same batch as the gradient \(_{t}\). As demonstrated in line 5, SAMPa also requires 2 gradient computations for each update. Despite this, SAMPa only needs half of the computational time of SAM because \(_{t}\) and \(g_{t+1}\) are calculated in parallel.
+
+## 4 Analysis
+
+In this section, we will show convergence of SAMPa even with a _nondecreasing_ perturbation radius. The analysis relies on the following standard assumptions.
+
+**Assumption 4.1**.: _The function \(f:^{d}\) is convex._
+
+**Assumption 4.2**.: _The operator \( f:^{d}^{d}\) is \(L\)-Lipschitz with \(L(0,)\), i.e.,_
+
+\[\| f(x)- f(y)\| L\|x-y\| x,y^{n}.\]
+
+The direction of the gradient used in the perturbation turns out to play a crucial role in the analysis. Specifically, we will show that the auxiliary gradient \( f(y_{t})\) in SAMPa can safely be used as a replacement of the original gradient \( f(x_{t})\) in SAM, since we will be able to control their difference. This is made precise by the following potential function used in our analysis:
+
+\[_{t}:=f(x_{t})+(1-_{t}L)\| f(x_{t})- f( y_{t})\|^{2}.\]
+
+As the potential function suggests we will be able to telescope the last term, which means that our convergence will remarkably only depend on the _initial_ difference \(\| f(y_{0})- f(x_{0})\|\), whose dependency we can remove entirely by choosing the initialization as \(x_{0}=y_{0}\). See the proof of Theorem 4.4 for details. In the following lemma we establish descent of the potential function.
+
+**Lemma 4.3**.: _Suppose Assumptions 4.1 and 4.2 hold. Then SAMPa satisfies the following descent inequality for \(>0\) and a decreasing sequence \((_{t})_{t}\) with \(_{t}(0,\{1,}{{L}}\})\) and \(c(0,1)\),_
+
+\[_{t+1}_{t}-_{t}(1-L}{2})\| f (x_{t})\|^{2}+_{t}^{2}^{2}C\]
+
+_where \(C=(L^{2}+L^{3}+}L^{4})\)._
+
+Notice that \(_{t}\) is importantly squared in front of the error term \(^{2}C\), while this is not the case for the term \(-\| f(x_{t})\|^{2}\). This allows us to control the error term while still providing convergence in terms of \(\| f(x_{t})\|^{2}\) as made precise by the following theorem.
+
+**Theorem 4.4**.: _Suppose Assumptions 4.1 and 4.2 hold. Then SAMPa satisfies the following descent inequality for \(>0\) and a decreasing sequence \((_{t})_{t}\) with \(_{t}(0,\{1,}{{2L}}\})\),_
+
+\[_{t=0}^{T-1}(1-_{t}L/2)}{_{t=0}^{T-1}_{t}(1- _{t}L/2)}\| f(x_{t})\|^{2}+C^{2}_{t=0}^ {T-1}_{t}^{2}}{_{t=0}^{T-1}_{t}(1-_{t}L/2)} \]
+
+_where \(_{0}=f(x_{0})-_{x^{d}}f(x)\) and \(C=+L^{3}}{2}+}{3}\). For \(_{t}=\{}}{},\{,1\}\}\)_
+
+\[_{t=0,,T-1}\| f(x_{t})\|^{2}=}{T}+C}}{} \]
+
+_Remark 4.5_.: Convergence follows as long as \(_{t=0}^{}_{t}=\) and \(_{t=0}^{}_{t}^{2}<\), since the stepsize allows the right hand side to be made arbitrarily small. Note that Theorem 4.4 even allows for an _increasing_ perturbation radius \(_{t}\), since it suffice to assume \(_{t=0}^{}_{t}=\) and \(_{t=0}^{}_{t}^{2}_{t}^{2}<\).
+
+## 5 Experiments
+
+In this section, we demonstrate the benefit of SAMPa across a variety of models, datasets and tasks. It is worth noting that to enable parallel computation of SAMPa, we perform the two gradient calculations across 2 GPUs. As shown in Algorithm 1, one GPU computes \( f(_{t},_{t})\) while another computes \( f(y_{t+1},_{t+1})\). For implementation guidance, we provide pseudo-code in Appendix E, along with algorithms detailing the integration of SAMPa with SGD and AdamW, both used as base optimizers in this section.
+
+[MISSING_PAGE_FAIL:6]
+
+**ImageNet-1K.** We evaluate SAM and SAMPa-0.2 on ImageNet-1K [Russakovsky et al., 2015], using \(90\) training epochs, a weight decay of \(10^{-4}\), and a batch size of \(256\). Other parameters match those of CIFAR-10. Each method undergoes \(3\) independent experiments, with test accuracies detailed in Table 3. Note that we omit SGD experiments due to computational constraints; however, prior research confirms SAM and its variants outperform SGD [Foret et al., 2021, Kwon et al., 2021].
+
+### Efficiency comparison with efficient SAM variants
+
+To comprehensively evaluate the efficiency gains of SAMPa compared to other variants of SAM in practical scenarios, we conduct experiments using five additional SAM variants on the CIFAR-10 dataset with ResNet-56 (detailed configuration in Appendix B.4): LookSAM [Liu et al., 2022], AE-SAM [Jiang et al., 2023], SAF [Du et al., 2022b], MESA [Du et al., 2022b], and ESAM [Du et al., 2022a]. Specifically, LookSAM alternates between SAM and a base optimizer periodically, while AE-SAM selectively employs SAM when detecting local sharpness. SAF and MESA eliminate the ascent step and introduce an extra trajectory loss term to reduce sharpness. ESAM leverages two strategies, _Stochastic Weight Perturbation (SWP)_ and _Sharpness-sensitive Data Selection (SDS)_, for efficiency.
+
+The number of sequentially computed gradients, as shown in Figure 1(a), serves as a metric for computational time in an ideal scenario. Notably, SAMPa, SAF, and MESA require the fewest number of sequential gradients, each needing only half of SAM's. Specifically, SAF and MESA necessitate just one gradient computation per update, while SAMPa parallelizes two gradients per update.
+
+However, real-world computational time encompasses more than just gradient computation; it includes forward and backward pass time, weight revision time, and potential communication overhead in distributed settings. Therefore, we present the actual training time in Figure 1(b), revealing that SAMPa and SAF serve as the most efficient methods. LookSAM and AE-SAM, unable to entirely avoid computing two sequential gradients per update, exhibit greater time consumption than SAMPa as expected. MESA, requiring an additional forward step compared to the base optimizer during implementation, cannot halve the computation time relative to SAM's. Regarding ESAM, we solely integrate SWP in this experiment, as no efficiency advantage is observed compared to SAM when SDS is included. The reported time of SAMPa-0.2 in Figure 1(b) includes 7.5% communication overhead across GPUs. Achieving a nearly 2\(\) speedup in runtime could be possible with faster interconnects between GPUs. In addition, the test accuracies and the wall-clock time per epoch are reported in Table 4. SAMPa-0.2 achieves strong performance and meanwhile requires near-minimal computational time.
+
+    & **SAM** & **SAMPa-0.2** & **LookSAM** & **AE-SAM** & **SAF** & **MESA** & **ESAM** \\  Accuracy & \(94.26\) & \(\) & \(91.42\) & \(94.46\) & \(93.89\) & \(94.23\) & \(94.21\) \\ Time/Epoch (s) & \(18.81\) & \(10.94\) & \(16.28\) & \(13.47\) & \(\) & \(15.43\) & \(15.97\) \\   
+
+Table 4: **Efficient SAM variants.** The best result is in bold and the second best is underlined.
+
+    & **SAM** & **SAMPa-0.2** \\  Top1 & \(77.25_{ 0.05}\) & \(_{ 0.03}\) \\ Top5 & \(93.60_{ 0.04}\) & \(_{ 0.08}\) \\   
+
+Table 3: **Top1/Top5 maximum test accuracies on ImageNet-1K.**
+
+Figure 2: **Computational time comparison for efficient SAM variants.** SAMPa-0.2 requires near-minimal computational time in both ideal and practical scenarios.
+
+### Transfer learning
+
+We demonstrate the benefits of SAMPa in transfer learning across vision and language domains.
+
+Image fine-tuning.We conduct transfer learning experiments using the pre-trained ViT-B/16 checkpoint from Visual Transformers (Wu et al., 2020), fine-tuning it on CIFAR-10 and CIFAR-100 datasets. AdamW is employed as the base optimizer, with gradient clipping applied at a global norm of 1. Training runs for 10 epochs, with a peak learning rate of \(10^{-4}\). Other parameters remain consistent with those outlined in Section 5.1. Results in Table 5 show the benefits of SAMPa in image fine-tuning.
+
+NLP fine-tuning.To explore if SAMPa can benefit the natural language processing (NLP) domain, we show empirical text classification results in this section. In particular, we use BERT-base model and finetune it on the GLUE datasets (Wang et al., 2018). We use AdamW as the base optimizer under a linear learning rate schedule and gradient clipping with global norm 1. We set the peak learning rate to \(2 10^{-5}\) and batch size to \(32\), and run \(3\) epochs with an exception for MRPC and WNLI which are significantly smaller datasets and where we used \(5\) epochs. Note that we set \(=0.05\) for all datasets except for CoLA with \(=0.01\), and RTE and STS-B with \(=0.005\). The setting of \(\) is uniformly applied across SAM, SAMPa-0 and SAMPa-0.1. We report the results computed over 10 independent executions in the Table 6, which demonstrates that SAMPa also benefits in NLP domain.
+
+### Noisy label task
+
+We test on a task outside the i.i.d. setting that the method was designed for. Following Foret et al. (2021) we consider label noise, where a fraction of the labels in the training set are corrupted to another label sampled uniformly at random. Through a grid search over \(\{0.005,0.01,0.05,0.1,0.2\}\), we set \(=0.1\) for SAM, SAMPa-0 and SAMPa-0.2 except for adjusting \(=0.01\) when the noise rate is \(80\%\). Other experimental setup is the same as in Section 5.1. We find that SAMPa-0.2 enjoys better robustness to label noise than SAM.
+
+### Incorporation with other SAM variants
+
+We demonstrate the potential of SAMPa to enhance generalization further by integrating it with other variants of SAM. Specifically, we examine the results of combining SAMPa with five SAM variants: mSAM (Foret et al., 2021; Behdin et al., 2023), ASAM (Kwon et al., 2021), SAM-ON (Mueller et al., 2024), VaSSO (Li and Giannakis, 2024), and BiSAM (Xie et al., 2024). Our experiments utilize Resnet-56 on CIFAR-10 trained with SAM and SAMPa-0.2, maintaining the same experimental setup as detailed in Section 5.1. Further specifics on the experimental configuration are provided in Appendix B.4. The results summarized in Table 8 underscore the seamless integration of SAMPa with these variants, leading to notable improvements in both generalization and efficiency.
+
+    &  & **CoLA** & **SST-2** & **MRPC** & **STS-B** & **QQP** & **MNLI** & **QNLI** & **RTE** & **WNLI** \\   & & _Mcc._ & _Acc._ & _Acc._/_F1._ & _Pear/Spa._ & _Acc._/_F1._ & _Acc._ & _Acc._ & _Acc._ & _Acc._ \\  AdamW & \(74.6\) & \(56.6\) & \(91.6\) & \(85.6/89.9\) & \(85.4/85.3\) & \(90.2/86.8\) & \(82.6\) & \(89.8\) & \(62.4\) & \(26.4\) \\ -w SAM & \(76.6\) & \(58.8\) & \(92.3\) & \(86.5/90.5\) & \(85.0/85.0\) & \(90.6/87.5\) & \(83.9\) & \(90.4\) & \(60.6\) & \(41.2\) \\ -w SAMPa-0 & \(76.9\) & \(58.9\) & \(92.5\) & \(86.4/90.4\) & \(85.0/85.0\) & \(90.6/87.6\) & \(83.8\) & \(90.4\) & \(60.4\) & \(43.2\) \\ -w SAMPa-0.1 & \(\) & \(58.9\) & \(92.5\) & \(86.8/90.7\) & \(85.2/85.1\) & \(90.7/87.7\) & \(84.0\) & \(90.5\) & \(61.3\) & \(51.6\) \\   
+
+Table 6: **Test results of BERT-base fine-tuned on GLUE.**
+
+  
+**Noise rate** & **SGD** & **SAM** & **SAMPa-0** & **SAMPa-0.2** \\  \(0\%\) & \(94.22_{ 0.14}\) & \(94.36_{ 0.07}\) & \(94.36_{ 0.12}\) & \(_{ 0.08}\) \\ \(20\%\) & \(88.65_{ 0.75}\) & \(92.20_{ 0.06}\) & \(92.22_{ 0.10}\) & \(_{ 0.09}\) \\ \
+
+## 6 Related Works
+
+SAM.Inspired by the strong correlation between the generalization of a model and the flat minima revealed in , Foret et al.  propose SAM seeking for a flat minima to improve generalization capability. SAM frames a minimax optimization problem that aims to achieve a minima whose neighborhoods also have low loss. To solve this minimax problem, the most popular way is using an ascent step to approximate the solution for the inner maximization problem with the fact that SAM with more ascent steps does not significantly enhance generalization . Notably, SAM has demonstrated effectiveness across various supervised learning tasks in computer vision , with studies demonstrating the realm of NLP tasks .
+
+Efficient variants of SAM.Compared with base optimizers like SGD, SAM doubles computational overhead stemming from its need for an extra gradient computation for perturbation per iteration. Efforts to alleviate SAM's computational burden have yielded several strategies. Firstly, strategies integrating SAM with base optimizers in an alternating fashion have been explored. For instance, _Randomized Sharpness-Aware Training (RST)_ employs a Bernoulli trial to randomly alternate between the base optimizer and SAM. Similarly, _LookSAM_ periodically computes the ascent step and utilizes the previous direction to promote flatness. Additionally, _Adaptive policy to Employ SAM (AE-SAM)_ selectively applies SAM when detecting local sharpness, as indicated by the gradient norm.
+
+Efficiency improvements have also been pursued by other means. _Efficient SAM (ESAM)_ enhances efficiency by leveraging less data, employing strategies such as Stochastic Weight Perturbation and Sharpness-sensitive Data Selection to subset random variables or mini-batch elements during optimization. Moreover, _Sparse SAM (SSAM)_ and _SAM-ON_ achieve computational gains by only perturbing a subset of the model's weights, which enhances efficiency during the backward pass when only sparse gradients are needed. Notably, Du et al.  offer alternative approaches, _SAF_ and _MESA_, estimating sharpness using loss trajectory instead of a single ascent step. Nonetheless, SAF requires increased memory consumption due to recording the outputs of historical models and MESA needs one extra forward pass. We compare against these methods in Section 5.2, where we find that SAMPa leads to a smaller wall-clock time.
+
+## 7 Conclusion and Limitations
+
+This paper introduces _Sharpness-aware Minimization Parallelized_ (SAMPa) that halves the temporal cost of SAM through parallelizing gradient computations. The method additionally incorporates the optimistic gradient descent method. Crucially, SAMPa beats almost all existing efficient SAM variants regarding computational time in practice. Besides efficiency, numerical experiments demonstrate that SAMPa enhances the generalization among various tasks including image classification, transfer learning in vision and language domains, and noisy label tasks. SAMPa can be integrated with other SAM variants, offering both efficiency and generalization improvements. Furthermore, we show convergence guarantees for SAMPa even with a fixed perturbation size through a novel Lyapunov function, which we believe will benefit the development of SAM-based methods.
+
+Although SAMPa achieves a 2\(\) speedup along with improved generalization, the computational resources required remain the same as SAM's, as two GPUs with equivalent memory (as discussed in Appendix D) are still needed. Future research could explore reducing costs by either: (i) eliminating the need for additional parallel computation, or (ii) reducing memory usage per GPU, making the resource requirements more affordable. Moreover, we prove convergence for SAMPa only in the specific case of \(=0\), leaving the analysis for general \(\) as an open challenge for our future work.
+
+  
+**mSAM** & **+SAMPa** & **ASAM** & **+SAMPa** & **SAM-ON** & **+SAMPa** & **VaSSO** & **+SAMPa** & **BiSAM** & **+SAMPa** \\  \(94.28\) & \(\) & \(94.84\) & \(\) & \(94.44\) & \(\) & \(94.80\) & \(\) & \(94.49\) & \(\) \\   
+
+Table 8: **Incorporation with variants of SAM. SAMPa in the table denotes SAMPa-0.2. The incorporation of SAMPa with SAM variants enhances both accuracy and efficiency.**

@@ -1,0 +1,303 @@
+# CoMERA: Computing- and Memory-Efficient Training via Rank-Adaptive Tensor Optimization
+
+Zi Yang
+
+University at Albany, SUNY
+
+zyang8@albany.edu
+
+&Ziyue Liu
+
+University of California at Santa Barbara
+
+ziyueliu@ucsb.edu
+
+&Samridhi Choudhary
+
+Amazon Alexa AI
+
+samridhc@amazon.com
+
+&Xinfeng Xie
+
+Meta
+
+xinfeng@meta.com
+
+&Cao Gao
+
+Meta
+
+caogao@meta.com
+
+&Siegfried Kunzmann
+
+Amazon Alexa AI
+
+kunzman@amazon.com
+
+&Zheng Zhang
+
+University of California at Santa Barbara
+
+zhengzhang@ece.ucsb.edu
+
+The majority of this work was done when the first author was a postdoc at UC Santa Barbara.
+
+###### Abstract
+
+Training large AI models such as LLMs and DLRMs costs massive GPUs and computing time. The high training cost has become only affordable to big tech companies, meanwhile also causing increasing concerns about the environmental impact. This paper presents CoMERA, a **C**omputing- and **M**emory-**E**fficient training method via **R**ank-**A**daptive tensor optimization. CoMERA achieves rank-adaptive tensor-compressed (pre)-training via a multi-objective optimization formulation and improves the training to provide both a high compression ratio and excellent accuracy in the training process. Our optimized numerical computation (e.g., optimized tensorized embedding and tensor-network contractions) and GPU implementation eliminate part of the run-time overhead in the tensorized training on GPU. This leads to, for the first time, \(2-3\) speedup per training epoch compared with standard training. CoMERA also outperforms the recent GalCore in terms of both memory and computing efficiency. Specifically, CoMERA is \(2\) faster per training epoch and \(9\) more memory-efficient than GalCore on a tested six-encoder transformer with single-batch training. Our method also shows \( 2\) speedup than standard pre-training on a BERT-like code-generation LLM while achieving \(4.23\) compression ratio in pre-training. With further HPC optimization, CoMERA may reduce the pre-training cost of many other LLMs. An implementation of CoMERA is available at [https://github.com/ziyangjoy/CoMERA](https://github.com/ziyangjoy/CoMERA).
+
+## 1 Introduction
+
+Deep neural networks have gained success in solving numerous engineering problems. These approaches usually use a huge number of variables to parametrize a network, and require massive hardware resources to train the model. For instance, the Deep Learning Recommendation Model (DLRM) released by Meta (which is smaller than the practical product)  has 4.2 billion parameters: GPT-3  has 175 billion parameters. OpenAI shows that the computing power required for key AI tasks has doubled every 3.4 months  since 2012. Training a large language model like ChatGPT and LLaMA from scratch often takes several weeks or months on thousands of GPUs .
+
+Large AI models often have much redundancy. Therefore, numerous methods have been developed to reduce the cost of AI inference ). However, training large AI models (especially from scratch) remains an extremely challenging task. Low-precision training  has been popular in on-device setting, but its memory reduction is quite limited. Furthermore, it is hard to utilize ultra low-precision training on GPU since current GPUs only support limited precision formats for truly quantized training. Chen  employed the idea of robust matrix factorization to reduce the training cost. Similar low-rank matrix approximation techniques have been applied to train large AI models including large language models . Among them, GaLore  can train the 7B LLaMA model on an RTX 4090 GPU using a single-batch and layer-wise setting. However, this setting can lead to extremely long training time, which is infeasible in practical settings.
+
+Compared with matrix compression, low-rank tensor compression has achieved much higher compression ratios on various neural networks . This idea has been studied in structure search for compact representations , post-training compression , fixed-rank training , zeroth-order training  and parameter-efficient fine tuning . The recent work  provides a rank-adaptive tensor-compressed training from a Bayesian perspective. However, to achieve a reduction in both memory and training time (especially on transformers), two open problems need to be addressed. Firstly, a more robust rank-adaptive tensor-compressed training model is desired, since the method in  relies on a heuristic fixed-rank warm-up training. Secondly, while modern GPUs are well-optimized for large-size matrix computations, they are unfriendly for low-rank tensor-compressed training. Specifically, most operations in tensor-compressed training are small-size tensor contractions, which can cause significant runtime overhead on GPUs even though the theoretical computing FLOPS is very low. As a result, as far as we know no papers have reported real training speedup on GPU. This issue was also observed in . SVDinsTN  controls tensor ranks to search for a compact tensor structure of a given tensor. HEAT  uses tensor decompositions for post-training model compression of trained models. Detailed comparisons with these works are shown in Appendix A.1.
+
+Paper Contributions.In this work, we propose CoMERA, a tensor-compressed training method that can achieve, for the first time, _simultaneous reduction of both memory and runtime on GPU_. Our specific contributions are summarized as follows.
+
+* **Multi-Objective Optimization for Rank-Adaptive Tensor-Compressed Training**. We propose a multi-objective optimization formulation to balance the compression ratio and model accuracy and to customize the model for a specific resource requirement. One by-product of this method is the partial capability of automatic architecture search: some layers are identified as unnecessary and can be completely removed by rank-adaptive training.
+* **Performance Optimization of Tensor-Compressed Training.** While tensor-compressed training greatly reduces the memory cost and computing FLOPS, it often slows down the practical training on GPU. We propose three approaches to achieve real training speedup: 1 optimizing the lookup process of tensorized embedding tables, 2 optimizing the tensor-network contractions in both forward and backward propagation, 3 eliminating the GPU backend overhead via CUDA Graph.
+* **Experimental Results.** We evaluate our method on the end-to-end training of a transformer with six encoders and the deep learning recommendation system model (DLRM). On these two benchmarks, our method achieves \(80\) and \(99\) compression ratios respectively, while maintaining the testing accuracy of standard uncompressed training. CoMERA also achieves \(2-3\) speedup per training epoch compared with standard training methods on the transformer model. In a preliminary study of LLM pre-training, CoMERA shows \(1.9\) to \(2.3\) speedup in different pre-training stages on CodeBERT , while achieving \(4.23\) overall model reduction in the pre-training process.
+
+Figure 1: Training time and total memory cost of CoMERA, GaLore  and LTE  on a six-encoder transformer with varying batch sizes. The experiment is done on Nvidia RTX 3090 GPU.
+
+Figure 1 compares our CoMERA with GaLore  and the recent LoRA-based training method LTE  on the six-encoder transformer. When data and back-end memory cost are considered, CoMERA's memory consumption is \(9\) less than GaLore in the single-batch training as adopted in , and it uses the least memory under all batch sizes. Our method is \(2-3\) faster than GaLore and LTE in each training epoch, although CoMERA has not yet been fully optimized on GPU.
+
+While this work focuses on reducing the memory and computing cost of training, it can also reduce the communication cost by orders of magnitude: only low-rank tensorized model parameters and gradients need to be communicated in a distributed setting. The CoMERA framework can also be implemented on resource-constraint edge devices to achieve energy-efficient on-device learning.
+
+## 2 Background
+
+The tensor [26; 28]\(}^{n_{1} n_{2} n_{d}}\) is indexed as \(}=(a_{i_{1} i_{d}})_{1 i_{j} n_{j}}\) and is said to have order \(d\) and dimension \(n_{1},,n_{d}\). The Frobenius norm of tensor \(}\) is defined as \(\|}\|:=,,i_{d}}^{n_{1},,n_{d}}a_{i _{1} i_{d}}^{2}}\). In tensor networks, the order-\(d\) tensor \(}\) is represented as a node with \(d\) edges. Some tensor network representations are illustrated in Fig. 2 (a).
+
+**Tensor Contraction.** Let \(}^{n_{1} n_{2} n_{d}}\) and \(}^{l_{1} l_{2} l_{m}}\) be two tensors with \(n_{s}=l_{t}\). The tensor contraction product \(}=}_{s,t}}\) has dimension \(_{i s}n_{i}_{j t}l_{j}\) and the entries are
+
+\[c_{(i_{p})_{p s},(j_{p})_{p t}}=_{i_{s}=j_{t}=1}^{n_{s}}a_{i_{1}  i_{s} i_{m}}b_{j_{1} j_{t} j_{k}}. \]
+
+This definition can be naturally generalized to multiple pairs. Figure 2(b) illustrates some tensor contractions. For general operations among multiple tensors, we use PyTorch einsum in the following
+
+\[}=(S_{1},,S_{m} T,[}_{1},,}_{m}]), \]
+
+where each \(S_{i}\) is a string of characters that specifies the dimension of \(}_{i}\). The output tensor \(}\) is obtained by summing over all other dimensions that are not in \(T\). In the following, we show a few commonly used einsum operations. The Tensor-Train decomposition as in (3) is
+
+\[}=(n_{1}r_{1},,r_{d-1}n_{d} n_{ 1}n_{2} n_{d},[}_{1},}_{2},}_{d}]).\]
+
+For the batched matrices \(}^{b m k},}^{b k n}\), the batched matrix multiplication is
+
+\[}=}}=(bmk,bkn  bmn,[},}]),\ \ \ }[i,:,:]=}[i,:,:]}[i,:,:].\]
+
+Tensor Decomposition.In this paper, we will mainly use tensor-train (TT)  and tensor-train matrix (TTM)  decomposition for compressed neural network training. TT  represents the tensor \(}^{n_{1} n_{2} n_{d}}\) as a set of small-size cores \(}_{1},,}_{d}\) such that \(}_{i}^{r_{i-1} n_{i} r_{i}}\) and
+
+\[}=}_{1}_{3,1}}_{2}_{ 3,1}_{3,1}}_{d}. \]
+
+The tuple \((r_{0},r_{1},,r_{d})\) is the TT rank of the TT decomposition (3) and must satisfy \(r_{0}=r_{d}=1\). TTM considers an order-\(2d\) tensor \(}\) of dimension \(m_{1} n_{2} m_{d} n_{d}\), and represents \(}\) as
+
+\[}=}_{1}_{4,1}}_{2}_{ 4,1}_{4,1}}_{d}, \]
+
+where \(}_{i}^{r_{i-1} m_{i} n_{i} r_{i}}\) for \(i=1,,d\) and \(r_{0}=r_{d}=1\). Figure 3 shows the tensor-network representations of TT and TTM decomposition.
+
+In tensor-compressed neural networks, large weight matrices are reshaped to high-order tensors and compressed into small tensor cores in TT or TTM format. The weights of linear layers are often compressed into the TT format due to its efficiency in tensor-vector multiplications. The TTM format is more suitable for embedding tables whose dimension is highly unbalanced.
+
+Figure 2: (a) Tensors. (b) Tensor contractions.
+
+## 3 The CoMERA Training Framework
+
+The size of the tensor-compressed neural networks can be adjusted by modifying the tensor ranks. However, it also brings in an important problem: _how can we determine the tensor ranks automatically for a given resource limit?_ We propose a multi-objective optimization to address this issue.
+
+### Multi-Objective Training Model
+
+A Modified TT Representation.We consider the tensor-compressed training for a generic neural network. Suppose that the neural network is parameterized as \(f(|\{^{i}_{1},,^{i}_{d_{i}}\}_{i=1}^{P})\), where \(\{^{i}_{j}^{r^{i}_{j-1} n^{i}_{j} r^{i}_{j }}\}_{j=1}^{d_{i}}\) compress the original weight \(_{i}\). Let \(\{_{k},y_{k}\}_{k=1}^{N}\) be training data and \(\) be the loss function. The training is to minimize the following objective function
+
+\[_{\{^{i}_{1},,^{i}_{d_{i}}\}_{i=1}^{P}}L:=_{ k=1}^{N}(y_{k},f(_{k}|\{^{i}_{1},, ^{i}_{d_{i}}\}_{i=1}^{P})). \]
+
+We modify the TT compression and control the ranks of \(^{i}_{1},,^{i}_{d_{i}}\) by a set of diagonal matrices \(\{^{i}_{j}^{r^{i}_{j} r^{i}_{j}}\}_{j=1}^{d-1}\). Specifically, let \(_{i}\) be the reshape of \(_{i}\), and the compression of \(_{i}\) is
+
+\[_{i}=^{i}_{1}_{3,1}^{i}_{1}_{2,1} ^{i}_{2}_{3,1}_{3,1}^{i}_{d_{i-1}} _{2,1}^{i}_{d_{i}}. \]
+
+Now the tensor cores for \(_{i}\) have \(S_{i}=n^{i}_{1}\|^{i}_{1}\|_{0}+n^{i}_{d_{i}}\|^{i}_{d_{i-1 }}\|_{0}+_{j=2}^{d_{i}-1}n^{i}_{j}\|^{i}_{j-1}\|_{0}\|^ {i}_{j}\|_{0}\) variables. For simplicity, we denote \(:=\{^{i}_{1},,^{i}_{d_{i}}\}_{i=1}^{P}\) and \(:=\{^{i}_{1},,^{i}_{d_{i-1}}\}_{i=1}^{P}\).
+
+Multi-Objective Optimization.We intend to minimize both the loss and compressed network size, which can be formulated as a multi-objective optimization \(_{,}\{L(,),S() \},\) where \(S():=_{i=1}^{P}S_{i}()\). In most cases, we cannot find a point that minimizes the loss and model size simultaneously. Therefore, we look for a Pareto point \((^{*},^{*})\), meaning that there exist no \(\) and \(\) such that \(L(,) L(^{*},^{*})\), \(S() S(^{*})\), and at least one of inequalities is strict.
+
+### Training Methods
+
+We convert a multi-objective optimization to a single-objective one via scalarization. We use different scalarization methods at the early and late stage of training. The late stage is optional, and it can further compress the model to enable efficient deployment on resource-constraint platforms.
+
+Early Stage.At the early stage of CoMERA, aggressively pruning ranks dramatically hurts the convergence. Hence, we start the training with the following linear scalarization formulation 
+
+\[_{,}\ L(,)+ S(). \]
+
+It is still hard to solve (7) since \(S()\) uses \(\|\|_{0}\) which is nonsmooth. Therefore, we replace \(\|\|_{0}\) by the \(_{1}\) norm \(\|\|_{1}\) and get the convex relaxation
+
+\[():=_{i=1}^{P}(_{i=1}^{P}n^{i}_{1}\|^{ i}_{1}\|_{1}+n^{i}_{d_{i}}\|^{i}_{d_{i}-1}\|_{1}+_{j=2}^{d_{i}-1 }n^{i}_{j}\|^{i}_{j-1}\|_{1}\|^{i}_{j}\|_{1}). \]
+
+We note that \(()\) can be arbitrarily close to \(0\) while keeping \(L(,)\) unchangeable, since the corresponding slices of TT factors can be scaled accordingly. Therefore, a direct relaxation of the scalarization (11) does not have a minimizer. To address this issue, we add an \(_{2}\) regularization \(\|\|^{2}:=_{i=1}^{P}_{j=1}^{d_{i}}\|^{i}_{j}\|^{2}\) to the relaxation and get the formulation
+
+\[_{,}\ L(,)+( )+\|\|^{2}. \]
+
+The optimizer of Problem (9) is a Pareto point for a constrained problem, shown in the following.
+
+Figure 3: Tensor networks for (a) tensor-train and (b) tensor-train-matrix decompositions.
+
+**Proposition 3.1**.: _For all \(>0,>0\), there exists some constant \(C>0\) such that the solution to the problem (9) is a Pareto point of the following multi-objective optimization problem_
+
+\[_{},}\ \ \ (L(},),( ))\ \ \ \|}\|^{2} C. \]
+
+Proof.: See Appendix A.2 for the complete proof. 
+
+**Late Stage (Optional).** The early-stage training can provide us with a Pareto point, but we cannot control where the Pareto point is. In the late stage of CoMERA, we may continue training the model towards a preferred loss \(L_{0}\) and a preferred model size \(S_{0}\) for deployment requirements. This can be achieved by the achievement scalarization  that leads to a Pareto point close to \((L_{0},S_{0})\):
+
+\[_{},}\ \{w_{1}(L(}, )-L_{0}),w_{2}(S()-S_{0})\}+(L(}, )+S()). \]
+
+Here \(w_{1},w_{2}>0\) scale the objectives into proper ranges, and \(>0\) is a small constant. After relaxing \(S()\) to \(()\) and adding the regularization term, we get the following problem
+
+\[_{},}\ \{w_{1}(L(}, )-L_{0}),w_{2}(S()-S_{0})\}+(L(}, )+())+\|}\|^{2}, \]
+
+where \(>0\) is a positive constant. Note that the \(S()\) inside \(\) is not relaxed now for accurate comparisons. When \(w_{1}(L(},)-L_{0}) w_{2}(S()-S_{0})\), we consider the following problem
+
+\[_{},}\ w_{1}(L(}, )-L_{0})+(L(},)+())+ \|}\|^{2}. \]
+
+We run a step of a gradient-based algorithm on this problem. When \(w_{1}(L(},)-L_{0})<w_{2}(S()-S_{0})\), we relax the \(S()\) again and get the following problem
+
+\[_{},}\ w_{2}(()-S_{0})+(L( },)+())+\|}\|^{ 2}, \]
+
+and run a step of a gradient-based algorithm on this problem. The Algorithm 1 is summarized in Appendix A.3. The late stage optimization can be independently applied to a trained tensor-compressed model for further model size reductions.
+
+## 4 Performance Optimization of CoMERA
+
+While CoMERA can greatly reduce training variables and memory cost, the low-rank and small-size tensor operations in CoMERA are not efficiently supported by GPU. This often slows the training process. This section presents three methods to achieve real training speedup on GPU.
+
+### Performance Optimization of TTM Embedding Tables.
+
+Embedding tables are widely used to transfer discrete features into continuous hidden space. The row size of embedding tables is usually much larger than the column size, making TTM compression more suitable than the TT format. In the following, we use an order-4 TTM embedding table to illustrate how to accelerate the lookup process.
+
+We consider an embedding table \(^{m n}\). A look-up operation selects the submatrix \([,:]^{b n}\) for the index set \(=\{i_{k}\}_{k=1}^{b}\). This operation is fast and inexpensive. However, the full embedding table itself is extremely memory-consuming. Suppose that \(m=m_{1}m_{2}m_{3}m_{4},n=n_{1}n_{2}n_{3}n_{4}\), then we reshape \(\) into tensor \(}^{m_{1} n_{1} m_{4}  n_{4}}\) and represent it in TTM format
+
+\[}=}_{1}_{4,1}}_{2}_{ 4,1}}_{3}_{4,1}}_{4}. \]
+
+The compressed embedding table does not have the matrix \(\) explicitly. We convert each row index \(i_{k}\) to a tensor index vector \((z_{k}^{1},z_{k}^{2},z_{k}^{3},z_{k}^{4})\) and denote \(_{t}=\{z_{t}^{k}\}_{t=1}^{b}\), then \([,:]\) can be computed by contracting the tensors \(\{}_{t}[:,_{t},:,:]\}_{t=1}^{4}\) where each has size \(r_{t-1} b n_{i} n_{t}\). The \(}_{t}[:,_{t},:,:]\) stores many duplicated values especially when the set \(\) is large. Therefore, directly computing the tensor contractions can cause much computing and memory overhead.
+
+We optimize the tensor contraction by eliminating the redundant computation at two levels. **Row-index level.** We construct the index set \(_{u}=\{i_{k}\}_{k=1}^{}\) containing all unique indices in \(\). We can easily obtain \([,:]\) from \([_{u},:]\). **Tensor-index level.** The reduced index set \(_{u}\) leads to \(\) associated tensor index vectors \((z_{1}^{k},z_{2}^{k},z_{3}^{k},z_{4}^{k})\), but at most \(m_{1}m_{2}\) pairs of \((z_{1}^{k},z_{2}^{k})\) and \(m_{3}m_{4}\) pairs of \((z_{3}^{k},z_{4}^{k})\) are unique. For instance, (2,3,1,3) and (2,3,2,4) are common in (2,3), so we only compute (2,3) entry once. Therefore, we can consider all unique pairs \((z_{1}^{k},z_{2}^{k})\) and \((z_{3}^{k},z_{4}^{k})\) and compute
+
+\[}_{1}= (r_{0}m_{1}n_{1}r_{1},r_{1}m_{2}n_{2}r_{2} (m_{1}m_{2})(n_{1}n_{2})r_{2},[}_{1},}_{2}]), \] \[}_{2}= (r_{2}m_{3}n_{3}r_{3},r_{3}m_{4}n_{4}r_{4} r _{2}(m_{3}m_{4})(n_{3}n_{4}),[}_{3},}_{4}]). \]
+
+For each \(i_{k}_{u}\), let \((j_{1}^{k},j_{2}^{k})\) be the coordinate of \(i_{k}\) for size \((m_{1}m_{2},m_{3}m_{4})\). We denote \(_{1}=\{j_{1}^{k}\}_{k=1}^{}\) and \(_{2}=\{j_{2}^{k}\}_{k=1}^{}\), then compute the unique rows of \(\) as
+
+\[[_{u},:]=((n_{1}n_{2})r_{2},r_{2} (n_{3}n_{4})(n_{1}n_{2}n_{3}n_{4}),[}_ {1}[_{1},:,:],}_{1}[:,_{2},:]]). \]
+
+Figure 4 summarizes the whole process of TTM embedding table look-up. This approach can be easily applied to higher-order embedding tables by first grouping some small tensor cores to obtain intermediate tensors and then utilizing them to compute unique row vectors.
+
+Performance.We demonstrate the optimized TTM embedding tables on a single RTX 3090 GPU. We consider an embedding table of TTM shape \([,]\) and rank \(32\), extracted from a practical DLRM model. As shown in Figure 5, our proposed method achieves about \(4-5\) speed-up and \(2-3\) memory saving than the standard TTM embedding without any optimization. The uncompressed embedding with sparse gradients is faster than our approach since our TTM embedding table requires extra computation, but it uses much more memory than the TTM embedding table.
+
+### Contraction Path Optimization for TT-Vector Multiplications
+
+Next, we optimize the forward- and back- propagation of linear layers in the TT format. We consider the linear layer \(=\), where \(^{b N_{2}},^{N_{1} N _{2}},^{b N_{1}}\). The \(\) is compressed into the Tensor-Train format: \(}=[}_{1},,}_{2d}] ^{n_{1} n_{2d}}\),where \(}_{i}^{r_{i-1} n_{i} r_{i}}\) and \(N_{1}=n_{1} n_{d},N_{2}=n_{d+1} n_{2d}\). The forward-propagation in the einsum form is
+
+\[==(bn_{1} n_{d},S_{1}, ,S_{2d} bn_{d+1} n_{2d},[},}_{1},,}_{2d}]) \]
+
+where \(}^{b n_{1} n_{d}}\) is the reshaping of \(\) and \(S_{i}\) denotes \(r_{i-1}n_{i}r_{i}\). Suppose that the gradient to \(\) is \(_{}\), then the gradients to \(}_{i}\) and \(}\) can be computed as follows:
+
+\[_{}_{i}}=bn_{1}  n_{d},bn_{d+1} n_{2d},S_{1},,S_{i-1},S_{i+1},,S_{2d}  S_{i},\] \[[},_{},}_{1}, ,}_{i-1},}_{i+1},,}_{2 d}]), \] \[_{}}=bn_{d+1} n _{2d},S_{1},,S_{2d} bn_{1} n_{d},[_{},}_{1},,}_{2d}]). \]
+
+In total, \(2d+2\) contraction sequences are needed for the TT-format forward- and back- propagation. To reduce the computational costs, it is critical to find an optimal or near-optimal contraction path.
+
+Figure 5: Performance of optimized TTM embedding table lookup. The labels _uncompressed, proposed approach, optimized order, unique indices, without optimization_ represent standard embedding with sparse gradients, the new method in 4.1, the method that only uses the unique order, the method that only uses the unique indices, and the method without optimization, respectively.
+
+Large batch case.We denote \(}_{i}:=}_{1}}_{i},}_{-i}=}_{d-i+1}}_{d}, }_{i}:=}_{d+1}}_{ d+i},}_{-i}=}_{2d-i+1}}_{2d}\), which are all computed sequentially. In practice, we only need to compute \(}_{d},}_{-d},}_{d},}_{-d}\) and store the intermediate results. The forward-propagation (19) is then computed in the following way
+
+\[}_{1} = (bn_{1} n_{d},n_{1} n_{d}r_{d} br _{d},[},}_{d}]) \] \[} = (br_{d},r_{d}n_{d+1} n_{2d} bn_{1 } n_{d},[}_{1},}_{d}]). \]
+
+In backward propagation, the gradients are computed in the following way:
+
+* The gradient \(_{}}\) is computed as \[}_{1} = (bn_{d+1} n_{2d},r_{d}n_{d+1} n_{2d}  br_{d},[_{}},}_{d}])\] (24) \[_{}} = (br_{d},n_{1} n_{d}r_{d} bn_{1}  n_{d},[}_{1},}_{d}]).\] (25)
+* The gradients \(_{}_{i}}\) for \(i d+1\) can be computed as \[}_{2} = (br_{d},bn_{d+1} n_{2d} r_{d}n_{d +1} n_{2d},[}_{1},_{}}])\] (26) \[_{}_{i}} = (r_{d}n_{d+1} n_{2d},r_{d}n_{d+1} n_{i -1}r_{i-1},r_{i}n_{i+1} n_{2d}\] \[r_{i-1}n_{i}r_{i},\ [}_{2},}_{i-1-d}, }_{-(2d-i)}]).\]
+* Similarly, the gradients \(_{}_{i}}\) for \(i d\) can be computed as \[}_{2} = (br_{d},bn_{1} n_{d} r_{d}n_{1}  n_{d},[}_{1},}])\] (28) \[_{}_{i}} = (r_{d}n_{1} n_{d},n_{1} n_{i-1}r_{i-1},r_{i}n_{i+1} n_{d}r_{d}\] \[r_{i-1}n_{i}r_{i},\ [}_{2},}_{i},}_{-(d-i)}]).\]
+
+The contraction paths of forward- and back- propagation are summarized in Appendix A.5.
+
+Analysis.The proposed empirical path is near-optimal for large batch sizes. The following result analyzes the contraction path for forward-propagation.
+
+**Proposition 4.1**.: _Suppose that the TT ranks satisfy \(1=r_{0}<r_{1} r_{d} r_{d-1}> r_{2d}=1\) and the batch size \(b\) is large enough. There exist groups \(\{S_{i}\}_{i=1}^{k}\) where \(S_{i}=\{}_{ji+1},,}_{ji+1}\}\) containing consecutive tensor cores for \(0=j_{1}<<j_{k}<j_{k+1}=2d\). Then, the contraction path with the least number of flops for the forward-propagation (19) first contracts the tensor cores in each \(S_{i}\) to obtain \(}_{i}\) with dimension \(r_{j_{i}} n_{j_{i}+1} n_{j_{i+1}} r_{j_{i+1}}\) and then contract the input tensor \(}\) with tensors \(\{}_{i}\}_{i=1}^{k}\) in the sequential order._
+
+Proof.: See Appendix A.4 for the complete proof. 
+
+Proposition 4.1 implies that the optimal path first contracts some consecutive tensor cores and then contracts obtained tensors with the input tensor sequentially. The groups \(\{S_{i}\}_{i=1}^{k}\) depend on the dimensions, ranks, and batch size. The proposed contraction path satisfies the property shown in Proposition 4.1 and has flops roughly \(b(n_{1} n_{d}+n_{d+1} n_{2d})r_{d}\). The optimal contraction path has flops about \(bn_{1} n_{d}c_{1}+bn_{d+1} n_{2d}c_{2}\), where \(c_{1},c_{2}\) are some constants. Hence, the proposed is near-optimal and has a comparable complexity to the optimal path. Suppose the optimal path is different from the proposed empirical path. Then the optimal path will likely involve a few more large intermediate tensors, which pose more memory costs during training and inference especially for static computational graphs. The empirical path is a good choice to balance time and memory consumption. Similar arguments can be applied to the contractions for back-propagation.
+
+When the batch size is small, the optimal path may have much fewer flops. However, the execution time is almost the same as the proposed path since all the operations are too small. Hence, we can use the proposed path for most batch sizes. See Appendix A.6 for more analysis.
+
+### GPU Performance Optimization via CUDA Graph
+
+While CoMERA consumes much less computing FLOPS than standard uncompressed training, it can be slower on GPU if not implemented carefully. Therefore, it is crucial to optimize the GPU performance to achieve real speedup. Modern GPUs are highly optimized for large-size matrix multiplications. However, the small-size tensor contractions in CoMERA are not yet optimized on GPU and require many small-size GPU kernels, causing significant runtime overhead. During the training, Cuda Graph launches and executes the whole computing graph rather than launching a large number of kernels sequentially. This can eliminate lots of back-end overhead and lead to significant training speedup. It is more suitable for CoMERA since tensor-compressed training has much more small kernels than uncompressed training. This is just an initial step of GPU optimization. We expect that a more dedicated GPU optimization can achieve a more significant training speedup.
+
+## 5 Training Results
+
+In this section, we test the performance of CoMERA on a few benchmarks, including a domain-specific LLM. Our experiments are run on a Nvidia RTX 3090 GPU with 24GB RAM.
+
+### A Medium-Size Transformer with Six Encoders
+
+We first consider a six-encoder transformer. The embedding tables and all linear layers are represented as tensor cores in the training process as detailed in Appendix A.7. We train this model on the MNLI dataset  with the maximum sequence length \(128\) and compare the accuracy, resulting model size, and training time of CoMERA with the standard uncompressed training.
+
+**CoMERA Accuracy and Compression Performance.** Table 1 summarizes the training results. The **early-stage training** of CoMERA achieves \(74\) compression ratio on all tensorized layers, and the validation accuracy is even higher than the uncompressed training. Figure 6 shows the validation accuracy of CoMERA. In the **late stage** of CoMERA, we set different target compression ratios for more aggressive rank pruning. The target compression ratios are for the tensorized layers rather than for the whole model. The late-stage training can reach the desired compression ratio with very little accuracy drop. The smallest model has a compression ratio of \(80\) for the whole model due to a \(361\) compression on the tensorized layers with slightly worse accuracy.
+
+**Architecture Search Capability of CoMERA.**
+
+A major challenge in training is architecture search: shall we keep certain layers of a model? Interestingly, CoMERA has some capability of automatic architecture search. Specifically, the ranks of some layers become zero in the training, and thus the whole layer can be removed. For the target compression ratio \(0.2\), the whole second last encoder and some linear layers in other encoders are completely removed after late-stage rank-adaptive training. The change of ranks of layers in the 5th encoder is shown in Table 2.
+
+**Training Time.** As shown in Figure 7, CoMERA with CUDAGraph achieves around \(3\) speed-up than uncompressed training. CoMERA without CUDAGraph can take much longer time in small batch-size setting due to the launching overhead of too many small kernels. The uncompressed training with CUDAGraph takes longer time than the one without CUDAGraph. This is because CUDAGraph requires all batches to have the same sequence length, and the consequent computing overhead is more than the time reduction of CUDAGraph. In contrary, CoMERA has much fewer computing FLOPS and the computing part accounts for a much smaller portion of the overall
+
+   & validation & total size (MB) & compressed size (MB) \\  uncompressed training & 62.2\% & 256 (1\(\)) & 253 (1\(\)) \\ CoMERA (early stage) & 63.3\% & 5.9 (43\(\)) & 3.4 (74\(\)) \\ CoMERA (late stage), target ratio: 0.8 & 62.2\% & 4.9 (52\(\)) & 2.4 (105\(\)) \\ CoMERA (late stage), target ratio: 0.5 & 62.1\% & 3.9 (65\(\)) & 1.4 (181\(\)) \\ CoMERA (late stage), target ratio: 0.2 & 61.5\% & 3.2 (80\(\)) & 0.7 (361\(\)) \\  
+
+Table 1: Result of Transformer on MNLI of batch size 128.
+
+   & before training & early-stage rank & late-stage rank \\  Q-layer in attention & \((12,30,30,30,12)\) & \((12,30,30,30,12)\) & \((0,0,0,0,0)\) \\  K-layer in attention & \((12,30,30,30,12)\) & \((12,30,30,30,12)\) & \((0,0,0,0,0)\) \\  V-layer in attention & \((12,30,30,30,12)\) & \((12,30,30,30,12)\) & \((9,11,11,7,9)\) \\  FC-layer in attention & \((12,30,30,30,12)\) & \((12,30,29,30,12)\) & \((9,8,10,8,8)\) \\  \#1 linear-layer in Feed-Forward & \((12,30,30,30,16)\) & \((0,0,0,0,0)\) & \((0,0,0,0,0)\) \\  \#2 linear-layer in Feed-Forward & \((16,30,30,30,12)\) & \((0,0,0,0,0)\) & \((0,0,0,0,0)\) \\  
+
+Table 2: The change of ranks of layers in the fifth encoder block.
+
+Figure 6: Behavior of early-stage CoMERA training on the MNLI dataset.
+
+Figure 7: Training time per epoch for the six-encoder transformer model on the MNLI dataset.
+
+runtime. Empirically CoMERA is \(2-3\) faster in the whole training than uncompressed training for transformers on a single GPU, but we do not have theoretical guarantees about the number of epochs although they are similar in our experiments. Appendix A.8 provides more details about the run-time comparison on this benchmark, showing that CoMERA is still faster than standard training even if the compression ratio is close to 1.
+
+### A DLRM Model with 4-GB Model Size
+
+We further test CoMERA on DLRM  released by Meta on Criteo Ad Kaggle dataset . We compress the ten largest embedding tables into the TTM format as in Section 4.1. All fully connected layers with sizes \(>128\) are compressed into TT format. The model is trained for two epochs.
+
+Effect of Optimized TTM Embedding.The training time per epoch and peak memory cost are shown in Figure 9. Our optimized TTM lookup speeds up the training process by around \(2\) and remarkably reduces the memory cost by \(4-5\).
+
+Overall Performance of CoMERA.Table 3 shows the testing accuracy, testing loss (measured as normalized CE), memory costs, and model sizes of CoMERA and uncompressed training. CoMERA achieves similar accuracy as the uncompressed training, while CoMERA compresses the whole model by \(99\) and saves \(7\) peak memory cost (with consideration of the data and backend overhead) in the training process. The reduction of model size and memory cost mainly comes from the compact TTM tensor representation of large embedding tables. Standard uncompressed training is faster than CoMERA since DLRM is an embedding-intensive model, and the computation in the embedding table is look-up rather than matrix multiplications. However, CoMERA uses much less memory, saving 6.9X, 4.8X, and 3.1X memory for batch sizes 10000, 2000, and 4000, respectively. Furthermore, CoMERA has a similar convergence curve and needs fewer iterations than standard training for DLRM, as shown in Figure 8.
+
+### Comparison with GaLore and LTE
+
+We compare our method with two recent low-rank compressed training frameworks: GaLore  and LTE . GaLore  reduces the memory cost by performing SVD compression on the gradient, and LTE represents the weights as the sum of parallel low-rank matrix factorizations. We evaluate their memory costs and training times per epoch on the six-encoder transformer model under different batch sizes. We do not compare the total training time because the training epochs of various methods are highly case-dependent. The CoMERA and GaLore achieve almost the same validation accuracy, 64%, on the MNLI dataset. However, the LTE approach does not converge on the task using its default setting.
+
+Training Time Per Epoch.We use rank \(128\) for the low-rank gradients in GoLore, and rank \(32\) and head number \(16\) for the low-rank adapters in LTE. For a fair comparison, all methods are executed with CUDA graph to reduce the overhead of launching CUDA kernels. The runtimes per training epochs are reported in Figure 1(a). For the LTE, we only report the results for batch sizes \(32,64,128\) since it requires the batch size to be a multiple of the head number. Overall, our CoMERA is about \(2\) faster than GaLore and \(3\) faster than LTE for all batch sizes, because the forward and backward propagation using low-rank tensor-network contractions dramatically reduce the computing FLOPS.
+
+   & uncompressed & CoMERA \\  accuracy & 78.68\% & 78.76\% \\ normalized CE & 0.793 & 0.792 \\ model size (GB) & 4.081 & 0.041 (**99\(\)**) \\ peak memory (GB) & 18.275 & 2.612 (7\(\)) \\  
+
+Table 3: Training results on the DLRM model with a batch size \(10,000\).
+
+Figure 8: NCE loss curve of DLRM on the validation dataset.
+
+Figure 9: Performance of optimized CoMERA on training DLRM.
+
+Memory Cost.Figure 1 (b) shows the memory cost of all three training methods. In the single-batch setting as used in , our CoMERA method is \(9\) more memory-efficient than Galore on the tested case (with consideration of data and back-end cost). As the batch size increases, the memory overhead caused by data and activation functions becomes more significant, leading to less memory reduction ratios. However, our proposed CoMERA still uses the least memory.
+
+We run the experiments on the RTX 3090 GPU. The work GaLore uses the RTX 4090 GPU for experiments, so we also compare them on the RTX 3090 GPU. The results are in Appendix A.9.
+
+### Preliminary LLM Pre-Training Results: Case Study on CodeBERT
+
+To show the benefit of CoMERA in pre-training (domain-specific) LLMs, we follow the setup from CodeBERT  to pre-train a BERT-like model for code generation. The pre-training dataset is the CodeSearchNet , a collection of 2M (comment, code) pairs and 6M pure code sequences from open-source libraries with 6 types of programming languages. We pre-train CodeBERT\({}_{}\) (\(357\)M) and its CoMERA (84M) variant using the masked language modeling (MLM) objective and compare their training loss in Figure 10. We achieve up to \(12.72\) compression on tensorized layers and \(4.23\) overall compression with final loss of \(0.40\) vs \(0.28\). There is a small gap between the final losses. However, this does not necessarily imply performance degradation on downstream tasks, based on our observation on BERT\({}_{}\) shown in Appendix A.10. Furthermore, CoMERA is \(2.3\) and \(1.9\) faster than standard pre-training in Phase 1 and Phase 2 respectively, when evaluated on the Nvidia RTX 3090 GPU. Our current CoMERA implementation is still slower than standard pre-training on massive GPUs, since no performance optimization has been done on HPC.
+
+## 6 Conclusions and Future work
+
+This work has presented CoMERA framework to reduce the memory and computing time of training AI models. We have investigated rank-adaptive training via multi-objective optimization to meet specific model sizes while maintaining model performance. We have achieved real training speedup on GPU via three optimizations: optimizing the tensorized embedding tables, optimizing the contraction path in tensorized forward and backward propagation, and optimizing the GPU latency via CUDAGraph. The experiments on a transformer model demonstrated that CoMERA can achieve \(2-3\) speedup per training epoch. The model sizes of the transformer and a DLRM model have been reduced by \(43\) to \(99\) in the training process, leading to significant peak memory reduction (e.g., \(7\) total reduction in large-batch training of DLRM on a single GPU). Our method has also outperformed the latest GaLore and LTE frameworks in both memory and runtime efficiency. More importantly, our method has demonstrated significant speedup and model compression in pre-training CodeBERT, a domain-specific LLM for automatic code generation. We have also observed further speedup by combining CoMERA with mixed-precision computation. The discussions and some preliminary results are in Appendix A.11.
+
+Unlike large-size matrix operations, the small low-rank tensor operations used in CoMERA are not yet well-supported by existing GPU kernels. The performance of CoMERA can be further boosted significantly after a comprehensive GPU and HPC optimization. The existing optimizers, e.g. Adam, are well-studied for uncompressed training. However, CoMERA has a very different optimization landscape due to the tensorized structure. Therefore, it is also worth studying the optimization algorithms specifically for CoMERA in the future.
+
+## 7 Acknowledgement
+
+The pre-training task used resources of the National Energy Research Scientific Computing Center, a DOE Office of Science User Facility supported by the Office of Science of the U.S. Department of Energy under Contract No. DE-AC02-05CH11231 using NERSC award ASCR-ERCAP0030039.
+
+Figure 10: Pre-training loss curves of CodeBERT and CoMERA.

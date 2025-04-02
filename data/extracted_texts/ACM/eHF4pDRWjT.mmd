@@ -1,0 +1,291 @@
+# Retrieval with Learned Similarities
+
+Anonymous Author(s)
+
+###### Abstract.
+
+Retrieval plays a fundamental role in recommendation systems, search, and natural language processing (NLP) by efficiently finding relevant items from a large corpus given a query. Dot products have been widely used as the similarity function in such retrieval tasks, thanks to Maximum Inner Product Search (MIPS) that enabled efficient retrieval based on dot products. However, state-of-the-art retrieval algorithms have migrated to learned similarities. Such algorithms vary in form; the queries can be represented with multiple embeddings, complex neural networks can be deployed, the item ids can be decoded directly from queries using beam search, and multiple approaches can be combined in hybrid solutions. Unfortunately, we lack efficient solutions for retrieval in these state-of-the-art setups. Our work investigates techniques for efficient retrieval with expressive learned similarity functions. We first prove that Mixture-of-Logits (MoL) is a universal approximator, and can express all learned similarity functions. We then demonstrate how to apply MoL to common retrieval tasks in recommendation systems and NLP. We next propose techniques to retrieve the approximate top \(K\) results using MoL with a tight bound. We finally compare our techniques with existing approaches, showing that MoL, with a new mutual information-based load balancing loss we propose, sets new state-of-the-art results across heterogeneous scenarios, including sequential retrieval models in recommendation systems and finetuning language models for question answering; and our approximate top-k retrieval with learned similarities outperforms baselines by up to 105% in latency, while achieving \(>.99\) recall rate of exact algorithms.
+
+Nearest Neighbor Search, Learned Similarities, Top-K Retrieval, Vector Databases, Recommendation Systems, Question Answering 1
+
+## 1. Introduction
+
+Retrieval requires efficient storing, indexing, and querying relevant candidate items represented by high-dimensional vectors. Retrieval is widely used as the initial preprocessing stage for internet applications such as recommendations, search, question answering, and natural language processing that operate over corpus with up to billions of items . In many concrete use cases, such as vector databases , the query- and the item- embeddings are learned with deep neural networks in a dual-encoder setup, and dot products are applied on top of such embeddings as the similarity function for measuring relevance.
+
+Despite the popularity of dot products and numerous work done to improve their efficiency , state-of-the-art retrieval algorithms have long moved to various learned similarity functions. Their most basic versions preserve some dot product-related structures, but turn either the query or the item into multiple embeddings, and rely on a max operator to combine those similarity values . As another example, Probabilistic Label Trees (PLTs)  and Tree-based Deep Models (TDMs)  map items to leaf nodes in a tree, and reduce retrieval to beam search by making decisions sequentially using learned classifiers while traversing trees from root to leaf. More recent work on generative retrieval directly map the query to the item ids in sequence-to-sequence or decoder-only setups . Combinations of these approaches have also been studied, with some performing coarse-grained retrieval with generative approaches, followed by re-ranking using dot products . Finally, the similarity function can be directly parameterized by carefully designed deep neural networks that take various forms .
+
+Supporting efficient retrieval with these diverse learned similarities is challenging. Learned similarity functions are generally expensive to compute; with learned index structures, traversing a binary tree with 4 million items requires running beam search for 20 non-parallelizable steps , while recommendation and NLP deployments commonly need to handle billions of items  with a latency budget of tens of milliseconds. When an arbitrary deep neural network is employed, it's no longer clear how to perform top-\(K\) retrieval other than through brute-force  or heuristics . While graph-based methods can be used to prune the search space , such methods tend to be much slower compared with MIPS algorithms leveraging quantization at high recall rates , and their performance can degrade when the similarity function is not a distance metric . What is worse, these algorithms vary significantly in terms of their exact formulations, and the lack of a universal interface makes it even more difficult to design a general solution for efficient retrieval.
+
+Taking a step back, our key insight is that learned similarity approaches are but different ways to increase the expressiveness of the retrieval stage. Formally, for a query \(q\) and an item \(x\), the expressiveness of the similarity function boils down to deriving alternative parameterizations of \(p(x|q)\) matrices, with full rank matrices being the most expressive among them. Dot products, on the other hand,induces a low-rank bottleneck due to the dimensionality of the embedding, i.e., \( p(x|q)(f(q),g(x))\) (\(f(q),g(x)^{d}\)). This cannot be alleviated by simply increasing the embedding dimension \(d\), due to memory bandwidth being the main bottleneck in modern dot-product based retrieval systems, such as vector databases (Becker et al., 2015; Zhang et al., 2016; Zhang et al., 2017), and overfitting issues that come with larger embedding dimensions due to the common need to co-train or finetune query- and item-encoders from data (Becker et al., 2015; Zhang et al., 2016; Zhang et al., 2016; Zhang et al., 2017; Zhang et al., 2017; Zhang et al., 2018).
+
+This insight enables us to support efficient retrieval with expressive learned similarity functions by approximating them with MoL. To the best of our knowledge, this is the first work that tackles the problem of efficient retrieval with universal learned similarities, while setting new state-of-the-art results across _heterogeneous_ scenarios. We first show that Mixture-of-Logits (MoL) is a universal approximator as it can express \(p(x|q)\) matrices of arbitrary high rank, and hence approximate all learned similarity functions (Section 2.1). Our work lays theoretical foundations for MoL's empirical impressive performance gains of 20%-30% across Hit Rate@50-400 on web-scale corpus with hundreds of millions to billions of items (Becker et al., 2015; Zhang et al., 2017), and further enables MoL to be effectively applied across diverse retrieval scenarios, from large-scale recommendation systems to finetuning language models for question answering (Section 2.2). We next propose techniques to retrieve the approximate top-\(K\) results using MoL with a tight bound (Section 3). Our solution leverages exiting widely used APIs of vector databases like top-K queries, thus benefiting from prior work on efficient vector search like MIPS (Becker et al., 2015; Zhang et al., 2016; Zhang et al., 2017; Zhang et al., 2018). We empirically compare our techniques with existing approaches, showing that MoL sets new state-of-the-art results on recommendation retrieval and question answering tasks, and our approximate top-k retrieval with learned similarities outperforms baselines by up to 105% in latency, while achieving \(>.99\) recall rate of exact algorithms (Section 4). Importantly, our approach with learned similarities efficiently utilizes modern accelerators due to MoL's higher arithmetic intensity (Zhang et al., 2017), which results in MIPS-level inference latency and throughput. Overall, our work provides strong theoretical and practical justifications to migrate away from the broadly adopted MIPS solution in vector databases to Retrieval with Learned Similarities (RAILS) on GPUs.
+
+## 2. Mixture of Logits
+
+In this section, we describe Mixture of Logits (MoL), propose a load balancing loss to improve conditional computations in MoL, prove that MoL is expressive enough to represent any learned similarity function, and demonstrate how to apply MoL to retrieval tasks. Table 1 summarizes the notations in this paper.
+
+We first describe Mixture of Logits (MoL).
+
+_Mixture of Logits (MoL)._MoL. (Zhang et al., 2017) assumes that the query \(q\) and the item \(x\) are already mapped to \(P\) groups of low-rank embeddings ("component-level embeddings"), \(f_{p}(q),g_{p}(x)^{d_{P}}\), where \(f_{p}(q),g_{p}(x)\) are parameterized with some neural networks based on query and item features, respectively, and \(dp\) is the dimensionality of the low-rank embeddings. MoL then calculates the similarity between the query \(q\) and the item \(x\) by applying adaptive gating weights, \(_{p}(q,x)\), to the inner products of these \(P\) pairs of low-rank embeddings, or \( f_{p}(q),g_{p}(x)\)s. Note that prior work assumes that \(_{p}_{p}(q,x)=1\)(Becker et al., 2015; Zhang et al., 2017), but this does not affect our analyses in this paper. Following (Zhang et al., 2017):
+
+\[(q,x)=_{p=1}^{p}_{p}(q),g_{p}(x) \]
+
+To extend this to large-scale datasets and to enable hardware-efficient implementations on accelerators like GPUs, Equation 1 was further modified by decomposing those \(P\) dot products as (batched) outer products of \(P_{q}\) query-side and \(P_{x}\) item-side embeddings, where \(P_{q} P_{x}=P\), and applying 12-norm to \(f_{p}(q)\)s and \(g_{p}(x)\)s:
+
+(2)
+
+We use Equation 1 and 2 interchangeably as the MoL form to analyze throughout the rest of this paper, given that the embedding normalization for \(f_{p_{q}}(q)\)s and \(g_{p_{x}}(x)\)s can be precomputed.
+
+_Mixture of Logits (MoL) with load balancing regularization loss._ We further observe \(_{p}(q,x)\) defines conditional computation to be performed over the \(p\) low-rank embedding pairs, or \( f_{p}(q),g_{p}(x)\)s. \(_{p}(q,x)\) should hence satisfy two conditions:
+
+* Globally, the \(p\) low-rank embedding pairs, or \( f_{p}(q),g_{p}(x)\)s, should receive a similar number of training examples even when \(p\) is large and \(_{p}(q,x)\) is sparse, with load distributed evenly across the \(p\) pairs. One way to do this is to maximize the entropy \(H(p)\) over these embedding pairs.
+* The low-rank embedding pairs used to compute each \((q,x)\) should be non-uniform and ideally sparse; e.g., it's desirable to avoid the degenerate solution where \(_{p}(q,x)=\).
+
+ 
+**Notation** & **Description** \\  \(q\) (\(Q\), \(|Q|\)) & query (set of queries, number of queries) \\ \(\) (\(X_{i}\), \(|X|\)) & item (set of items, number of items) \\ \((q,x)\) & the learned similarity function, i.e., Mixture-of-Logits (MoL). \\ \(P\) (\(P_{q}\), \(P_{x}\)) & MoL uses \(P\) low-rank embeddings (“component-level embeddings”) to represent \(q\) and \(x\). With the (batched) outer product form of MoL, \(P_{q}\) and \(P_{x}\) are the numbers of embeddings for \(q\) and \(x\), respectively; \(P=P_{q} P_{x}\). \\ \(_{p}(q,x)\) (\(_{p_{q} p_{x}}(q,x)\)) & weight for the \(p\)-th (or \(p_{q}\)-th by \(p_{x}\)-th with outer product) embedding set for \((q,x)\). \\ \(f(q)\) (\(f_{p}(q)\)) & learned embedding for the query (\(p\)-th component-level query embedding) \\ \(g(x)\) (\(g_{p}(x)\)) & learned embedding for the item (\(p\)-th component-level item embedding) \\ \(d_{p}\) & dimensionality of low-rank (component-level) embeddings. \(f_{p}(q),g_{p}(q)^{d_{P}}\). \\ \( f(q),g(x)\) & the dot product similarity function; \( f(q),g(x)=g(x)^{T}f(q)\). \\  
+
+Table 1. Table of Notations.
+
+One way to do this is to minimize the conditional entropy \(H(p|(q,x))\) of \(p\) given (query, item) pairs.
+
+Given these two desired conditions, we propose a mutual information-based regularization loss for load balancing, defined as
+
+\[_{MI}=-H(p)+H(p|(q,x)) \]
+
+with the overall training loss as
+
+\[-} ((q,x^{}))}+_{MI} \]
+
+where the first part of Equation 4 is the sampled softmax loss used in (Spielman and Hinton, 2006), and the second part adjusts the weight for the mutual information-based load balancing loss with a hyperparameter \(\).
+
+### Expressiveness of Mixture of Logits
+
+Now we show that any high-rank matrix can be decomposed into a mixture of logits based on low-rank matrices, i.e., MoL is a universal approximator. Without loss of generality, we prove the following:
+
+**Theorem 1**.: _MoL decomposition: Let \(A\) be a matrix of \(n m\), where \(n m\). There exists \(_{1},B_{1},_{2},B_{2},,_{p},B_{p}\) such that \(|A-_{p=1}^{p}_{p} B_{1}|<\), where \(\) is a small positive number. Here \(B_{i}\) is a matrix of \(n m\) with rank equal to or less than \(d\), and \(_{1},_{2},,_{p}\) are \(n m\) matrices that together define a probability distribution over each \((i,j)\) tuple, such that \(_{p=1}^{p}_{p}(i,j)=1,0_{p}(i,j) 1\) for any \(1 i n,1 j m\), \(1 p P\)._
+
+We can think about \(n\) as the number of queries and \(m\) the number of items (or vice versa). First, the theorem trivially holds if the rank of \(A\) is less than or equal to \(d\) (\(d n\)):
+
+**Lemma 1**.: _MoL decomposition when \(Rank(A) d\): Let \(A\) be a matrix as defined in Theorem 1. If the rank of \(A\) is less than or equal to \(d\), then we have \(A= A\), where \((i,j)=1\) for any \(1 i n,1 j m\)._
+
+Then we prove for the case where the rank of \(A\) is greater than \(d\). Without loss of generality, we prove the case where the matrix has full rank, i.e., \(Rank(A)=n\):
+
+**Lemma 2**.: _MoL decomposition when \(Rank(A)=n\): Let \(A\) be a matrix as defined in Theorem 1. Then there exists \(,B_{1},B_{2}\) such that \(|A-( B_{1}+(1-) B_{2})|<\), where \(Rank(B_{1}) d,Rank(B_{2}) d\), and \(0(i,j) 1\) for \(1 i n,1 j m\)._
+
+Because \(A\) is a matrix of rank \(n\), it can be rewritten as \(A=U_{B}V\), where \(I_{B}\) is an identity matrix with rank \(n\). Thus, \(A_{ij}=_{k=1}^{n}U_{ik}V_{kj},1 i n,1 j m\). Let \(A^{}\) be a matrix of \(n m\), where \(A^{}_{ij}=_{ij}_{k=1}^{d}U_{ik}V_{kj}\) for \(1 i n,1 j m\). Here, \(_{ij}=1+^{n}U_{ik}V_{kj}}{_{k=1}^{n}U_{ik}V_{kj}}\) if \(_{k=1}^{d}U_{ik}V_{kj} 0\), otherwise \(_{ij}=1+^{n}U_{ik}V_{kj}}{}\). Thus, we have \(|A-A^{}|\).
+
+Let \(_{min}=_{ij}\), and \(_{max}=_{ij}\). Let \(B_{1}=_{min}UD_{n,d}V\), \(B_{2}=_{max}UD_{n,d}V\), where \(D_{n,d}\) denotes an \(n\)-by-\(n\) diagonal matrix with the first \(d\) elements of the diagonal being \(1\)s and the rest being \(0\)s. We have \(A^{}_{ij}=_{ij}_{k=1}^{d}U_{ik}V_{kj}=(i,j) B_{1ij}+( 1-(i,j)) B_{2ij}\), where \((i,j)=-_{ij}}{_{max}-_{min}}\). Because \(_{min}_{ij}_{max}\), we have \(0(i,j) 1\).
+
+Thus, we have constructed \(B_{1},B_{2},\) such that \(|A-( B_{1}+(1-) B_{2})|=|A-A^{}|\).
+
+_Remark_ Here, we have shown that any high-rank matrix can be expressed as a mixture of logits of two low-rank matrices. Note that our decomposition is not intended to be used as a distillation of the original high-rank matrix. It is likely prohibitively expensive to populate the full matrix with a learned similarity function. In addition, our proof also does not indicate that having two mixture components is sufficient to train the embeddings and the learned similarity function. It is well-known that overparameterization is often necessary to enable efficient and performant training.
+
+### Applying MoL to Heterogeneous Use Cases
+
+We now discuss how to apply MoL to retrieval tasks in different domains. Parameterization of the low-rank, component-level embeddings, or \(f_{p}(q),g_{p}(x)^{dp}\), plays an important role in realizing MoL's theoretical expressiveness in practice, as suggested by prior work (Golov et al., 2013). We discuss two scenarios on the opposite end of the spectrum, one with _a large number of heterogeneous features_ - retrieval in large-scale recommendation systems, followed by another with _a single homogeneous feature_ - finetuning language models for question answering and related NLP use cases, shown in Figure 2.
+
+_Retrieval in Large-scale Recommendation Systems._ Recommendation systems are characterized by the large number of heterogeneous features they use (Golov et al., 2013; Zhang et al., 2014; Zhang et al., 2015). This naturally enables some of those features to be utilized on the query- (user-) or on the item-side. For instance, embeddings can be constructed based on cluster ids on both the query-side and the item-side (Golov et al., 2013). For common benchmark datasets, User ID-based one-hot embeddings (Golov et al., 2013) represent another possible \(g_{p}(q)\) to use, which we evaluate in Section 4.
+
+_Finetuning Language Models for Question Answering._ In contrast, language models are characterized by their use of homogeneous
+
+Figure 1. Mixture-of-logits (MoL) learned similarity.
+
+semantic features, such as wordpieces and sentencepieces (Shan et al., 2017). We observe that MoL can be similarly adopted for those use cases. To obtain the \(P_{X}\) item embeddings for MoL, we expand tokenizer's vocabulary with \(P_{X}\)_special aggregation tokens_\(X_{1},,X_{P_{X}}\), and append those \(P_{X}\) tokens at the beginning of every tokenized sequence, \(SP_{1},,SP_{N}\), as illustrated in Figure 2.1. These \(P_{X}\) special tokens play similar roles as the CLS token in BERT (Devlin et al., 2019), and during finetuning of the language model, are co-trained to aggregate different aspects of information as inputs for MoL. Additionally, we can design a learned pooling function to adapt pooling policy at an example-level ("Parameterized Pooling") to improve model quality, which we discuss further in Appendix A.2.
+
+## 3. Retrieval Algorithms
+
+In this section, we describe the problem of retrieving the top \(K\) items with _MoL_ as well as exact and approximate retrieval algorithms. Formally, we define the top \(K\) retrieval problem as the following:
+
+Definition 1.: _Top \(K\) with MoL. Let \(q\) be a query and \(X\) be a set of items, where both the query \(q\) and each item \(x X\) are associated with \(P\) embeddings. Together we have \(P\) pairs of embeddings, \((f_{p}(q),g_{p}(x))\), \(1 p P\). Let \((q,x)=_{p=1}^{P}_{p}(q,x)(f_{p}(q),g_{p}(x))\) be the similarity score of \(q,x\), where \(x X\). The top \(K\) query with MoL returns the \(K\) items from \(X\) with the highest \((q,x)\)s._
+
+For approximate top \(K\) retrieval with _MoL_, we define the gap of the approximate and exact top \(K\) results as follows:
+
+Definition 2.: _Gap of approximate top \(K\): Let \(q\) be a query and \(X_{K}\) be the set of exact top \(K\) items for the query \(q\) from a set of items. \(X\). Let \(X^{*}\) be the approximate top \(K\) results, where \(X^{*} X\). Let \(S=((q,x),x X^{*})\) and \(S^{}=((q,x),x X_{K} X^{*})\). We call \(S_{}=S^{}-S\) the gap of the top \(K\) with \(X^{*}\)._
+
+### Exact algorithm
+
+The brute-force algorithm to retrieve the exact top \(K\) with _MoL_ is to evaluate \((q,x)\) for each query \(q\) and item \(x\). This algorithm can be prohibitively expensive if the number of items is large. Instead, we describe a more efficient two-pass algorithm to retrieve the exact top \(K\) items as shown in Algorithm 1.
+
+```
+0: query \(q\), a set of items \(X\), \(f_{p}()\), \(g_{p}()\) for constructing the component-level embeddings \(f_{p}(q),g_{p}(x)\)
+0: exact top \(K\) items
+1:\(G\)
+2:for\(p P\)do
+3:\(X_{p}\{g_{p}(x),x X\}\)\(\) Can be preprocessed.
+4:\(G G TopKDotProduct(f_{p}(q),X_{p})\)\(\) Retrieve top \(K\) items
+5:for each pair of embeddings
+6:\(S_{ m}\)
+7:for\(x G\)do
+8:\(s MoL(q,x)\)
+9:if\(s<S_{min}\)then\(S_{min} s\)
+10:\(G^{}\)
+11:for\(p P\)do
+12:\(G^{} G^{} RangeDotProduct(f_{p}(q),S_{min},X_{p})\)\(\) Retrieve all items \(x X_{p}\) with \( f_{p}(q),x S_{min}\).
+13:return\(BruteForceTopKDot\)(\(q,G^{}\))\(\) Retrieve the top \(K\) items from \(G^{}\) with MoL.
+```
+
+**Algorithm 1** Exact top \(K\) algorithm.
+
+We start by retrieving the top \(K\) items with the highest dot product scores for each group of embeddings as the initial candidate set \(G\) (line 1-4). Then we evaluate the _MoL_ scores of the items in \(G\) and find the minimal learned similarity score \(S_{min}\) (line 5-8). Next we retrieve all items within a distance of \(S_{min}\) with the query \(q\) as the candidate set \(G^{}\) (line 9-11). Finally, we evaluate the _MoL_ scores of the items in \(G^{}\), and return the top \(K\) items with the highest scores (line 12).
+
+We argue that Algorithm 1 retrieves the exact top \(K\) items with _MoL_. Let \(X_{K}\) be the set of the exact top \(K\) items and \(X^{}\) be the result of Algorithm 1. Let \(x X_{K}\) and \((q,x)\) be the _MoL_ score of \(x\) and \(q\). Since \(x\) has the highest top \(K\) score with _MoL_, \((q,x) S_{min}\). Since the _MoL_ score is a weighted score over the total product scores, we have \(( f_{p}(q),g_{p}(x),1 p P)(q,x) S_{min}\). Since Algorithm 1 retrieves all the items with a dot product higher than or equal to \(S_{min}\) of \(q\) for each embedding \(q_{p}\) (line 9-11), we have \(x G^{}\). Thus, \(x X^{}\). So we have shown that \(X_{K}=X^{}\).
+
+### Approximate algorithms
+
+In the exact algorithm shown in Algorithm 1, we need to retrieve all the items with a dot product higher than or equal to a threshold. When the threshold is a loose filter of the item set, which may happen when the dot product scores are skewed, \(G^{}\) can be large,
+
+Figure 2. Illustration of how to apply Mixture-of-logits (MoL) learned similarity to various retrieval scenarios, with a language model finetuning use case (characterized by a single homogeneous feature) shown on the left, and a recommendation use case (characterized by a large number of heterogeneous features) shown on the right. More details can be found in Appendix A.2.
+
+and the evaluation of _MoL_ over a large number of candidate items can still be expensive. Here, we describe two heuristics to approximately retrieve the top \(K\) items and analyze their gap against the exact top \(K\) algorithm.
+
+In both heuristics, we perform a two-stage retrieval as shown in Algorithm 2. In the first stage, we retrieve a set of \(K^{}\) candidate items that are potentially high in _MoL_ score by using dot products (line 2). Note that \(K^{}\) can be larger than \(K\), e.g., due to oversampling. In the second stage, we evaluate the _MoL_ scores of the candidate items and return the top \(K\) items (line 3).
+
+```
+0: a query \(q\), a set of items \(X\)
+0: approximate top \(K\) items
+1:functionApproxTo(\(q,X,K^{}\))
+2:\(G TopKCandidate(q,X,K^{})*\) Retiree the top \(K^{}\) candidates
+3:return\(BruteForceTopKMod(q,G,K)\)\(\) Retrieve the top \(K\) items with _MoL_.
+4:a query \(q\), a set of items \(X\), \(f_{p}()\), \(g_{p}()\) for constructing the component-level embeddings \(f_{p}(q),g_{p}(x)\)
+5:union of top \(K\) items over \(P\) component-level embeddings by dot product
+6:functionTorKPreEmbedding(\(q,X,K\))
+7:\(G\)
+8:for\(p P\)do
+9:\(X_{p}(g_{p}(x),x X)\)\(\) Can be preprocessed.
+10:\(G G TopKDotProduct(f_{p}(q),X_{p},K)\)\(\) Retrieve the top \(K\) items by dot product
+11:return\(G\)
+12:Input: a query \(q\), a set of items \(X\), \(f_{p}()\), \(g_{p}()\) for constructing the component-level embedding \(f_{p}(q),g_{p}(x)\)
+13:Output top \(K\) items based on the averaged dot product, \(_{p}\{f_{p}(q),g_{p}(x)\}/P\).
+14:functionTorKAvo(\(q,X,K\))
+15:\(q^{}_{p,p^{}}^{P}f_{p}(q)\)
+16:\(X^{}(_{p,p^{}}^{P}g_{p}(x)/P,x X)\)\(\) Can be preprocessed.
+17:return\(TopKDotProduct(q^{},X^{},K)\)
+```
+
+**Algorithm 2** Approximate top \(K\) algorithms.
+
+Here, we describe two heuristics to retrieve the candidate items:
+
+_Top \(K\) per embedding_. Given a query \(q\) and a set of items \(X\), for each embedding set \(p\), retrieve top \(K\) items \(X_{K,p}\) based on dot product (\( f_{p}(q),g_{p}(x)\)). Return the union across \(P\) queries.
+
+The top \(K\) per embedding heuristic returns the union of the top \(K\) items for each embedding by dot product. We analyze the gap of this heuristic as follows:
+
+**Theorem 2**.: _Upper bound of the gap of top \(K\) per embedding_: Let \(X_{K,p}\) be the top \(K\) items of the embedding set \(p\) and \(S=\{(q,x),x X_{K+1,p}\}\). _Let \(S_{min}\) be the \(K^{th}\) largest MoL score of the items in \(_{P}X_{K,p}\), then the gap of \(S_{} S^{}-S_{min}\).
+
+_Remark_ Note that there exists an _MoL_ such that \(S_{}=S-S_{min}\), i.e., when \(_{p}(q,x)=1\) for \(x_{p}=_{x,p}\{ f_{p}(q),g_{p}(x),x X_{K+1,p} X _{K,p}\}\). Thus, the upper bound of \(S_{}\) is tight.
+
+_Top \(K\) average_. Given a query \(q\) and a set of items \(X\), return the top \(K\) items with the highest average dot product \(_{p}\{ f_{p}(q),g_{p}(x)/P\).
+
+Note that the top \(K\) average heuristic returns the exact top \(K\) items when the gating weight distribution in _MoL_, \(\), is uniform.
+
+This heuristic is interesting for two reasons. First, the items retrieved by this heuristic are likely to be the top \(K\) items of _MoL_ when the weight distribution is more balanced. This complements the heuristic that retrieves top \(K\) per embedding. Second, in the setup where the set of embedding pairs is constructed as the outer product of the embeddings of a query and those of an item (Equation 2), the average dot product can be efficiently preprocessed and materialized for the items, and the computation of the top \(K\) average is then _agnostic_ to the number of embedding pairs, \(P=P_{q} P_{S}\).
+
+Formally, let \(P=P_{q}-P_{x}\) be the number of embedding pairs, where \(P_{q}\) is the number of embeddings of a query \(q\) and \(P_{X}\) is that of an item \(x\). The average dot product can be computed as
+
+\[_{p=1}^{P} f_{p}(q),g_{p}(x) = _{p,q^{}=1}^{P_{q}}_{p,q^{}=1 }^{P_{q}} f_{p}(q),g_{p*}(x) \] \[= _{p,q^{}=1}^{P_{q}}f_{p*}(q),_{p,q^ {}=1}^{P_{q}}g_{p*}(x)\]
+
+Thus, we can preprocess the embeddings of the items and the query, so the number of embeddings accessed is 1 per item for a given query, regardless of the overall number of component-level embeddings used by _MoL_, i.e., \(P\).
+
+Finally, we can combine the candidates retrieved from top \(K\) per embedding group and the top \(K\) average as the following:
+
+_Combined top \(K\)_. Given a query \(q\), a set of items \(X\), and \(K\), return the union of the items from the top \(K\) per embedding group across the \(P\) groups and the top \(K\) items from the top \(K\) average.
+
+**Theorem 3**.: _Upper bound of the gap of combined top \(K\). Let \(X_{K,p}\) be the top \(K\) items of the embedding set \(p\) and \(S_{min}\) as defined in Theorem 2. Let \(X^{}_{K}\) be the top \(K\) items from top \(K\) average. Let \(S^{}=\{(q,x),x X(_{p}X_{K,p} X^{}_{K})\}\). Then the gap of \(S_{} S^{}-S_{min}\)._
+
+_Remark_ Similar to Theorem 2, the upper bound of the gap is tight. In practice, we can configure the \(K\) to be different for the two heuristics, i.e., \(K_{1}\) and \(K_{2}\). For example, when the weight distribution \(\) is more balanced, \(K_{2}\) can be configured to be larger as the top \(K\) average approach approximates _MoL_ well while being more computationally efficient.
+
+## 4. Evaluation
+
+In this section, we evaluate the performance of the _MoL_ based learned similarity with the proposed load balancing loss, and the efficiency of our retrieval algorithms discussed in Section 3. Our code and model checkpoints are available at the following anonymized GitHub repository: [https://anonymous.4open.science/r/rails-4E62](https://anonymous.4open.science/r/rails-4E62).
+
+### Workloads
+
+We benchmark _MoL_ with the proposed load balancing loss \(_{MI}\), on top of state-of-the-art baselines in recommendation systems and question answering. We describe workloads used below.
+
+_Recommendation Systems_. We consider three widely used datasets, the 1M and 20M subsets of MovieLens (Shi et al., 2019), and the largest Books subset of Amazon Reviews (Shi et al., 2019). Sequential retrieval models have been shown to achieve state-of-the-art results on these datasets (Shi et al., 2019; Shi et al., 2019).
+
+27, 60]. In these settings, sequential encoders, like RNNs or Transformers, are used to map user representations at time \(t\) - e.g., in a commonly used setting shown in Figure 2, the list of items in user history up until time \(t\), \(_{0}\),..., \(_{t}\) - to \(^{d}\), and the model is trained to autoregressively predict the next item \(x_{t+1}\). We hence compare MoL with the proposed regularization loss on top of two popular backbones used for sequential retrieval models, SASRec  and HSTU , against cosine similarity baselines. We utilize user id-based embeddings discussed in Section 2.2 and MLPs to parameterize the \(P_{Q}\) query-side and the \(P_{X}\) item-side features.
+
+_Question Answering (QA)_. Natural Questions (NQ)  is commonly used to evaluate state-of-the-art neural retrieval models, including dense retrieval  and generative retrieval  approaches in recent years. The most commonly used version , which we reuse in our work, is often referred to as NQ320k. NQ320k consists of 320k query-items pairs, where the items are from Wikipedia pages and the queries are natural language questions. We utilize special aggregation tokens discussed in Section 2.2 to parameterize embeddings in MoL, and compare MoL with popular sparse retrieval methods , dense retrieval methods , and generative retrieval methods . Consistent with recent work , we use the pre-trained query generation model from DocTSQuery  to generate synthetic (query, item) pairs for data augmentation.
+
+Table 2 summarizes the statistics of these four workloads.
+
+### Quality of MoL-based Learned Similarity
+
+_Metrics._ We use Recall (Hit Rate) as the main metric. We report Hit Rate@ and Mean Reciprocal Rank (MRR) on NQ320K, following , and Hit Rate@ on _ML-1M_, _ML-20M_, and _Books_, following .
+
+_Hyperparameter Settings._ We set the weight \(\) for the proposed load balancing loss \(_{MI}\) to 0.001 for all experiments. We reuse baseline settings for most other hyperparameters, including learning rate, number of examples used for in-batch negative sampling, etc., with detailed discussions in Appendix A. For the NQ320K dataset, we reuse SEAL  and NCI  results reported by , and results for other models as reported by . The Sentence-T5 , GENRE , DSI , SEAL , DSI+QQ , NCI , and GenRet  rows are all finetuned from T5-base, consistent with MoL, to ensure a fair comparison. All other results are reimplemented ourselves in PyTorch, and are trained with 1x/2x 48GB GPUs for the recommendation datasets and 4x 80GB GPUs for the QA datasets.
+
+_Results._ Across the six recommendation scenarios utilizing different sequential encoder backbones, Mixture-of-Logits (MoL rows) consistently outperform dot products by an average of 18.5% in MRR, 22.0% in HR@1, and 18.5% in HR@10 (Table 3). On the widely used Natural Questions QA dataset, MoL outperforms all recent generative retrieval approaches as well as strong dot product (dense retrieval) baselines (Table 4). These results validate that learned similarities, in particular MoL, are not only theoretically expressive but also _practically learnable_, improving retrieval quality across heterogeneous scenarios, including sequential retrieval models for Recommendations and finetuning LMs for Question Answering.
+
+_Ablation Studies._ We conduct ablation studies for the proposed mutual information-based load balancing loss relative to the best performing method for each dataset ("abl. \(_{MI}\)" rows). Results show that our proposed \(_{MI}\) loss improves HR@1 by 4.6%, HR@10
+
+    &  &  \\  & K=1 & K=10 & K=100 & & \\  _Sparse retrieval_ & & & & & \\ BM25  &.297 &.603 &.821 &.402 &.663 \\ DocTSQuery  &.380 &.693 &.861 &.489 &.666 \\  _Dense retrieval_ & & & & & \\ DPR  &.502 &.777 &.909 &.599 &.688 \\ Sentence-T5  &.536 &.830 &.938 &.641 &.699 \\ GTR-Base  &.560 &.844 &.937 &.662 &.670 \\  _Generative retrieval_ & & & & & \\ GENRE  &.552 &.673 &.754 &.599 &.672 \\ DSI  &.552 &.674 &.780 &.596 &.673 \\ SEAL  &.570 &.800 &.914 &.655 &.674 \\ DSI-QQ  &.631 &.807 &.880 &.695 &.675 \\ NCI  &.659 &.852 &.924 &.731 &.678 \\ GenRet  &.681 &.888 &.952 &.759 &.677 \\  _Learned similarities_ & & & & & \\ MoL & **.685** & **.919** & **.970** & **.773** & \\ MoL & abl. \(_{MI}\) &.673 & **.919** &.968 &.767 \\   
+
+Table 4. Evaluation of performance for QA retrieval models finetuned from language models on Natural Questions.
+
+    &  &  \\  & K=1 & K=10 & K=50 & & \\  _ML-1M_ dataset & & & & & \\ SASRec  &.0610 &.2818 &.5470 &.7540 &.1352 \\ SASRec + MoL &.0697 &.3036 &.5617 &.7667 &.1441 \\ HSTU  &.0750 &.3332 &.5956 &.7824 &.1579 \\ HSTU + MoL & **.0884** & **.3465** & **.6022** &.7935 & **.1712** & **.665** \\ HSTU + MoL & abl. \(_{MI}\) &.0847 &.3417 &.6011 & **.7942** &.1662 \\  _ML-20M_ dataset & & & & & \\ SASRec  &.0653 &.2883 &.5484 &.7658 &.1375 \\ SASRec + MoL &.0778 &.3102 &.5682 &.7779 &.1535 \\ HSTU  &.0962 &.3557 &.6146 &.8080 & **.1800** & \\ HSTU + MoL & abl. \(_{MI}\) &.0100 & **.3698** & **.6260** & **.8132** & **.1881** \\ HSTU + MoL & abl. \(_{MI}\) &.0994 &.3670 &.6241 &.8128 &.1866 \\  _Books_ dataset & & & & & \\ SASRec  &.0058 &.0306 &.0754 &.1431 &.0153 \\ SASRec + MoL &.005 &.0429 &.0915 &.1635 &.0212 \\ HSTU  &.0101 &.0496 &.1066 &.1876 &.0233 \\ HSTU + MoL & **.0156** & **.0693** & **.1362** &.2144 & **.0329** & **.686** \\ HSTU + MoL & abl. \(_{MI}\) &.0139 &.0661 &.1315 & **.2153** &.0323 & **.67** \\   
+
+Table 3. Evaluation of performance for sequential retrieval models on MovieLens and Amazon Reviews.
+
+by 1.7% and MRR by 1.6% across the four datasets. In particular, our proposed \(_{MI}\) loss enables MoL to outperform the best generative retrieval approach on NQ320K, GenRet (Yang et al., 2019), across all metrics.
+
+### Top \(K\) retrieval performance
+
+We evaluate the following methods for top \(K\) retrieval performance:
+
+* Brute-force top \(K\) (_BruteForce_): Evaluate the _MoL_ scores for all items and return the top \(K\) items. This is the ground truth in our top \(K\) evaluation 2. * Per embedding top \(K\) (_TopKPerEmbd(N)_): This algorithm is described in Section 3.2. \(N\) is the number of candidate items retrieved from each embedding set, where \(N P K\).
+* Average top \(K\) (_TopKAvg(N)_): This algorithm is described in Section 3.2. \(N\) is the number of the candidate items retrieved by average dot products, where \(N K\).
+* Combined top \(K\) from per embedding top \(K\) and average top \(K\) (_CombTopKN1_N2_): This is described in Section 3.2. \(N_{1}\) is the number of candidate items retrieved from per embedding top \(K\) and \(N_{2}\) is the number of candidate items retrieved from average top \(K\), where \(N_{1} P+N_{2} K\).
+
+For each dataset, we evaluate top \(K\) retrieval methods based on the best performing model configurations reported in Table 3 and Table 4. Table 5 shows the hit rate (HR) and latency of all the methods. The hit rate is normalized by the ground truth, i.e., the hit rate achieved with brute-force top \(K\). We measure latency by evaluating a batch of 32 retrieval queries, in order to achieve high accelerator utilization; this is consistent with prior work on GPU/TPU-based retrieval algorithms (Bahdanau et al., 2015; Yang et al., 2019; Yang et al., 2019). We omit _ML-1M_ as its size is small (Table 2). We perform evaluation on a single RTX 6000 Ada GPU. We report latency averaged over 20 warm runs.
+
+We observe that our approximate heuristics achieve high HR with oversampling. For example, _TopKAvg500_ is \(>.99\) in relative HR across the board for _ML-20M_, and _TopKAvg100_ is \(>.99\) in relative HR across the board for _NQ320K_. In addition, the combined top \(K\) algorithm can outperform both _TopKPerEmbd_ and _TopKAvg_ of the corresponding configurations, sometimes significantly, e.g., _CombTopKX5_ 200_ vs. _TopKPerEmbd_5 and _TopKAvg200_ on _Books_. This indicates that the set of candidate items retrieved by each individual approximate algorithm indeed complements each other when the weight distributions, \(_{p}(q,x)\)s, vary in _MoL_.
+
+In terms of efficiency, we observe that our approximate heuristics are significantly lower in latency than the exact baseline, especially as the number of items in the dataset becomes large. For example, compared to _BruteForce_, _TopKAvg_ achieves \(>.99\) relative HR@100 with a speedup of 105\(\) and 66\(\) in latency for _Books_ and _NQ320K_,
+
+    & **Method** & **HR@1** & **HR@5** & **HR@10** & **HR@50** & **HR@100** & **Latency/\(ms\)** \\   & _BruteForce_ & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 3.17\(\)0.03 & 736 \\  & _TopKPerEmbd5_ &.762 &.707 &.647 &.645 &.402 & 1.28\(\)0.04 & 737 \\  & _TopKPerEmbd10_ &.956 &.881 &.820 &.646 &.564 & 1.31\(\)0.04 & 738 \\  & _TopKPerEmbd50_ & **1.00** & **.992** &.982 &.933 &.900 & 1.63\(\)0.02 & 739 \\  & _TopKPerEmbd100_ & **1.00** & **1.00** & **.999** &.981 &.966 & 2.41\(\)0.04 & 730 \\  & _TopKAvg200_ & **1.00** & **.998** & **.997** &.982 &.939 &.86\(\)0.04 & 731 \\  & _TopKAvg500_ & **1.00** & **1.00** & **1.00** & **1.00** & **.998** &.88\(\)0.03 & 762 \\  & _CombTopK5_ 200_ & **1.00** & **1.00** & **1.00** & **1.00** & **.998** & 1.46\(\)0.04 & 763 \\   & _BruteForce_ & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 181.34\(\)9.09 & 744 \\  & _TopKPerEmbd5_ &.907 &.915 &.809 &.509 &.396 & 26.40\(\)6.03 & 765 \\  & _TopKPerEmbd50_ & **.993** & **.992** & **.994** &.956 &.902 & 27.59\(\)6.68 & 766 \\  & _TopKPerEmbd100_ & **1.00** & **.995** & **.996** & **.985** &.959 & 29.64\(\)6.65 & 766 \\  & _TopKAvg200_ & **1.00** &.978 &.948 &.845 &.767 & 0.81\(\)1.11 & 767 \\  & _TopKAvg500_ & **1.00** & **.992** & **.996** &.919 &.875 & 0.80\(\)0.09 & 768 \\  & _TopKAvg1000_ & **1.00** & **1.00** & **.996** &.963 &.939 & 0.87\(\)0.04 & 769 \\  & _TopKAvg2000_ & **1.00** & **1.00** & **1.00** &.980 &.968 & 1.11\(\)0.04 & 770 \\  & _TopKAvg4000_ & **1.00** & **1.00** & **1.00** & **.996** & **.987** & 1.72\(\)0.04 & 771 \\  & _CombTopK5_ 200_ &.979 &.984 &.981 &.892 &.818 & 25.73\(\)7.76 & 772 \\  & _CombTopK5_ 500_ & **.993** & **.989** & **.994** &.975 &.961 & 27.99\(\)6.65 & 773 \\  & _CombTopK100_ & **1.000** & **.997** & **.996** & **.993** & **.992** & 30.40\(\)6.67 & 774 \\   & _BruteForce_ & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 37.74\(\)4.07 & 773 \\  & _TopKPerEmbd5_ & **1.00** & **1.00** & **.995** &.961 & **1.00** & 4.71\(\)0.08 & 776 \\  & _TopKPerEmbd10_ & **1.00** & **1.00** & **1.00** &.981 & **1.00** & 4.83\(\)0.08 & 777 \\  & _TopKPerEmbd50_ & **1.00** & **1.00** & **1.00** & **1.00** & **1.00** & 6.31\(\)0.09 & 778 \\  & _TopKAvg100_ & **.999** & **.999** & **.999** & **.998** & **.995** & 57\(\)0.05 & 779 \\  & _TopKAvg200_ & **1.00** & **1.00** & **1.00** & **.999** & **.999** & 6.64\(\)0.01 & 780 \\  & _CombTopK5_ 100_ & **1.00** & **1.00** & **1.00** & **.999** & **.999** & 5.28\(\)0.08 & 781 \\   
+
+Table 5. Evaluation of top \(K\) retrieval performance, with hit rate (HR) normalized by the brute-force top \(K\) method and latency with standard deviation (i.e., \(\)) measured over a batch of queries (where the batch size is 32). (Relative) hit rate higher than.99 is marked in bold.
+
+respectively. While the algorithm latency grows with the size of the dataset in the brute-force baseline, it grows much slower with the approximate methods. For example, the algorithm latency increases by 57\(\) from _ML-20M_ to _Books_ in _BruteForce_, while the growth rate is 12\(\) and 1.0\(\) for _TopKPerEmbd_100 and _TopKAvg_500, respectively. Thus, we expect that the speedup of the approximate methods to become even more prominent with larger datasets.
+
+We also notice that _TopKAvg_ tends to be more efficient than _TopKPerEmbd_ with comparable HR, e.g., _TopKAvg_2000 vs. _TopKPerEmbd_100 on _Books_ with 27\(\) speedup in latency. We believe that this is mainly due to two reasons. First, when the HR is comparable, the maximal number of candidate items from _TopKPerEmbd_ is larger than that of _TopKAvg_. Second, compared to _TopKPerEmbd_, the computation of _TopKAvg_ is agnostic to the number of component-level low-rank embeddings, \(P\), because of the materialization optimization described in Section 3.2. Interestingly, we also see that the combined top \(K\) is more efficient than the summation of the latency of its individual components, e.g., _CombTopK_5_200 is 1.5\(\) faster than the sum of the latency from _TopKPerEmbd_5 and _TopKAvg_200 on _ML-20M_. This is because our implementation reduces the overhead of the combined method by consolidating processing shared by the two components.
+
+Overall, empirically _TopKAvg_ strikes a good balance between high HR and low latency, and the combined top \(K\) algorithm can be used if the target HR is extremely stringent.
+
+## 5. Related work
+
+_Similarity Functions in Retrieval._ Most information retrieval models in recommendation systems and natural language processing (e.g., question answering) follow a classical two-stage paradigm (Golovne and Mikolov, 2013; Mikolov et al., 2013; Mikolov et al., 2013; Mikolov et al., 2013), where up to billions of items (Bahdanau et al., 2014; Mikolov et al., 2013; Mikolov et al., 2013; Mikolov et al., 2013) are first filtered down to hundreds in the _retrieval_ stage, followed by another stage (e.g., ranking in recommendation systems or generation in RAG (Mikolov et al., 2013)) that produces the final results. Earlier work on large-scale neural retrieval models primarily utilize dual-encoder (dense retrieval, etc.) setups, with dot products as the similarity function (Golovne and Mikolov, 2013; Mikolov et al., 2013; Mikolov et al., 2013; Mikolov et al., 2013). Researchers quickly realized that dot products limited retrieval stage's performance, and explored various learned similarity-based approaches. Prominent variants include maximum similarity based on multiple embeddings (Mikolov et al., 2013; Mikolov et al., 2013; Mikolov et al., 2013), specialized neural networks, often leveraging Hadamard products (Bahdanau et al., 2014; Mikolov et al., 2013; Mikolov et al., 2013), and representing item ids as token sequences ("learned index structures"), either implicitly defined during tree traversal (Mikolov et al., 2013; Mikolov et al., 2013; Mikolov et al., 2013) or explicitly in the "generative retrieval" setups (Bahdanau et al., 2014; Mikolov et al., 2013; Mikolov et al., 2013; Mikolov et al., 2013; Mikolov et al., 2013). It has been shown, however, that learned neural distances often fail to outperform dot products, e.g., Hadamard MLPs in recommendation systems (Mikolov et al., 2013) and DSI for QA scenarios in NLP (Mikolov et al., 2013). Learned index structures further introduce stability and latency challenges as both NLP and recommendation systems need to support billion-scale realtime updated set of items (Bahdanau et al., 2014; Mikolov et al., 2013; Mikolov et al., 2013). Despite these challenges, significant gains (17% gains at Hit Rate@100 (Mikolov et al., 2013) to 24% gains at Hit Rate@400 (Bahdanau et al., 2014)) with learned similarities have been reported in recent years; these can be attributed to careful construction of learned similarity functions (Mikolov et al., 2013; Mikolov et al., 2013), implicit diversification done as part of beam search (Mikolov et al., 2013), explicit incorporation of side-information using special neural architectures (Bahdanau et al., 2014), and hardware-aware similarity function and inference algorithm design on GPUs (Bahdanau et al., 2014; Mikolov et al., 2013; Mikolov et al., 2013).
+
+_Load Balancing for Conditional Computations in Neural Networks._ Conditional computations have been widely utilized in deep learning models (Bahdanau et al., 2014; Mikolov et al., 2013). Regularization losses have been proposed based on the observation that an ideal policy should evenly utilize all compute units in aggregate while being sparse at an individual example level (Bahdanau et al., 2014). Mixture-of-experts, a common way to implement conditional computations, has been widely used in language and vision domains (Bahdanau et al., 2014; Mikolov et al., 2013) where mutual information-based regularization losses between experts and tasks (Bahdanau et al., 2014) and experts and tokens (Mikolov et al., 2013) have been shown to help with various architectures.
+
+_Efficient Nearest Neighbor Search (NNS)._ Nearest neighbor search has been a popular topic of research due to their critical role in large-scale retrieval and vector databases. Most studies focus on the dot product case, also known as Maximum Inner Product Search (MIPS). Various techniques were proposed and analyzed, including tree structures (Bahdanau et al., 2014; Mikolov et al., 2013), locality sensitive hashing (Golovne and Mikolov, 2013; Mikolov et al., 2013), production quantization (Golovne and Mikolov, 2013; Mikolov et al., 2013), data partitioning (Zhu et al., 2014; Mikolov et al., 2013), graph-based methods (Zhu et al., 2014; Mikolov et al., 2013), and so on. The general case for NNS utilizing learned similarities remains less studied; for learned index structures, techniques to construct trees have been proposed to ensure beam search result in globally optimal top-\(K\) results (Zhu et al., 2014). Algorithms based on implicit (Zhu et al., 2014; Mikolov et al., 2013; Mikolov et al., 2013) or explicit graphs (Zhu et al., 2014) have been proposed to obtain a tractable candidate set in multi-stage retrieval setups; however, such approaches' performance can degrade when the similarity function is not a metric, and constructing appropriate graph indices for non-metric similarity functions can remain challenging even for the inner product case (Zhu et al., 2014). Due to GPUs and other accelerators having orders of magnitude higher arithmetic intensity vs CPUs, traditional quantization techniques (Golovne and Mikolov, 2013; Mikolov et al., 2013) no longer fully utilize GPUs; accelerator-specific nearest neighbor algorithms that benefit from increased compute have been proposed recently (Bahdanau et al., 2014; Mikolov et al., 2013; Mikolov et al., 2013).
+
+## 6. Conclusion
+
+We have analyzed techniques for efficient retrieval with expressive learned similarities in this work. We begin by showing Mixture-of-Logits (_MoL_) is a universal approximator of learned similarity functions, and further empirically learnable - _MoL_ with our proposed load balancing loss consistently outperforms dot products (dense retrieval), sparse retrieval, and generative retrieval approaches across Recommendation Systems and Question Answering scenarios, setting new state-of-the-art across common, heterogeneous benchmark datasets. We next propose both exact and approximate algorithms to enable efficient retrieval using learned similarity functions, and show their correctness and bounds. Across all datasets evaluated, we demonstrate that our approximate top \(K\) algorithms can reach.99 of Hit Rate relative to exact algorithms, while achieving up to 105\(\) reduction in end-to-end latency and with minimal indexing overheads. We expect the speedups to be further amplified with larger-scale datasets and GPU kernel optimizations. Given MoL's empirical impressive performance gains of 20%-30% across Hit Rate@50-400 over hundreds of millions to billions of items (Bahdanau et al., 2014; Mikolov et al., 2013) and broad applicability across heterogeneous scenarios, our work provides strong theoretical and practical justifications for migrating web-scale vector databases away from dense retrieval and MIPS to Retrieval with Learned Similarities (RAILS) on GPUs.
+
+[MISSING_PAGE_FAIL:9]
+
+* [Online et al.2019] Ilya Loshchilov and Frank Hutter. 2019. Decoupled Weight Decay Regularization. In _International Conference on Learning Representations_. [https://openreview.net/forum?id=B3636077](https://openreview.net/forum?id=B3636077)
+* [Online et al.2020] Yu A. Malkov and D. A. Yashunin. 2020. Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Nargible Small World Graphs. _IEEE Trans. Pattern Anal. Mach. Intell._ 42, 4 (2020), 824-836. [https://doi.org/10.1109/TAPAMI.2020.182892973](https://doi.org/10.1109/TAPAMI.2020.182892973)
+* [Online et al.2015] Julian McAuley, Christopher Targett, Qinfeng Shi, and Anton van den Hengel. 2015. Image-Based Recommendations on Styles and Substitutes. In _Proceedings of the 33th International ACM SIGIR Conference on Research and Development in Information Retrieval_ (Santiago, Chile) (SIGIR '15) Association for Computing Machinery, New York, NY, USA, 42-5, [https://doi.org/10.1145/26466-27755](https://doi.org/10.1145/26466-27755)
+* [Online et al.2018] Stanislav Monrov and Artem Babenko. 2018. Monte-Similarity Graphs for Maximum Inner Product Search. In _Advances in Neural Information Processing Systems_. Springer, R. Bengio, H. Wallach, H. Larochelle, K. Grauman, N. Cesa-Sincoli, and R. Garnett (Eds.), Vol. 31. Curran Associates, Inc. [https://proceedings.neurips.cc/paper/files/paper/2018/file29779071906052043247269397_paper.pdf](https://proceedings.neurips.cc/paper/files/paper/2018/file29779071906052043247269397_paper.pdf)
+* [Online et al.2022] Jimmy M. Gusatkoos Hernandez, Shook Nontani, M. Nitz, K. Halli, Daniel C., and Yinfei Tan. 2022. Sentence-T5: Scalable Sentence Encoders from Pretrained Text-to-Text. In _Findings of the Association for Computational Linguistics: ACL_. 2022. Samantha Muresan, Preslav Nakov, and Alice Villarrencio (Eds.). Association for Computational Linguistics, Dublin, Ireland, 1864-1874. [https://doi.org/10.1855/142](https://doi.org/10.1855/142)
+
+#### a.2.1. Recommendation Systems
+
+Prior work have shown that careful parameterization of low-rank ("component-level") embeddings, or \(f_{p}(q)\) and \(g_{p}(x)\)s for \(1 p P\), can significantly improve Mol.'s performance . In the context of large-scale recommendation systems, cluster information based on interests of cohorts of members and topics of posts by themselves can lead to 10% recall gain at \(K=400\). However, we cannot easily access similar information in the publicly available MovieLens  and Amazon Reviews  datasets. We therefore follow implementation provided by  and additionally optionally utilizes a User ID keyed one-hot embedding as one query-side low-rank ("component-level") embeddings \(f_{p}(q)\), which is a widely used technique in recommendation systems  that we discussed in Section 2.2. All other component-level embeddings, \(f_{p}(q)\)s and \(g_{p}(x)\)s, are obtained by applying a multi-layer perceptron (MLP) on top of query-side/item-side representations in standard sequential recommendation setups . The overall setup is illustrated on the right hand side of Figure 3.
+
+#### a.2.2. Question Answering (QA)
+
+Unlike Recommendation Systems, retrieval models used in question answering generally take the full semantic representation(s) of the query and/or the document as input, and are finetuned on top of pre-trained language models with homogeneous inputs, or wordpiece / sentencepiece tokens. Our Mol. embedding construction consists of two components, special aggregation tokens and parameterized pooling. We present embedding construction on the query side first.
+
+#### Special Aggregation Tokens
+
+Given both queries and documents are represented as token sequences (e.g., SentencePieces  in T5 ), we propose to add special tokens that can be used to aggregate different aspects of information as part of the overall self-attention based language model. Specifically, on the query side, let the tokenized sequence be \(SP_{1},SP_{2},,SP_{N}\). During finetuning of the pretrained language model, we create \(P_{Q}\) special tokens, \(Q_{1},,QP_{Q}\), and add them to the vocabulary of the query tokenizer. We also append those exact same \(P_{Q}\) tokens before \(SP_{1},SP_{2},,SP_{N}\)3, so that the \(P_{Q}\) special tokens can be used to aggregate information across the query input using early-fusion mechanisms. Our construction can also be viewed as a way to extend the CLS token in BERT  to cover multiple aspects of
+
+Figure 3. Illustration of how to parameterize the embeddings to adapt Mixture-of-logits (MoL) learned similarity to various retrieval scenarios, with a language model (LM) finetuning use case in question answering (characterized by a single homogeneous feature) shown on the left, and a recommendation systems use case (characterized by a large number of heterogeneous features) shown on the right. For the Question Answering example on the left, \(SP_{1},,SP_{N}\) represents the original SentencePiece  tokens that are inputs to the pre-trained language model LM, e.g., T5 . \(Q_{1},Q_{2},,QP_{Q}\) and \(X_{1},X_{2},,X_{P_{X}}\) represent the “special aggregation tokens we add to the LM tokenizer for pooling information across the sequence. The “Parameterized Pooling” component uses a \(D\)-dimensional embedding as input to _parameterize, at an example-level_, how to weight each of the “(max_seq_len) encoder outputs for the \(P_{Q}/P_{X}\) Mol. component-level embeddings.
+
+[MISSING_PAGE_FAIL:12]

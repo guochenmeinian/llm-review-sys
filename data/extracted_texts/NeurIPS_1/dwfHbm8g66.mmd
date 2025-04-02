@@ -1,0 +1,207 @@
+# Deep Patch Visual Odometry
+
+Zachary Teed
+
+Princeton University
+
+zteed@princeton.edu
+
+Equal Contribution
+
+&Lahav Lipson
+
+Princeton University
+
+llipson@princeton.edu
+
+&Jia Deng
+
+Princeton University
+
+jiadeng@princeton.edu
+
+Equal Contribution
+
+###### Abstract
+
+We propose Deep Patch Visual Odometry (DPVO), a new deep learning system for monocular Visual Odometry (VO). DPVO uses a novel recurrent network architecture designed for tracking image patches across time. Recent approaches to VO have significantly improved the state-of-the-art accuracy by using deep networks to predict dense flow between video frames. However, using dense flow incurs a large computational cost, making these previous methods impractical for many use cases. Despite this, it has been assumed that dense flow is important as it provides additional redundancy against incorrect matches. DPVO disproves this assumption, showing that it is possible to get the best accuracy and efficiency by exploiting the advantages of sparse patch-based matching over dense flow. DPVO introduces a novel recurrent update operator for patch based correspondence coupled with differentiable bundle adjustment. On Standard benchmarks, DPVO outperforms all prior work, including the learning-based state-of-the-art VO-system (DROID) using a third of the memory while running 3x faster on average. Code is available at [https://github.com/princeton-vl/DPVO](https://github.com/princeton-vl/DPVO)
+
+## 1 Introduction
+
+Visual Odometry (VO) is the task of estimating a robot's position and orientation from visual measurements. In this work, we focus on most challenging case--monocular VO--where the only input is a monocular video stream. The goal of the system is to estimate the 6-DOF pose of the camera at every frame while simultaneously building a map of the environment.
+
+VO is closely related to Simultaneous Localization and Mapping (SLAM). Like VO, SLAM systems aim to estimate camera pose and map the environment but also incorporate techniques for global corrections--such as loop closure and relocalization (3). SLAM systems typically include a VO frontend which tracks incoming frames and performs local optimization.
+
+Prior work typically treats VO as an optimization problem solving for a 3D model of the scene which best explains the visual measurements (3). _Indirect_ approaches first detect and match keypoints between frames, then solve for poses and 3D points which minimize the reprojection distance (26; 4; 20). _Direct_ approaches, on the other hand, operate directly on pixel intensities, attempting to solve for poses and depths which align the images (13; 15; 12). The main issue with prior systems, both direct and indirect, is the lack of robustness. Failure cases are too frequent for many important applications such as autonomous vehicles. These failure cases typically stem from moving objects, lost feature tracks, and poor convergence.
+
+Several deep learning approaches (37; 45; 34; 39; 5; 43) have been introduced to address the robustness issue. The main advantage of deep learning is better features as well as differentiable optimization layers guided by neural networks. DROID-SLAM (37), which includes a VO frontend, uses neural networks to estimate dense flow fields which are subsequently used to optimize depthand camera pose. DROID-SLAM has significantly improved the state-of-the-art in visual SLAM and VO. However, it comes with a large computational cost: in VO mode (without the backend), it averages 40FPS on an RTX-3090 using 8.7GB GPU memory, which can be impractical for resource-constrained devices. In this work, we aim to significantly improve the efficiency of deep VO, and therefore SLAM, without sacrificing its accuracy.
+
+We propose Deep Patch Visual Odometry (DPVO), a new deep learning system for monocular VO. Our method achieves the accuracy and robustness of deep learning-based approaches while running 1.5-8.9x faster using 57%-29% the memory. It has lower average error than all prior work on common benchmarks. On an RTX-3090, it averages 60FPS using only 4.9GB of memory, with a minimum frame rate of 48FPS. It can run at 120FPS on the EuRoC dataset (2) using 2.5GB while still outperforming prior work on average. The frame rate of DPVO is relatively-constant in practice, and does not significantly depend on the degree of camera motion, as opposed to prior methods including DROID-SLAM which slow down during fast camera motion [(12; 37; 27)]. We train our entire system end-to-end on synthetic data but demonstrate strong generalization on real video.
+
+This leap in efficiency is achieved by the combination of **1)** a deep feature-based patch representation for keypoints which encodes their local context, and **2)** a novel recurrent architecture designed to track a sparse collection of these patches through time--alternating patch trajectory updates with a differentiable bundle adjustment layer to allow for end-to-end learning of reliable feature matching. This efficiency boost enables the design of DPVO to allocate resources towards components which improve accuracy, which are described in Sec. 3.
+
+Existing approaches such as DROID-SLAM estimate camera poses by predicting dense flow [(24; 23; 37)]. Designing an efficient VO system with the same-or-better accuracy poses a significant challenge, since using dense matches in SLAM provides additional redundancy against incorrect matches. However, DPVO still achieves robustness by introducing components which improve matching accuracy, using resources which would otherwise be spent estimating dense flow. We observe, surprisingly, that patch-based correspondence improves both efficiency and robustness over dense flow. In classical approaches to VO, patch-based matching [(12)] has been shown to improve accuracy over keypoint-based methods [(27)]. However, it has remained unclear how to leverage this idea using deep networks without underperforming dense-flow approaches.
+
+To summarize, we contribute Deep Patch Visual Odometry, a new method for tracking camera motion from video. DPVO uses a novel recurrent network designed for sparse patch-based correspondence. DPVO outperforms all prior work across several evaluation datasets, while running 1.5-8.9x faster than the previous state-of-the-art and using only 57-29% as much memory.
+
+## 2 Related Work
+
+Visual Odometry (VO) systems aim to estimate robot state (position and orientation) from a video. Overtime, a VO system will accumulate drift, and modern SLAM methods incorporate techniques to identify previously mapped landmarks to correct drift (i.e loop closure). VO can be considered a subproblem of SLAM with global optimization and loop closures disabled [(3)].
+
+Many different modalities of VO have been explored by past work, including visual-inertial odometry (VIO) [(41; 14)] and stereo VO [(42; 13)]. Here, we focus on the monocular case, where the only input is a monocular video stream. Early works approached the problem using filtering and maximum-likelihood methods [(6; 25)]. Modern methods almost universally perform Maximum a Posteriori (MAP) estimation over factor graphs with Gaussian noise; in which case, the MAP estimate can be found by solving a non-linear least-squares optimization problem [(8)]. This problem has lead to the development of many libraries for optimizing non-linear least-squares problems [(1; 17; 7)].
+
+Among VO systems, our method borrows many core ideas of Direct Sparse Odometry (DSO) [(12)], a classical system based on least-squares optimization. Namely, we adopt a similar patch representation and reproject patches between frames to construct the objective function. Unlike DSO, the residuals are not based on intensity differences but instead predicted by a neural network which can pass information between patches and across patch lifetimes. Outlier rejection is automatically handled by the network, making our system more robust than classical systems like DSO and ORB-SLAM [(12; 26)]. One important component of classical systems is the careful selection of which image regions to use. We find, surprisingly, that our system works well on a small number (64 per frame) of _randomly_ sampled image patches.
+
+With regards to deep SLAM systems, our method is closely related to DROID-SLAM  but uses a different underlying representation and different network architecture. DROID-SLAM is an end-to-end deep SLAM system which shows good performance compared to both classical and deep baselines. Like our method, it works by iterating between motion updates and bundle adjustment. However, it estimates dense motion fields between selected pairs of frames which has a high computational cost and large memory footprint. While it is capable of 40FPS inference _on average_, its speed varies depending on the amount of motion in the video. Our method selects sparse patches from the video stream, with a relatively constant runtime per frame and 1.5-8.9x faster inference than DROID-SLAM.
+
+Prior works such as BA-Net  and  also have embedded bundle adjustment layers in end-to-end differentiable network architectures. However, BA-Net does not use patch-based correspondence.  and  have proposed neural networks which sit atop COLMAP  and perform subpixel-level refinement; these approaches are not, however, able to perform 3D reconstruction on their own and are subject to failure cases in the underlying SfM system.
+
+## 3 Approach
+
+**Preliminaries:** Given an input video, we represent a scene as a collection of camera poses \((3)^{N}\) and a set of square image patches \(\) extracted from the video frames. Using \(\) to represent inverse depth and \((,)\) to represent pixel coordinates, we represent each patch as the \(4 p^{2}\) homogeneous array
+
+\[_{k}=(\\ \\ \\ ),,^{1 p^{2}} \]
+
+where \(p\) is the width of the patch. We assume a constant depth for the full patch, meaning that it forms a fronto-parallel plane in the frame from which it was extracted. Letting \(i\) denote the index of the _source frame_ of the patch, i.e. the frame from which which patch \(_{k}\) was extracted, we can reproject the patch onto another frame \(j\)
+
+\[^{}_{kj}_{j}_{i}^{-1}^{-1} _{k}. \]
+
+taking \(\) to be the \(4 4\) calibration matrix
+
+\[=(f_{x}&0&c_{x}&0\\ 0&f_{y}&c_{y}&0\\ 0&0&1&0\\ 0&0&0&1) \]
+
+The pixel coordinates \(^{}=(x^{},y^{})\) can be recovered by dividing by the third element. For the rest of the paper, we use the shorthand \(^{}_{kj}=_{ij}(,_{k})\) to denote the reprojection of patch \(k\) onto frame \(j\) in terms of pixel coordinates.
+
+_Patch Graph:_ We use a bipartite _patch graph_ to represent the relations between patches and video frames. Edges in the graph connect patches with frames. We show an example in Fig. 1. By default, the graph is constructed by adding an edge between each patch and every frame within distance \(r\) from the index of the source frame of the patch. The reprojections of a patch in all of its connected frames in the patch graph form the _trajectory_ of the patch. Note that a trajectory is a set of reprojections of a single patch into multiple frames; it is not a set of original square patches. The graph is dynamic; as new video frames are received, new frames and patches are added while old ones are removed. We provide an example trajectory in Fig. 3.
+
+**Approach Overview:** At a high level, our approach works similarly to a classical system: it samples a set of patches for each video frame, estimates the 2D motion (optical flow) of each patch against each of its connected frames in patch graph, and solves for depth and camera poses that are consistent with the 2D motions. But our approach differs from a classical system in that these steps are done through a recurrent neural network and a differentiable optimization layer. Our approach can be understood as a sparsified variant of DROID-SLAM in VO mode; instead of estimating dense optical flow, we estimate flow for a sparse set of patches.
+
+**Feature Extraction:** To estimate the optical flow of the patches, we need to extract per-pixel features and use them for computing visual similarities. We use a pair of residual networks. One network extracts _matching_ features while the other extracts _context_ features. The first layer of each network is a \(7 7\) convolution with stride 2 followed by two residual blocks at 1/2 resolution (dimension 32) and 2 residual blocks at 1/4 resolution (dimension 64), such that the final feature map is one-quarter the input resolution. The architectures of the matching and context networks are identical with the exception that the matching network uses instance normalization and the context network uses no normalization. We construct a two-level feature pyramid by applying average pooling to the matching features with a \(4 4\) filter with stride 4.
+
+**Patch Extraction:** We create patches by randomly sampling 2D locations, which we find to work well despite its simplicity. We associate each patch with a per-pixel feature map of the same size, cropped with bilinear interpolation from both the full matching and full context feature maps. We provide an example in Fig. 0(a). The patch features are used to compute visual similarities, but unlike DROID-SLAM, we compute them on the fly instead of precomputing them as correlation volumes.
+
+### Update Operator
+
+The core of our approach is the update operator, which is a recurrent network that iteratively refines the depth of each patch and the camera pose of each video frame. At each iteration, it uses the patch features to propose revisions to the optical flow of the patches, and updates depth and camera poses through a differentiable bundle adjustment layer. Because the patches are sparsely located and spatially separated, the recurrent network includes special designs that facilitate exchange of information between patches. We provide a schematic overview of the operator in Fig. 2. The operator operates on the patch graph and maintains a hidden state for each edge. Its first three components (Correlation, Temporal Convolutions, Softmax-Aggregation) produce and aggregate information across edges, the Transition block produces an update to each hidden state, and the final two components (Factor-Head + Bundle-Adjustment) produce an update to the camera poses and patch depths. When a new edge is added, its hidden state is initialized with zeros.
+
+_Correlation:_ For each edge \((k,j)\) in the patch graph, we compute correlation features (visual similarities) to assess the visual alignment given by current estimates of depth and poses and to propose revisions. We first use Eqn. 2 to reproject patch \(k\) from frame \(i\) into frame \(j\): \(^{}_{kj}=_{ij}(,_{k})\). Given patch features \(^{p p D}\) and frame features \(^{H W D}\), for each pixel \((u,v)\) in patch \(k\), we compute its correlation \(^{p p 7 7}\) with a grid of pixels centered at its reprojection in frame \(j\), using the inner product:
+
+\[_{uv}=_{uv},\ (^{ }_{kj}(u,v)+_{}) \]
+
+where we take \(\) to be a \(7 7\) integer grid centered at 0 indexed by \(\) and \(\), and \(()\) denotes bilinear sampling. We compute these correlation features for both levels in the pyramid and concatenate the results. This operation is implemented as an optimized CUDA layer which leverages the regular grid structure of the interpolation step. This implementation is identical to the alternative correlation
+
+Figure 1: Constructing the patch graph. (a) Residual networks extract 1) a context feature map at \(\) image-resolution and 2) a 2-level pyramid of matching features at \(\) and \(\) resolution. Many \(p p\) patches are cropped from this feature map at _random_ pixel coordinates using bilinear sampling. (b) Multiple patches are extracted from each frame (e.g. blue) and are connected to nearby frames (green and purple). In the resulting patch graph, edges connect patches with frames.
+
+implementation used by RAFT [(36)] and is equivalent to indexing correlation volumes due to the linearity of the inner product and interpolation.
+
+_1D Temporal Convolution:_ DPVO operates on real-time video, where neighboring frames tend to be highly correlated. To leverage this correlation, we apply a 1D-convolution in the temporal dimension to each patch trajectory. Since trajectories vary in length and keyframes are actively added and removed, it is not straightforward to implement convolution as a batched operation. Instead, for each edge \((k,j)\) we index the features of its temporally-adjacent neighbors at \((k,j-1)\) and \((k,j+1)\), concatenate, then apply a linear projection. The temporal convolution allows the network to propagate information along each patch trajectory and model appearance changes of the patch through time.
+
+_SoftMax Aggregation:_ Even though the patches are sparsely located, their motion and appearance can be still be correlated as they may belong to the same object. We leverage this correlation through global message passing layers that propagate information between edges in the patch graph. This operation has appeared before in the context of graph neural networks [(30)]. Given edge \(e\) and its neighbors \(N(e)\) we define the channel-wise aggregation function
+
+\[([_{x N(e)}(x)(x)]\ /_{x N (e)}(x)) \]
+
+where \(\) and \(\) are linear layers and \(\) is a linear layer followed by a sigmoid activation. We perform two instantiations of soft aggregation: (1) patch aggregation where edges are neighbors if they connect to the same patch (2) frame aggregation where edges are neighbors if they connect to both the same destination frame and different patches from the same source frame. Note that this graph-based aggregation is unique to our sparse patch-based representation, because for dense flow the same effect is easily achieved with convolution in prior approaches [(37)].
+
+_Transition Block:_ Following the softmax-aggregation, we include a _transition block_ (shown in Fig. 2) to produce an update to the hidden state for each edge in the patch graph. Our transition block is simply two gated residual units with Layer Normalization and ReLU non-linearities. We find that layer normalization helps avoid exploding values for recurrent network modules.
+
+_Factor Head:_ The final _learned_ layer in our update operator is the _factor head_, which proposes 2D revisions to the current patch trajectories and associated confidence weights. This layer consists of 2 MLPs with one hidden unit each. For each edge \((k,j)\) in the patch graph, the first MLP predicts the trajectory update \(_{kj}^{2}\): a 2D flow vector indicating how the reprojection of the patch center should be updated in 2D; the second MLP predicts the confidence weight \(_{kj}^{2}\) which is bounded to \((0,1)\) using a sigmoid activation.
+
+_Differentiable Bundle Adjustment:_ Given the proposed 2D revisions to trajectories, we need to solve for the updates to depth and camera poses to realize the proposed revisions. This is achieved through a differentiable bundle adjustment (BA) layer, which operates globally on the patch graph and outputs updates to depth and camera poses. The predicted factors \((,)\) are used to define an
+
+Figure 2: Schematic of the _update operator_. Correlation features are extracted from edges in the patch graph and injected into the hidden state alongside context features. We apply 1D convolution, message passing and a transition block. The factor head produces trajectory revisions which are used by the bundle adjustment layer to update the camera poses and the depth of patches. Each “+” operation is a residual connection followed by layer normalization.
+
+optimization objective:
+
+\[_{(k,j)}\|_{ij}(,_{k})-[ }^{}_{kj}+_{kj}]\|_{_{kj}}^{2} \]
+
+where \(\|\|\|_{}\) is the Mahalanobis distance and \(}^{}_{kj}\) denotes the center of \(^{}_{kj}\). We apply two Gauss-Newton iterations to the linearized objective, optimizing the camera poses as well as the inverse depth component of the patch while keeping the pixel coordinates constant. This optimization seeks to refine the camera poses and depth such that the induced trajectory updates agree with the predicted trajectory updates. Like DROID-SLAM , we use the Schur complement trick for efficient decomposition and backpropagate gradients through the Gauss-Newton iterations.
+
+### Training and Supervision
+
+DPVO is implemented using PyTorch. We perform supervised training of our network on the TartanAir dataset. On each training sequence, we precompute optical flow magnitude between all pairs of frames using ground truth poses and depth. During training, we sample trajectories where frame-to-frame optical flow magnitude is between 16px and 72px. This ensures that training instances are generally difficult but not impossible.
+
+We apply supervision to poses and induced optical flow (i.e. trajectory updates), supervising each intermediate output of the update operator and detach the poses and patches from the gradient tape prior to each update.
+
+_Pose Supervision:_ We scale the predicted trajectory to match the groundtruth using the Umeyama alignment algorithm . Then for every pair of poses \((i,j)\), we supervise on the error
+
+\[_{(i,j)\ i j}\|Log_{SE(3)}[(_{i}^{-1}_{j})^{-1}( _{i}^{-1}_{j})]\| \]
+
+where \(\) is the ground truth and \(\) are the predicted poses.
+
+_Flow Supervision:_ We additionally supervise on the distance between the induced optical flow and the ground truth optical flow between each patch and the frames within two timestamps of its source frame. Each patch induces a \(p p\) flow field. We take the minimum of all \(p p\) errors.
+
+The final loss is the weighted combination
+
+\[=10_{pose}+0.1_{flow}. \]
+
+_Training Details:_ We train for a total of 240k iterations on a single RTX-3090 GPU with a batch size of 1. Training takes 3.5 days. We use the AdamW optimizer and start with an initial learning rate of 8e-5 which is decayed linearly during training. We apply standard augmentation techniques such as resizing and color jitter.
+
+We train on sequences of length 15. The first 8 frames are used for initialization while the next 7 frames are added one at a time. We unroll 18 iterations of the update operator during training. For the first 1000 training steps, we fix poses with the ground truth and only ask the network to estimate the depth of the patches. Afterwards, the network is required to estimate both poses and depth.
+
+Figure 3: A subset of the patch trajectories predicted by our method. Patches extracted from the green keyframe are tracked through subsequent frames. When a new keyframe is added (blue), additional patches are extracted and tracked. Our method produces confidence values which weight their respective contribution to the bundle adjustment.
+
+### VO System
+
+We implement the logic of the full VO system primarily in Python with bottleneck operations such as bundle adjustment and visualization implemented in C++ and CUDA.
+
+_Overview:_ In Fig. 5 we show an overview of the VO system. The visualization and frame loading are performed in separate threads.
+
+_Initialization:_ We use 8 frames for initialization. We add new patches and frames until 8 frames are accumulated and then run 12 iterations of our update operator. There needs to be some camera motion for initialization; hence, we only accumulate frames with an average flow magnitude of at least 8 pixels from the prior frame.
+
+_Expansion:_ When a new frame is added we extract features and patches. The pose of the new frame is initialized using a constant velocity motion model. The depth of the patch is initialized as the median depth of all the patches extracted from the previous 3 frames.
+
+We connect each patch to every frame within distance \(r\) from the frame index where the patch was extracted. This means that when a new patch is added, we add edges between that patch and the previous \(r\) keyframes. When a new frame is added, we add edges between each patch extracted in the last \(r\) keyframes with the new frame. This strategy means that each patch is connected to no more than \((2r-1)\) frames, bounding the worst-case latency.
+
+_Optimization:_ Following the addition of edges we run one iteration of the update operator followed by two bundle adjustment iterations. We fix the poses of all but the last 10 keyframes. The inverse depths of all patches are free parameters. The patches are removed from optimization once they fall outside the optimization window.
+
+_Keyframing:_ The most recent 3 frames are always taken to be keyframes. After each update, we compute the optical flow magnitude between keyframe \(t-5\) and \(t-3\). If this is less than 64px, we remove the keyframe at \(t-4\). When a keyframe is removed, we store the relative pose between its neighbors such that the full pose trajectory can be recovered for evaluation.
+
+Figure 4: Results on the TartanAir (44) validation split. Our method gets an AUC of 0.80 compared to 0.71 for DROID-SLAM while running 4x faster.
+
+Figure 5: Overview of the VO System. The visualization and frame loading are performed in separate threads.
+
+## 4 Experiments
+
+We evaluate DPVO on the TartanAir (44), TUM-RGBD (33), EuRoC (2) and ICL-NUIM (19) benchmarks. On each dataset, we run five trials each with a different set of patches and report the median results obtained. Example reconstructions on the TartanAir and ETH3D datasets are shown in Fig. 3(a) and in the Appendix, respectively. We benchmark two configuration settings of DPVO: Ours (Default) uses 96 patches per image and a 10 frame optimization window and Ours (Fast) uses 48 patches and a 7 frame optimization window. Our frame rates are practically near constant, since our method uses a constant number of FLOPS per-frame, unlike prior methods which slow down and make more keyframes during fast motion [(37; 12)]. We also benchmark two versions of DROID-SLAM: the full version and a version where loop closure and global bundle adjustment is disabled (DROID-VO). DROID-VO is more comparable to our method as we only perform local optimization. Across all benchmarks, DPVO achieves the lowest average error among all previous VO systems, and even outperforms full SLAM systems on some benchmarks. We focus on average error as it reflects the expected performance of our system in the wild.
+
+**TartanAir Validation Split:** We use the same 32-sequence validation split as DROID-SLAM and report aggregated results in Fig. 3(b) and compare with DROID-SLAM and ORB-SLAM3. We run our method 3 times on each sequence and aggregate the results. In the \(\)m error window, we get an AUC of 0.80 compared to 0.71 for DROID-SLAM.
+
+**TartanAir Test Split:** Tab. 1 reports results on the test-split used in the ECCV 2020 SLAM competition compared to state-of-the-art methods. Classical methods such as DSO and ORB-SLAM fail on more than 80% of the sequences, hence we use COLMAP as a classical baseline as it was used in the two winning solutions of the ECCV SLAM competition. We attain an error 40% lower than DROID-SLAM and 64% lower than DROID-VO. COLMAP takes 2 days to complete the 16 sequences and typically produces broken reconstructions which lead to large errors in evaluation.
+
+**EuRoC MAV (2)** In Tab. 3 we benchmark on the EuRoC MAV (2) dataset and compare to other visual odometry methods including SVO (15), DSO (12) and the visual odometry version of DROID-SLAM (36). Video from the EuRoC benchmark is recorded at 20FPS. Like DROID-SLAM, we skip every other frame, doubling the effective frame rate of the system. Our default system outperforms prior work on the majority of the EuRoC sequences. The average error is 43% lower than DROID-VO (37). Even our 120-FPS system outperforms DROID-VO on most video.
+
+    & ME & ME & ME & ME & ME & ME & ME & ME & ME & ME & ME & ME & ME & ME & ME & ME & ME & ME & ME \\  & 000 & 002 & 003 & 004 & 005 & 006 & 007 & 000 & 001 & 002 & 003 & 004 & 008 & 006 & 007 & Avg \\  ORB-SLAM3*(4) & 13.61 & 16.86 & 20.57 & 16.00 & 22.27 & 9.28 & 21.61 & 7.74 & 15.44 & 2.92 & 13.51 & 8.18 & 2.59 & 21.91 & 11.70 & 25.88 & 14.38 \\ COLMAP*(31) & 15.20 & 5.58 & 10.86 & 3.91 & 2.62 & 14.78 & 7.00 & 18.47 & 12.26
+
+**TUM-RGBD (33):** In Tab. 2 we benchmark on TUM-RGBD (33) and compare to DSO (12), the visual odometry version of DROID-SLAM (36), and ORB-SLAM3 (27). We evaluate only visual-only monocular methods, identical to the TUM-RGBD evaluation in (37). This benchmark evaluates motion tracking in an indoor environment with erratic camera motion and significant motion blur. Video from the TUM-RGBD benchmark is recorded at 30FPS.
+
+Classical approaches such as ORB-SLAM (27) and DSO (12) perform well on some sequences but exhibit frequent catastrophic failures. Similar to DROID-VO, our system is also robust to such failures but our average error is 9% lower. This indicates that our sparse, patch-based approach performs better in-the-wild compared to dense flow.
+
+**ICL-NUIM (19):** In Tab. 4 we evaluate on the ICL-NUIM (19) SLAM benchmark and compare to other visual odometry and SLAM methods including SVO (15), DSO (12) and DROID-SLAM (37). Video from the ICL-NUIM benchmark is recorded at 30FPS. ICL-NUIM is a synthetic dataset for evaluating SLAM performance in indoor environments with repetitive or monochrome textures (e.g. blank white walls). Our system outperforms prior work on the majority of the ICL-NUIM sequences.
+
+Figure 6: Ablation experiments. (a) We show the importance of using patches over point features. (b) Removal of different components of the update operator degrades accuracy. (c) Randomly selecting patch centroids works better than 2D keypoint locations produced via SIFT (22), ORB (29), Superpoint (9), or pixels with high image gradient.
+
+   & MH01 & MH02 & MH03 & MH04 & MH05 & V101 & V102 & V103 & V201 & V202 & V203 & Avg \\   TartanVO (43) & 0.639 & 0.325 & 0.550 & 1.153 & 1.021 & 0.447 & 0.389 & 0.622 & 0.433 & 0.749 & 1.152 & 0.680 \\ SVO (15) & 0.100 & 0.120 & 0.410 & 0.430 & 0.300 & 0.070 & 0.210 & - & 0.110 & 0.110 & 0.800 & 0.294 \\ DSO (12) & **0.046** & **0.046** & 0.172 & 3.810 & **0.110** & 0.089 & **0.107** & 0.903 & **0.044** & 0.132 & 1.152 & 0.601 \\ DROID-VO (37) & 0.163 & 0.121 & 0.242 & 0.399 & 0.270 & 0.103 & 0.165 & 0.158 & 0.102 & 0.115 & **0.204** & 0.186 \\  Ours (Default) & 0.087 & 0.055 & **0.158** & **0.137** & 0.114 & **0.050** & 0.140 & **0.086** & 0.057 & **0.049** & 0.211 & **0.105** \\ Ours (Fast) & 0.101 & 0.067 & 0.177 & 0.181 & 0.123 & 0.053 & 0.158 & 0.095 & 0.095 & 0.063 & 0.310 & 0.129 \\   
+
+Table 3: Monocular SLAM on the EuRoC datasets, ATE[m] compared to other visual odometry methods. For our method, we report the median of 5 runs.
+
+Figure 7: Efficiency on EuRoC. (a) Compared to DROID-VO (the front-end of DROID-SLAM), the _Default_ and _Fast_ variants of DPVO run 1.5x (60FPS) and 3x (120FPS) faster on average. DPVO’s frame-rate is relatively stable, remaining above 48FPS and 98FPS for 95% of frames. In contrast, DROID-VO drops to 11FPS, an 8.9x difference. (b) DPVO (Default) and DPVO (Fast) use 57% and 29% as much memory as DROID-VO, respectively. (c) We can trade-off speed for performance by increasing the number of patches tracked. However, performance quickly saturates beyond 96.
+
+The average error of our faster model is \(51\%\) lower than DROID-SLAM (37) and \(32\%\) lower than SVO (15). Our faster and default systems perform similarly.
+
+**Efficiency:** In Fig. 7 we compare the efficiency of DPVO and DROID-VO. Our 60-FPS variant is 1.5x faster on average and 4.3x faster in the worst case (5th percentile), using 57% the GPU memory of DROID-VO. The 120-FPS DPVO variant is 3x faster on average and 8.9x faster in the worst-case, using less than a third of the memory.
+
+### Ablations
+
+We perform ablation experiments on the TartanAir validation split and show results in Fig. C. We use the same parameter settings in all experiments with augmentation disabled. We run each ablation experiment three times on the validation split and aggregate the results.
+
+_Point vs Patch Features:_ In Fig. 5(a), we demonstrate the importance of the patches over simply using point features (i.e 1x1 patches). The patch features encode local context which is lacking with point features. The additional information stored in the correlation features allows for more precise tracking.
+
+_Update Operator:_ In Fig. 5(b), we test the effect of removing various components from the update operator. Both removing 1D-Convolution and Softmax-Aggregation degrade performance on the validation set.
+
+_Patch Selection:_ In Tab. 5(c), we compare different methods for selecting 2D patch centroids. Surprisingly, our method performs best when _randomly_ selecting keypoint centroids.
+
+## 5 Conclusion
+
+DPVO is a new deep visual odometry system built using a sparse patch representation. It is accurate and efficient, capable of running at 60-120 FPS with minimal memory requirements. DPVO outperforms all prior work (classical or learned) on EuRoC, TUM-RGBD, the TartanAir ECCV 2020 SLAM competition, and ICL-NUIM.
+
+**Acknowledgments:** This work was partially supported by the Princeton University Jacobus Fellowship, NSF, Qualcomm, and Amazon.

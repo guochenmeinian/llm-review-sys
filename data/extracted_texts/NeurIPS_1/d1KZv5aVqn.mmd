@@ -1,0 +1,217 @@
+# Sparse Backpropagation for MoE Training
+
+Liyuan Liu\({}^{@sectionsign}\) Jianfeng Gao\({}^{@sectionsign}\) Weizhu Chen\({}^{}\)
+
+\(@sectionsign\)Microsoft Research \(\)Microsoft Azure AI
+
+{lucliu, jfgao, wzchen}@microsoft.com
+
+###### Abstract
+
+One defining characteristic of Mixture-of-Expert (MoE) models is their capacity for conducting sparse computation via expert routing, leading to remarkable scalability. However, backpropagation, the cornerstone of deep learning, requires dense computation, thereby posting challenges in MoE gradient computations. Here, we introduce SparseMixer, a scalable gradient estimator that bridges the gap between backpropagation and sparse expert routing. Unlike typical MoE training which strategically neglects certain gradient terms for the sake of sparse computation and scalability, SparseMixer provides scalable gradient approximations for these terms, enabling reliable gradient estimation in MoE training. Grounded in a numerical ODE framework, SparseMixer harnesses the mid-point method, a second-order ODE solver, to deliver precise gradient approximations with negligible computational overhead. Applying SparseMixer to Switch Transformer on both pre-training and machine translation tasks, SparseMixer showcases considerable performance gain, accelerating training convergence by up to 2 times.
+
+## 1 Introduction
+
+The significant success of large-scale pre-training across various applications has underscored the imperative need for scalable models that are economically feasible (Chowdhery et al., 2022; OpenAI, 2023; Touvron et al., 2023). Recent advances in sparsely activated networks, prominently known as Mixture-of-Experts (MoE), have attracted widespread interest (Shazeer et al., 2017; Lepikhin et al., 2020; Fedus et al., 2021; Riquelme et al., 2021; Mustafa et al., 2022). Unlike traditional networks that densely activate all modules for all input, MoE selectively activates parts of modules to specific inputs through a process called expert routing, leading to notable efficiency enhancements.
+
+However, such efficiency gain comes at a cost: gradient estimation in MoE becomes challenging due to expert routing. Specifically, the routing function, being discrete in nature, produces non-differentiable outputs. Meanwhile, backpropagation, the cornerstone of deep learning, relies on the Chain rule, making it exclusively compatible with differentiable functions (Rosenblatt, 1957; Bengio et al., 2013), and cannot be directly applied for gradient computation of expert routing.
+
+Numerous methods have emerged to bridge discrete and back-propagation, and most of them are based on Straight-Through (ST) (Rosenblatt, 1957; Bengio et al., 2013; Jang et al., 2017; Liu et al., 2023). Unfortunately, all existing ST estimators are incompatible with MoE, since they require activating all experts for gradient computing, thereby eliminating all the efficiency improvements of MoE. Consequently, typical MoE training strategically neglects the gradient computation for routing, trading certain training signals for sparse computation. Despite the scalability brought by sparse computation, this trade-off may result in slow convergence and improperly trained models.
+
+Our solution to this quandary is SparseMixer--a novel approach designed to reconcile the divide between sparse MoE routing and backpropagation. Drawing inspiration from numerical methods for ordinary differential equations (ODE), SparseMixer provides reliable gradient approximationfor expert routing, even when only a subset of experts are activated. Moreover, to furnish accurate gradient approximations with negligible computation overheads, we integrate the mid-point method, a second-order numerical ODE solver, which matches the Taylor expansion of the gradient to the second order without requiring the Hessian matrix or other second-order derivatives.
+
+We apply SparseMixer to Switch Transformer on both pretraining and neural machine translation. SparseMixer not only accelerates training convergence by up to two times but also facilitates MoE with properly trained expert routing. Remarkably, while Switch Transformer underperforms the dense model in all three pretraining settings, incorporating SparseMixer as the gradient estimator allows the resulting MoE models to consistently outperform the dense model.
+
+## 2 Related Work and Preliminary
+
+Mixture-of-Expert for Transformer.MoE originate from Jacobs et al. (1991) and Jordan and Jacobs (1994), which integrates separate networks together and uses each to handle a separate subset of training cases. Recently, many attempts have been made to leverage MoE for scaling large language models (Shazeer et al., 2017; Lepikhin et al., 2020; Lewis et al., 2021; Fedus et al., 2021).
+
+To keep things straightforward, we will focus on a simplified setting of the switch Transformer layer (Fedus et al., 2021), and the resulting algorithm can be easily extended to other MoE designs. Considering a set of N experts, \(\{f_{i}()\}_{i=1}^{N}\), the gate value of expert \(i\) is computed with the softmax function as \(_{i}=()_{i}=_{i})}{ _{j=1}^{n}(_{j})}\), where \(=W_{r}\). For \(i[1,,N]\), we mark its one-hot representation as \(_{i}^{N 1}\), whose element equals \(1\) if it is the \(i\)-th element or equals \(0\) otherwise. Let \(\) be a discrete random variable and \(\{_{1},,_{N}\}\). Then, the final output of this MoE layer is \(=_{}f_{}()\). Note that \(\) is sampled as \(\) during training, and is computed as \(_{_{i}}_{_{i}}\) during inference. Marking other parts of the neural network as a differentiable function \(g:^{n}\), we aim to minimize:
+
+\[_{W_{r}}(W_{r}),\ (W_{r})=E_{ (W_{r})}[g(_{}f_{}())]= _{}_{} g(_{}f_{}()). \]
+
+First, we focus our discussions on this simplified MoE model. In Section 3.3, we will discuss its difference with the Switch Transformer and necessary adaptations.
+
+Gradient Computation for Expert Routing.For simplicity, we mark \((W_{r})}{ W_{r}}\) as \(_{0}+_{1}\):
+
+\[}{ W_{r}}:=_{0}+_{1},_{0}=_{_{i}}g(_{_{i}}f_{_{i}}()) _{_{i}}}{\,W_{r}}_{1}=_{_{i}}_{_{i}}_{_{i}}f_{_{i}}())}{\,W_{r}}. \]
+
+Figure 1: Training curves of Switch Transformer on WMT’14 En-De.
+
+It is easy to notice that \(_{1}\) can be computed reliably via backpropagation. \(_{0}\), however, is hard to reliably estimate in typical MoE training practice. In this study, we focus our discussions on \(_{0}\).
+
+REINFORCE (Williams, 1992) is unbiased (i.e., \(E[_{}]=_{0}\)) and only requires the distribution of the discrete variable to be differentiable (i.e., no backpropagation through \(g\)):
+
+\[_{}:=g(_{}f_{}())_{}}{\,W_{r}}. \]
+
+Despite the \(_{}\) estimator being unbiased, it tends to have prohibitively high variance, especially for networks that have other sources of randomness (i.e., dropout or other independent random variables). Recently, attempts have been made to reduce the variance of REINFORCE (Gu et al., 2016; Tucker et al., 2017; Grathwohl et al., 2018; Shi et al., 2022). Still, it has been found that the REINFORCE-style estimators fail to work well in MoE training (Kool et al., 2021).
+
+Straight-Through.Despite \(_{}\) being unbiased, it treats the remaining network (\(g\)) as a black-box and only leverages the zero-order information of \(g\). In practice, a popular family of estimators, Straight-Through (ST), leveraging the first-order information of \(g\) (note that \(g\) is a scalar and \(g^{}\) is a vector), has been shown to achieve a better performance in more complicated settings (Liu et al., 2023). ST computes the backpropagation "through" a surrogate that treats the non-differentiable function (e.g., the sampling of \(\)) as an identity function (Rosenblatt, 1957; Bengio et al., 2013; Jang et al., 2017; Liu et al., 2023). In our MoE setting, ST treats the sampling of \(\) as an identity function and estimates the gradient as:
+
+\[_{}:=_{}f_{}( {x}))}{\,_{}f_{}()} {D}_{i}_{_{i}}f_{_{i}}()}{}_{}}{ W_{r}}. \]
+
+An alternative strategy is to conduct the concrete random variable relaxation (Maddison et al., 2014; Jang et al., 2017). It is observed that the sampling of \(\) can be reparameterized using Gumbel random variables at the zero-temperature limit of the tempered softmax (Gumbel, 1954):
+
+\[=_{ 0}_{},_{}=_{}(+),_{i}_{i}(0,1).\]
+
+Straight-Through Gumbel-Softmax (STGS) treats the zero-temperature limit as identity function during the backpropagation:
+
+\[_{}:=_{}f_{}( ))}{\,_{}f_{}()} _{,i}_{_{i}}f_{_{i}}()}{_{ }}_{}}{ W_{r}}. \]
+
+Although \(E[_{}]\) has been formally established as a first-order approximation of \(_{0}\)(Liu et al., 2023), applying ST estimators necessitates the need for computing \(f_{i}()\) for all \(i\{_{1},,_{N}\}\), i.e., the outputs from all experts. For example, in Equation 4, we have \(_{i}_{_{i}}f_{_{i}}()}{ }=(_{i}_{i}_{_{i}}f_{_{ i}}())\), which involves the computation of \(\{f_{_{i}}(),,f_{I_{N}}()\}\). Essentially, computing all \(f_{_{i}}\) turns MoE into a densely activated network. Thus, using ST-style estimators undermines the sparse computation, fundamentally obstructing the scaling of MoE models.
+
+## 3 Scalable Gradient Approximation
+
+As discussed in Section 2, although ST estimators bridged discrete variables and backpropagation, they require the network to be densely activated. Here, we first discuss the intrinsic limitation of ST estimators. Then, we go beyond ST and bridge sparse expert routing and backpropagation. Finally, we revisit the current practice of MoE training and discuss the difference between the Switch Transformer and the simplified setting (as presented in Section 2).
+
+### Why Existing ST Estimators Are Not Scalable?
+
+We formally establishes that \(E[_{}]\) is a first-order approximation of \(_{0}\) in Liu et al. (2023) (note that \(_{0}\) is defined in Equation 2). Since \(_{i}=1=_{i}\), we can reparameterizing \(_{}f_{}\) as \(h()=_{i}_{i}_{_{i}}f_{_{i}}\). Then, we have1:
+
+\[_{0}=_{_{i}}(h(_{i})-E[h])_{_{i}}}{\,W_{r}}=_{_{i}}_{_{j}}_{_{j}}(h( _{i})-h(_{j}))_{_{i}}}{\,W_{ r}}. \]Specifically, approximating \(g(}}f_{I_{i}})-g(}}f_{I_{j}})\) as \(g^{}(}}f_{I_{j}})(}}f_{I_{i}}-}}f_{I_{j}})\), the resulting gradient approximation will have the same form as \(E[_{}]\)(Liu et al., 2023). In numerical analyses, this approximation is known as the forward Euler method (briefly introduced in Appendix A), which has first-order accuracy. Liu et al. (2023) also explored higher-order ODE solvers to better approximate \(g(}}f_{I_{i}})-g(}}f_{I_{j}})\). However, all these approximations involve both activated experts (i.e., \(f_{I_{j}}\)) and unactivated experts (i.e., \(f_{I_{j}}\)), thus contradicting scalability. In order words, although those ST estimators bridge discrete and backpropagation, their computations are dense instead of sparse.
+
+### Expert Routing Gradient Approximation: Backpropagation Made Sparse
+
+To bridge the gap between sparse MoE routing and back-propagation, we need to approximate \(_{0}\) without requiring outputs from all experts. In our study, we move beyond ST and present a novel framework to bridge backpropagation and sparse expert routing.
+
+Here, we start by introducing the most simple gradient estimator, i.e., \(_{}}}\), where
+
+\[_{}}}:=f_{D}())}{\,W_{r}}.\]
+
+Similar to \(E[_{}]\), \(E[_{}}}]\) is a first-order approximation of \(_{0}\). To demonstrate this, we take an alternative approach to rewrite \(_{0}\):
+
+\[_{0}=_{}}(g(_{}}f_{}})-g()) {\,}}}{\,W_{r}}. \]
+
+Note that \(g()\) is only used as a vehicle for derivations. It is worth mentioning that, unlike the baseline used in Equation 4 (i.e., \(E[h]\), which has been shown to be the optimal control variate in Weaver & Tao, 2001), it is not a suitable to use \(g()\) as the control variate for policy gradient.
+
+Adopting the Euler method to Equation 7, we estimate \(g(}}f_{}})-g()\) as \(g^{}(}}f_{}})}}f_{}}\). Comparing to the first-order approximation of Equation 6, this first-order approximation only requires the output of one expert. Then, it is easy to note:
+
+\[_{0}}{}_{}}g^{}( }}f_{}})}}f_{}}}}}{\,W_{r}}=E_{}[f_{D}())}{\,W_{r}}]=E[_{}}}].\]
+
+Note that, same with \(_{}\), \(_{}}}\) adopts the forward Euler method and achieves first-order accuracy. Meanwhile, \(_{}}}\) only requires the output of one expert thus not sacrificing scalability, while \(_{}\), as in Equation 4, requires the output of all experts.
+
+### Understand Current MoE Training Practice in Simplified Setting
+
+Besides providing sound gradient approximation with negligible computation overheads, our study also sheds insights into the underlying mechanism of the current MoE training practice. In this section, we introduce the current MoE training practice with our simplied setting. Then, in Section 3.4, we further discuss MoE training in the realistic Switch Transformer setting.
+
+**Current MoE Training Practice.**  Due to all the challenge discussed in Section 3.1, the current MoE training practice trades certain training signals for scalability. Specifically, \(_{0}\) is strategically neglected in gradient computation (the value of \(_{0}\) is set to 0), and only \(_{1}\) is used for model training (Fedus et al., 2021). Despite the success of such practice, it remains unclear on the impact of neglecting \(_{0}\), how to conduct training with only part of the gradient, and whether gradient descent is still effective after neglecting \(_{0}\).
+
+**Underlying Mechanism of Current MoE Training Practice.**  Comparing Equation 7 and Equation 2, we can observe that \(_{}}}\) has the same form with \(_{1}\), which implies:
+
+\[}{}2_{1}.\]
+
+Therefore, in our simplified setting, directly dropping the \(_{0}\) can be viewed as down-scaling \(\) by \(0.5\). Since typical training practice employs adaptive optimizers for model training, whose update rule is invariant to constant gradient scaling, our observation here provides a natural explanation on the effectiveness of current MoE training.
+
+### From Simplified Setting to Switch Transformer: Expert Sampling
+
+As mentioned in Section 2, our modeling of MoE is a simplified Switch Transformer. Here, we first discuss the difference between our simplified setting and Switch Transformer, and then move to necessary modifications to apply SparseMixer to Switch Transformer.
+
+Difference between Simplified Setting and Switch Transformer.The difference between our simplified setting and switch Transformer is the sampling of \(\). Specifically, in our simplified setting, we assume \(\) is sampled from \(\); in Switch Transformer, \(\) is sampled as Equation 8 instead.
+
+\[=*{arg\,max}_{_{i}}(_{_{i}} u_{ _{i}}),u_{_{i}}}{}(1-r,1+r). \]
+
+With this sampling strategy, \(_{1}\) is no longer a first-order approximation to \(_{0}\) (it can be viewed as conducting importance sampling without applying the likelihood ratio).
+
+An Important Property of Expert Sampling in Switch Transformer.To obtain sound gradient estimation with a strong performance, it is necessary to adapt the sampling process of expert networks. As observed in Fedus et al. (2021), directly sampling \(\) from \(\) leads to notable performance degradation (also discussed in Section 5.3). In our study, we observe an important property of the sampling process used in the Switch Transformer setting and suggest it to be the major issue with the original softmax sampling.
+
+Marking \(^{*}:=_{_{i}}_{_{i}}\), in Switch Transformer, \(_{i}\) will never be sampled if:
+
+\[^{*}-_{_{i}}>r(|^{*}|+| _{_{i}}|).\]
+
+In other words, the distribution of \(\) in switch Transformer is masked: small probabilities would directly drop to zero once the corresponding logits hit a threshold. In our experiments, we observe that such sparse distribution plays a crucial role in the success of MoE and conduct more empirical discussions in the experiment section (Section 5.3).
+
+Adapting Expert Sampling for MoE Training.Guided by our analyses, we deploy a sampling process that is differentiable as sampling from \(\), while sharing some important properties with Switch Transformer. Specifically, we changed the computation of \(\) from \(_{i}=()_{i}=_{i})}{_ {j=1}^{n}(_{j})}\) to
+
+\[_{i}=_{i})_{i}}{_{j=1}^{n}( {}_{j})_{j}},_{j}=(^{*}-_{_{i}} r(|^{*}|+|_{_{i}}|)). \]
+
+In other words, we apply a mask to the softmax function, in order to sample only from experts that are not masked by the Switch Transformer. This adaptation allows MoE to be trained with both sparse expert sampling and sound gradient approxiamtion, we observe it leads to a significant performance boost.
+
+Empirical Benefits on Expert Sampling Adaptation.As elaborated in Section 5.3, we conduct comparisons with Switch and SparseMixer-ablation-2. Both are based on the first-order approximation as discussed in Section 3.3. The difference between these two are:
+
+* SparseMixer-ablation-2 conducts expert sampling as in Equation 9 and uses a first-order approximation of \(_{0}\) for parameter updates.
+* Switch conducts expert sampling as in Equation 8, downscales the routing gradient by 0.5 (as in Section 3.3), thus adding additional bias to the first-order approximation.
+
+As in Figure 1, the SparseMixer-ablation-2 method achieves consistent performance gain to Switch Transformer. applies the abovementioned sampling process to Switch Transformer, and.(see Section 5.3 for more details).
+
+## 4 Towards Second-Order Accuracy with Negligible Overheads
+
+The literature on numerical methods for differential equations shows that it is possible to achieve higher-order accuracy _without computing higher-order derivatives_. Correspondingly, we aim to provide better gradient approximation with negligible computation overheads.
+
+### Achieving Second-Order Accuracy with the Mid-point Method
+
+To furnish accurate gradient approximations, we employ a second-order ODE method, the mid-point method (briefly introduced in Appendix A). Specifically, \(_{}\) is a second-order approximation of \(\), where
+
+\[_{}\,:=2}f_{D}()}{2})}{\,W_{r}}.\]
+
+To demonstrate the connection between \(_{}\) and the mid-point method, we employ the mid-point method to approximate \(g(_{I_{i}}f_{I_{i}})-g()\) as \(g^{}(}f_{I_{i}}}{2})_{I_{i}}f_{I_{i}}\), which also requires only the output of one expert. Similarly, it is easy to note:
+
+\[_{0}}}{{}}_{_{i }}g^{}(}f_{I_{i}}}{2})_{I_{i}}f_{I_{i}} _{I_{i}}}{\,W_{r}}=E_{}[2 f_{D}()}{2})}{\,W_{r}}]=E[ {}_{}\,].\]
+
+Notably, it is feasible to employ more advanced ODE solvers like RKF4 and approximate \(_{0}\) with even higher-order accuracy (Fehlberg, 1969). In our experiments, we observe that the mid-point method is accurate enough and decide to stick to the mid-point method for simplicity.
+
+### Balancing Router Training and Expert Training
+
+Trade-off Behind Applying the Mid-Point Method.Comparing to \(_{}\), \(_{}\) provides better gradient estimation for router training. However, \(_{}\) causes additional difficulties for expert training.
+
+Specifically, \(_{}\) requires to change the MoE output from \(_{}f_{}()\) to \(}f_{}()}{2}\). Intuitively, this change leads to two gaps:
+
+1. A gap between the training (\(}f_{}()}{2}\)) and the inference (\(_{}f_{}()\)).
+2. A gap between estimating \(_{0}\) (\(}f_{}()}{2}\)) and \(_{1}\) (\(_{}f_{}()\)).
+
+In other words, applying mid-point method would lead to a better approximation of \(_{0}\), at the cost of additional bias in computing \(_{1}\). Similarly, as discussed in Section 5.4, such gap creates significant obstacles for MoE training.
+
+Hybrid Gradient Estimation: SparseMixer.We notice that \(\) is assigned as \(_{_{i}}_{I_{i}}\) during the inference, instead of being sampled from \(\). Thus, it would be sufficient to close the gap by only applying \(_{}\) when \(_{_{i}}_{I_{i}}\). Accordingly, we propose SparseMixer to balance router training and expert training:
+
+\[_{}\,:=(1-_{})_ {}\,+_{}_{}\,,_{}=1,&=_{_{i}}_{_{i}}\\ 0,&.\]
+
+Additional Sampling Adaptation.Since the value of \(\) will be different after applying the mask (which impacts the gradient magnitude of other components), we further changed the output of the MoE layer from \(_{} f_{}()\) to \(_{} f_{}()\), where \(\) is trainable and is initialized as the \(\) vector. Intuitively, \(\) can be viewed as an adaptation on the learning rate for training expert networks. Note that, \(\) can be re-parameterized into the feedforward layer after training.
+
+Computational Efficiency of SparseMixer.\(_{}\) does not require Hessian or other second-order derivatives, thus having negligible computation overheads. Also, it is worth mentioning that \(_{}\) has the same order of computation complexity and memory complexity with only estimating \(_{1}\) (i.e., the current practice of MoE training neglects \(_{0}\) directly). Empirical verification is discussed in Section 5.5, which matches our analyses here.
+
+At the same time, similar to \(_{}\), our proposed algorithm can be easily integrated with popular library like PyTorch, making it easy to be integrated with existing algorithms.
+
+Experiments
+
+### Experiment Setting
+
+Here, we conduct experiments on pretraining and neural machine translation. We closely follow the experiment setting of the existing study. Due to the constraint of computation resources, we left MoE related hyper-parameters untuned in all settings, i.e., jitter (\(r\)) is set to 0.1 and load balance loss ratio is set to 0.01 (Fedus et al., 2021). Detailed configurations are elaborated in Appendix B.
+
+### Applying SparseMixer on Switch Transformer
+
+NMT on WMT'14 En-De.We visualized the training curve in Figure 1 and summarized the BLEU score in Table 1. Regarding both convergence speed and the final performance, Switch+SparseMixer consistently outperforms Switch in all five settings. Notably, Switch+SparseMixer matches the training performance of Switch with about _50% less training updates when \(N\{4,6,8\}\)_ and about _40% less training updates when \(N\{2,16\}\)_.
+
+We can observe that, with more experts, MoE models achieve lower training loss with a worse BLEU score. Specifically, although Switch Transformer achieves better training performance, its final performance (BLEU score) never outperforms the Dense model, regardless of how many experts it has. We believe it requires more data to fully unleash the potential of MoE and suggest this phenomenon indicates that MoE models are prone to overfitting (Zuo et al., 2022).
+
+Meanwhile, without changing hyper-parameters or model architectures, the downstream performance of Switch + SparseMixer outperforms both Dense and Switch, when \(N\{2,4\}\). Specifically, SparseMixer improves the performance of Switch from 28.17 to 28.72 (when \(N=2\)) and from 28.05 to 28.61 (when \(N=4\)). This phenomenon implies that, with the help of SparseMixer, a sound gradient estimator, MoE learns an expert routing that generalizes better.
+
+Pretraining.Following previous work (Dong et al., 2023), we visualized the training curve in Figure 6 and summarized the fine-tuning results in Table 2. Regarding both convergence speed and downstream performance, Switch+SparseMixer consistently outperforms Switch in all settings. Also, similar to the experiments on machine translation, we observe that MoE models are easier to overfit and both settings achieve the best downstream performance with two experts.
+
+Also, it is worth mentioning that, while Switch Transformer only outperforms the dense model when the number of experts is set to 2, Switch + SparseMixer consistently outperforms the Dense model in all four settings. This phenomenon further verifies our intuition that SparseMixer facilitates MoE models with better expert router training, thus having the resulting model to generalize better.
+
+### Discussions
+
+Here, we conduct experiments to discuss our modeling of the MoE layer as in Section 2.
+
+Importance of Scaling Expert Outputs with Gating Networks.One important design detail of MoE is to scale the output of the expert network with the gating network, i.e., the output of the MoE layer is computed as \(_{D}f_{D}()\), instead of \( f_{D}()\). This scaling design greatly facilitates the derivation of SparseMixer in Section 3, and inspires the introduction of \(\) (further discussed in Section 5.4). Here, we empirically examine the importance of this scaling design.
+
+Specifically, we conduct experiments with a variant of Switch Transformer, i.e., Switch w.o. Scaling, which sets the output of the MoE layer as \( f_{D}()\). We apply this Switch variant on
+
+    & Dense &  \\  & \(N=2\) & \(N=4\) & \(N=6\) & \(N=8\) & \(N=16\) \\  Transformer-base & 28.33 & / & / & / & / & / \\ Switch & / & 28.17 & 28.05 & 27.96 & 27.99 & 27.81 \\ Switch+SparseMixer & / & **28.72** & **28.61** & **28.32** & **28.12** & **28.08** \\   
+
+Table 1: BLEU score on WMT’14 En-De (\(N\) refers to the number of experts).
+
+[MISSING_PAGE_FAIL:8]
+
+* ablation-2 further replaces the mid-point method with the forward Euler method in SparseMixerablation-1, i.e., \(_{}\) is employed as the gradient estimator and \(\) is removed.
+
+We apply these two variants to WMT'14 En-De. As in Figure 1, both variants outperform the baseline. The results further verified our intuition that \(\) facilitates MoE training by alleviating the impact of applying masks. Also, it shows that integrating the mid-point method helps to better approximate expert routing gradient.
+
+### Efficiency
+
+We summarized the average time cost per update in Table 3. Switch+SparseMixer achieves an identical average time cost with Switch in all eight settings. This shows that the computation overheads of SparseMixer are negligible.
+
+To better understand the computation overhead brought by SparseMixer, we compute the floating point operations (FLOPS) for one forward propagation and one backward propagation. We visualized the FLOPS ratio of Switch and Switch+SparseMixer of various number of experts in Figure 5. It shows the computation overhead brought by SparseMixer only composes up to 0.1% of the total training FLOPS, for MoE models with up to 16384 experts.
+
+## 6 Conclusion
+
+In this study, we present SparseMixer to move beyond ST and bridge the gap between sparse MoE routing and backpropagation. Rooted in a numerical ODE framework, SparseMixer harnesses the mid-point method, a second-order ODE solver, to deliver precise gradient approximations with negligible computational overhead. In our experiments on both neural machine translation and pre-training tasks, SparseMixer not only accelerates training convergence by up to two times but also facilitates MoE with properly trained expert routing. Remarkably, while Switch Transformer underperforms the dense model in all three pretraining settings, incorporating SparseMixer as the gradient estimator allows the resulting MoE models to consistently outperform the dense model.
