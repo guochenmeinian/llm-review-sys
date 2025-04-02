@@ -126,7 +126,7 @@ def create_paper_review_dataset(aggregated_reviews, parsed_pdfs, output_path):
             # 提取论文内容
             paper_content = ""
             if 'abstract' in pdf_data:
-                paper_content += f"{pdf_data['abstract']}\n\n"
+                paper_content += f"Abstract: {pdf_data['abstract']}\n\n"
             if 'sections' in pdf_data:
                 for section in pdf_data['sections']:
                     if 'heading' in section and 'text' in section:

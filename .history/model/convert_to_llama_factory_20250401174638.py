@@ -2,16 +2,15 @@ import os
 import json
 from tqdm import tqdm
 
-def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, min_input_length=1000):
-    """将数据集格式化为Llama Factory所需的格式，并过滤掉过长或过短的输入"""
+def format_for_llama_factory(dataset_path, output_path, max_input_length=150000):
+    """将数据集格式化为Llama Factory所需的格式，并过滤掉过长的输入"""
     # 加载数据集
     with open(dataset_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
     # 转换为Llama Factory格式
     llama_factory_data = []
-    filtered_long_count = 0
-    filtered_short_count = 0
+    filtered_count = 0
     
     print(f"正在处理数据集，共 {len(data)} 条记录...")
     
@@ -21,12 +20,8 @@ def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, 
         response = item['aggregated_review']
         
         # 检查输入长度
-        input_length = len(prompt)
-        if input_length > max_input_length:
-            filtered_long_count += 1
-            continue
-        elif input_length < min_input_length:
-            filtered_short_count += 1
+        if len(prompt) > max_input_length:
+            filtered_count += 1
             continue
         
         llama_factory_item = {
@@ -43,10 +38,8 @@ def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, 
         json.dump(llama_factory_data, f, ensure_ascii=False, indent=2)
     
     print(f"已创建Llama Factory格式数据集，包含 {len(llama_factory_data)} 条记录")
-    if filtered_long_count > 0:
-        print(f"已过滤 {filtered_long_count} 条过长输入 (超过 {max_input_length} 字符)")
-    if filtered_short_count > 0:
-        print(f"已过滤 {filtered_short_count} 条过短输入 (少于 {min_input_length} 字符)")
+    if filtered_count > 0:
+        print(f"已过滤 {filtered_count} 条过长输入 (超过 {max_input_length} 字符)")
     
     return llama_factory_data
 

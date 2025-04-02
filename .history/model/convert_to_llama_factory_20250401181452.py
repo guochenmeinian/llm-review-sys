@@ -2,7 +2,7 @@ import os
 import json
 from tqdm import tqdm
 
-def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, min_input_length=1000):
+def format_for_llama_factory(dataset_path, output_path, max_input_length=150000, min_input_length=1000):
     """将数据集格式化为Llama Factory所需的格式，并过滤掉过长或过短的输入"""
     # 加载数据集
     with open(dataset_path, 'r', encoding='utf-8') as f:

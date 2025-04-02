@@ -35,8 +35,8 @@ def process_all_papers(input_dir, output_dir):
             print(f"处理文件 {mmd_file} 时出错: {str(e)}")
 
 def extract_key_info_from_paper(content, max_tokens=30000):
-    """提取论文关键信息，简化版本：保留大部分内容，只清除参考文献等不需要的部分"""
-    # 提取标题
+    """Extract key information from papers"""
+    # 提取标题 - 支持多种格式
     title = "Unknown Title"
     
     # 尝试匹配标准Markdown标题格式
@@ -44,55 +44,94 @@ def extract_key_info_from_paper(content, max_tokens=30000):
     if title_match:
         title = title_match.group(1)
     else:
-        # 尝试匹配双星号格式的标题 - 更灵活的匹配
-        title_match = re.search(r'(?:^|\n)\s*\*\*(.*?)\*\*\s*(?:\n|$)', content)
+        # 尝试匹配双星号格式的标题
+        title_match = re.search(r'^\*\*(.*?)\*\*\s*$', content, re.MULTILINE)
         if title_match:
-            title = title_match.group(1).strip()
-        # 如果仍然没有找到标题，尝试匹配第一行作为标题
-        elif '\n' in content:
-            first_line = content.split('\n')[0].strip()
-            if first_line and len(first_line) < 200:  # 合理的标题长度
-                title = first_line
+            title = title_match.group(1)
     
-    # 清理内容 - 移除参考文献、致谢等部分
-    cleaned_content = content
+    # 查找所有章节
+    sections = {}
     
-    # 移除参考文献部分
-    cleaned_content = re.sub(r'(?:^|\n)#{1,3}\s+(?:References|Bibliography|参考文献)[\s\S]*$', '', cleaned_content, flags=re.IGNORECASE)
-    cleaned_content = re.sub(r'(?:^|\n)\*\*(?:References|Bibliography|参考文献)\*\*[\s\S]*$', '', cleaned_content, flags=re.IGNORECASE)
+    # 首先尝试匹配标准Markdown章节格式
+    section_matches = re.findall(r'(?:^|\n)(#{1,3}\s+.*?)(?=\n)(.*?)(?=\n#{1,3}\s+|\Z)', content, re.DOTALL)
     
-    # 移除致谢部分
-    cleaned_content = re.sub(r'(?:^|\n)#{1,3}\s+(?:Acknowledgements?|Acknowledgments?)[\s\S]*?(?=\n#{1,3}|\Z)', '', cleaned_content, flags=re.IGNORECASE)
-    cleaned_content = re.sub(r'(?:^|\n)\*\*(?:Acknowledgements?|Acknowledgments?)\*\*[\s\S]*?(?=\n\*\*|\Z)', '', cleaned_content, flags=re.IGNORECASE)
+    # 如果没有找到标准章节，尝试匹配双星号格式的章节
+    if not section_matches:
+        # 匹配双星号格式的章节标题和内容
+        section_matches = re.findall(r'(?:^|\n)(\*\*([^*:]+)(?::|)\*\*)(?=\n)(.*?)(?=\n\*\*[^*]+\*\*|\Z)', content, re.DOTALL)
+        if section_matches:
+            # 转换匹配结果格式以与标准格式兼容
+            section_matches = [(match[0], match[2]) for match in section_matches]
     
-    # 移除脚注
-    cleaned_content = re.sub(r'Footnote \d+:.*?\n', '', cleaned_content)
-    
-    # 移除引用标记 [1], [2,3], etc.
-    cleaned_content = re.sub(r'\[\d+(?:,\s*\d+)*\]', '', cleaned_content)
-    
-    # 移除LaTeX残留标记
-    cleaned_content = re.sub(r'\\[a-zA-Z]+(\{[^}]*\})*', '', cleaned_content)
-    
-    # 移除多余空行
-    cleaned_content = re.sub(r'\n{3,}', '\n\n', cleaned_content)
-    
-    # 移除中文内容（如果有）
-    cleaned_content = re.sub(r'[\u4e00-\u9fff]+', '', cleaned_content)
-    
-    # 组合最终结果
-    if title != "Unknown Title":
-        # 如果找到了标题，确保它在文档开头
-        # 先移除原始标题行
-        if title_match:
-            cleaned_content = cleaned_content.replace(title_match.group(0), '', 1)
+    # 如果仍然没有找到任何章节，可能是格式问题，尝试直接使用整个内容
+    if not section_matches:
+        # 保留标题，然后添加剩余内容
+        title_line = None
+        if re.search(r'^#\s+.*?$', content, re.MULTILINE):
+            title_line = re.search(r'^#\s+.*?$', content, re.MULTILINE)
+        elif re.search(r'^\*\*.*?\*\*\s*$', content, re.MULTILINE):
+            title_line = re.search(r'^\*\*.*?\*\*\s*$', content, re.MULTILINE)
         
-        # 添加标准格式的标题
-        final_content = f"# {title}\n\n{cleaned_content.strip()}"
+        if title_line:
+            remaining_content = content.replace(title_line.group(0), '', 1).strip()
+            if remaining_content:
+                sections["Content"] = clean_section_content(remaining_content)
     else:
-        final_content = cleaned_content.strip()
+        for header, content_text in section_matches:
+            # 处理标准Markdown格式
+            if header.startswith('#'):
+                header_text = header.strip('# \n')
+            # 处理双星号格式
+            else:
+                header_text = header.strip('* \n')
+                # 移除可能的冒号
+                header_text = re.sub(r':\s*$', '', header_text)
+            
+            # 跳过参考文献和致谢章节
+            if re.search(r'reference|bibliography|acknowledgement|acknowledgment', header_text, re.IGNORECASE):
+                continue
+            
+            sections[header_text] = clean_section_content(content_text.strip())
     
-    return final_content
+    # 提取图表信息
+    figure_captions = extract_figure_captions(content)
+    table_captions = extract_table_captions(content)
+    
+    # 组合提取的信息
+    combined_text = f"# {title}\n\n"
+    
+    # 添加所有章节（除了参考文献）
+    for header, section_content in sections.items():
+        if section_content.strip():  # 只添加非空章节
+            combined_text += f"## {header}\n{section_content}\n\n"
+    
+    # 添加图表注释
+    if figure_captions or table_captions:
+        combined_text += "## Figures and Tables\n"
+        
+        if figure_captions:
+            combined_text += "### Figures\n"
+            combined_text += figure_captions + "\n\n"
+            
+        if table_captions:
+            combined_text += "### Tables\n"
+            combined_text += table_captions + "\n\n"
+    
+    # 最终清理
+    combined_text = final_cleanup(combined_text)
+    
+    # 如果结果只有标题，尝试使用原始内容
+    if combined_text.strip() == f"# {title}":
+        # 移除参考文献部分
+        cleaned_content = re.sub(r'(?:^|\n)#{1,3}\s+(?:References|Bibliography|参考文献)[\s\S]*$', '', content, flags=re.IGNORECASE)
+        cleaned_content = re.sub(r'(?:^|\n)\*\*(?:References|Bibliography|参考文献)\*\*[\s\S]*$', '', cleaned_content, flags=re.IGNORECASE)
+        # 清理内容
+        cleaned_content = clean_section_content(cleaned_content)
+        # 最终清理
+        cleaned_content = final_cleanup(cleaned_content)
+        return cleaned_content.strip()
+    
+    return combined_text.strip()
 
 def clean_section_content(content):
     """清理章节内容"""
@@ -199,26 +238,17 @@ def final_cleanup(text):
     # 移除空章节
     text = re.sub(r'## [^\n]+\n\s*(?=\n##|$)', '', text, flags=re.DOTALL)
     
-    # 移除参考文献部分
+    # 移除参考文献部分 - 更全面的匹配模式
     text = re.sub(r'## (?:[Rr]eference|[Rr]eferences|[Bb]ibliography)(?:\s+[^\n]+)?\n[\s\S]*?(?=\n##|$)', '\n\n', text, flags=re.DOTALL)
-    text = re.sub(r'\*\*(?:[Rr]eference|[Rr]eferences|[Bb]ibliography)\*\*(?:\s+[^\n]+)?\n[\s\S]*?(?=\n\*\*|\Z)', '\n\n', text, flags=re.DOTALL)
     
     # 移除致谢部分
     text = re.sub(r'## (?:[Aa]cknowledg(?:e)?ment(?:s)?)(?:\s+[^\n]+)?\n[\s\S]*?(?=\n##|$)', '\n\n', text, flags=re.DOTALL)
-    text = re.sub(r'\*\*(?:[Aa]cknowledg(?:e)?ment(?:s)?)\*\*(?:\s+[^\n]+)?\n[\s\S]*?(?=\n\*\*|\Z)', '\n\n', text, flags=re.DOTALL)
     
     # 移除LaTeX残留标记
     text = re.sub(r'\\[a-zA-Z]+(\{[^}]*\})*', '', text)
     
     # 移除重复的章节标题
     text = re.sub(r'(## [^\n]+)\n\s*\1', r'\1', text)
-    
-    # 提取文档标题
-    title_match = re.search(r'^# (.*?)$', text, re.MULTILINE)
-    if title_match:
-        title = title_match.group(1)
-        # 移除与文档标题相同的章节标题及其内容
-        text = re.sub(r'## ' + re.escape(title) + r'\n.*?(?=\n##|\Z)', '', text, flags=re.DOTALL)
     
     return text.strip()
 

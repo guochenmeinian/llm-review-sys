@@ -33,6 +33,13 @@ def find_parsed_pdfs(base_dir):
             current_section = None
             current_text = []
             
+            # 添加关键章节的检测标志
+            has_introduction = False
+            has_discussion = False
+            has_conclusion = False
+            has_experiment = False
+            has_method = False
+            
             for line in content.split('\n'):
                 if line.startswith('# '):  # 标题
                     title = line[2:].strip()
@@ -43,6 +50,55 @@ def find_parsed_pdfs(base_dir):
                             'text': '\n'.join(current_text)
                         })
                     current_section = "Abstract"
+                    current_text = []
+                # 检测关键章节
+                elif line.startswith('## Introduction') or line.startswith('## INTRODUCTION'):
+                    has_introduction = True
+                    if current_section and current_text:
+                        if current_section == "Abstract":
+                            abstract = '\n'.join(current_text)
+                        else:
+                            sections.append({
+                                'heading': current_section,
+                                'text': '\n'.join(current_text)
+                            })
+                    current_section = "Introduction"
+                    current_text = []
+                elif line.startswith('## Discussion') or line.startswith('## DISCUSSION'):
+                    has_discussion = True
+                    if current_section and current_text:
+                        sections.append({
+                            'heading': current_section,
+                            'text': '\n'.join(current_text)
+                        })
+                    current_section = "Discussion"
+                    current_text = []
+                elif line.startswith('## Conclusion') or line.startswith('## CONCLUSION'):
+                    has_conclusion = True
+                    if current_section and current_text:
+                        sections.append({
+                            'heading': current_section,
+                            'text': '\n'.join(current_text)
+                        })
+                    current_section = "Conclusion"
+                    current_text = []
+                elif line.startswith('## Experiment') or line.startswith('## EXPERIMENT') or line.startswith('## Experiments') or line.startswith('## EXPERIMENTS'):
+                    has_experiment = True
+                    if current_section and current_text:
+                        sections.append({
+                            'heading': current_section,
+                            'text': '\n'.join(current_text)
+                        })
+                    current_section = "Experiments"
+                    current_text = []
+                elif line.startswith('## Method') or line.startswith('## METHOD') or line.startswith('## Methods') or line.startswith('## METHODS'):
+                    has_method = True
+                    if current_section and current_text:
+                        sections.append({
+                            'heading': current_section,
+                            'text': '\n'.join(current_text)
+                        })
+                    current_section = "Methods"
                     current_text = []
                 elif line.startswith('## '):  # 其他章节
                     # 保存之前的章节
@@ -76,7 +132,12 @@ def find_parsed_pdfs(base_dir):
                 'title': title,
                 'abstract': abstract,
                 'sections': sections,
-                'file_path': mmd_file
+                'file_path': mmd_file,
+                'has_introduction': has_introduction,
+                'has_discussion': has_discussion,
+                'has_conclusion': has_conclusion,
+                'has_experiment': has_experiment,
+                'has_method': has_method
             }
             
         except Exception as e:
@@ -126,7 +187,7 @@ def create_paper_review_dataset(aggregated_reviews, parsed_pdfs, output_path):
             # 提取论文内容
             paper_content = ""
             if 'abstract' in pdf_data:
-                paper_content += f"{pdf_data['abstract']}\n\n"
+                paper_content += f"Abstract: {pdf_data['abstract']}\n\n"
             if 'sections' in pdf_data:
                 for section in pdf_data['sections']:
                     if 'heading' in section and 'text' in section:
