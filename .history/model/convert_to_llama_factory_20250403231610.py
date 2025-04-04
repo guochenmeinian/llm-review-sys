@@ -16,12 +16,8 @@ def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, 
     print(f"正在处理数据集，共 {len(data)} 条记录...")
     
     for item in tqdm(data, desc="格式化并过滤数据"):
-        # 获取平均评分和置信度
-        rating = item.get('avg_rating', 0)
-        confidence = item.get('avg_confidence', 0)
-        
         # 构建提示和回复
-        prompt = f"""Please provide a comprehensive review of the following academic paper. Your review should be structured into four main sections:
+        prompt = f"""Please review the following academic paper and provide a structured review following these requirements:
 
 ### Key Points
 Summarize the main contributions and key ideas of the paper.
@@ -35,9 +31,15 @@ Weaknesses:
 ### Suggestions for Improvement
 Provide specific recommendations for enhancing the paper.
 
-### Rating
-Overall Quality (1-10)
-Review Confidence (1-5)
+### Rating and Confidence
+Please provide:
+- Rating (1-10): Rate the paper's overall quality
+- Confidence (1-5): Rate your confidence in this review
+
+Review Guidelines:
+- Maintain academic tone and technical precision throughout
+- Address suggestions directly to the authors
+- Use phrases like "This paper presents..." or "The authors propose..." when discussing the work
 
 Paper Details:
 Title: {item['title']}
@@ -46,13 +48,21 @@ Conference: {item['conference']} {item['year']}
 Content:
 {item['paper_content']}"""
         
-        # 构建标准化的输出格式
-        response = f"{item['aggregated_review']}\n### Rating\nOverall Quality: {rating:.1f}\nReview Confidence: {confidence:.1f}"
+        # 获取评分和置信度
+        rating = item.get('rating', {}).get('value', 0)
+        confidence = item.get('confidence', {}).get('value', 0)
+        
+        response = item['aggregated_review']
+        
+        # 在response末尾添加评分信息
+        response = f"{response}\n\nRating: {rating}/10\nConfidence: {confidence}/5"
         
         llama_factory_item = {
-            "instruction": "You are an academic paper reviewer. Please provide a comprehensive review with ratings for the given paper.",
+            "instruction": "You are an academic paper reviewer. Your task is to provide comprehensive and structured reviews of academic papers, including quality ratings and confidence levels.",
             "input": prompt,
-            "output": response
+            "output": response,
+            "rating": rating,
+            "confidence": confidence
         }
         
         # 检查输入长度

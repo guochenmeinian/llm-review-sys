@@ -21,7 +21,7 @@ def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, 
         confidence = item.get('avg_confidence', 0)
         
         # 构建提示和回复
-        prompt = f"""Please provide a comprehensive review of the following academic paper. Your review should be structured into four main sections:
+        prompt = f"""Please provide a comprehensive review of the following academic paper. Your review should be structured into three main sections:
 
 ### Key Points
 Summarize the main contributions and key ideas of the paper.
@@ -36,8 +36,8 @@ Weaknesses:
 Provide specific recommendations for enhancing the paper.
 
 ### Rating
-Overall Quality (1-10)
-Review Confidence (1-5)
+Overall Quality (1-10): {rating:.1f}
+Review Confidence (1-5): {confidence:.1f}
 
 Paper Details:
 Title: {item['title']}
@@ -47,7 +47,7 @@ Content:
 {item['paper_content']}"""
         
         # 构建标准化的输出格式
-        response = f"{item['aggregated_review']}\n### Rating\nOverall Quality: {rating:.1f}\nReview Confidence: {confidence:.1f}"
+        response = f"{item['aggregated_review']}\n### Rating\nOverall Quality (1-10): {rating:.1f}\nReview Confidence (1-5): {confidence:.1f}"
         
         llama_factory_item = {
             "instruction": "You are an academic paper reviewer. Please provide a comprehensive review with ratings for the given paper.",
