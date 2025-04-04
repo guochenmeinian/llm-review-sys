@@ -1,0 +1,1 @@
+rm ./llama_factory_dataset/*.json

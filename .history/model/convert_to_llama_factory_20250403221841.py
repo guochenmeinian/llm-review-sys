@@ -17,24 +17,18 @@ def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, 
     
     for item in tqdm(data, desc="格式化并过滤数据"):
         # 构建提示和回复
-        prompt = f"""Please provide a comprehensive review of the following academic paper. Your review should be structured into three main sections:
+        prompt = f"""Please review the following academic paper and provide a structured review following these requirements:
 
-### Key Points
-Summarize the main contributions and key ideas of the paper.
+1. Key points
+2. Strengths and weaknesses
+3. Suggestions for improvement
 
-### Strengths and Weaknesses
-Strengths:
-- List the paper's major strengths and significant contributions
-Weaknesses:
-- Identify areas that need improvement
-
-### Suggestions for Improvement
-Provide specific recommendations for enhancing the paper.
-
-Review Guidelines:
-- Maintain academic tone and technical precision throughout
-- Address suggestions directly to the authors (e.g., "We recommend that the authors improve...")
-- Use phrases like "This paper presents..." or "The authors propose..." when discussing the work
+Critical Requirements:
+- Strictly maintain academic tone and technical precision
+- When making suggestions, address the authors directly (e.g., "We recommend that the authors improve...")
+- When discussing the paper, use phrases like "This paper presents..." or "The authors propose..."
+- Use "### Key Points", "### Strengths and Weaknesses", and "### Suggestions for Improvement" as section headers
+- In the Strengths and Weaknesses section, write "Strengths:" and "Weaknesses:" on separate lines
 
 Paper Details:
 Title: {item['title']}
@@ -44,6 +38,12 @@ Content:
 {item['paper_content']}"""
         
         response = item['aggregated_review']
+        
+        llama_factory_item = {
+            "instruction": "You are an academic paper reviewer. Please provide a comprehensive and structured review of the given paper.",
+            "input": prompt,
+            "output": response
+        }
         
         # 检查输入长度
         input_length = len(prompt)
@@ -55,7 +55,26 @@ Content:
             continue
         
         llama_factory_item = {
-            "instruction": "You are an academic paper reviewer. Your task is to provide comprehensive and structured reviews of academic papers.",
+            "instruction": """
+            Please generate a concise summary based on the following review(s) with the following three sections:
+                1. Key points
+                2. Strengths and weaknesses
+                3. Suggestions for improvement
+
+            Critical Requirements:
+            - Strictly maintain the exact core viewpoints of the original review(s)
+            - Absolute prohibition on adding any new information
+            - Summarize ONLY using the provided review content
+            - Preserve verbatim any specific technical suggestions or terms
+            - Ensure the summary captures the full depth and nuance of the original reviews
+            - Match the original review's academic tone and technical precision
+            - Reduce length by 20-30% without losing critical information
+            - When making suggestions, write as if reviewers are directly addressing the authors (e.g., "We recommend that the authors improve..." rather than "The reviewers suggest..." or "We should improve...")
+            - When discussing the paper in the Key points section, use phrases like "This paper presents..." or "The authors propose..." rather than "We present..."
+
+            Format Requirements:
+            - Use "### Key Points", "### Strengths and Weaknesses", and "### Suggestions for Improvement" as section headers
+            - In the Strengths and Weaknesses section, write "Strengths:" and "Weaknesses:" on separate lines""",
             "input": prompt,
             "output": response
         }

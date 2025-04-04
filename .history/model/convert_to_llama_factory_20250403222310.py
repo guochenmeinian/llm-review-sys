@@ -17,24 +17,18 @@ def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, 
     
     for item in tqdm(data, desc="格式化并过滤数据"):
         # 构建提示和回复
-        prompt = f"""Please provide a comprehensive review of the following academic paper. Your review should be structured into three main sections:
+        prompt = f"""Please review the following academic paper and provide a structured review following structure and requirements:
 
-### Key Points
-Summarize the main contributions and key ideas of the paper.
+1. Key points
+2. Strengths and weaknesses
+3. Suggestions for improvement
 
-### Strengths and Weaknesses
-Strengths:
-- List the paper's major strengths and significant contributions
-Weaknesses:
-- Identify areas that need improvement
-
-### Suggestions for Improvement
-Provide specific recommendations for enhancing the paper.
-
-Review Guidelines:
-- Maintain academic tone and technical precision throughout
-- Address suggestions directly to the authors (e.g., "We recommend that the authors improve...")
-- Use phrases like "This paper presents..." or "The authors propose..." when discussing the work
+Critical Requirements:
+- Strictly maintain academic tone and technical precision
+- When making suggestions, address the authors directly (e.g., "We recommend that the authors improve...")
+- When discussing the paper, use phrases like "This paper presents..." or "The authors propose..."
+- Use "### Key Points", "### Strengths and Weaknesses", and "### Suggestions for Improvement" as section headers
+- In the Strengths and Weaknesses section, write "Strengths:" and "Weaknesses:" on separate lines
 
 Paper Details:
 Title: {item['title']}

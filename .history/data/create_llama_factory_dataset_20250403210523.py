@@ -120,15 +120,6 @@ def create_paper_review_dataset(aggregated_reviews, parsed_pdfs, output_path):
         if paper_id in existing_ids:
             continue
             
-        # 获取原始评分和置信度
-        original_ratings = review.get('original_ratings', [])
-        original_confidences = review.get('original_confidences', [])
-        
-        # 如果没有原始评分或置信度，直接跳过
-        if not original_ratings or not original_confidences:
-            unmatched_ids.append(paper_id)
-            continue
-            
         if paper_id in parsed_pdfs:
             pdf_data = parsed_pdfs[paper_id]
             
@@ -141,35 +132,44 @@ def create_paper_review_dataset(aggregated_reviews, parsed_pdfs, output_path):
                     if 'heading' in section and 'text' in section:
                         paper_content += f"{section['heading']}\n{section['text']}\n\n"
             
+            # 修改这里：确保使用正确的review字段
             review_content = review.get('review') or review.get('aggregated_review', '')
             
             # 计算平均评分和平均置信度
-            valid_ratings = [r for r in original_ratings if r != -1]
-            valid_confidences = [c for c in original_confidences if c != -1]
+            avg_rating = -1
+            avg_confidence = -1
             
-            # 只有当有有效评分和置信度时才添加数据
-            if valid_ratings and valid_confidences:
+            # 获取原始评分和置信度
+            original_ratings = review.get('original_ratings', [])
+            original_confidences = review.get('original_confidences', [])
+            
+            # 计算平均评分（跳过-1值）
+            valid_ratings = [r for r in original_ratings if r != -1]
+            if valid_ratings:
                 avg_rating = sum(valid_ratings) / len(valid_ratings)
+            
+            # 计算平均置信度（跳过-1值）
+            valid_confidences = [c for c in original_confidences if c != -1]
+            if valid_confidences:
                 avg_confidence = sum(valid_confidences) / len(valid_confidences)
-                
-                data_item = {
-                    "id": paper_id,
-                    "title": review['title'],
-                    "conference": review.get('conference', ''),
-                    "year": review.get('year', ''),
-                    "paper_content": paper_content,
-                    "aggregated_review": review_content,
-                    "original_ratings": original_ratings,
-                    "original_confidences": original_confidences,
-                    "avg_rating": round(avg_rating, 2),
-                    "avg_confidence": round(avg_confidence, 2)
-                }
-                
-                new_data.append(data_item)
-                matched_count += 1
-                matched_ids.append(paper_id)
-            else:
-                unmatched_ids.append(paper_id)
+            
+            # 创建数据项
+            data_item = {
+                "id": paper_id,
+                "title": review['title'],
+                "conference": review.get('conference', ''),
+                "year": review.get('year', ''),
+                "paper_content": paper_content,
+                "aggregated_review": review_content,  # 使用修改后的review内容
+                "original_ratings": original_ratings,
+                "original_confidences": original_confidences,
+                "avg_rating": round(avg_rating, 2) if avg_rating != -1 else -1,
+                "avg_confidence": round(avg_confidence, 2) if avg_confidence != -1 else -1
+            }
+            
+            new_data.append(data_item)
+            matched_count += 1
+            matched_ids.append(paper_id)
         else:
             unmatched_ids.append(paper_id)
     
