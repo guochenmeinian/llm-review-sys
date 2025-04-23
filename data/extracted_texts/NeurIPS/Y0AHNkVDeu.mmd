@@ -1,0 +1,211 @@
+# Efficient Parallelization Layouts
+
+for Large-Scale Distributed Model Training
+
+ Johannes Hagemann
+
+Aleph Alpha / Hasso Plattner Institute
+
+johannes.hagemann@student.hpi.de &Samuel Weinbach
+
+Aleph Alpha
+
+samuel.weinbach@aleph-alpha.com Konstantin Dobler
+
+Hasso Plattner Institute
+
+konstantin.dobler@hpi.de &Maximilian Schall
+
+Hasso Plattner Institute
+
+maximilian.schall@hpi.de &Gerard de Melo
+
+Hasso Plattner Institute
+
+gerard.demelo@hpi.de
+
+###### Abstract
+
+Efficiently training large language models requires parallelizing across hundreds of hardware accelerators and invoking various compute and memory optimizations. When combined, many of these strategies have complex interactions regarding the final training efficiency. Prior work tackling this problem did not have access to the latest set of optimizations, such as FlashAttention or sequence parallelism. In this work, we conduct a comprehensive ablation study of possible training configurations for large language models. We distill this large study into several key recommendations for the most efficient training. For instance, we find that using a micro-batch size of 1 usually enables the most efficient training layouts. Larger micro-batch sizes necessitate activation checkpointing or higher degrees of model parallelism and also lead to larger pipeline bubbles. Our most efficient configurations enable us to achieve state-of-the-art training efficiency results over a range of model sizes, most notably a Model FLOPs utilization of 70.5% when training a Llama 13B model.
+
+## 1 Introduction
+
+The number of parameters and computational resources spent on training deep neural networks is growing rapidly . The largest models consisting of hundreds of billions of parameters do not even fit onto a single hardware accelerator. Thus, training these models requires various ways of reducing the memory requirements, such as ZeRO , activation checkpointing , and 3D-parallel (data, tensor, and pipeline parallel) training . 3D parallelism, in particular, has been demonstrated to be effective for the training of Transformer-based large language models (LLMs) with hundreds of billions of parameters .
+
+However, training these models efficiently with 3D parallelism requires significant domain expertise and extensive manual effort to determine the ideal configurations. These configurations not only need to combine data, model, and pipeline parallelism most efficiently, but also consider complex interactions with other memory and compute optimizations. FlashAttention in particular has had a notable impact since its release, enabling us to train models at previously impossible degrees of training efficiency. In light of these developments, we conduct a systematic study via a large-scale training efficiency sweep of these interactions. We consider up to 256 GPUs and Llama models with up to 65 billion parameters.
+
+We expand on previous work in this direction , but include more complex interactions, such as varying the micro-batch size alongside the 3D-parallel configuration. We also investigate the impact of newer methods, such as FlashAttention and sequence parallelism , finding that these can affect the optimal training configuration considerably. Our paper provides several actionable insights for efficiently training LLMs. In summary, the contributions of our work are as follows:
+
+* We conduct a large sweep over possible configurations for efficiently training LLMs.
+* Our work considers more degrees of freedom in the training configurations than previous work  and incorporates important recent techniques such as FlashAttention and sequence parallelism.
+* We distill our findings into several, actionable insights that enable a more efficient large-scale training of LLMs.
+
+## 2 Background
+
+Training very large models requires the combination of various techniques for parallelization across devices and other memory and compute optimizations. In the following, we provide an overview of the techniques implemented in our in-house training framework AA-Scaling, which we use to conduct the experiments in this paper. These techniques are also implemented in various other frameworks [28; 10; 19; 17; 25].
+
+Data ParallelismData parallelism  splits the dataset across GPUs during training. Each GPU holds a full model copy, computing loss and gradients for its data shard in parallel. Gradients are then synchronized across devices before weight updates. However, this requires that the model fits entirely within a single GPU's memory. For larger models, we can also shard the optimizer states, gradients, and model parameters across GPUs using techniques like ZeRO or FSDP [16; 27]. However, especially when sharding parameters, this introduces additional communication overhead.
+
+Tensor ParallelismTensor parallelism splits individual weight matrices across multiple GPUs and computes the matrix multiplication in parallel across them. As each GPU only holds a shard of the full weight matrix, we can fit larger models into memory. For Transformer models, the self-attention and MLP blocks can be parallelized this way with little communication overhead . Due to the natural parallelism of separate attention heads, we only need a single all-reduce operation in both the forward and backward passes. The MLP block similarly requires just a single synchronization in each pass.
+
+Pipeline ParallelismPipeline parallelism splits the model's layers into subsequent stages across GPUs. Activations are transferred between these stages. As each GPU only holds some of the layers of the model, we can again fit larger models into memory. However, it can introduce "pipeline bubbles" of GPU inactivity due to processing delays. PipeDream  is a scheduling algorithm to reduce these by using micro-batches and scheduling their forward and backward computations across pipeline stages. By interleaving forward and backward passes for each micro-batch, PipeDream further reduces memory usage, discarding activations after the specific micro-batch's backward pass.
+
+3D ParallelismAs shown by Megatron-LM , data, tensor, and pipeline parallelism can be combined, which is also referred to as 3D parallelism. In this paper, we use model parallelism as an umbrella term for both tensor and pipeline parallelism. With an efficient combination of these techniques, we can scale the training of models up to 1 trillion parameters .
+
+Sequence ParallelismSequence parallelism  builds on tensor parallelism  by further parallelizing normalization and dropout operations along the sequence dimension. This reduces activation memory usage, especially for longer sequences. Efficiently implemented, sequence parallelism does not introduce additional communication overhead when used together with tensor parallelism.
+
+Activation CheckpointingActivation checkpointing  enables a tradeoff between memory and compute. Instead of storing all activations for gradients, they are recalculated on the fly during the backward pass. This enables fitting larger models into memory and can improve training throughput by enabling larger batch sizes .
+
+Fused KernelsFusing sequential operations into a single kernel enhances the efficiency of memory-bound computations. By executing multiple operations concurrently within a single kernel, data is loaded only once, minimizing memory accesses and optimizing computational overhead.
+
+Flash AttentionDao et al. [5; 4] introduce an IO-aware attention algorithm that builds on kernel fusion. Their method provides speedups compared to a conventional implementation by minimizing read/write operations between the slower high-bandwidth memory and the quicker on-chip SRAM in GPUs. Additionally, selective activation recomputation during the backward pass alleviates the \((n^{2})\) memory cost in the sequence length.
+
+## 3 Experimental Setup
+
+Our experiments are conducted on up to 32 NVIDIA DGX A100 nodes, each equipped with eight NVIDIA A100 80GB GPUs, resulting in a total of 256 GPUs. The GPUs within each node are interconnected via a third-generation NVLink1, which provides 600GB/s of bandwidth. Cross-node communication is facilitated by NVIDIA Mellanox 200Gb/s HDR Infiniband2 connections.
+
+We chose the Llama model architecture for our experiments, due to its recent popularity. The Llama architecture introduces minor improvements over the standard Transformer architecture , which have been incorporated into other models over the past few years. The primary architecture modifications include pre-normalization and RMSNorm , the SwiGLU activation function , and rotary positional embeddings . Our Llama models use a 128k token vocabulary. The Llama models have a sequence length of 2k tokens. However, the growing trend of training LLMs with longer sequences [14; 22] led us to assess the training efficiency of our Llama models on sequences of up to 8k in length. We use AdamW optimization  following the training setup of Llama. All training runs are conducted with our in-house large-scale training framework AA-Scaling using mixed-precision with bfloat16. We use ZeRO-1  to shard the optimizer states across all data parallel ranks based on the results of previous scaling experiments . The communication framework in use is the torch.distributed package with NCCL.
+
+We aim to provide a systematic analysis of different combinations of parallelization strategies and other memory and compute optimizations. To this end, we conducted a large-scale _training efficiency sweep_. We ran this analysis for the following model types: Llama 13B (2k & 8k sequence length), Llama 30B (2k & 8k sequence length), and Llama 65B (2k sequence length). Depending on the model size and availability of compute, we used 64 to 256 GPUs. Table 1 lists the different configuration options for each of the model types. For our training efficiency sweep, we build the Cartesian product of possible options and benchmark each individual configuration. For each configuration, we train for 10 global steps and measure the Model FLOPS Utilization (MFU) . We
+
+  
+**Model** & **Seq. Len.** & **GPUs** & **TP sizes** & **PP sizes** & **MB sizes** & **Act. Checkpointing** & **RMSNorm Kernel** \\ 
+13B & 2k & 64 & (1, 2) & (1, 2) & (1, 2, 4, 8) & (yes, no) & (yes, no) \\ 
+13B & 8k & 128 & (1, 2, 4) & (1, 2, 4) & (1, 2, 4) & (yes, no) & (yes, no) \\ 
+30B & 2k & 256 & (1, 2, 4) & (1, 2, 4) & (1, 2, 4) & (yes, no) & (yes, no) \\ 
+30B & 8k & 128 & (2, 4) & (2, 4, 8, 16) & (1, 2, 4) & (yes, no) & (yes, no) \\ 
+65B & 2k & 128 & (2, 4, 8) & (2, 4, 8) & (1, 2, 4) & (yes, no) & (yes, no) \\   
+
+Table 1: Search space of our training efficiency sweep. We sweep over the Cartesian product of all options given in set notation. In particular, we sweep over different tensor parallelization (**TP**), pipeline parallelization (**PP**), and micro-batch (**MB**) sizes, and also whether activation checkpointing was used. Models with a sequence length of 2k use a global batch size of 2,048, whereas models with a sequence length of 8k use a global batch size of 512. All runs use FlashAttention-2. For runs using activation checkpointing, the RMSNorm kernel caused an error. Therefore, this combination is omitted.
+
+exclude the first step, as its performance is significantly impacted by a warm-up phase, and report the mean of the last 9 steps.3 We chose MFU  over other metrics such as measured hardware TFLOPS, since the latter are system- and implementation-dependent.
+
+Specifically, we compare different tensor parallelization, pipeline parallelization, and micro-batch sizes, as well as the use of activation checkpointing (yes/no). Since we operate with a fixed number of GPUs and global batch size for each model, the data parallelization size and the number of necessary accumulation steps directly follow from the other specified options and are automatically calculated. For example, using 128 GPUs with a tensor parallelization size of 4 and pipeline parallelization size of 2 results in a rank 16 data parallelization (with \(4 2 16=128\)), each with 2 pipeline stages and each pipeline stage sharded across 4 tensor parallel splits. We provide the full results of our training efficiency sweep in Table B.1.
+
+Additionally, we conducted a preliminary sweep over different attention kernels (native Torch implementation, Megatron-LM kernel4, FlashAttention-1.0.8, and FlashAttention-2). Based on the results, we concluded that FlashAttention-2 is superior and thus always used it for our main sweep.
+
+In the following section, we will distill the extensive sweep into different, actionable findings that allow us to select the optimal combination of different optimizations.
+
+## 4 Efficient LLM Training Analysis
+
+### Fused Kernels and Flash Attention
+
+Our evaluation of FlashAttention expands on the evaluations present in the original papers [5; 4]. While those studies compared the efficiency of FlashAttention for models up to 2.7B parameters on a single node, we scaled our experiments to substantially larger model sizes and also up to 256 GPUs. We further compare with a more optimized baseline, the Megatron-LM softmax attention kernel. Additionally, we evaluate the use of an optimized RMSNorm kernel from the FlashAttention repository.
+
+#### 4.1.1 Attention
+
+In Figure 1, we present results from both our main and preliminary sweeps over attention implementations, detailed in Section 3. We compare the following different kernels: FlashAttention-2, FlashAttention-1.0.8, the Megatron-LM kernel, and the standard PyTorch implementation. The fused kernel does not support a sequence length exceeding 2,048 tokens. Due to the underperformance
+
+Figure 1: Comparison of the MFU with different attention layer optimizations. The optimal 3D layout was selected for each respective setting. Each optimal layout is annotated with its (micro-batch size, tensor parallelism size, pipeline parallelism size). The kernel from Megatron-LM failed to operate with an 8k sequence length.
+
+of pure PyTorch attention in our Llama 13B evaluation, we did not include it for larger models. For Llama 65B and 30B with 8k sequence length, we only considered FlashAttention.
+
+Unsurprisingly, we find that FlashAttention vastly outperforms the native PyTorch implementation. However, we also find that FlashAttention significantly outperforms the kernel from Megatron-LM. Between the two different FlashAttention versions, FlashAttention-2 outperforms FlashAttention-1.0.8 by 4 to 13 percentage points across model sizes. FlashAttention-1.0.8 already contains many of the optimizations introduced in the FlashAttention-2 paper, which measures a 2\(\) improvement .
+
+It is important to note that FlashAttention's improvements are two-fold: FlashAttention's improved tiling method for an efficient IO-aware SRAM cache utilization and reduced memory requirements through its activation recomputation approach in the attention block. Notably, all best-performing FlashAttention layouts reported in Figure 1 do not make use of activation checkpointing, thereby also benefiting from FlashAttention's own activation recomputation.
+
+#### 4.1.2 RMSNorm Kernel
+
+We also evaluate the effect of FlashAttention's optimized RMSNorm kernel in Figure 1. We see that the RMSNorm kernel provides a significant boost in training efficiency, up to 14 percentage points compared to FlashAttention-2 without the RMSNorm kernel. Notably, with the use of the kernel, we can fit the entire Llama 13B model into a single GPU without model parallelization during training (although we still employ ZeRO-1 and shard the optimizer states). In general, the RMSNorm kernel allows us to choose more efficient parallelization layouts due to its memory savings. We do not have results combining activation checkpointing with the RMSNorm kernel, as the combination caused an error in our experiments. We control for this and only consider runs without the RMSNorm kernel whenever necessary for a fair comparison.
+
+### Activation Checkpointing
+
+In Figure 2, we report the MFU of the best configurations across model sizes, both with activation checkpointing of every layer and without. Overall, we see that not using activation checkpointing and compensating for the incurred memory cost with smaller batch sizes or a higher degree of model parallelism achieves the best training throughputs. For a fair comparison, we do not include runs with the RMSNorm kernel, since the kernel caused an error when coupled with checkpointing.
+
+For the Llama 30B with 8k sequence length, activation checkpointing was necessary to fit the model into memory during training, even with tensor parallelism sizes up to 4 and pipeline parallelism
+
+Figure 2: Comparing MFU of the optimal 3D layout with and without activation checkpointing. Llama 30B with 8k sequence length did not fit into memory without checkpointing. The reported results do not use the RMSNorm kernel. Each optimal layout is annotated with its (micro-batch size, tensor parallelism size, pipeline parallelism size).
+
+sizes of up to 16. We could not increase the tensor parallelism because the Llama 30B model has 52 attention heads, which are not divisible by 8. In Section 4.1, we show that adding the RMSNorm kernel further reduces the required memory so that activation checkpointing does not become necessary. In this case, we again see that a layout without activation checkpointing achieves the best throughput.5
+
+It is crucial to underline that achieving efficient performance for such model sizes without activation checkpointing is only feasible due to FlashAttention. Without FlashAttention, any runs exceeding the size of Llama 13B required the use of activation checkpointing due to out-of-memory errors, despite the high degrees of parallelization we considered as part of our sweep.
+
+FlashAttention already employs its own selective activation checkpointing in the attention block. These findings suggest activation checkpointing for large-scale Transformer training needs to be more targeted. Previous work  has also questioned the need for checkpointing in every layer and suggests a selective activation recomputation approach within the attention block. However, with the introduction of FlashAttention, the focus on selective activation recomputation within the attention block arguably becomes less important, as this is already covered in an efficient manner within FlashAttention. Nevertheless, a promising approach can be the application of selective activation recomputation only to the MLP block, thereby complementing FlashAttention's inherent activation recomputation of the attention block. Recently, this issue was tackled with an activation checkpointing strategy that is aware of FlashAttention's activation recomputation .
+
+### Micro-batch size
+
+In this section, we evaluate the tradeoff between the micro-batch size and required degree of model (tensor or pipeline) parallelism and activation checkpointing. Previous work  benchmarked different micro-batch sizes with fixed degrees of tensor and pipeline parallelism and show that larger micro-batch sizes lead to higher throughput. However, a smaller micro-batch size might enable
+
+Figure 3: MFU of the best-performing run configurations at different fixed micro-batch sizes, visualized by the (activation checkpointing, tensor parallelism size, pipeline parallelism size) triple. The reported results do not use the RMSNorm kernel.
+
+a different, more efficient parallelization configuration. Also, the degree of tensor and pipeline parallelism are often not fixed in practice.
+
+In Figure 3, we show the best performing (activation checkpointing, tensor parallelism size, pipeline parallelism size) configuration for each of our assessed model types. To fairly evaluate activation checkpointing, we do not include runs with the RMSNorm kernel, since the kernel resulted in an error when coupled with checkpointing. We see that for all model types, a micro-batch size of 1 achieves the best MFU. In general, we find: the smaller the micro-batch size, the better the MFU. The models with an 8k sequence length did not fit into memory with any configuration when using a micro-batch size bigger than 2.
+
+Thus, we conclude that choosing a micro-batch size of 1 is beneficial in most scenarios. The superior performance of a micro-batch size of 1 can be attributed to the following three factors.
+
+**Minimal Degree of Model Parallelization:** The most efficient training typically requires the least amount of model (tensor or pipeline) parallelization, which is achieved when the micro-batch size is smallest.
+
+**Avoiding Activation Checkpointing:** For some models (e.g., Llama 65B), a micro-batch size of 1 was the only configuration allowing training without activation checkpointing. As discussed in the previous section, not using activation checkpointing often allows for the highest throughput configurations. The Llama 30B 8k model did not fit into memory without using the RMSNorm kernel.
+
+**Reduced Pipeline Bubble Time:** A smaller micro-batch size reduces the time spent in the pipeline bubble at the beginning and end of a batch. We already use the better-than-naive Pipedream 1F1B scheduling method  discussed in Section 2.
+
+### Tensor vs. Pipeline Parallelism
+
+Narayanan et al.'s  ablation studies show that neither tensor nor pipeline parallelism, when used in isolation, can achieve the performance of utilizing both at the same time. Our empirical data, especially from the Llama 65B model - where higher degrees of parallelism are necessary - validate this to some extent even in combination with the newly introduced optimizations, as depicted in Figure 4. Their results suggest that an even distribution between the tensor and pipeline parallelism size is optimal, up until the tensor parallelism size reaches the GPU limit in a single node. In contrast, our results favor pipeline parallelism over tensor parallelism. The Llama 65B model performed best with a (tensor, pipeline) parallelism size of \((2,8)\) compared to an evenly distributed \((4,4)\). Also, the \((8,2)\) configuration was considerably less efficient. This trend was also observed in the Llama 13B with 8k sequence length and Llama 30B model, where the configurations with a
+
+Figure 4: MFU for various model and pipeline parallel configurations for the Llama 13B with 8k sequence length, Llama 30B, and Llama 65B models. Only runs with a micro-batch size of 1, activation checkpointing disabled, FlashAttention-2, and the RMS norm kernel are included; runs that ran out of memory are excluded. The Llama 13B and the Llama 30B with 8k sequence length models are excluded due to limited model parallel configuration options in our sweep.
+
+higher pipeline parallel size outperform the configurations with a larger tensor parallelism size. The training efficiency measured by Megatron-LM  was comparable when the tensor and pipeline parallelism sizes were interchanged.
+
+### Sequence Parallelism
+
+In this section, we perform an additional efficiency sweep to assess the impact of sequence parallelism. Based on the findings from previous sections, we limited the search space to consistently use FlashAttention-2 and the RMSNorm kernel, while omitting the use of activation checkpointing. Furthermore, we restricted the number of GPUs for each model type due to computational constraints. The full configuration sweep for each model type is documented in Table 9.
+
+In Figure 5, we report the MFU of the best configurations across model sizes, both with sequence parallelism enabled or disabled. For the Llama 13B and 30B models with a 2k sequence length, the top configurations do not employ any tensor parallelism, hence the activation of sequence parallelism shows no effect. In the case of the 13B model with an 8k sequence length, the top configuration employs a tensor parallelism size of 2; however, no improvement in training efficiency is observed. For the largest models and sequence lengths, the 30B with 8k sequence length and the 65B models, we can see 2-6 percentage point improvements when using sequence parallelism. In both cases, sequence parallelism enables a lower degree of model parallelization due to the reduced memory requirements, leading to higher training efficiency.
+
+Therefore, we conclude that the use of sequence parallelism, when paired with several other optimizations explored in this work, only facilitates a notable difference in training efficiency for model sizes exceeding 30B parameters or 2k sequence length.
+
+### End-to-End Performance
+
+We evaluate the recommendations distilled from our extensive training efficiency sweep against other publicly reported results in Table 2. For our runs using the in-house AA-Scaling framework, we report the MFU of the best configuration for each model size, following our recommendations.
+
+We evaluate against publicly available benchmarks from MosaicML6, Megatron-DeepSpeed , Meta's Llama, and Megatron-LM . Other frameworks were excluded from our comparisons, because they either lacked publicly available training efficiency scores, used entirely different hardware, or trained models with vastly different parameter sizes. To the best of our knowledge, we
+
+Figure 5: Comparing MFU of the optimal 3D layout with and without sequence parallelism. The reported results use the RMSNorm kernel. Each optimal layout is annotated with its (micro-batch size, tensor parallelism size, pipeline parallelism size).
+
+have gathered the best performing, publicly available training efficiency benchmarks for LLMs with comparable architectures and parameter counts.
+
+In general, our best configurations achieve the highest MFU numbers, setting the state-of-the-art for all our assessed model sizes. The improvements on top of the previous state-of-the-art range from 6-18 MFU percentage points. Noticeably our Llama 13B model achieves an MFU of 70.5%, outperforming the MPT and Megratron-LM models. For the 13B and 30B models with an 8k sequence length, our only point of comparison are the models by MosaicMLs framework. Here, we outperform the MPT models by 9-17 percentage points. Within the 65B parameter model range, we outperform MPT-70B, the original Llama 65B model by Meta, and the Megatron-LM 76B model with an MFU of 59.6% compared to 53.3%, 49.4%, and 34.7%, respectively.
+
+We hope that our findings can contribute to pushing the envelope of efficiently utilizing hardware accelerators for large-scale model training.
+
+Note on comparability.Most of the comparisons in Table 2 are not one-to-one, due to further differences such as model architecture, employed global batch size, number of used GPUs, and hardware interconnect. For example, the MPT model family employs additional efficiency optimizations, such as the use of ALiBi  instead of RoPE . On the other hand, our models use a 128k token vocabulary, which can result in a more optimistic MFU estimate compared to smaller vocabulary sizes. The comparison made in Table 2 is not meant to be directly one-to-one, but a wholesale evaluation of the achieved end-to-end training efficiency. We hope to showcase that a careful evaluation of the training layout and optimizations used can enable a significant boost to training efficiency.
+
+## 5 Conclusion
+
+We conducted an exhaustive search over possible combinations of tensor, pipeline, and data parallelism layouts, fused kernels, FlashAttention, activation checkpointing, micro-batch sizes, and sequence parallelism. Based on our findings, we make the following recommendations:
+
+* Use a micro-batch size of 1 to enable the least degree of model parallelization, to avoid activation checkpointing, and to reduce pipeline bubbles.
+
+  
+**Model** & **GPUs** & **Seq. Len.** & **Batch Size** & **MFU** (\(\)) \\ 
+**AA-Scaling Llama 13B (ours)** & 64 & 2048 & 2048 & **70.5\%** \\ MPT 13B & 64 & 2048 & 2048 & 52.5\% \\ Megatron-LM 18B\({}^{}\) & 256 & 2048 & 1024 & 34.2\% \\ 
+**AA-Scaling Llama 13B (ours)** & 64 & 8192 & 512 & **62.7\%** \\ MPT 13B & 8 & 8192 & 120 & 52.8\% \\ 
+**AA-Scaling Llama 30B (ours)** & 64 & 2048 & 2048 & **61.9\%** \\ MPT 30B & 64 & 2048 & 3072 & 52.9\% \\ Megatron-DeepSpeed 22B & 8 & 2048 & 4 & 41.5\% \\ Megatron-LM 39B\({}^{}\) & 512 & 2048 & 1536 & 34.5\% \\ 
+**AA-Scaling Llama 30B (ours)** & 64 & 8192 & 512 & **60.2\%** \\ MPT 30B & 8 & 8192 & 168 & 42.6\% \\ 
+**AA-Scaling Llama 65B (ours)** & 64 & 2048 & 2048 & **59.6\%** \\ MPT 70B & 64 & 2048 & 2048 & 53.3\% \\ Llama 65B by Meta\({}^{}\) & 2048 & 2048 & 2048 & 49.4\% \\ Megatron-LM 76B\({}^{}\) & 1024 & 2048 & 1792 & 34.7\% \\   
+
+Table 2: Best achieved end-to-end training efficiency numbers using our recommendations compared to other public training efficiency numbers. We group across comparable model sizes and sequence length. Batch size refers to the _Global_ Batch size. \({}^{}\): MFU numbers were calculated by us based on published training times, as detailed in Appendix A. We provide the exact configurations of our runs included in this table in Appendix B.1.
+
+* Prefer increasing the degree of tensor and pipeline parallelization over the use of activation checkpointing.
+* Only scale the micro-batch size when you cannot further reduce the degree of model parallelization.
+* Use sequence parallelization for models exceeding 30B parameters and 2k sequence length.
+
+We experimentally verify that the efficacy of the FlashAttention-2 kernel remains as we scale the model size to tens of billions of parameters and to training on multiple nodes. Additionally, we compared the end-to-end training efficiency of our most efficient configurations against several other frameworks. We achieved state-of-the-art efficiency in five out of the five model configurations we evaluated, reaching up to 70.5% MFU.
+
+For future work, reconciling activation checkpointing with FlashAttention via a more selective approach that targets the MLP block presents an exciting opportunity. Also, NVIDIA's recently released H100 GPUs with more efficient support for fp8 precision might enable new training strategies, which should be evaluated.
+
+We publish the full data of our sweeps on GitHub at https://github.com/Aleph-Alpha/NeurIPS-WANT-submission-efficient-parallelization-layouts.
+
+## Limitations
+
+Applicability of recommendations to other frameworks.We expect that our recommendation results will be applicable to frameworks, such as Megatron-DeepSpeed, that utilize similar 3D parallel training configurations and ZeRO-1. However, some recommendations may be less relevant to frameworks that use different ZeRO stages , FSDP , or other parallelization strategies .
+
+Global batch size and number of GPUs considerations.The global batch size for our experiments was set based on the pre-training of the original Llama. Reducing the global batch size or increasing the number of GPUs used during training might lead to a lower model FLOPs utilization than reported in our experiments. This can be attributed to fewer gradient accumulation steps, which could increase the pipeline bubble's share.
+
+Applicability to other Model Architectures and Domains.We perform our training analysis using a Transformer language model with the Llama architecture. Some of the benchmarked optimizations are specific to the general Transformer architecture, such as FlashAttention, or to specific choices in architecture design, such as the use of RMSNorm. In our experiments, we only considered the language modeling task. Applications of the Transformer architecture to other domains, such as vision , might also benefit from our recommendations. However, we did not experimentally verify this.
+
+Applicability to other Hardware Accelerators.The scope of our training analysis was limited to NVIDIA DGX A100 nodes, connected via high-speed Infiniband. The use of slower interconnects or other hardware accelerators, such as TPUs or AMD GPUs, might affect the applicability of our recommendations.
+
+End-to-End Performance Comparison.We stress again that the comparison of training efficiency in Table 2 is not suitable as a one-to-one comparison due to differences in model architecture, employed hardware, and training settings.

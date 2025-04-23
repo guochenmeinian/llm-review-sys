@@ -1,0 +1,204 @@
+# ShiftAddLLM: Accelerating Pretrained LLMs via Post-Training Multiplication-Less Reparameterization
+
+Haoran You\({}^{}\), Yipin Guo\({}^{}\), Yichao Fu\({}^{}\), Wei Zhou\({}^{}\), Huihong Shi\({}^{}\), Xiaofan Zhang\({}^{*}\)
+
+**Souvik Kundu\({}^{}\)**, **Amir Yazdanbakhish\({}^{}\)**, **Yingyan (Celine) Lin\({}^{}\)**
+
+\({}^{}\)Georgia Institute of Technology \({}^{}\)Intel Labs \({}^{*}\)Google \({}^{}\)Google DeepMind
+
+\({}^{}\)_{haoran.you, celine.lin}@gatech.edu, eic-lab@groups.gatech.edu_
+
+\({}^{}\)_sovikk.kundu@intel.com, \({}^{*}\){xiaofanz, ayazdan}@google.com_
+
+###### Abstract
+
+Large language models (LLMs) have shown impressive performance on language tasks but face challenges when deployed on resource-constrained devices due to their extensive parameters and reliance on dense multiplications, resulting in high memory demands and latency bottlenecks. Shift-and-add reparameterization offers a promising solution by replacing costly multiplications with hardware-friendly primitives in both the attention and multi-layer perceptron (MLP) layers of an LLM. However, current reparameterization techniques require training from scratch or full parameter fine-tuning to restore accuracy, which is resource-intensive for LLMs. To address this, we propose accelerating pretrained LLMs through post-training shift-and-add reparameterization, creating efficient multiplication-free models, dubbed ShiftAddLLM. Specifically, we quantize each weight matrix into binary matrices paired with group-wise scaling factors. The associated multiplications are reparameterized into (1) shifts between activations and scaling factors and (2) queries and adds according to the binary matrices. To reduce accuracy loss, we present a multi-objective optimization method to minimize both weight and output activation reparameterization errors. Additionally, based on varying sensitivity across layers to reparameterization, we develop an automated bit allocation strategy to further reduce memory usage and latency. Experiments on five LLM families and eight tasks consistently validate the effectiveness of ShiftAddLLM, achieving average perplexity reductions of 5.6 and 22.7 points at comparable or lower latency compared to the most competitive quantized LLMs at 3- and 2-bit precision, respectively, and more than 80% memory and energy reductions over the original LLMs. Codes and models are available at https://github.com/GATECH-EIC/ShiftAddLLM.
+
+## 1 Introduction
+
+Pretrained LLMs have demonstrated state-of-the-art performance in language understanding and generation tasks [46; 47; 59; 3; 74; 57; 58; 2]. However, deploying these LLMs incurs significant hardware demands, including high latency, memory, and energy consumption, especially on edge or cloud GPU devices. The primary bottlenecks are their immense parameter sizes and the associated multiplication operations. For instance, GPT-3, with 175 billion parameters, requires 350GB of memory in FP16 format  and performs \(10^{15}\) floating-point operations (FLOPs) for a single forward pass . Previous efforts to improve LLM efficiency have focused on pruning [40; 55; 20; 24; 44], quantization [63; 38; 18; 48], and attention optimization [12; 71; 67]. However, these methods still rely on costly multiplication operations in both the attention and MLP layers.
+
+We identify a promising yet unexplored opportunity for improving LLM efficiency: _reparameterizing their extensive multiplications with more cost-effective hardware substitutes, such as bitwise shifts and adds_. Inspired by practices in computer architecture and digital signal processing, replacing multiplications with bitwise shifts and adds [66; 22] can offer up to \(}{{0.1}}=\) 31\(\) energy and \(}{{137}}\) 26\(\) area reductions (see Tab. 1). This hardware-inspired approach can lead to efficient and fast implementations, as shown by previous research on ShiftAddNet [69; 70; 72]. Unlike previous techniques that require training from scratch or extensive fine-tuning, we propose a new method to integrate the shift-and-add concept into LLMs through post-training optimization.
+
+To design multiplication-less LLMs, we need to address three key challenges: _First_, how can we effectively reparameterize pretrained LLMs with shifts and adds in a post-training manner? Previous reparameterization techniques [69; 72] can result in nontrivial quantization errors, requiring fine-tuning or retraining to avoid accuracy drops. We aim to develop a ready-to-use _post-training_ reparameterization method for LLMs. _Second_, how can we mitigate the accuracy drop from shift-and-add reparameterization? Approximating original multiplications with lower-bit shifts and adds typically reduces model accuracy. Most studies resort to fine-tuning or increasing model sizes, complicating LLM deployment. We hypothesize that optimizing both weight and activation errors can minimize overall reparameterization error, aligning with recent activation-aware weight quantization methods in LLMs. _Third_, how can we handle varying sensitivities to reparameterization across different layers and blocks in LLMs? An automated strategy to determine the optimal number of bits for reparameterized weights in each layer is needed. More vulnerable layers should have higher-bit representations, while less sensitive layers can use lower-bit representations. This ensures no bottleneck layers due to aggressive reparameterization and maximizes redundancy exploitation. To the best of our knowledge, _this is the first attempt_ to address these three challenges for multiplication-less LLMs through _post-training_ reparameterization. Our contributions are summarized as follows:
+
+* We propose accelerating pretrained LLMs via a _post-training_ bitwise shift-and-add reparameterization, resulting in efficient multiplication-less LLMs, dubbed ShiftAddLLM. All weights are quantized into binary matrices paired with group-wise scaling factors; the associated multiplications are reparameterized into shift-and-add operations.
+* To mitigate accuracy loss, we present a multi-objective optimization method aligning and optimizing both weight and output activation objectives, minimizing overall reparameterization error, and achieving lower perplexity and better task accuracy.
+* We introduce a mixed and automated bit allocation strategy that determines the optimal number of bits for reparameterized weights per layer, based on their vulnerability to compression. Susceptible layers receive higher-bit representations, while less sensitive ones get lower-bit representations.
+
+Our extensive results across five LLMs and eight tasks consistently show the superior accuracy and efficiency trade-offs achieved by ShiftAddLLM, with average perplexity reductions of 5.6 and 22.7 at comparable or even lower latency compared to the most competitive quantized LLMs at three and two bits, respectively, and more than 80% memory and energy reductions over the original LLMs.
+
+## 2 Related Works
+
+**LLM Quantization.** Significant efforts have been made to quantize LLMs, including quantization-aware training (QAT) [39; 52] and post-training quantization (PTQ) [18; 38; 63; 15]. QAT requires calibrated data and significant retraining resources, whereas PTQ is more dominant due to it lower computational and time overhead. There are two prevalent PTQ strategies for LLMs: _(1)_ uniform quantization of both weights and activations [63; 15; 68], often limited to 8 bits (W8A8) as lower bit representations can significantly reduce accuracy; and **(2)** lower bit weight-only quantization [18; 48; 14; 28; 6], which quantizes LLM weights to lower bits while keeping activations in a FP16 format.
+
+    &  &  &  &  \\   & FP32 & FP16 & INT32 & INT8 & FP32 & FP16 & INT32 & INT8 & INT32 & INT16 & INT8 & **(8-bit Query)** \\ 
+**Energy (pl)** & 3.7 & 0.9 & 3.1 & 0.2 & 1.1 & 0.4 & 0.1 & 0.03 & 0.13 & 0.057 & 0.024 & 0.37 (8 OPs) \\
+**Area (\(\)m\({}^{2}\))** & 7700 & 1640 & 3495 & 282 & 4184 & 1360 & 137 & 36 & 157 & 73 & 34 & 787 (8 OPs) \\    \\ 
+
+Table 1: Hardware cost under 45nm CMOS [27; 69; 23; 50; 5].
+
+This approach alleviates memory bottlenecks associated with the vast parameters of LLMs. For instance, GPTQ  uses gradient-based weight quantization and develops INT3/4 kernels to reduce data movements, and LUT-GEMM  eliminates the dequantization and uses custom LUT-based CUDA kernels to reduce memory and computation costs. In contrast, ShiftAddLLM is the first to employ the shift-and-add idea for reparameterizing pre-trained LLMs. This reparameterization reduces bit usage for weights and replaces costly multiplications with hardware-friendly primitives, further reducing energy, latency, and memory.
+
+**Multiplication-less Models.** The efficient model community has focused on reducing or replacing multiplications. In CNNs, binary networks [10; 32] binarize weights and activations, while shift-based networks use spatial shifts  or bitwise shifts  to substitute for multiplications. AdderNet [7; 65; 61] replaces multiplications with additions, albeit with a small accuracy drop. ShiftAddNet  reparameterizes CNNs with cascaded shift and add layers. These techniques have been adapted to Transformers. BiLLM  introduces binary LLMs, while  and  extend the addition or shift concepts to the attention mechanisms, respectively. ShiftAddViT  reparameterizes pretrained Vision Transformers (ViTs) with shifts and adds. Contemporary work MatMul-free LM  leverages additive operators and Hadamard products for multiplication-free language model training, relying on FPGAs for speedups. Compared to closely related works like ShiftAddNet  and MatMul-free LM , which requires training from scratch, and ShiftAddViT , which demands extensive parameter fine-tuning, ShiftAddLLM applies the shift-and-add concept to pre-trained LLMs without additional training or fine-tuning. We also use a multi-objective optimization and automated bit allocation strategy to further improve accuracy or reduce GPU latency, energy, and memory usage.
+
+## 3 Preliminaries
+
+**Binary-coding Quantization (BCQ).** BCQ  quantizes each weight tensor in an \(L\)-layer LLM \(^{m n}\) into \(q\) bits using a linear combination of binary matrices \(\{_{i}\}_{i=1}^{q}\) and corresponding scaling factors \(\{_{i}\}_{i=1}^{q}\), where \(_{i}\{-1,1\}^{m n}\). The weights are then approximated by \(_{q}=_{i=1}^{q}_{i}_{i}\) as a result of minimizing the quantization error, i.e., \(*{arg\,min}_{_{i},_{i}}\|-_{i=1}^{q }_{i}_{i}\|^{2}\) to obtain the optimal \(_{i}^{*},_{i}^{*}\). If \(q\) is \(1\), then the problem collapses to binary quantization, which has an analytical solution: \(^{*}=(),^{*}=^{}^ {*}/n\). For multi-bit quantization, we resort to greedy and alternating methods [64; 30; 33], as shown in Alg. 1. Initially, we use the greedy method  to initialize \(_{i},_{i}\), where the \(i\)-th bit quantization is performed by minimizing the residual \(\) from the \((i-1)\)-th bit:
+
+\[_{_{i},_{i}}\|_{i-1}-_{i}_{i}\| ^{2},_{i-1}=-_{j=1}^{i-1} _{j}_{j}, 1<i q.\] (1)
+
+We then obtain the initialized \(_{i},_{i}\) sequentially as \(_{i}=(_{i})\) and \(_{i}=_{i}^{}_{i}/n\)_(Line 4)_. Next, we perform alternating optimization to further minimize the quantization error. Specifically, \(\{_{i}\}_{i=1}^{q}\) can be iteratively refined using ordinary least squares (LS)  as \([_{1},...,_{q}]=((^{})^{-1}^{ })^{},\) where \(=[_{1},...,_{q}]\{-1,1\}^{m n q}\)_(Line 6)_. The binary codes \(\{_{i}\}_{i=1}^{q}\) can then be iteratively recalibrated using a binary search (BS) given the refined \(\{_{i}\}_{i=1}^{q}\)_(Line 7)_.
+
+Such BCQ can support both uniform and non-uniform quantization formats by adjusting the scaling factors and biases accordingly . Our ShiftAddLLM is built on top of BCQ but further replaces all associated multiplications with lower-cost hardware substitutes (e.g., shifts, adds, and LUT queries). We optimize not only the weight quantization error but also the output activation error, thereby achieving lower quantization bits along with savings in energy, memory, and computational costs.
+
+**Shift and Add Primitives.** Direct hardware implementation of multiplications is often inefficient. Using shift and add operations as "shortcuts" provides a more efficient alternative. Shifts, which are equivalent to multiplying by powers of two, offer a non-uniform quantization solution and can result in significant savings. For example, we tested matrix multiplication from one MLP layer of OPT-66B between weight \(W^{9216 36884}\) and activation \(A^{1 9216}\) using FP16 MACs and our 3-bit ShiftAddLLM. Energy consumption was 80.36J vs. 9.77J, achieving 87.8% savings with our method. Both primitives have inspired many innovations in efficient model innovations [7; 16; 69; 72].
+
+## 4 The Proposed ShiftAddLLM Framework
+
+**Overview.** We introduce our ShiftAddLLM as follows: _First_, we describe the reparameterization of pretrained LLMs through a _post-training_ shift-and-add approach in Sec. 4.1. _Second_, to enhance accuracy, we introduce a multi-objective optimization method that accounts for both weight quantization error and output activation error, detailed in Sec. 4.2. _Third_, to improve efficiency, we explore a mixed and automated bit allocation strategy, illustrated in Sec. 4.3.
+
+### ShiftAddLLM: Post-training Reparameterization of LLMs with Shift and Add Primitives
+
+**Post-training Reparameterization of LLMs.** To avoid the need for fine-tuning after reparameterization, our method closely mimics the original multiplications used in LLMs. Previous methods, such as weight-only quantization techniques , employ gradient-based or activation-aware uniform quantization to fit the pretrained weight distribution better, thereby achieving lower quantization errors. However, these methods often lack direct hardware support and require on-the-fly dequantization to FP16 for multiplication with activations, as depicted in Fig. 1 (a). In contrast, our ShiftAddLLM uses the BCQ format, supporting non-uniform quantization with customized CUDA kernels [48; 29], bypassing the need for dequantization, as illustrated in Fig. 1 (b). In particular, our method employs the Alg. 1 to quantize pretrained weights into binary matrices \(\{_{i}\}_{i=1}^{q}\) and scaling factors \(\{_{i}\}_{i=1}^{q}\). Note that during the alternating optimization cycles, we further quantize all scaling factors to powers of two (PoT) , as described by the equation:
+
+\[_{k}=(_{k-1})=(-_{j=0 }^{k-1}_{j}),()=( ) 2^{}, 1 k K.\] (2)
+
+This additive PoT method adopts a greedy strategy to enhance the representational capacity of PoT, using \(K\) scaling factors, where the \(k\)-th PoT minimizes the residual \(\) of the \((k-1)\)-th PoT. Each PoT effectively quantizes the scaling factor \(\) into \(() 2^{}\), where \(()\) indicates sign flips, \(=(_{2}(()))\), and \(2^{}\) denotes a bitwise shift to the left (\(>0\)) or right (\(<0\)).
+
+After the above reparameterization, we can then replace the associated multiplication between weights and activations into two steps: (1) Bitwise shifts between activations and scaling factors. Note that the activation is still in the FP16 format, and the multiplication between a floating-point number and a positive or negative PoT integer can be efficiently implemented by an integer addition instruction on existing hardware following DenseShift , as also illustrated in Fig. 1 (c); (2) Queries and
+
+Figure 1: Illustration of our proposed post-training reparameterization for ShiftAddLLM.
+
+adds intermediate shifted activations with the binary matrices. To implement this efficiently and reduce redundant additions or accumulations, as shown in Fig. 1 (d), we pre-compute 256 (\(=2^{8}\)) possible values for every eight elements in the shifted activations to construct LUTs. Here every eight grouped binary weights form an 8-bit key. Suppose the shifted activation is an \(n\)-dimensional vector. In that case, we will get \(}{{8}}\) LUTs, where the grouped binary weights are used as keys, and the precomputed partial sums are stored as values. This allows us to handle the multiplication between the binary matrix \(_{i}\) and the shifted activations as queries to the LUTs. We then add all the partial sums to obtain the final output activations in FP16 format. Such LUTs are well supported by existing GPU kernels [48; 29]. The reparameterization can be applied to all weights in pretrained LLMs in a _post-training_ manner, replacing costly multiplications with efficient hardware operations.
+
+**Takeaway.** ShiftAddLLM presents a novel _multiplication-less_ approach that leverages non-uniform quantization via BCQ and additive PoT. This methodology enhances the representation capacity for outlier weights and activations of large magnitude compared to uniform quantization. Moreover, additive PoT effectively resolves the issue of limited quantization resolution for non-outlier weights and activations. Overall, it allows the quantization levels to better align with the data distribution.
+
+### ShiftAddLLM: Multi-objective Optimization
+
+**Motivating Analysis on Previous LLM Quantization Objectives.** We examine previous weight-only quantization methods to understand the causes of large quantization error and accuracy drop. These methods typically use either a _weight_ or _activation_ objective to minimize quantization error. Specifically, the "_weight objective_" (see Fig. 2 (a)) aims to minimize the weight quantization error, i.e., \(\|-_{q}\|^{2}\), and adopts scaling factors for each row of quantized weights. However, this does not optimize output activation error, as each weight element is multiplied by a unique input activation before summing to produce the output. Varying input activations, especially outliers [63; 38], rescale the weight quantization error differently, causing significant divergence in the output activation. For example, LUT-GEMM  adopts this weight objective. On the other hand, the "_activation objective_" (see Fig. 2 (b)) minimizes the output activation error, i.e., \(\|-_{q}\|\), by quantizing one column of weights at a time and continuously updating the remaining unquantized weights to compensate for the quantization error incurred by quantizing a single weight column. However, the fixed scaling factors may not adequately accommodate the weights adjusted afterward. OPTQ  employs this activation objective.
+
+**Our Multi-Objective Optimization.** To further mitigate accuracy drop after reparameterization (see Sec. 4.1), we introduce a multi-objective optimization framework that combines weight and activation objectives using column-wise scaling factors. This framework effectively reduces quantization error for both weights and activations, thereby improving the accuracy of ShiftAddLLM.
+
+As shown in Fig. 2 (c), using column-wise scaling factors overcomes the limitations of the previous weight objective  by eliminating the impact of varying input activations on quantized weights.
+
+Figure 2: Illustration of our proposed multi-objective optimization framework.
+
+Each scaling factor corresponds to a constant activation value. Additionally, scaling factors for subsequent columns are updated gradually after compensating for the corresponding column's weights, ensuring a better fit than the previous activation objective .
+
+**Accuracy vs. Latency Tradeoffs.** The column-wise scaling factor design significantly boosts accuracy after reparameterization. However, it does not fully leverage BCQ [48; 29], which process eight elements per row of weights in parallel as LUT keys, resulting in latency overhead for models with \(\)30B parameters. For example, testing on the OPT-30B  model and WikiText-2 dataset  showed \((16.3-9.6)=6.7\) perplexity reduction but with a \((44.1-33.2)/44.1\) 24.7% latency overhead, as shown in Fig. 3 (b).
+
+To address this, we propose a block-wise scaling factor design that groups 8 columns and 1/8 of the original rows to share a scaling factor, ensuring compatibility with the BCQ kernel and achieving latency reductions, as shown in Fig. 3 (a). We refer to ShiftAddLLM with column-wise scaling factors as "_Ours (Acc.)_" for high accuracy optimization, and with block-wise scaling factors as "_Ours (Lat.)_" for optimized accuracy-latency trade-off.
+
+**Takeaway.** Our multi-objective optimization approach integrates both weight and activation objectives, reducing weight quantization error in an activation-aware manner and output activation error reduction in a weight-aware manner. This synergy, achieved through a simple column-wise or block-wise design, significantly boosts the accuracy of weight-only quantization. This aligns with the principles of previous activation-aware weight quantization methods .
+
+### ShiftAddLLM: Mixed and Automated Bit Allocation
+
+**Sensitivity Analysis.** We analyze the sensitivity of different layers and blocks in LLMs to shift-and-add reparameterization. As shown in Fig. 4, later blocks incur more quantization or reparameterization errors. Within each block, Query/Key (Q/K) layers are generally more sensitive to reparameterization than other linear layers. This diverse sensitivity motivates us to explore mixed bit allocations for LLM reparameterization and develop strategies to automatically determine the optimal bit allocations given the average bit budgets.
+
+**Criteria and Automated Bit Allocation.** To develop the bit allocation scheme, we propose criteria to estimate the importance of linear weights and formulate the bit allocation as an integer programming problem. For weight \(_{i}\) from the \(i\)-th layer of an LLM, the criterion \(C_{i}\) is defined as follows:
+
+\[ C_{i}&=\| \|_{F}()^{2},\\ &=_{i}/(((_{i}_{i}^{T})^{-1})),\] (3)
+
+where the importance score (IS) is inspired by Optimal Brain Compression [25; 17; 18] and is correlated to the increase in the quadratic reconstruction error \(\|-_{q}\|^{2}\) after reparameterizing the weights, i.e., IS \(\), error increases \(\). The \(F\)-norm of IS indicates the overall importance of \(_{i}\), while the standard deviation (STD) highlights the reparameterization difficulty for outliers. Considering both factors, we achieve a more effective evaluation metric proportional
+
+Figure 4: Sensitivity analysis on OPT-1.3B .
+
+Figure 5: Rank comparisons.
+
+Figure 3: (a) the block-wise scaling factors and (b) the comparison among different designs on OPT-30B .
+
+to the actual reparameterization error. As shown in Fig. 5, the rankings derived from our defined criteria and the actual reparameterization error are highly correlated, with a Kendall \(\) of 0.905. To refine the criteria by incorporating the bit-width, we use least squares polynomial fits to estimate each bit's corresponding reparameterization error as \(C_{i,b}\).
+
+Given the criteria, we can formulate the automated bit allocation as an integer programming problem:
+
+\[_{_{i,b}}_{i}^{L}_{b}_{i,b} C_{i,b},_{b}_{i,b}=1,_{i}^{L}_{b}_{i,b} b  L,\] (4)
+
+where \(L\) is the number of layers in the target LLM, \(b\{2,3,4\}\) denotes the available bit widths, and \(_{i,b}\{0,1\}\) is the one-hot indicator for the \(i\)-th layer to determine the assigned bits, e.g., \(\{0,1,0\}\) means 3 bits. The objective is to minimize the summed criteria \(C\) of all layers under the given average bit budget \(\) per layer. The final \(_{i,b}\) represents the assigned bits for the \(i\)-th layer in the target LLM.
+
+**Takeaway.** Using mixed bits instead of static ones can improve the accuracy-efficiency tradeoffs by adapting the varying sensitivities across layers, e.g., Q/K linear layers exhibit higher sensitivity to reparameterization; Our adopted criteria provide a quick estimation of the reparameterization error.
+
+## 5 Experiments
+
+### Experiment Settings
+
+_Models._ We consider five representative SOTA LLM families, including OPT , LLAMA-1/2/3 [58; 2], Gemma , Mistral , and Bloom . _Tasks and Datasets._ We evaluate all five LLMs on the commonly adopted language modeling task using the WikiText-2  dataset for perplexity measurement. Additionally, we extend the evaluation of the two largest models, OPT-66B and LLAMA-2-70B, to eight downstream tasks for zero-shot accuracy evaluation. These tasks include ARC (Challenge/Easy) , BoolQ , Copa , PIQA , RTE , StoryCloze , and MMLU . _Baselines._ We consider four SOTA LLM quantization methods: OPTQ , LUTGEMM , QuIP , and AWQ . _Evaluation Metrics._ We evaluate ShiftAddLLM and the baselines using both accuracy and efficiency metrics. For accuracy, we evaluate perplexity on the WikiText-2 dataset and zero-shot accuracy on eight downstream tasks. For efficiency, we measure the latency on a single A100-80GB GPU (PCIe)  and estimate the energy costs using an Eyeriss-like hardware accelerator [75; 8], which calculates not only computational but also data movement energy (within 18% of the differences with Eyeriss's chip measurement results as claimed).
+
+### ShiftAddLLM over SOTA LLM Quantization Baselines
+
+**Results on OPT Models.** To evaluate the effectiveness of our ShiftAddLLM, we compare against four SOTA LLM quantization baselines: OPTQ , LUT-GEMM , QuIP , and AWQ . Using the OPT model family  and the WikiText-2 dataset , we assess perplexity, GPU latency, and energy costs. As shown in Tab. 2, _Ours (Acc.)_ consistently outperforms all baselines, achieving an average perplexity reduction of 5.63/38.47/5136.13 compared to OPTQ, LUT-GEMM,
+
+  
+**OPT (PPL \(\))** & **Bits** & **125M** & **350M** & **1.3B** & **2.7B** & **6.7B** & **13B** & **30B** & **66B** \\  FP16 & 16 & 27.65 & 22.00 & 14.62 & 12.47 & 10.86 & 10.13 & 9.56 & 9.34 \\  OPTQ  & 3 & 53.85 & 33.79 & 20.97 & 16.88 & 14.86 & 11.61 & 10.27 & 14.16 \\ LUT-GEMM  & 3 & 60.00 & 42.32 & 49.10 & 17.55 & 17.44 & 12.50 & 139.90 & 100.33 \\ AWQ  & 3 & 54.75 & 35416.00 & 24.60 & 39.01 & 16.47 & 16.53 & 31.01 & 5622.00 \\
+**Ours (Acc.)** & 3 & **31.29** & **24.24** & **21.53** & **13.68** & **11.18** & **10.39** & **9.63** & **9.43** \\  OPTQ  & 2 & 2467.50 & 10433.30 & 4737.05 & 6294.68 & 442.63 & 126.09 & 71.70 & 20.91 \\ LUT-GEMM  & 2 & 4844.32 & 2042.90 & 3851.50 & 616.30 & 17455.52 & 4963.27 & 7727.27 & 6246.00 \\ AWQ  & 2 & 3514.61 & 18313.24 & 9472.81 & 22857.70 & 8168.30 & 5014.92 & 7780.96 & 103843.84 \\ QuIP  & 2 & 92.84 & 146.15 & 27.90 & 30.02 & 16.30 & 12.34 & 11.48 & 10.92 \\
+**Ours (Acc.)** & 2 & **51.15** & **40.24** & **29.03** & **20.78** & **13.78** & **12.17** & **10.67** & **10.33** \\   
+
+Table 2: Perplexity comparisons of the OPT models on WikiText-2. Note that we set the group size of all methods as the length of rows following the setting of OPTQ  for a fair comparison.
+
+and AWQ, respectively, at 3 bits. At 2 bits, where most baselines fail with significantly high perplexity, our method maintains low perplexity, and achieves an average 22.74 perplexity reduction over the most competitive QuIP. Also, as shown in Fig. 6 (a & b), _Ours (Lat.)_ consistently achieves better accuracy-latency tradeoffs, with a perplexity reduction of 0.91\(\)103830.45 at comparable latency or 6.5%\(\)60.1% latency reductions and 26.0%\(\)44.7% energy savings at similar or even lower perplexity. Complete quantitative data on accuracy, latency, and energy is provided in Appendix A.
+
+**Results on LLaMA Models.** We further evaluate ShiftAddLLM on LLaMA models  due to their superior performance among open-source LLMs. As shown in Tab. 3, _Ours (Acc.)_ consistently outperforms all baselines, achieving an average perplexity reduction of 1.82/1.47/0.29 and 80.87/4606.98/678658.74 compared to OPTQ, LUT-GEMM, and AWQ at 3 and 2 bits, respectively. Evaluating _Ours (Lat.)_ with both accuracy and latency metrics as shown in Fig. 6 (c & d), _Ours (Lat.)_ demonstrates better accuracy-latency tradeoffs. It achieves 1.1\(\)1719987.6 perplexity reduction at comparable latency or 19.9%-65.0% latency reductions and 28.4%-89.9% energy savings at similar or even lower perplexity. Complete quantitative data on accuracy, latency, and energy are provided in Appendix B.
+
+**Results on Gemma/Mistral/Bloom Models.** We also evaluate ShiftAddLLM on Gemma , Mistral , and Bloom  models, which are among the most popular open-source LLMs and Mixture-GExpert (MoE) models. As shown in Tab. 4, _Ours (Acc.)_ achieves perplexity reductions of 11.12/29.4 for Gemma-2B, 1.67/16.76 for Mistral-7B, and 3.30/6.93 and 1.76/5.58 for BLOOM-3B/7B, respectively, compared to OPTQ and LUT-GEMM. As shown in Fig. 6 (e), _Ours (Lat.)_ shows better accuracy-latency tradeoffs, e.g., achieving 9.56 perplexity reduction and 11% latency reductions over the OTPQ baseline on Gemma models. These results on five LLM families consistently validate the effectiveness of our ShiftAddLLM.
+
+**Zero-shot Downstream Tasks.** We extend our evaluation to zero-shot downstream datasets for a more comprehensive assessment. As shown in Tab. 5, _Ours (Acc.)_ consistently improves performance over previous SOTA baselines, achieving an average accuracy gain of 13.37/13.19 and 2.55/2.39 over OPTQ and LUT-GEMM baselines at 3 bits when evaluated on OPT-6
+
+  
+**PPL (\(\))** & **Bits** & **Gemma-2B** & **Mistral-7B** & **Bloom-3B** & **Bloom-7B** \\  FP16 & 16 & 13.88 & 5.25 & 13.48 & 11.37 \\  OPTQ & 3 & 26.08 & 7.27 & 17.40 & 13.47 \\ LUT-GEMM & 3 & 44.36 & 22.36 & 21.03 & 17.29 \\
+**Ours (Acc.)** & 3 & **14.96** & **5.60** & **14.10** & **11.71** \\   
+
+Table 4: Results on Gemma/Mistral/Bloom models.
+
+    &  &  &  &  \\   & & **7B** & **7B** & **13B** & **70B** & **8B** & **70B** \\  FP16 & 16 & 5.68 & 5.47 & 4.88 & 3.32 & 6.14 & 2.86 \\  OPTQ  & 3 & 8.81 & 6.43 & 5.48 & 3.88 & 13.69 & 4.91 \\ LUT-GEMM  & 3 & 7.18 & 7.02 & 5.89 & 4.01 & 11.10 & 5.92 \\ AWQ  & 3 & 6.35 & 6.24 & 5.32 & 3.74 & 8.15 & 4.69 \\
+**Ours (Acc.)** & 3 & **6.04** & **5.89** & **5.16** & **3.64** & **7.20** & **4.35** \\  OPTQ  & 2 & 68.60 & 19.92 & 12.75 & 6.82 & 398.0 & 26.65 \\ LUT-GEMM  & 2 & 303.00 & 2242.2 & 279.10 & 13.64 & 19906 & 3121 \\ AWQ  & 2 & 2.65 & 2.265 & 1.265 & 7.264 & 1.76e & 1.76e \\
+**Ours (Acc.)** & 2 & **7.98** & **8.51** & **6.77** & **4.72** & **12.07** & **7.51** \\   
+
+Table 3: Perplexity comparisons of the LLaMA models on WikiText-2. The group size is set to 128 following .
+
+Figure 6: Accuracy-latency tradeoff comparisons on the OPT, LLaMA-2/3, and Gemma models.
+
+respectively. These experiments demonstrate that our method not only reduces perplexity but also improves downstream task accuracy.
+
+**GPU Memory Savings.** Our ShiftAddLLM also reduces GPU memory usage. For OPT-66B, our method saves 81% and 87% memory costs over FP16 at 3 (23GB vs. 122GB) and 2 bits (16GB vs. 122GB), respectively. For LLaMA-2-70B, it saves 80% and 87% memory costs at 3 (25GB vs. 128GB) and 2 bits (17GB vs. 128GB), respectively.
+
+**Results of Mixed Bit Allocation.** We evaluate our mixed bit allocation strategy (see Sec. 4.3) and compare _Ours (Mixed)_ with _Ours (Lat.)_. As shown in Tab. 6, _Ours (Mixed)_ further reduces the perplexity by an average of 79.45 for OPT model families under comparable or even less latency. We provide more results in Appendix F to validate the effectiveness of our mixed bit allocation strategy.
+
+### Ablation Studies of ShiftAddLLM
+
+**Visualization of Mixed Bit Allocation.** We visualize the bit allocations after applying our automated bit allocation strategy with an average bit budget of 2.2 (Fig. 7). The allocation pattern correlates with the sensitivity to reparameterization identified in Sec. 4.3 and shown in Fig. 4. For instance, later blocks, which experience more quantization or reparameterization errors, receive more bits. The K linear layers and the first MLP (FC1) in each block are also allocated higher bits. This visualization confirms that our strategy effectively adjusts bits according to reparameterization errors.
+
+**Performance and Energy Breakdown.** To examine the contribution of each proposed technique, we conducted ablation studies on OPT-6.7B/13B models. As shown in Tab. 7, the vanilla ShiftAddLLM (Sec. 4.1) suffers from a significant perplexity increase with 2-bit reparameterization. Our multi-objective optimization (Sec. 4.2) reduces perplexity by an average of 3.9e4, and the mixed bit allocation strategy (Sec. 4.3) further reduces perplexity by 0.77, maintaining comparable latency. These experiments validate the effectiveness of each component in ShiftAddLLM. In addition, profiling the two largest models on an Eyeriss accelerator illustrates the energy breakdown of the original LLMs and ShiftAddLLMs.
+
+    &  &  &  \\   & & **125M** & **350M** & **1.3B** & **2.7B** & **6.7B** & **13B** & **125M** & **350M** & **1.3B** & **2.7B** & **6.7B** & **13B** \\ 
+**Ours (Lat.)** & 2 & 712.55 & 445.78 & 40.28 & 50.95 & 18.56 & 14.76 & 6.3 & 12.4 & 12.3 & 16.9 & 16.9 & 20.9 \\
+**Ours (Mixed)** & 2.2 & 435.84 & 279.19 & 27.37 & 31.97 & 17.99 & 13.79 & 6.3 & 12.6 & 12.5 & 16.8 & 16.7 & 21.0 \\   
+
+Table 6: Perplexity and latency results of our mixed bit allocation.
+
+    &  &  &  \\   & & **6.7B** & **13B** & **6.7B** & **13B** & **6.7B** & **13B** \\ 
+4.1 & & 2 & 6.4e4 & 1.5e4 & 16.5 & 20.1 \\
+4.18\&4.2 & 2 & 18.56 & 14.76 & 16.9 & 20.9 \\
+4.18\&4.2\& 4.3 & 2.2 & **17.99** & **13.79** & 16.7 & 21.0 \\   
+
+Table 7: Performance breakdown analysis.
+
+Figure 7: Visualizing the average bit allocation.
+
+  
+**Models** & **Methods** & **Bits** & **ARC\_C** & **ARC\_E** & **Copa** & **BoolQ** & **PIQA** & **Storycloze** & **RTE** & **MMLU** & **Mean** \\   & Floating Point & 16 & 37.20 & 71.25 & 86 & 69.82 & 78.67 & 77.47 & 60.65 & 25.89\&0.37 & 63.37 \\  & OPTQ  & 3 & 24.66 & 48.86 & 70 & 52.05 & 64.47 & 67.09 & 53.07 & 23.98\&0.36 & 50.52 \\  & LUT-GEMM  & 3 & 24.15 & 81.85 & 81 & 53.52 & 61.97 & 60.60 & 48.74 & 23.73\&0.36 & 50.70 \\  & **Ours (Acc.)** & 3 & **35.24** & **70.88** & **87** & **72.45** & **77.64** & **77.15** & **63.18** & **27.56\&0.38** & **63.89** \\   & Floating Point & 16 & 49.57 & 76.14 & 90 & 82.57 & 80.79 & 78.61 & 68.23 & 65.24\&0.37 & 72.89 \\  & OPTQ  & 3 & 45.82 & 76.34 & 90 & 81.74 & 79.71 & 77.34 & 67.51 & 60.14\&0.36 & 72.33 \\   & LUT-GEMM  & 3 & 47.70 & 76.42 & 89 & 80.31 & 80.20 & 77.78 & 68.59 & - & - \\   & **Ours (Acc.)** & 3 & **48.38** & **77.06** & **93** & **84.25** & **80.47** & **78.49** & **75.09** & **62.33\&0.38 & **74.88** \\   
+
+Table 5: Accuracy comparisons on seven downstream tasks for OPT-66B and LLaMA-2-70B.
+
+As shown in Fig. 8, ShiftAddLLM reduces energy consumption by 87.2% for OPT-66B and 86.0% for LLaMa-2-70B, with shift-and-add leading to 89.7% and 89.9% energy reduction compared to original multiplications.
+
+### Discussion on Limitation
+
+We demonstrated the accuracy and efficiency of post-training shift-and-add reparameterization of LLMs using multi-objective optimization and automated bit allocation, addressing the challenge of efficient LLM serving. However, achieving GPU speedup relied on BCQ kernels and the compatible Ours (Lat.) with a block-wise scaling factor design. While Ours (Acc.) with a column-wise design delivers high accuracy, we lack the fast CUDA kernel required for similar speedups.
+
+### Discussion on Technique Applicability Beyond LLMs
+
+We acknowledge that the idea of shift-and-add reparameterization is general and can be extended to other smaller models like CNNs  or ViTs . Meanwhile, this work's implementation is specifically dedicated to large-scale LLMs: It is the first instance of applying the shift-and-add technique at the scale of LLMs with billions of parameters. While many ideas perform well with models having millions of parameters, they often fail to scale effectively. Unlike previous methods that require additional training and do not yield good results for large-scale LLMs, our approach is uniquely tailored for LLMs. We incorporate "post-training" reparameterization and carefully designed scaling factor patterns, enabling multi-objective optimization for LLMs and ensuring superior performance compared to prior quantization methods.
+
+## 6 Conclusion
+
+We propose accelerating pretrained LLMs through post-training shift-and-add reparameterization, creating efficient multiplication-free models. Our method reparameterizes weight matrices into binary matrices with group-wise scaling factors, transforming multiplications into shifts and adds. To mitigate accuracy loss, we introduce a multi-objective optimization strategy that minimizes weight and activation reparameterization errors. Additionally, we develop an automated bit allocation strategy based on layer sensitivity to further improve the accuracy-efficiency tradeoff. Extensive results across various LLM families and tasks validate the effectiveness of ShiftAddLLM. This work opens a new perspective on designing efficient LLM serving systems through _post-training_ optimization.

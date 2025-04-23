@@ -1,0 +1,235 @@
+# Transcoders Find Interpretable LLM Feature Circuits
+
+Jacob Dunefsky
+
+Yale University
+
+New Haven, CT 06511
+
+jacob.dunefsky@yale.edu
+
+&Philippe Chlenski
+
+Columbia University
+
+New York, NY 10027
+
+pac@cs.columbia.edu
+
+&Neel Nanda
+
+Equal contribution.
+
+###### Abstract
+
+A key goal in mechanistic interpretability is circuit analysis: finding sparse subgraphs of models corresponding to specific behaviors or capabilities. However, MLP sublayers make fine-grained circuit analysis on transformer-based language models difficult. In particular, interpretable features--such as those found by sparse autoencoders (SAEs)--are typically linear combinations of extremely many neurons, each with its own nonlinearity to account for. Circuit analysis in this setting thus either yields intractably large circuits or fails to disentangle local and global behavior. To address this we explore **transcoders**, which seek to faithfully approximate a densely activating MLP layer with a wider, sparsely-activating MLP layer. We introduce a novel method for using transcoders to perform weights-based circuit analysis through MLP sublayers. The resulting circuits neatly factorize into input-dependent and input-invariant terms. We then successfully train transcoders on language models with 120M, 410M, and 1.4B parameters, and find them to perform at least on par with SAEs in terms of sparsity, faithfulness, and human-interpretability. Finally, we apply transcoders to reverse-engineer unknown circuits in the model, and we obtain novel insights regarding the "greater-than circuit" in GPT2-small. Our results suggest that transcoders can prove effective in decomposing model computations involving MLPs into interpretable circuits. Code is available at https://github.com/jacobtunefsky/transcoder_circuits/.
+
+## 1 Introduction
+
+In recent years, transformer-based large language models (LLMs) have displayed outstanding performance on a wide variety of tasks . However, the mechanisms by which LLMs perform these tasks are opaque by default . The field of mechanistic interpretability  seeks to understand these mechanisms, and doing so relies on decomposing a model into **circuits**: interpretable subcomputations responsible for specific model behaviors .
+
+A core problem in fine-grained circuit analysis is incorporating MLP sublayers . Attempting to analyze MLP neurons directly suffers from "polysemanticity" : the tendency of neurons to activate on many unrelated concepts. To address this, **sparse autoencoders (SAEs)** have been used to perform fine-grained circuit analysis by instead looking at **features**--vectors in the model's representation space--instead of individual neurons . However, while SAE features are often interpretable, these vectors tend to be dense linear combinations of many neurons . Thus, mechanistically understanding how an SAE feature before one or more MLP layers affects a later SAE feature may require considering an infeasible number of neurons and their nonlinearities. Prior attempts to circumvent this  use a mix of causal interventions and gradient-basedapproximations to MLP layers. But these approaches fail to exhibit **input-invariance**: the connections between features can only ever be described _for a given input_, and not for the model as a whole. Attempts to address this, e.g. by averaging results over many inputs, conversely lose their ability to yield **input-dependent** information that describes a connection's importance on a single input. This means that SAEs _cannot tell us about the general input-output behavior of an MLP across all inputs_.
+
+To address why input-invariance is desirable, consider the following example: say that one has a post-MLP SAE feature and wants to see how it is computed from pre-MLP SAE features. Doing e.g. patching on one input shows that a pre-MLP feature for Polish last names is important for causing the post-MLP feature to activate. But on other inputs, would features other than the Polish last name feature also cause the post-MLP feature to fire (e.g. an English last names feature)? Could there be other inputs where the Polish last names feature fires but the post-MLP feature does not? We can see that without input-invariance, it is difficult to make general claims about model behavior.
+
+Motivated by this, in this work, we explore **transcoders** (an idea proposed, but not explored, in Templeton et al.  and Li et al. ): wide, sparsely-activating approximations of a model's original MLP sublayer. Specifically, MLP transcoders are wide ReLU MLPs with one hidden layer that are trained to faithfully approximate the original narrower MLP sublayer's output, with an L1 regularization penalty on neuron activations to encourage sparse activations. **Our primary motivation** is to enable input-invariant feature-level circuit analysis through MLP sublayers, which allows us to understand and interpret the general behavior of circuits involving MLP sublayers.
+
+Our contributions.Our main contributions are (1) to introduce a method for circuit analysis using transcoders, (2) to confirm that transcoders are a faithful and interpretable approximation to MLP sublayers, and (3) to demonstrate the utility of our circuit analysis method on detailed case studies.
+
+After describing the architecture of transcoders in SS3.1, we demonstrate in SS3.2 that transcoders additionally enable circuit-finding techniques that are not possible using SAEs, and introduce a novel method for performing circuit analysis with transcoders and demonstrate that transcoders cleanly factorize circuits into _input-invariant_ and _input-dependent_ components.
+
+Then, in SS4, we evaluate transcoders' interpretability, sparsity, and faithfulness to the original model. Because SAEs are the standard method for finding sparse decompositions of model activations, we compare transcoders to SAEs on models up to 1.4 billion parameters and verify that transcoders are on par with SAEs or better with respect to these properties.
+
+We apply transcoder circuit analysis to a variety of tasks in SS5.1 and SS5.2, including "blind case studies," which demonstrate how this approach allows us to understand features without looking at specific examples, and an in-depth analysis of the GPT2-small "greater-than circuit" previously studied by Hanna et al. .
+
+## 2 Transformers preliminaries
+
+Following Elhage et al. , we represent the computation of a transformer model as follows. First, the model maps input tokens (and their positions) to embeddings \(_{}^{(,)}^{d_{}}\), where \(t\) is the token index and \(d_{}\) is the _model dimensionality_. Then, the model applies a series of "layers," which map the hidden state at the end of the previous block to the new hidden state. This can be expressed as:
+
+Figure 1: A comparison between SAEs, MLP transcoders, and MLP sublayers for a transformer-based language model. SAEs learn to reconstruct model activations, whereas transcoders imitate sublayers’ input-output behavior.
+
+\[_{}^{()} =_{}^{()}+_{h}^{(l,h)}(_{}^{()}; _{}^{()})\] (1) \[_{}^{()} =_{}^{()}+^{(l )}(_{}^{()})\] (2)
+
+where \(l\) is the layer index, \(t\) is the token index, \(^{(l,h)}(_{}^{()}; _{}^{()})\) denotes the output of attention head \(h\) at layer \(l\) given all preceding source tokens \(_{}^{()}\) and destination token \(_{}^{()}\), and \(^{(l)}(_{}^{()})\) denotes the output of the layer \(l\) MLP.2
+
+Equation 1 shows how the **attention sublayer** updates the hidden state at token \(t\), and Equation 2 shows how the **MLP sublayer** updates the hidden state. Importantly, each sublayer always _adds_ its output to the current hidden state. As such, the hidden state always can be additively decomposed into the outputs of all previous sublayers. This motivates Elhage et al.  to refer to each token's hidden state as its **residual stream**, which is "read from" and "written to" by each sublayer.
+
+## 3 Transcoders
+
+### Architecture and training
+
+Transcoders aim to learn a "sparsified" approximation of an MLP sublayer: they approximate the output of an MLP sublayer as a sparse linear combination of feature vectors. Formally, the transcoder architecture can be expressed as
+
+\[_{}() =(_{}+ _{})\] (3) \[() =_{}_{}()+ _{},\] (4)
+
+where \(\) is the input to the MLP sublayer, \(_{}^{d_{} d_{}}\), \(_{}^{d_{} d_{}}\), \(_{}^{d_{}}\), \(_{}^{d_{}}\), \(d_{}\) is the number of feature vectors in the transcoder, and \(d_{}\) is the dimensionality of the MLP input activations. Usually, \(d_{}\) is far greater than \(d_{}\).
+
+Each feature in a transcoder is associated with two vectors: the \(i\)-th row of \(_{}\) is the **encoder feature vector** of feature \(i\), and the \(i\)-th column of \(_{}\) is the **decoder feature vector** of feature \(i\). The \(i\)-th component of \(_{}()\) is called the **activation** of feature \(i\). Intuitively, for each feature, the encoder vector is used to determine how much the feature should activate; the decoder vector is then scaled by this amount, and the resulting weighted sum of decoder vectors is the output of the transcoder. In this paper, the notation \(_{}^{()}\) and \(_{}^{()}\) is used to denote the \(i\)-th encoder feature vector and decoder feature vector, respectively, in the layer \(l\) transcoder.
+
+Because we want transcoders to learn to approximate an MLP sublayer's computation with a sparse linear combination of feature vectors, transcoders are trained with the following loss, where \(_{1}\) is a hyperparameter mediating the tradeoff between sparsity and faithfulness:
+
+\[_{TC}()=()- ()\|_{2}^{2}}_{}+ \|_{}()\|_{1}}_ {}.\] (5)
+
+### Circuit analysis with transcoders
+
+We now introduce a novel method for performing feature-level circuit analysis with transcoders, which provides a scalable and interpretable way to identify which transcoder features in different layers connect to compute a given task. Importantly, this method provides insights into the general input-output behavior of MLP sublayers, which SAE-based methods cannot do.
+
+In particular, the primary goal of circuit analysis is to identify a subgraph of the model's computational graph that is responsible for (most of) the model's behavior on a given task [11; 19; 20]; this requires a means of evaluating a computational subgraph's importance to the task in question. In order to determine which edges are included in this subgraph, we thus have to compute **attributes** for each edge: how much the earlier node contributes to the later node's own contribution. Circuit analysis with SAEs thus entails computing the attribution of pre-MLP SAE features to post-MLP SAE features, _as mediated through the MLP_. Standard methods for computing attributions are causal patching (which inherently only gives information about local MLP behavior on a single input) and methods like input-times-gradient or attribution patching (which are equivalent in this setting). We will now demonstrate why these methods cannot yield information about the MLP's general behavior. Letting \(\) be the activation of an earlier-layer feature, \(^{}\) be the activation of the later-layer feature, and \(\) be the activation of the MLP at layer \(l^{}\), the input-times-gradient is given by:
+
+\[(^{}}{}) =(^{}}{ }}{}).\] (6)
+
+Unfortunately, not only is \(\) input-dependent, but so is \(^{}}{}\) as well, because \(}{}\) is.
+
+This means that we cannot use SAEs to understand the general behavior of MLPs on various inputs. In contrast, we will show that when we replace MLP sublayers with sufficiently faithful and interpretable transcoders, we obtain attributions that neatly factorize into _input-dependent_ terms and _input-invariant_ terms; the latter can be computed just from model and transcoder weights, and tell us about the MLP behavior across all inputs.
+
+#### 3.2.1 Attribution between transcoder feature pairs
+
+We begin by showing how to compute attributions between pairs of transcoder features. This attribution is given by the product of two terms: the earlier feature's activation (which depends on the input to the model), and the dot product of the earlier feature's decoder vector with the later feature's encoder vector (which is independent of the model input).
+
+The following is a more formal restatement. Let \(z_{TC}^{(l,i)}(_{}^{(,)})\) denote the scalar activation of the \(i\)-th feature in the layer \(l\) transcoder on token \(t\), as a function of the MLP input \(_{}^{(,)}\) at token \(t\) in layer \(l\). Then for layer \(l<l^{}\), the contribution of feature \(i\) in transcoder \(l\) to the activation of feature \(i^{}\) in transcoder \(l^{}\) on token \(t\) is given by
+
+\[^{(l,i)}(_{}^{(,)})}_{}_{}^ {(,)}_{}^{(^{}, ^{})})}_{}\] (7)
+
+This expression is derived in App. D.2. Note that \((_{}^{(,)}_{ }^{(^{},^{})})\) is _input-invariant_: once the transcoders have been trained, this term does not depend on the input to the model. This term,
+
+Figure 2: A visualization of the circuit-finding algorithm.
+
+analyzed in isolation, can thus be viewed as providing information about the general behavior of the model. The only _input-dependent_ term is \(z_{TC}^{(l,i)}(_{}^{(,)})\), the activation of feature \(i\) in the layer \(l\) transcoder on token \(t\). As such, this expression cleanly factorizes into a term reflecting the general input-invariant connection between the pair of features and an interpretable term reflecting the importance of the earlier feature on the current input.
+
+#### 3.2.2 Attribution through attention heads
+
+So far, we have addressed how to find the attribution of a lower-layer transcoder feature directly on a higher-layer transcoder feature at the same token. But transcoder features can also be mediated by attention heads. We will thus extend the above analysis to account for finding the attribution of transcoder features through the OV circuit of an attention head. For a full derivation, see App. D.3.
+
+As before, we want to understand what causes feature \(i^{}\) in the layer \(l^{}\) transcoder to activate on token \(t\). Given attention head \(h\) at layer \(l\) with \(l<l^{}\), the contribution of token \(s\) at layer \(l\) through head \(h\) to feature \(i^{}\) in layer \(l^{}\) at token \(t\) is given by
+
+\[^{(l,h)}(_{}^{(,)},_{}^{(,)})((( _{}^{(,)})^{T}_{}^{(^{},^{})}) _{}^{(,)}),\] (8)
+
+where \(^{(l,h)}(_{}^{(,)},_{}^{(,)})\) is the attention score for head \(h\) and layer \(l\) from token \(s\) to token \(t\).
+
+#### 3.2.3 Finding computational subgraphs
+
+Using this observation, we present a method for finding computational subgraphs. We now know how to determine, on a given input and transcoder feature \(i^{}\), which earlier-layer transcoder features \(i\) are important for causing \(i^{}\) to activate. Once we have identified some earlier-layer features \(i\) that are relevant to \(i^{}\), then we can then recurse on \(i\) to understand the most important features causing \(i\) to activate by repeating this process.
+
+Doing so iteratively (and greedily pruning all but the most important features at each step) thus yields a set of computational paths (a sequence of connected edges). These computational paths can then be combined into a computational subgraph, in such a way that each node (transcoder feature or attention head), edge, and path is assigned an attribution. A full description of the circuit-finding algorithm is presented in App. D.5. Figure 2 provides a visualization of this algorithm.
+
+#### 3.2.4 De-embeddings: a special case of input-invariant information
+
+Earlier, we discussed how to compute the input-invariant connection between a pair of transcoder features, providing insights on general behavior of the model. A related technique is something that we call **de-embeddings**. A de-embedding vector for a transcoder feature is a vector that contains the direct effect of _the embedding of each token in the model's vocabulary_ on the transcoder feature. The de-embedding vector for feature \(i\) in the layer \(l\) transcoder is given by \(}^{T}_{}^{(,)}\), where \(}\) is the model's token embedding matrix. Importantly, this vector gives us input-invariant information about how much each possible input token would directly contribute to the feature's activation.
+
+Given a de-embedding vector, looking at which tokens in the model's vocabulary have the highest de-embedding scores tells us about the feature's general behavior. For example, for a certain GPT2-small MLP0 transcoder feature that we investigated, the tokens with the highest scores were \(\), \(\), \(\), \(\), and \(\). Notice the interpretable pattern: all of these tokens come from European surnames, primarily Polish ones, suggesting that the feature generally fires on Polish surnames.
+
+## 4 Comparison with SAEs
+
+Transcoders were originally conceived as a variant of SAEs, and as such, there are many similarities between them. They differ only in their training objective: because SAEs are autoencoders, the faithfulness term in the SAE loss measures the reconstruction error between the SAE's output and its original input. In contrast, the faithfulness term of the transcoder loss measures the error between the transcoder's output and the original MLP sublayer's output.
+
+Because of these similarities, SAEs can be quantitatively evaluated (for sparsity and fidelity) and qualitatively evaluated (for feature interpretability) in precisely the same way as transcoders, using standard SAE evaluation methods [4; 29]. We now report the results of evaluations comparing SAEs to transcoders on these metrics, and find that transcoders are comparable to or better than SAEs.
+
+### Blind interpretability comparison of transcoders to SAEs
+
+In order to evaluate the interpretability of transcoders, we manually attempted to interpret 50 random features from a Pythia-410M layer 15 transcoder and 50 random features from a Pythia-410M layer 15 SAE trained on _MLP inputs_.3 For each feature, the examples in a subset of the OpenWebText corpus that caused the feature to activate the most were computed ahead of time. Then, the features from both the SAE and the transcoder were randomly shuffled. For each feature, the maximum-activating examples were displayed, but not whether the feature came from an SAE or transcoder. We recorded for each feature whether or not there seemed to be an interpretable pattern, and only after examining every feature did we look at which features came from where. The results, shown in Table 1, suggest transcoder features are approximately as interpretable as SAE features. This further suggests that transcoders incur no penalties compared to SAEs.
+
+### Quantitative comparison of transcoders to SAEs
+
+#### 4.2.1 Evaluation metrics
+
+We evaluate transcoders _qualitatively_ on their features' interpretability as judged by a human rater, and _quantitatively_ on the sparsity of their activations and their fidelity to the original MLP's computation.
+
+As a qualitative proxy measure for the interpretability of a feature, we follow Bricken et al.  in assuming that interpretable features should demonstrate interpretable patterns in the examples that cause them to activate. To this end, one can run the transcoder on a large dataset of text, see which dataset examples cause the feature to activate, and see if there is an interpretable pattern among these tokens. While imperfect , this is still a reasonable proxy for an inherently qualitative concept.
+
+To measure the sparsity of a transcoder, one can run the transcoder on a dataset of inputs, and calculate the mean number of features active on each token (the mean \(L_{0}\) norm of the activations). To measure the fidelity of the transcoder, one can perform the following procedure. First, run the original model on a large dataset of inputs, and measure the next-token-prediction cross entropy loss on the dataset. Then, replace the model's MLP sublayer corresponding to the transcoder _with the transcoder_, and measure the modified model's mean loss on the dataset. Now, the faithfulness of the transcoder can be quantified as the difference between the modified model's loss and the original model's loss.
+
+#### 4.2.2 Results
+
+We trained SAEs and transcoders on activations from GPT2-small , Pythia-410M, and Pythia-1.4B . For each model, we trained multiple SAEs and transcoders on the same inputs, but with different values of the \(_{1}\) hyperparameter controlling the fidelity-sparsity tradeoff for each SAE and each transcoder. The transcoders were trained on MLP-in and MLP-out activations, while SAEs were
+
+    & Transcoder & MLP-in SAE \\  \# interpretable & 41 & 38 \\ \# maybe & 8 & 8 \\ \# uninterpretable & 1 & 4 \\   
+
+Table 1: The number of interpretable features, possibly-interpretable features, and uninterpretable features for the transcoder and MLP-in SAE. Of the interpretable features, we additionally deemed 6 transcoder features, and 16 SAE features to be “context-free”, meaning they appeared to fire on a single token without any evident context-dependent patterns.
+
+trained on MLP-out activations (as these are the activations that MLP SAEs are typically trained on). Due to compute limitations, we used the same learning rate, which was determined via a hyperparameter sweep on _transcoders_, for both SAEs and transcoders. This means that the learning rate might not be optimal for SAEs. Nevertheless, we did perform a separate hyperparameter sweep of \(_{1}\) for the SAEs and transcoders.
+
+We evaluated each SAE and transcoder on the same 3.2M tokens of OpenWebText data . We also recorded the loss of the unmodified and mean-ablated model (always replacing the MLP sublayer output with its mean output over the dataset) as best- and worst-case bounds, respectively.
+
+We summarize the Pareto frontiers of the sparsity-accuracy tradeoff for all models in Figure 3. In all cases, transcoders are equal to or better than SAEs. In fact, the gap between transcoders and SAEs seems to widen on larger models. Note, however, that compute limitations prevented us from performing more exhaustive hyperparameter sweeps; as such, it might be possible that a different set of hyperparameters could have allowed SAEs to surpass transcoders. Nonetheless, these results make us optimistic that using transcoders incurs no penalties versus SAEs trained on MLP activations.
+
+## 5 Circuit analysis case studies
+
+### Blind case study: reverse-engineering a feature
+
+To understand the utility of transcoders for circuit analysis, we carried out nine **blind case studies**, where we randomly selected individual transcoder features in a ninth-layer (of 12) GPT2-small transcoder and used circuit analysis to form a hypothesis about the semantics of the feature--_without looking at the text of examples that cause the feature to activate_. In blind case studies, we use a combination of input-invariant and input-dependent information to allow us to evaluate transcoders as a tool to infer model behavior with minimal prompt information. This better reflects a key goal of mechanistic interpretability: to be able to understand model behavior on unknown, unforeseen tasks.
+
+In contrast, reverse-engineering a feature where one already has an idea of its behavior can introduce confirmation bias. For instance, looking at activation patterns prior to circuit analysis can predispose a researcher to seek out only circuits that corroborate their interpretation of these activation patterns, potentially ignoring circuits that reveal other information about the feature. Conversely, if the circuit analysis method is faulty and yields some explanations that are not reflected in the feature activations, then the researcher might ignore those spurious explanations and thus obtain an overly-positive assessment of the circuit analysis method. The "rules of the game" for blind case studies are that:
+
+1. The specific tokens contained in any prompt are not allowed to be directly seen. As such, prompts and tokens can only be referenced by their index in the dataset.
+2. These prompts may be used to compute input-dependent information (activations and circuits), as long as the tokens themselves remain hidden.
+3. Any input-invariant information, including feature de-embeddings, is allowed.
+
+In this section, we summarise a specific blind case study, how we used our circuits to reverse-engineer feature 355 in our layer 8 transcoder. Other studies, as well as a longer description of the study summarized here, can be found in App. H.
+
+Figure 3: The sparsity-accuracy tradeoff of transcoders versus SAEs on GPT2-small, Pythia-410M, and Pythia-1.4B. Each point corresponds to a trained SAE or transcoder, and is labeled with the L1 regularization penalty \(_{1}\) used during training.
+
+Note that we use the following compact notation for transcoder features: tcA[B]OC refers to feature B in the layer A transcoder at token C.
+
+**Building the first circuit.** We started by getting a list of indices of the top-activating prompts in the dataset for tc8. Importantly, we did not look at the actual tokens in these prompts, as doing so would violate Rule 1. For our first input, we chose example 5701, token 37; tc8 fires at strength 11.91 on this token in this input. Our greedy algorithm for finding the most important computational paths for causing tc8O37 to fire revealed contributions from the current token (37) and earlier tokens (like 35, 36, and 31).
+
+**Current-token features.** From token 37, we found strong contributions from tc0O37 and tc0O37. Input-invariant de-embeddings of these layer 0 features revealed that they primarily activate on variants of \(}\), suggesting that token 37 contributed to the feature by virtue of being a semicolon. Another feature which contributed strongly through the current token, tc6, showed a similar pattern. Among the top _input-invariant_ connections from layer 0 transcoder features to tc6, we once again found the same semicolon features tc0 and tc0.
+
+**Previous-token features.** Next we checked computational paths from previous tokens through attention heads. Looking at these contextual computational paths revealed a contribution from tc0O36; the top de-embeddings for this feature were years like 1973, 1971, 1967, and 1966. Additionally, there was a contribution from tc0O31, for which the top de-embedding was.
+
+Furthermore, there was a contribution from tc6O35. The top input-invariant connections to this feature from layer 0 were tc0 and tc0. The top de-embeddings for the former were tokens associated with Eastern European last names (e.g. kowski,henko,owicz) and the top de-embeddings for the latter feature were English surnames (e.g. Burnett, Hawkins,Johnston). This heavily suggested that tc6 was a surname feature.
+
+Thus, the circuit revealed this pattern was important to our feature: "[\([]\)-[\(]\)-[\(]\)-[\(\)]-[\(\)]-\(}\)".
+
+**Analysis.** We hypothesized that tc8 fires on semicolons in parenthetical citations like "(Vaswani et al. 2017; Elhage et al. 2021)". Further investigation on another input yielded a similar pattern--along with a feature whose top de-embedding tokens included Accessed Retrieved Neuroscience, and Springer. This bolstered our hypothesis even more.
+
+Here, we decided to end the blind case study and check if our hypothesis was correct. Sure enough, the top activating examples included semicolons in citations such as "(Poeck, 1969; Rinn, 1984)" and "(Robinson et al., 1984; Starkstein et al., 1988)". We note that the first of these is the example at index \((5701,37)\) we analyzed above.
+
+"Restricted" blind case studies.Because MLP0 features tend to be single-token, significant information about the original prompt can be obtained by looking at which MLP0 transcoder features are active and then taking their de-embeddings. In order to address this and more fully investigate the power of input-invariant circuit analysis, six of the eight case studies that we carried out were **restricted blind case studies**, in which all input-dependent MLP0 feature information is forbidden to use. For more details on these case studies, see Appendix H.2.
+
+### Analyzing the GPT2-small "greater-than" circuit
+
+We now turn to address the "greater-than" circuit in GPT2-small previously considered by Hanna et al. (2015). They considered the following question: given a prompt such as "The war lasted from 1737 to 17", how does the model know that the predicted next year token has to be greater than 1737? In their original work, they analyzed the circuit responsible for this behavior and demonstrated that MLP10 plays an important role, looking into the operation of MLP10 at a neuronal level. We now apply transcoders and the circuit analysis tools accompanying them to this same problem.
+
+#### 5.2.1 Initial investigation
+
+First, we used the methods from Sec. 3.2.3 to investigate a single prompt and obtain the computational paths most relevant to the task. This placed a high attribution on MLP10 features, which were in turn activated by earlier-layer features mediated by attention head 1 in layer 9. This corroborates the analysis in the original work.
+
+Next, we investigated which MLP10 transcoder features were most important on a variety of prompts, and how their activations are mediated by attention head 1 in layer 9. Following the original work, we generated all 100 prompts of the form "The war lasted from 17YY to 17", where YY denotes a two-digit number. We found that the MLP10 features with the highest variance in activations over this set of prompts also had top input-dependent connections from MLP0 features through attention head 1 in layer 9 whose top de-embeddings were two-digit numbers. The top _input-invariant_ connections from MLP0 features through attention head 1 in layer 9 to MLP10 features _also had two-digit numbers among their top de-embedding tokens_. This positive result was somewhat unexpected, given that there are only 100 two-digit number tokens in the model's vocabulary of over 50k tokens.
+
+We then used **direct logit attribution (DLA)** to look at the effect of each transcoder feature on the predicted logits of each YY token in the model's vocabulary. These results, along with de-embedding scores for each YY token, can be seen in Figure 5. The de-embeddings scores are highest for YY tokens where years following them are boosted and years preceding them are inhibited.
+
+#### 5.2.2 Comparison with neuronal approach
+
+Next, we compared the transcoder approach to the neuronal approach to see whether transcoders give a _sparser_ description of the circuit than MLP neurons do. To do this, we computed the 100 highest-variance layer 10 transcoder features and MLP10 neurons. Then, for \(1 k 100\), we zero-ablated all but the top \(k\) features in the transcoder/neurons in MLP10 and measured how this affected the model's performance according to the **mean probability difference** metric presented in the original paper. We also evaluated the original model with respect to this metric, along with the model when MLP10 is replaced with the full transcoder.
+
+The results are shown in the left half of Figure 4. For fewer than 24 features, the transcoder approach outperforms the neuronal approach; its performance drops sharply, however, around this point. Further investigation revealed that tc10, the 24th-highest-variance transcoder feature, was responsible for this drop in performance. The DLA for this feature is plotted in the right half of Figure 4. Notice how, in contrast with the three highest-variance transcoder features, tc10 displays a flatter DLA, boosting all tokens equally. This might explain why it contributes to poor performance. To account for this, note that the left half of Figure 4 also demonstrates the performance of the transcoder when this "bad feature" is removed.
+
+While the transcoder does not recover the full performance of the original model, it needs only a handful of features to recover most of the original model's performance; many more MLP neurons are needed to achieve the same level of performance. This suggests that the transcoder is particularly useful for obtaining a sparse, understandable approximation of MLP10. Furthermore, the transcoder features suggest a simple way that the MLP10 computation may (approximately) happen: by a small set of features that fire on years in certain ranges and boost the logits for the following years.
+
+Figure 4: **Left:** Performance according to the probability difference metric when all but the top \(k\) features or neurons in MLP10 are zero-ablated. **Right:** The DLA and de-embedding score for tc10, which contributed negatively to the transcoder’s performance.
+
+## 6 Related work
+
+**Circuit analysis** is a common framework for exploring model internals [15; 32; 41]. A number of approaches exist to find circuits and meaningful components in models, including causal approaches , automated circuit discovery , and sparse probing . Causal methods include activation patching [28; 49; 52], attribution patching [30; 39], and path patching [22; 50]. Much circuit analysis work has focused on attention head circuits , including copying heads , induction heads , copy suppression , and successor heads . Methods connecting circuit analysis to SAEs include He et al. , Batson et al.  and Marks et al. . Our recursive greedy circuit-finding approach was largely based on that of Dunefsky & Cohan .
+
+**Sparse autoencoders** have been used to disentangle model activations into interpretable features [7; 12; 51]. The development of SAEs was motivated by the theory of superposition in neural representations . Since then, much recent work has focused on exploring and interpreting SAEs, and connecting them to preexisting mechanistic interpretability techniques. Notable contributions include tools for exploring SAE features, such as SAE lens ; applications of SAEs to attention sublayers ; scaling up SAEs to Claude 3 Sonnet  and improved SAE architectures . Transcoders have been previously proposed as a variant of SAEs under the names "predicting future activations"  and "MLP stretchers" , but not explored in detail.
+
+## 7 Conclusion
+
+Fine-grained circuit analysis requires an approach to handling MLP sublayers. To our knowledge, the transcoder-based circuit analysis method presented here is the only such approach _that cleanly disentangles input-invariant information from input-dependent information_. Importantly, transcoders bring these benefits without sacrificing fidelity and interpretability: when compared to state-of-the-art feature-level interpretability tools (SAEs), we find that transcoders achieve equal or better performance. We thus believe that transcoders are an improvement over other forms of feature-level interpretability tools for MLPs, such as SAEs on MLP outputs.
+
+Future work on transcoders includes directions such as comparing the features learned by transcoders to those learned by SAEs, seeing if there are classes of features that transcoders struggle to learn, finding interesting examples of novel circuits, and scaling circuit analysis to larger models.
+
+Overall, we believe that transcoders are an exciting new development for circuit analysis and hope that they can continue to yield deeper insights into model behaviors.
+
+LimitationsTranscoders, like SAEs, are approximations to the underlying model, and the resulting error may lose key information. We find transcoders to be approximately as unfaithful to the model's computations as SAEs are (as measured by the cross-entropy loss), although we leave comparing the errors to future work. Our circuit analysis method (App. D.5) does not engage with how attention patterns are computed, and treats them as fixed. A promising direction of future work would be trying to extend transcoders to understand the computation of attention patterns, approximating the attention softmax. We only present circuit analysis results for a few qualitative case studies, and our results would be stronger with more systematic analysis.
+
+Figure 5: For the three MLP10 transcoder features with the highest activation variance over the “greater-than” dataset, and for every possible YY token, we plot the direct logit attribution (the extent to which the feature boosts the output probability of YY) and the de-embedding score (an input-invariant measurement of how much YY causes the feature to fire).
+
+## Impact statement
+
+This paper seeks to advance the field of mechanistic interpretability by contributing a new tool for circuit analysis. We see this as foundational research, and expect the impact to come indirectly from future applications of circuit analysis such as understanding and debugging unexpected model behavior and controlling and steering models to be more useful to users.
+
+Jacob and Philippe were funded by a grant from AI Safety Support Ltd. Jacob was additionally funded by a grant from the Long-Term Future Fund. Philippe was additionally funded by NSF GRFP grant DGE-2036197. Compute was generously provided by Yale University.
+
+We would like to thank Andy Arditi, Lawrence Chan, and Matt Wearden for providing detailed feedback on our manuscript. We would also like to thank Senthooran Rajamanoharan and Juan David Gil for discussions during the research process, and Joseph Bloom for advice on how to use (and extend) the SAELens library. Finally, we would like to thank Joshua Batson for a discussion that inspired us to investigate transcoders in the first place.

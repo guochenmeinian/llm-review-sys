@@ -1,0 +1,177 @@
+# Hugo Laurencon\({}^{*,1,2}\)** **Leo Tronchon\({}^{*,1}\)** **Matthieu Cord\({}^{2,3}\)** **Victor Sanh\({}^{1}\)
+
+## What matters when building vision-language models?\({}^{1}\)Hugging Face \({}^{2}\)Sorbonne Universite \({}^{3}\)valeo.ai, Paris, France
+
+\({}^{*}\)The order was chosen randomly.
+
+### Abstract
+
+The growing interest in vision-language models (VLMs) has been driven by improvements in large language models and vision transformers. Despite the abundance of literature on this subject, we observe that critical decisions regarding the design of VLMs are often not justified. We argue that these unsupported decisions impede progress in the field by making it difficult to identify which choices improve model performance. To address this issue, we conduct extensive experiments around pre-trained models, architecture choice, data, and training methods. Our consolidation of findings includes the development of Idefics2, an efficient foundational VLM of 8 billion parameters. Idefics2 achieves state-of-the-art performance within its size category across various multimodal benchmarks, and is often on par with models four times its size. We release the model (base, instructed, and chat) along with the datasets created for its training.
+
+Figure 1: Idefics2-chatty analyzes the table to compute and answer the query.
+
+Introduction
+
+Vision-language models (VLMs) that take images and texts as inputs and output texts, are useful for many tasks, like retrieving information in a scanned PDF (Hu et al., 2024), explaining charts or diagrams (Carbune et al., 2024), transcribing the text in an image (Blecher et al., 2023), counting objects in a picture (Goyal et al., 2017) or turning screenshots of webpages into code (Laurencon et al., 2024). The development of powerful open large language models (Touvron et al., 2023; Jiang et al., 2023; Team et al., 2024) and image encoders (Zhai et al., 2023; Sun et al., 2023; Radford et al., 2021) enables researchers to build upon these unimodal pre-trained models to create advanced VLMs that solve these problems with increasing accuracy (Dai et al., 2023; Liu et al., 2023; Bai et al., 2023; Lin et al., 2023; Li et al., 2023; Wang et al., 2023). Despite the progress in the field, the literature reveals many disparate design choices which are often not justified experimentally, or very briefly.
+
+This situation makes it challenging to distinguish which decisions truly account for model performance, thereby making it difficult for the community to make meaningful and grounded progress. For instance, (Alayrac et al., 2022; Laurencon et al., 2023) use interleaved Transformer-based cross-attentions to fuse the image information into the language model, while (Li et al., 2023; Liu et al., 2023) concatenate the sequence of image hidden states with the sequence of text embeddings, and feed the concatenated sequence to the language model. To our knowledge, this choice has not been properly ablated, and trade-offs in terms of compute, data efficiency and performance are poorly understood. In this work, we aim to bring experimental clarity to some of these core design choices and pose the question: **What matters when building vision-language models?**
+
+We identify two areas where various works adopt different design choices: (a) model architecture, and in particular, connector modules that fuse the vision and text modalities and their impact on inference efficiency, (b) multimodal training procedure and its impact on training stability. For each of these areas, we rigorously compare different design choices in a controlled environment and extract experimental findings. Notably, we find that (a) the progress of vision-language models is in large part driven by the progress of pre-trained unimodal backbones, (b) the more recent fully autoregressive architecture outperforms the cross-attention architecture, although it requires modifications to the optimization procedure to ensure a stable training, (c) adaptation of the pre-trained vision backbone and the modules connecting the text and vision modalities allow for more efficiency at inference time on one side, and handling images in their original ratio and size without harming downstream performance on the other side, and (d) modifications to the image processing enables trading inference cost for downstream performance.
+
+Our results are complementary with those presented in (Karamcheti et al., 2024; McKinzie et al., 2024; Lin et al., 2023) which derive insights about multi-stage training, selective unfreezing of the pre-trained backbones, data repetition, and impact of training mixture on zero and few-shot performance. We specifically analyze unexplored aspects such as model architecture, training methods, stability, and efficiency improvements at inference. For example, we introduce the task of text transcription from PDFs directly in the pre-training, we justify the benefits of using synthetic captions in image-text pair datasets, we detail our multi-stage training procedure to save computational resources, and we create a large-scale instruction fine-tuning dataset.
+
+Learning from these insights, we train Idefics2, a foundational VLM with 8 billion parameters. Idefics2 achieves state-of-the-art performance in its size category on various benchmarks while being more efficient at inference, for both the base and the fine-tuned version. It is on par with state-of-the-art models 4 times larger on some vision-language benchmarks and matches the performance of Gemini 1.5 Pro on some challenging benchmarks. We release the base, instructed, and chat versions of Idefics2 as resources for the VLM community along with the data created to train the model.
+
+## 2 Terminology
+
+We first establish shared terminology for discussing the different design choices. Training VLMs typically requires gluing together a pre-trained vision backbone and a pre-trained language backbone by initializing new parameters to connect the two modalities. Training these new parameters is done during the _pre-training phase_. This stage commonly leverages a large multimodal dataset such as image-caption pairs. We note that even though it is most common to start from two separate unimodal pre-trained backbones, the parameters of these two backbones can be optionally shared and initialized from scratch as done in (Bavishi et al., 2023). As in the large language models literature, the pre-training stage is followed by an instruction fine-tuning stage, in which the model learns from task-oriented samples.
+
+Recent works explore two main choices to combine the visual inputs and the text inputs. In the _cross-attention architecture_(Alayrac et al., 2022; Laurencon et al., 2023; Awadalla et al., 2023), the images encoded through the vision backbone are injected at different layers within the language model by interleaving cross-attention blocks in which the text cross-attends to the image hidden states. In contrast, in the _fully autoregressive architecture_(Koh et al., 2023; Driess et al., 2023; Liu et al., 2023), the output of the vision encoder is directly concatenated to the sequence of text embeddings, and the entire sequence is passed as input to the language model. The input sequence of the language model is thus the concatenation of _visual tokens_ and text tokens. The sequence of visual tokens can be optionally pooled into a shorter sequence, providing more compute efficiency. We refer to the layers that maps the vision hidden space to the text hidden space as _modality projection_ layers. Figure 2 highlights the fully-autoregressive architecture we ultimately use for Idefics2.
+
+## 3 Exploring the design space of vision-language models
+
+In this section, we compare recurrent design choices in the vision-language model literature and highlight findings. Unless specified otherwise, we run the ablations for 6'000 steps and report the average score of the 4-shot performance on 4 downstream benchmarks measuring different capabilities: VQAv2 (Goyal et al., 2017) for general visual question answering, TextVQA (Singh et al., 2019) for OCR abilities, OKVQA (Marino et al., 2019) for external knowledge, and COCO (Lin et al., 2014) for captioning. We run the ablations on eight nodes containing eight H100s each, for up to five days.
+
+### Are all pre-trained backbones equivalent for VLMs?
+
+Most recent VLMs start from pre-trained unimodal backbones. How does the choice of the backbones (vision and text) influence the performance of the resulting VLM?
+
+We fix the size of the pretrained backbones, the data used for multi-modal pre-training, and the number of training updates. Under the cross-attention architecture, we observe that the greatest improvement in the performance on vision-language benchmarks comes from changing the language model to a better one. More specifically, replacing LLAMA-1-7B (Touvron et al., 2023) (35.1% on MMLU (Hendrycks et al., 2021)) by Mistral-7B (Jiang et al., 2023)
+
+  
+**LM backbone** & **Avg. score** \\  Llama-1-7B & 62.5 \\ Mistral-7B & 67.6 \\   
+
+Table 1: Ablation on the language model backbone.
+
+Figure 2: Idefics2 fully-autoregressive architecture: Input images are processed by the Vision encoder. The resulting visual features are mapped (and optionally pooled) to the \(LLM\) input space to get the visual tokens (64 in our standard configuration). They are concatenated (and potentially interleaved) with the input sequence of text embeddings (green and red column). The concatenated sequence is fed to the language model (\(LLM\)), which predicts the text tokens output.
+
+(60.1% on MMLU) yields a boost of 5.1 (see Table 1). Additionally, switching the vision encoder from CLIP-ViT-H (Radford et al., 2021) (78.0% on ImageNet(Deng et al., 2009)) to SigLIP-SO400M (Zhai et al., 2023) (83.2% on ImageNet) yields a 3.3 increase in performance on the benchmarks (see Table 2). This result on better vision backbones corroborates observations from (Karamcheti et al., 2024).
+
+We note that Chen and Wang (2022) reports a stronger increase in performance by scaling the size of the vision encoder compared to scaling the size of the language model even though scaling the vision encoder leads to a smaller parameter count increase. Although EVA-CLIP-5B (Sun et al., 2023) is ten times bigger in parameter counts than SigLIP-SO400M (Zhai et al., 2023), we obtain similar performance across 4 benchmarks, suggesting that EVA-CLIP-5B could be heavily under-trained, and we acknowledge that the open VLM community is missing a large well-trained vision encoder.
+
+_Finding 1._ Better pre-trained LLMs and vision encoders lead to better performance on multimodal tasks. However, with the best current models for both, the LLM has a higher impact.
+
+### How does the fully autoregressive architecture compare to the cross-attention architecture?
+
+To our knowledge, there is no proper comparison between the fully autoregressive and the cross-attention architecture. We aim to fill this gap by considering their trade-offs, namely performance, parameter count, and inference cost.
+
+Following (Alayrac et al., 2022), we first compare the two architectures by freezing the unimodal backbones and training only the newly initialized parameters (cross-attention on one side, and modality projection along with learned pooling on the other side), while fixing the amount of training data. Alayrac et al. (2022) shows that the more frequently the cross-attention blocks are interleaved with the language model layers, and the higher the vision-language performance. As such, we note that under this setup, the cross-attention architecture has 1.6B more trainable parameters (2.3B trainable parameters in total) than the fully autoregressive architecture. Additionally, at inference time, the former uses 10% more flops than the latter. Under these conditions, we observe that the cross-attention architecture performs 7 points better in Table 3.
+
+Out of the total number of parameters, approximately 10% for the fully autoregressive architecture and 25% for the cross-attention are trained. We hypothesize that this low proportion limits the expressivity of the training and hinders performance. To test that hypothesis, we compare the two architectures by unfreezing all parameters (newly initialized parameters and parameters of the pre-trained unimodal backbones). Under these conditions, training the fully autoregressive architecture would yield loss divergences, and we were not successful in stabilizing the training even by aggressively lowering the learning rate or gradually unfreezing various components. To overcome this stability challenge, we leverage Low-Rank Adaptation (Hu et al., 2022) to adapt the pre-trained parameters while using standard full fine-tuning for the newly initialized ones.
+
+This setup yields significantly more stable trainings, and more importantly, we observe a 12.9 points increase under the fully autoregressive architecture, and 0.6 point under the cross-attention architecture. While the cross-attention architecture performs better than the fully autoregressive architecture with frozen backbones, it is worse when we add degrees of liberty for the pre-trained backbones. Besides, using LoRA allows training the unimodal backbones at a fraction of the GPU memory cost of full fine-tuning, and LoRA layers can be merged back into the original linear layers
+
+  
+**VE backbone** & **Res.** & **Avg. score** \\  CLIP-ViT-H & 224 & 57.4 \\ EVA-CLIP-5B & 224 & 60.2 \\ SigLIP-SO400M & 384 & 60.7 \\   
+
+Table 2: Ablation on the vision encoder backbone.
+
+  
+**Architecture** &  **Backbones** \\ **training** \\  & **\# params** & 
+ **\# trainable** \\ **params** \\  & **Avg. score** \\  Fully autore. no Perceiver & Frozen & 7.6B & 5M & 51.8 \\ Fully autore. & Frozen & 8.3B & 740M & 60.3 \\ Cross-attention & Frozen & 10B & 2.3B & 66.7 \\ Cross-attention & LoRA & 10B & 2.5B & 67.3 \\ Fully autore. & LoRA & 8.3B & 950M & 69.5 \\   
+
+Table 3: Ablation for the architecture and method of training.
+
+yielding no additional cost at inference. We therefore choose the fully autoregressive architecture in the rest of this work.
+
+It is interesting to note that this finding contradicts (Karamcheti et al., 2024) in which the authors observed that unfreezing the pre-trained visual backbone would significantly degrade the performance. We hypothesize that using parameter-efficient fine-tuning methods is a key difference.
+
+|}  _Finding 2._ & The cross-attention architecture performs better than the fully autoregressive one when unimodal pre-trained backbones are kept frozen. However, when training the unimodal backbones, the fully autoregressive architecture outperforms the cross-attention one, even though the latter has more parameters. \\  _Finding 3._ & Unfreezing the pre-trained backbones under the fully autoregressive architecture can lead to training divergences. Leveraging LoRA still adds expressivity to the training and stabilizes it. \\  
+
+### Where are the efficiency gains?
+
+Number of visual tokensRecent VLMs typically route the entire sequence of the vision encoder's hidden states directly into the modality projection layer, which subsequently inputs into the language model, with no pooling. This is motivated by previous works in which adding a pooling strategy, like average pooling, was found to deteriorate the performance (Vallaeys et al., 2024). This results in a high number of visual tokens for each image ranging from 576 for DeepSeek-VL (Lu et al., 2024) to 2890 for SPHINX-2k (Lin et al., 2023). With the resulting sequence lengths, training is computationally costly, and in-context learning with interleaved images and texts is challenging because it requires modifications to the language models to handle very large context windows.
+
+We reduce the sequence length of each image's hidden states by using a perceiver resampler (Jaegle et al., 2021) as a form of trainable Transformer-based pooling. The number of queries (also referred to as latents) corresponds to the number of resulting visual tokens after the pooling (from one for classification Touvron et al. (2021) to several in Alayrac et al. (2022) or a growing number for continual learning Douillard et al. (2022)). We observe that the learned pooling is effective in two ways: it increases the performance by 8.5 points on average and reduces the number of visual tokens necessary for each image from 729 to 64 (see Table 3).
+
+In contrast to (Vallaeys et al., 2024; McKinzie et al., 2024) which find that the more visual tokens the higher the performance, we observe no gains when using more than 64 visual tokens. Other variations over the Perceiver architecture (Manas et al., 2023; Darcet et al., 2024; Vallaeys et al., 2024) resulted in decreased performance.
+
+|}  _Finding 4._ & Reducing the number of visual tokens with learned pooling significantly improves compute efficiency at training and inference while improving performance on non-OCR downstream tasks. \\  
+
+Preserving the original aspect ratio and image resolutionVision encoders, such as SigLIP, are typically trained on fixed-size square images. Resizing images alters their original aspect ratio, which is problematic, for instance, for tasks requiring reading long texts. Furthermore, conditioning the training on a single resolution size inherently introduces limitations: a low resolution omits crucial visual details, while a high resolution leads to inefficiency in training and inference. Allowing the model to encode images at various resolutions allows users to decide how much compute is spent on each image.
+
+Following Lee et al. (2023); Dehghani et al. (2023), we pass the image patches to the vision encoder without resizing the image or modifying its aspect ratio. Given that SigLIP was trained on fixed-size low-resolution square images, we interpolate the pre-trained positional embeddings to allow for
+
+  
+**Topoling** & **\# vis. tok.** & **Avg. score** \\  Perceiver & 128 & 71.2 \\ Perceiver & 64 & 71.7 \\   
+
+Table 4: Ablation on the pooling strategy.
+
+  
+**Images** & **Res.** & **Avg. score** \\  Square images & 768 & 73.1 \\ AR preserving & 378-768 & 72.1 \\   
+
+Table 5: Ablation on the aspect-ratio preserving strategy.
+
+a higher resolution and train the vision encoder with LoRA parameters to adapt to these modifications.2
+
+Our findings indicate that the aspect ratio preserving strategy maintains performance levels on downstream tasks while unlocking computational flexibility during both training and inference (see Table 5). In particular, not having to resize images to the same high resolution allows for saving GPU memory and handling images at the resolution they require.
+
+[leftmargin=*]
+
+_Finding 5._Adapting a vision encoder pre-trained on fixed-size square images to preserve images' original aspect ratio and resolution does not degrade performance while speeding up training and inference and reducing memory.
+
+### How can one trade compute for performance?
+
+[Lin et al., 2023; Li et al., 2023; Liu et al., 2024; McKinzie et al., 2024] show that splitting an image into sub-images allows boosting the downstream performance with no changes to the model's signature. An image is decomposed into sub-images (for instance 4 equal sub-images), which are then concatenated to the original image to form a sequence of 5 images. Additionally, the sub-images are resized to the original image's size. This strategy however comes at the cost of a much higher number of tokens to encode the images.
+
+We adopt this strategy during the instruction fine-tuning stage. Each single image becomes a list of 5 images: 4 crops and the original image. This way, at inference, the model is able to deal with standalone images (64 visual tokens per image), as well as artificially augmented images (320 visual tokens in total per image). We notice that this strategy is particularly useful for benchmarks like TextVQA and DocVQA, which require a sufficiently high resolution to extract the text in an image (see Table 9).
+
+Moreover, when we apply image splitting to only 50% of the training samples (instead of 100% of the samples), we observe that it does not impair the performance increase that image splitting provides. Surprisingly, we find at evaluation time that increasing the resolution of the sub-images (and the standalone image) provides only a minor boost in performance compared to the improvement yielded by sole image splitting: 73.6% when increasing the resolution of the sub-images to the maximum vs 73.0% accuracy on our validation set of TextVQA, and respectively 72.7 vs 72.9 ANLS on the validation set of DocVQA.
+
+[leftmargin=*]
+
+_Finding 6._Splitting images into sub-images during training allow trading compute efficiency for more performance during inference. The increase in performance is particularly noticeable in tasks involving reading text in an image.
+
+## 4 Idefics2 - an open state-of-the-art vision-language foundation model
+
+With these learnings in hand, we train an open 8B parameters vision-language model: Idefics2. This section describes the construction of the model, the choice of the dataset, the sequence of training phases and compares the resulting model against VLMs baselines.
+
+### Multi-stage pre-training
+
+We start from SigLIP-SO400M and Mistral-7B-v0.1 and pre-train Idefics2 on 3 types of data.
+
+**Interleaved image-text documents** We use OBELICS [Laurencon et al., 2023], an open web-scale dataset of interleaved image-text documents with 350 million images and 115 billion text tokens. As shown by the authors, the long documents of OBELICS allow for preserving the performance of the language model while learning to deal with an arbitrary number of interleaved images and texts and long context. Additionally, the authors show that interleaved image-text documents are the biggest driving factor in increasing the performance on visual question answering (VQA) tasks, in particular in the in-context learning setup. We perform an additional removal of newly opted-out content in January 2024 using the Spawning API3 even though OBELICS had already been filtered to exclude opted-out content as of September 2023. We also removed the 5% of documents with the highest perplexity scores, as computed by Falcon-1B (Penedo et al., 2023).
+
+Image-text pairsTraining on image-text pairs allows the model to learn the alignment between images and their associated texts. We use a combination of high-quality human-annotated image-text pairs from PMD (Singh et al., 2022) and higher-noise web-scale image-text pairs from (Schuhmann et al., 2022). To limit the amount of poor-quality data, we opt for the synthetic captions obtained through the LAION COCO4 version of the dataset where images have been captioned with a model trained on COCO. This improves the quality of the training samples and thus the quality of the resulting model (see Table 6). We use a NSFW classifier5 with a high recall and remove 7% of the samples in LAION COCO. We manually inspect 5'000 examples and found 28 pornographic images in the original LAION COCO and only 1 after filtering. This filtering does not negatively impact the downstream performance.
+
+PDF documentsSun et al. (2023) shows that a large proportion of mistakes of state-of-the art VLMs stem from their failure to accurately extract text in images or documents. In order to obtain strong OCR and document understanding abilities, we train Idefics2 on different sources of PDF documents: 19 million industry documents from OCR-IDL (Biten et al., 2022) and 18 million pages from PDFA6. Moreover, we add Rendered Text7 to complement the dataset with texts written with a wide variety of fonts and colors and on diverse backgrounds. These integrations significantly boost the performance on benchmarks that require reading text without decreasing the performance on other benchmarks (see Table 7).
+
+To maximize compute efficiency, we decompose the pre-training in two stages. In the first stage, we limit the max image resolution to 384 pixels, which allows us to use a large global batch size of 2'048 (17k images and 2.5M text tokens on average). We sample OBELICS for 70% of the examples with a maximum sequence length of 2'048, and the image-text pairs datasets for 30% of the examples with a maximum sequence length of 1'536. In the second stage, we introduce PDF documents. Since they require a higher image resolution for the text to be legible, we increase the resolution to a maximum of 980 pixels. We use the same global batch size, but have to decrease the per-device batch size and use gradient accumulation to compensate for the additional memory cost. OBELICS represents 45% of the examples with a maximum sequence length of 2'048, image-text pairs represent 35% of the examples with a maximum sequence length of 1'536, and PDF documents represent the remaining 20% of the examples with a maximum sequence length of 1'024. Additionally, we randomly scale up images to adequately cover the distribution of potential image sizes. We emphasize that the training stages are different than the ones ablated in (Karamcheti et al., 2024): instead of selectively freezing/unfreezing parts of the model, we train the entire model during both stages (some parameters are trained with LoRA) and increase the image resolution from one stage to the other.
+
+We use a learning rate of \(10^{-4}\) with AdamW for the optimizer, and do around 2 epochs on our training data. It corresponds to approximately 1.5 billion images and 225 billion text tokens. We note that this is orders of magnitude more training data than other open VLMs. For example, ShareGPT (Chen et al., 2023) uses 1.2 million images, while Monkey (Li et al., 2023) uses 1.4 million for training. In total, we use 32 nodes of eight H100s each for 3 weeks for the multi-stage pre-training.
+
+To evaluate the base model, we consider VQAv2 (Goyal et al., 2017), TextVQA (Singh et al., 2019), OKVQA (Marino et al., 2019), and COCO (Lin et al., 2014). Table 8 presents the results. While having fewer tokens per image, and thus being more efficient, Idefics2-base performs favorably
+
+  
+**Captions** & **Avg. score** \\  Alt-texts & 49.8 \\ Synthetic & 52.9 \\   
+
+Table 6: Ablation on synthetic captions against alt-text for image-text pairs.
+
+  
+**OCR data** & **Res.** & **DocVQA** \\  W/o & 384 & 22.6 \\ W/o & 768 & 42.9 \\ W/ & 768 & 49.9 \\   
+
+Table 7: Ablation on the synergy between OCR data and image resolution. We pre-trained the models for 5’500 steps, followed by 500 steps of fine-tuning on DocVQA.
+
+compared to the other current best base VLMs (OpenFlamingo (Awadalla et al., 2023), Idefics1 (Laurencon et al., 2023), Flamingo (Alayrac et al., 2022), and MM1 (McKinzie et al., 2024)). It is notably much better at reading texts in an image. Figure 3 shows an example of an output from the base model on a task similar to the pre-training.
+
+### Instruction fine-tuning
+
+We continue the training with an instruction fine-tuning phase.
+
+To do so, we create and release The Cauldron8, a massive collection of 50 vision-language datasets, covering a wide range of tasks: general visual question answering, counting, captioning, text transcription, document understanding, chart/figure understanding, table understanding, visual reasoning, geometry, spotting differences between 2 images or converting a screenshot to a functional code. Similarly to (Sanh et al., 2022; Wei et al., 2022; Bach et al., 2022; Dai et al., 2023; Li et al., 2023), each dataset is prompted into a shared question/answer format. When there are multiple question/answer pairs per image, we concatenate the pairs into a multi-turn conversation. We deduplicate the training set against the evaluation sets, ensuring that there is minimum contamination from the training to the evaluation.
+
+In addition to these vision-language datasets and following insights from (McKinzie et al., 2024), we add text-only instruction datasets to the mixture. The datasets aim at teaching the model to follow complex instructions, solve mathematical problems, or do arithmetic calculations. We give more details about the chosen datasets, the number of images, question-answer pairs, and size of each of the subsets, as well as our selected mixture proportion in Table 14 in Appendix A.2.1.
+
+We instruction-tune the base model using DoRA (Liu et al., 2024) (a variant of LoRA). During the fine-tuning, we only compute the loss on the tokens of the answers in the Q/A pairs. Since we are doing many epochs over some of the datasets, we employ several strategies to lower the risk of overfitting. First, we add noise to the embeddings with the NEFTune (Jain et al., 2024) technique.
+
+Figure 3: An example of text transcription with Idefics2-base.
+
+  
+**Model** & **Size** & **Archi.** & 
+ **\# tokens** \\ **per image** \\  & **VQAv2** & **TextVQA** & **OKVQA** & **COCO** \\  OpenFlamingo & 9B & CA & - & 54.8 & 29.1 & 41.1 & 96.3 \\ Idefics1 & 9B & CA & - & 56.4 & 27.5 & 47.7 & 97.0 \\ Flamingo & 9B & CA & - & 58.0 & 33.6 & 50.0 & 99.0 \\ MM1 & 7B & FA & 144 & 63.6 & 46.3 & 51.4 & **116.3** \\  Idefics2-base & 8B & FA & **64** & **70.3** & **57.9** & **54.6** & 116.0 \\   
+
+Table 8: Performance of Idefics2-base against state-of-the-art base VLMs. The evaluations were done with 8 random in-context examples, and in an open-ended setting for VQA tasks.
+
+_FA: fully autoregressive architecture. CA: cross-attention architecture. (Task, Metric, Split): (VQAv2, VQA acc., testdev), (TextVQA, VQA acc., val), (OKVQA, VQA acc., val), (COCO, CIDEr, test)_
+
+[MISSING_PAGE_FAIL:9]

@@ -1,0 +1,171 @@
+# CPSample: Classifier Protected Sampling for
+
+Guarding Training Data During Diffusion
+
+Joshua Kazdan\({}^{1}\), Hao Sun\({}^{2}\), Jiaqi Han\({}^{2}\), Felix Petersen\({}^{2}\), Frederick Vu\({}^{3}\), Stefano Ermon\({}^{2}\)
+
+\({}^{1}\)Department of Statistics, Stanford University
+
+\({}^{2}\)Department of Computer Science, Stanford University
+
+\({}^{3}\)Department of Mathematics, UCLA
+
+###### Abstract
+
+Diffusion models have a tendency to exactly replicate their training data, especially when trained on small datasets. Most prior work has sought to mitigate this problem by imposing differential privacy constraints or masking parts of the training data, resulting in a notable substantial decrease in image quality. We present CPSample, a method that modifies the sampling process to prevent training data replication while preserving image quality. CPSample utilizes a classifier that is trained to overfit on random binary labels attached to the training data. CPSample then uses classifier guidance to steer the generation process away from the set of points that can be classified with high certainty, a set that includes the training data. CPSample achieves FID scores of 4.97 and 2.97 on CIFAR-10 and CelebA-64, respectively, without producing exact replicates of the training data. Unlike prior methods intended to guard the training images, CPSample only requires training a classifier rather than retraining a diffusion model, which is computationally cheaper. Moreover, our technique provides diffusion models with greater robustness against membership inference attacks, wherein an adversary attempts to discern which images were in the model's training dataset. We show that CPSample behaves like a built-in rejection sampler, and we demonstrate its capabilities to prevent mode collapse in Stable Diffusion.
+
+## 1 Introduction
+
+Diffusion models are an emerging method of image generation that have surpassed GANs on many common benchmarks , achieving state-of-the-art FID scores on CIFAR-10 , CelebA , ImageNet , and other touchstone datasets. Although their capabilities are impressive, diffusion models still suffer from the tendency to exactly replicate images found in their training sets [5; 24; 41]. Given that diffusion models are sometimes trained on sensitive content, such as patient data [26; 38] or copyrighted data , this behavior is generally unacceptable. Indeed, Google, Midjourney, and Stability AI are already facing lawsuits for using copyrighted data to train image generation models [3; 4], some of which exactly replicate images from their training data during inference .
+
+The strongest formal guarantee against replicating or revealing training data is differential privacy (DP) . Although differentially private training methods for GANs (DP-GAN) , diffusion models (DPDM, DP-Diffusion) [12; 18], and latent diffusion models (DP-LDM)  have been developed, they typically result in significant degradation of image quality, and the balancing of privacy and image quality is complicated by the need to retrain models when adjusting desired levels of privacy. Due to this trade-off, some researchers have focused on producing model characteristics that are guaranteed by differential privacy, such as robustness to membership inference attacks , whereby the attacker aims to infer whether a given image was used to train the model. While a multitude of membership inference attacks have been developed, so far, few methods besidesdifferential privacy and data augmentation [33; 37] explicitly aim to defend against these attacks. Ambient diffusion  is one method to prevent excessive similarity to the training data without enforcing differential privacy; however, ambient diffusion still has notable negative effects on FID scores.
+
+Until recently, preventing image replication by diffusion models has involved corruption-based training methods, such as adding noise to gradients , diversifying images and captions , or corrupting the images themselves . Hyperparameter tuning for these methods requires retraining, making it difficult to calibrate them to the necessary level of privacy. Rejection sampling is a simple alternative that can guarantee that the training images will not be exactly replicated. However, rejection sampling is inefficient, and in extreme cases of model collapse as seen in Stable Diffusion , the model must be queried hundreds of times for an original image. Furthermore, rejection sampling is prone to membership inference attacks and privacy leakages .
+
+We present classifier-protected sampling (CPSample), a diffusion-specific data protection technique that, while not strictly differentially private, fortifies against some membership inference attacks and greatly reduces excessive similarity between the training and generated data. By overfitting a classifier on random binary labels assigned to the training data, CPSample guides the image generation process away from training data points. While rejection sampling only protects the final output, CPSample offers protection against some membership inference attacks during the generation process. CPSample achieves SOTA image quality, improving over previous data protection methods, such as ambient diffusion, DPDMs, and PAC Privacy Preserving Diffusion Models  for similar levels of "privacy", and offers flexibility in adjusting the level of protection without retraining, making it more efficient and adaptable for existing models. We summarize the primary contributions of our work as follows:
+
+* In Section 3.1, we introduce CPSample, a novel method of classifier-guidance for privacy protection in diffusion models that can be applied to existing models without retraining.
+* We show theoretically in Section 3.2 and empirically in Section 4.1 that CPSample prevents training data replication in unguided diffusion. We also provide evidence in Section 4.2 that CPSample can protect text-based image generation models, like Stable Diffusion.
+* We give empirical evidence that CPSample can foil some membership inference attacks in Section 4.3.
+* We demonstrate in Section 4.4 that CPSample attains better FID scores than existing methods of privacy protection while still eliminating replication of the training data.
+
+## 2 Background and Related Work
+
+### Diffusion Models
+
+We begin with a review of diffusion models. Denoising diffusion probabilistic models (DDPMs) [40; 20] gradually add Gaussian noise to image data during the "forward" process. Meanwhile, one trains a "denoiser" to predict the original image from the corrupted samples in a so-called "backward" process. During the forward process, one assigns
+
+\[x_{t}=}x_{0}+}\] (2.1)
+
+where \((0,I)\), \(x_{0}\) is the original image, and \(_{t}\) indicates the noise schedule. The variable \(t\{0,...,T\}\) specifies the step of the forward process, where \(x_{0}\) represents an image in the training data. When \(_{T}\) is set sufficiently close to \(0\), \(x_{T}\) is approximately drawn from a standard normal distribution. During intermediate steps, the distribution of \(x_{t}\) is
+
+\[q(x_{t} x_{0})=(x_{t};}x_{0},(1-_{t})I).\] (2.2)
+
+During training, one performs gradient descent on \(\) to minimize the score-matching loss, given by
+
+\[_{(0,1),x_{0}}[_{t=1 }^{T}^{2}}\|-_{}(_{t}}x_{0}+_{t}},t)\|^{2}].\] (2.3)
+
+Here, \(\) is the target distribution, which is approximated by sampling from the training data. Finally, to generate a new image, one samples standard Gaussian noise \(x_{T}(0,I)\). Then, one gradually denoises \(x_{T}\) by letting
+
+\[x_{t-1}=}}(x_{t}-}{_{t}}}_{}(x_{t},t))+_{t}z_{t},\] (2.4)
+
+where in each step, one has \(z_{t}(0,I)\), and \(_{t}\) and \(_{t}\) are scalar functions determined by the noise schedule that govern the rate of the backward diffusion process.
+
+Despite the superior image quality afforded by DDPMs, the sampling process sometimes involves \(1\,000\) or more steps, which has led to a variety of sampling schemes and distillation methods for speeding up inference [43; 27; 44; 19]. One of the most commonly used modifications to the sampling process is denoising diffusion implicit models (DDIMs), which enable skipping steps in the backward process.
+
+Currently, the state-of-the-art for guided generation is achieved by models with classifier-free guidance . However, since CPSample employs a classifier to prevent replication of its training data, it is more useful for us to review its predecessor, classifier-guided diffusion [29; 11]. In classifier guided diffusion, a pretrained classifier \(p_{}(y x_{t},t)\) assigns a probability to the event that \(x_{t}=}x_{0}+}\) for some \(x_{0}\) with label \(y\). The sampling process for classifier-guided DDIM is modified by
+
+\[_{t}=_{}(x_{t})-_{t}}_{x_{t}} p_{}(y x_{t},t)\] (2.5) \[x_{t-1}=_{t-1}}(-_{t}}_{t}}{_{t}}} )+_{t}}_{t}.\] (2.6)
+
+Such a modification of the sampling procedure corresponds to sampling \(x_{t}\) from the joint distribution:
+
+\[p_{,}(x_{t},y x_{t+1},t)=Zp_{}(x_{t} x_{t+1},t)p_{ }(y x_{t},t)\] (2.7)
+
+where \(Z\) is a normalization constant. This formulation can be adapted for continuous-time models, but for discrete-time models, additional care must be taken to ensure accuracy (see Appendix A for additional details).
+
+### Privacy in Diffusion Models
+
+Differential privacy (DP) is generally considered to be the gold standard for protecting sensitive data. The formal definition of (\(\)-\(\)) differential privacy is as follows :
+
+**Definition 2.1** ((\(\)-\(\))-Differential privacy).: _Let \(\) be a randomized algorithm that takes a dataset as input and has its output in \(\). If \(D_{1}\) and \(D_{2}\) are datasets with symmetric difference \(1\), then \(\) is \(\)-\(\) differentially private if for all \(S\),_
+
+\[((D_{1}) S)((D_{2}) S)e^{ }+.\] (2.8)
+
+DP ensures that the removal or addition of a single data point to the dataset does not significantly affect the outcome of the algorithm, thus protecting the identity of individuals within the dataset. It is highly improbable that a DP model will exactly reveal members of its training data. Therefore, while preventing exact replication of training data alone does not imply differential privacy, it still captures one of its desirable properties: the reduced likelihood of revealing one of its training data points.
+
+Though DP offers a formal guarantee that one's data is secure, imposing a DP constraint in practice severely compromises the quality of the synthetic images. Researchers thus often use empirical measures of similarity to determine the effectiveness of the models in providing privacy. For example, one can measure the distance of generated images to their nearest neighbors in the training set and try to ensure that the number with similarity exceeding some threshold is small [9; 8]. One typically computes similarity either via least squares or via cosine similarity, given by
+
+\[(x)}{\|x\|\|(x)\|},\] (2.9)
+
+with cosine similarity typically being computed in a feature space rather than the raw pixel space [35; 48]. Here, \((x)\) denotes the nearest neighbor of \(x\) among the training data. In 2023, MetaAIdeveloped the FAISS library for efficient similarity search using neural networks , making this type of privacy metric possible to compute approximately in a reasonable amount of time.
+
+Until recently, all attempts at enforcing privacy for diffusion models occurred during training. In 2023,  developed a method of classifier-guided sampling (PACPD) that has PAC privacy advantages over standard denoising. For text-guided models,  developed a method of randomly changing influential input tokens to avoid exact memorization, and  protected training data using a regularization technique on the classifier-free guidance network during training. In 2024,  devised a guidance method (AMG) which calculates similarity metrics at each step in the denoising schedule in order to guide the sampling process away from similar data points in the training corpus. By utilizing similarity metrics directly, they were able to effectively eliminate memorization in both text-conditional and unconditional diffusion models. Though theoretically valuable, the need to have access to the training data and to compute similarity measures at runtime is impractical for use outside of a research environment.
+
+### Membership Inference Attacks
+
+A third privacy measurement comes from membership inference attacks [15; 36; 14; 47], whereby one tries to discern whether a given data point was a member of the training set for the model. Membership inference attacks against diffusion models usually hinge on observed differences in reconstruction loss or likelihood that come from overfitting. If the resulting mean reconstruction error is significantly higher for test data than for training data, then we say that the diffusion model has failed the inference attack. Robustness to membership inference attacks is implied by differential privacy. In this paper, we test CPSample against a slight modification of the membership inference attack from , as described in Algorithm 1 in Appendix E.
+
+## 3 Protecting Privacy During Sampling
+
+In this section, we address the problem of training data replication in diffusion models, which poses significant privacy risks. One common solution to this problem is rejection sampling, whereby samples that closely resemble training data are discarded, but this method is computationally expensive and inefficient, as in extreme cases of mode collapse, one may need to generate dozens of images before generating original content.
+
+To overcome these limitations, we introduce CPSample, a method that integrates classifier guidance into the sampling process to avoid resampling. By overfitting a classifier on random binary labels assigned to the training data, CPSample steers away the generation process from the training data, thereby reducing the likelihood of replicating training data while preserving image quality.
+
+### Sampling Method
+
+The first step in CPSample is to train a classifier to assess the likelihood that a sample \(x_{t}\) will coincide with a member of the training data at the end of the denoising process. The classifier is trained to memorize random binary labels assigned to the training data. It was shown in  that this can be achieved with a network with a number of parameters that is linearly proportional to the size of the dataset, with a small constant of proportionality. Additionally, the training time required to memorize random labels is only a small constant factor more compared to the time it takes to memorize real, non-random labels. To address duplicated data in the training corpus, after the classifier has been sufficiently trained, items for which the classifier still shows significant loss can be reassigned a common label. Further training then ensures the classifier memorizes these items.
+
+During the denoising process, whenever the classifier predicts a label \(y\{0,1\}\) for \(x_{t}\) with probability greater than \(1-\), we perturb \(x_{t-1}\) towards data points with the opposite label using classifier guidance. For example, if the classifier predicts the label \(1\) with high probability, we adjust the sampling process to draw from the conditional distribution \(p_{,}(x_{t-1} x_{t},t,y=0)\), leading to a reduced likelihood of the final generated sample being close to the training data.
+
+To state our procedure more precisely, let \(_{}(,)\) be the denoiser. Note that the classifier is trained only once on the training data and not during each sample generation. The sampling process is then modified in the following steps:1. Randomly assign Bernoulli\((0.5)\) labels to each member of the training data, and let \(B\{0,1\}^{n}\) index these random labels. Train a classifier \(p_{}(y x_{t},t)\) to predict these labels. Here, \(x_{t}\) is generated by corrupting the training data \(x_{0}\) with noise: \(x_{t}=}x_{0}+}\) for \((0,I)\) and \(t\{0,...,T\}\).
+2. Set a tolerance threshold \(0<<0.5\) and a scale parameter \(s\). Let \(p_{}(y x_{t},t)\) be the probability assigned to the label \(y\) by the classifier \(p_{}(y x_{t},t)\). Sample \(x_{T}(0,I)\). For \(t\{T,....,1\}\), if \(p_{}(y=0 x_{t},t)<\), replace \(_{}(x_{t},t)\) with \[_{,}(x_{t},t)=_{}(x_{t},t)-s_{t}}(p_{}(y=0 x_{t},t)).\] If \(p_{}(y=1 x_{t},t)<\), replace \(_{}\) with \[_{,}(x_{t},t)=_{}(x_{t},t)-s_{t}}(p_{}(y=1 x_{t},t)).\] Otherwise, we leave the sampling process unchanged.
+
+The perturbation applied by the gradient of the log probability in CPSample moves the generated images away from regions where they can be easily classified as similar to the training data. Using random labels for the classifier has significant advantages over other approaches. If instead attributes of the data were used as labels, the classifier could push the generated images towards or away from specific attributes, influencing the content of the generated images in ways that could compromise their authenticity and diversity. This method is additionally far more effective than adding random noise, which would require significant amounts to achieve the same effect, thus degrading image quality.
+
+Unlike past training-based methods of privacy protection such as ambient diffusion and DPDM, once we have trained the classifier, we can adjust the level of protection by tuning the hyperparameters \(s\) and \(\) without necessitating retraining of the classifier or denoiser. Our method also does not require access to the training data or excessive additional computation during sampling as the inferenced-based method AMG does.
+
+### Theory
+
+In this section, we show that CPSample functions similarly to rejection sampling when preventing exact replication of the training images. We work under the following assumptions:
+
+**Assumption 1**.: _Suppose that the classifier \(p_{}(y x,t)\) has Lipschitz constant \(L\) in the argument \(x\) with respect to a metric \(d(,):_{ 0}\), where \(\) denotes the image space._
+
+**Assumption 2**.: _Let \(y_{i}\) be the random label assigned to \(x_{i} D\), where \(D\) is the training data. Let \(<\) be such that for all \(x_{i} D\), we have_
+
+\[p_{}(y_{i} x_{i},0)(1-,1].\] (3.1)
+
+**Assumption 3**.: _Suppose that CPSample generates data \(\) such that \(<p_{}(y,0)<1-\) with probability greater than \(1-\), where we are able to govern \(\) and \(\) by adjusting \(s\) and \(\) in Section 3.1._
+
+In Assumption 1 the constant \(L\) can be difficult to evaluate, but the assumption holds for neural network classifiers. Methods exist that can bound the local Lipschitz constant around the training data , which one can use to strengthen the guarantees of Lemma 1. Assumption 3 holds well empirically, and in Assumption 2, one can typically exert strong control over the size of \(\) without incurring too much additional computational overhead . Concretely, we were able to train our classifier to have a cross-entropy loss below \(0.05\) in the experiments from Sections 4.1 and 4.2. Moreover, during sampling, we observed that CPSample had control over the quantity \(p_{}(y x_{t},t)\). An example is given in Figure 5.
+
+Given these assumptions, we can demonstrate the following simple lemma, which links the behavior of CPSample to that of a rejection sampler without requiring expensive comparisons to the training dataset. A proof can be found in Appendix A.
+
+**Lemma 1**.: _Under the above assumptions, choose \(>0\) and \(0<<-}{L}\). Setting \(=\) and \(=+L\), when drawing a single sample, with probability greater than \(1-\), CPSample generates an image that lies outside of \(S=_{x D}B_{}(x)\) in the metric space defined by \(d\)._Note that the ability to control \((_{x D}B_{}(x))\) gives the same guarantee offered by rejection sampling. However, in extreme instances of mode collapse such as those exhibited by Stable Diffusion in Section 4.2, one might have to resample hundreds of times to generate original images, making standard rejection sampling highly inefficient. CPSample is able to produce original images without this high level of inefficiency.
+
+## 4 Empirical Results
+
+We run three distinct sets of experiments to demonstrate the ways in which CPSample protects the privacy of the training data. First, we statistically test the ability of CPSample to reduce similarity between generated data and the training set for unguided diffusion. We then demonstrate that CPSample can prevent Stable Diffusion from generating memorized images. Finally, we measure robustness against membership inference attacks. Hyperparameters, in all empirical tests, are chosen to maximize image quality while eliminating exact matches.
+
+### Similarity Reduction
+
+We generate images using DDIM with CPSample and \(1\,000\) denoising steps. The nearest neighbor to each generated image is found using Meta's FAISS model . Similarity between two images is measured by cosine similarity in a feature space defined by FAISS. We empirically find that a similarity score exceeding 0.97 often indicates nearly-identical images for CIFAR-10. For CelebA and LSUN Church, the thresholds lie around 0.95  and \(0.90\), respectively. Note that a cosine similarity score above the thresholds given is a necessary but not sufficient condition for images to look very alike. To ensure that we can observe a larger number of images with similarities exceeding our thresholds, we fine-tune the models using DDIM  on a subset of the data that consisted of \(1\,000\) images, as was done in . This modification allows us to statistically test the efficacy of CPSample without the large number of samples required to do hypothesis testing on rare exact replication events. After fine-tuning, up to \(12.5\%\) of the images produced by unprotected DDIM are nearly exact replicates of the fine-tuning data. One can see from Table 3 that CPSample significantly reduces the fraction of generated images that have high cosine similarity to members of the fine-tuning set. One can see histograms of the similarity score distribution with and without CPSample in Figures 1 and 9. Figures 2 and 8 show the most similar pairs of samples and fine-tuning data points. Uncurated images generated from CPSample can be found in Appendix F.
+
+While CPSample effectively reduces the similarity between generated images and the training data, our results in Table 6 indicate that CPSample achieves minimal degradation in quality compared to previous methods.
+
+Figure 1: Cosine similarity in feature space between generated images and their nearest neighbor in the fine-tuning dataset for standard DDIM sampling (red) and CPSample (blue) with \(=0.001,s=1\) on CIFAR-10 (left) and with \(=0.001,s=1\,000\) on CelebA-64 (right). Similarity scores were computed for \(21\,000\) generated samples for CIFAR-10 and \(8\,000\) images for CelebA. Note that standard DDIM exhibits many more samples with similarity scores exceeding the thresholds from Table 3.
+
+### Stable Diffusion
+
+As a second demonstration of CPSample, we present evidence that CPSample can prevent well-known examples of mode collapse in near-verbatim attacks against Stable Diffusion [45; 46]. We curate a small dataset of commonly reproduced images  and include other images from the LAION dataset depicting the same subjects, while ensuring that this dataset contains no duplicates. In this more targeted application, CPSample can prevent exact replication when used with the right hyperparameters. See Figure 3 and Table 4 for more details. Although CPSample does not provide as robust protection in this setting compared to [42; 46], these results highlight its potential for data protection in text-guided diffusion models. Moreover, the methods developed in [42; 46] do not apply to unguided diffusion models.
+
+### Membership Inference Attacks
+
+We also assess CPSample's ability to protect against membership inference attacks. Following Algorithm 1, we compute the mean reconstruction error for the training and test datasets and determine whether there is a statistically significant difference. To evaluate resistance to inference attacks, we use a model trained on the entire set of \(50\,000\) CIFAR-10 training images. We compare the reconstruction loss on these \(50\,000\) training images to the reconstruction loss on the \(10\,000\) withheld test samples included in the CIFAR-10 dataset. We compare the difference in reconstruction loss between these two datasets both for CPSample, using a classifier trained on the entirety of the CIFAR-10 training data with random labels, and for standard DDIM sampling. We demonstrate CPSample's resistance to inference attacks for \(\{0.5,0.25,0.001\}\) over approximately \(8\,000\) images from each of the training and test datasets. The \(p\)-values in this experiment are based on a two-sample, single-tailed \(Z\)-score that tests the null hypothesis "the average training reconstruction loss is less than or equal to the average test reconstruction loss." Precisely, let \(n\) denote the number of training data points and \(m\) denote the number of sampled test data points. The test statistic is then
+
+Figure 3: Selected examples for Stable Diffusion: original image (left), image generated from a similar caption by Stable Diffusion v1.4 (center), image generated with CPSample (right).
+
+Figure 2: Generated images and their most similar training image pairs for DDIM sampling and CPSample with \(=0.001,s=1\) on CIFAR-10 (left) and \(=0.1,s=10\) on LSUN Church (right). For each pair, the image on the left is the generated sample, and the one on the right is its nearest neighbor in the training set. These are the four examples out of \(21\,000\) images on CIFAR-10 and two out of \(1\,700\) images on LSUN Church with the highest similarity scores with their nearest neighbor.
+
+given by
+
+\[}-_{}}{}/m+V_{}/n}}.\]
+
+Here, the symbol \(V\) indicates the variance and \(\) indicates the mean. In this context, failure to reject the null hypothesis indicates a success for CPSample.
+
+We observe that in our experiments, a very low value of \(\) leads to a higher \(p\)-value, which is counter-intuitive on first glance. However, we believe that this occurs due to the fact that a small value of \(\) results in a more targeted application of CPSample, driving the loss up exclusively around the training data points. As shown in Table 5, for values of \(\) between \(0\) and \(0.5\), a conclusive membership inference attack against CPSample is not possible. We provide a second black-box membership inference attack based on permutation testing in Appendix E.
+
+### Quality Comparison
+
+As mentioned in the introduction and Section 4.1, other methods of privacy protection suffer from severe degradation of quality as measured by FID score. Here, we provide an FID score comparison between the CPSample model fine-tuned on curated subsets of CIFAR-10 and CelebA and existing methods of privacy protection. FID scores for unconditional generation of CIFAR-10 and CelebA are presented in Table 6. The images with the highest similarity to the training set, determined using FAISS, are shown in Figure 4. The particular values of \(\) and \(s\) were set in an attempt to find the least aggressive settings that still completely prevent exact replication of the training data. FID scores over a range of values for \(\) and \(s\) are displayed in Table 7.
+
+## 5 Limitations
+
+As mentioned in Section 3.1, the difference in training time required to get a classifier to memorize random labels versus real labels has been shown to be only a small constant factor . Compared to other leading methods of protecting training data, such as ambient diffusion, DPDM, and AMG, our method is significantly easier to employ in terms of computational resources. However, as we lack the resources to provide further empirical evidence beyond what has already been demonstrated in the literature, we leave this remark as a flag for a potential practical limitation of our method.
+
+Of slight theoretical concern is the difficulty in providing practical upper bounds on the Lipschitz constant of the classifier, for which a lower value would provide stronger formal guarantees of privacy. Further research into employing Lipschitz regularizations may both improve the performance of our method and provide stronger guarantees. In practice, we observe stronger protections than the formal guarantees provide.
+
+## 6 Conclusion
+
+We have presented a new approach to prevent memorized images from appearing during inference time. Our method is applicable to both guided and unguided diffusion models. Unlike previous methods intended to protect privacy of unguided diffusion models, CPSample does not necessitate retraining the denoiser. Moreover, the presence of duplicated data in the training corpus does not affect on our approach, and after training the classifier, one can adjust the level of protection enforced by CPSample without further training. We have shown theoretically that our method behaves similarly to rejection sampling without necessitating resampling. Finally, we have provided empirical evidence with rigorous statistical testing that our method is effective in unguided settings. We have also given examples in which CPSample was able to prevent extreme instances of mode collapse in Stable Diffusion. Despite its efficacy at preventing replication of training images, CPSample has little negative impact on image quality.
+
+Figure 4: The generated and real images with the highest similarity for CIFAR-10 (left) and CelebA (right) out of \(50\,000\) samples used to compute FID score.

@@ -1,0 +1,287 @@
+# Stochastic Taylor Derivative Estimator: Efficient amortization for arbitrary differential operators
+
+Zekun Shi
+
+National University of Singapore
+
+Sea AI Lab
+
+shizk@sea.com,
+
+&Zheyuan Hu
+
+National University of Singapore
+
+e0792494@u.nus.edu,
+
+&Min Lin
+
+Sea AI Lab
+
+linmin@sea.com,
+
+&Kenji Kawaguchi
+
+National University of Singapore
+
+kenji@nus.edu.sg
+
+###### Abstract
+
+Optimizing neural networks with loss that contain high-dimensional and high-order differential operators is expensive to evaluate with back-propagation due to \((d^{k})\) scaling of the derivative tensor size and the \((2^{k-1}L)\) scaling in the computation graph, where \(d\) is the dimension of the domain, \(L\) is the number of ops in the forward computation graph, and \(k\) is the derivative order. In previous works, the polynomial scaling in \(d\) was addressed by amortizing the computation over the optimization process via randomization. Separately, the exponential scaling in \(k\) for univariate functions (\(d=1\)) was addressed with high-order auto-differentiation (AD). In this work, we show how to efficiently perform arbitrary contraction of the derivative tensor of arbitrary order for multivariate functions, by properly constructing the input tangents to univariate high-order AD, which can be used to efficiently randomize any differential operator. When applied to Physics-Informed Neural Networks (PINNs), our method provides >1000\(\) speed-up and >30\(\) memory reduction over randomization with first-order AD, and we can now solve _1-million-dimensional PDEs in 8 minutes on a single NVIDIA A100 GPU1_. This work opens the possibility of using high-order differential operators in large-scale problems.
+
+Received the Best Paper Award at NeurIPS 2024
+
+## 1 Introduction
+
+In many problems, especially in Physics-informed machine learning [19; 33], one needs to solve optimization problems where the loss contains differential operators:
+
+\[*{arg\,min}_{}f(,u_{}(),^{^{(1)}}u_{}(),,^{^{(n)}}u_{ }()), u_{}:^{d}^{d^{}}.\] (1)
+
+In this above, \(^{}=}{ x_{1}^{_{1}}, , x_{d}^{_{d}}}\), \(=(_{1},_{2},,_{d})\) is a multi-index, \(u_{}\) is some neural network parameterized by \(\), and \(f\) is some cost function. When either the differentiation order \(k\) or the dimensionality \(d\) is high, the objective function above is expensive to evaluate with back-propagation (backward mode AD) in both memory and computation: the size of the derivative tensor has scaling \(d^{k}\), and the size of the computation graph has scaling \(2^{k-1}L\) where \(L\) is the number of ops in the forward computation graph.
+
+There have been several efforts to tackle this curse of dimensionality. One line of work uses randomization to amortize the cost of computing differential operators with AD over the optimization process so that the \(d\) in the above scaling becomes a constant for the case of \(k=2\). Stochastic Dimension Gradient Descent (SDGD)  randomizes over the input dimensions where in each iteration, the partial derivatives are only calculated for a minibatch of sampled dimensions with back-propagation. In [12; 21; 15], the classical technique of Hutchinson Trace Estimator (HTE)  is used to estimate the trace of Hessian or Jacobian to inputs. Others choose to bypass AD completely to reduce the complexity of computation. In , the finite difference method is used for estimating the Hessian trace. Randomized smoothing [11; 14] uses the expectation over Gaussian random variable as ansatz, so that its derivatives can be expressed as another expectation Gaussian random variable via Stein's identity . However, compared to AD, the accuracy of these methods is highly dependent on the choice of discretization.
+
+In this work, we address the scaling issue in both \(d\) and \(k\) for the optimization problem in Eq. 1 at the same time, by proposing an amortization scheme that can be efficiently evaluated via high-order AD, which we call _Stochastic Taylor Derivative Estimator (STDE)_. Our **main contributions** are:
+
+* We demonstrate how Taylor mode AD , a high-order AD method, can be used to amortize the optimization problem in Eq. 1. Specifically, we show that, with properly constructed input tangents, the univariate Taylor mode can be used to contract multivariate functions' derivative tensor of arbitrary order;
+* We provide a comprehensive procedure for randomizing arbitrary differential operators with STDE, while previous works mainly focus on the Laplacian operator, and we provide abundant examples of STDE constructed for operators in common PDEs;
+* STDE encompass and generalizes previous methods like SDGD  and HTE [16; 12]. We also prove that HTE-type estimator cannot be generalized beyond fourth order differential operator;
+* We determine the efficacy of STDE experimentally. When applied to PINN, our method provides a significant speed-up compared to the baseline method SDGD  and the backward-free method like random smoothing . Due to STDE's low memory requirements and reduced computation complexity, PINNs with STDE can **solve 1-million-dimensional PDEs on a single NVIDIA A100 40GB GPU within 8 minutes**, which shows that PINNs have the potential to solve complex real-world problems that can be modeled as high-dimensional PDEs. We also provide a detailed ablation study on the source of performance gain of our method.
+
+## 2 Related works
+
+High-order and forward mode ADThe idea of generalizing forward mode AD to high-order derivatives has existed in the AD community for a long time [5; 18; 40; 22]. However, accessible implementation for machine learning was not available until the recent implementation in JAX [6; 7], which implemented the Taylor mode AD for accelerating ODE solver. There are also efforts in creating the forward rule for a specific operator like the Laplacian [24; 23]. Randomization over the linearized part of the AD computation graph was considered in . Forward mode AD can also be used to compute neural network parameter gradient as shown in .
+
+Randomized Gradient EstimationRandomization [28; 29; 8] is a common technique for tackling the curse of dimensionality for numerical linear algebra computation, which can be applied naturally in amortized optimization . Hutchinson trace estimator  is a well-known technique, which has been applied to diffusion model  and PINNs . Another case that requires gradient estimation is when the analytical form of the target function is not available (black box), which means AD cannot be applied. The method of zeroth-order optimization  can be used in this case, as it only requires evaluating the function at arbitrary input. It is also useful when the function is very complicated like in the case of a large language model .
+
+## 3 Preliminaries and discussions
+
+### First-order auto-differentiation (AD)
+
+AD is a technique for evaluating the gradient of composition of known analytical functions commonly called primitives. In an AD framework, a neural network \(F_{}:^{d}^{d^{}}\) is constructed as the composition of primitives \(F_{i}\) that are parameterized by some parameters \(_{i}\). In this section, we will consider the neural networks with linear computation graphs like \(F=F_{L} F_{L-1} F_{1}\), but the results generalize to arbitrary directed acyclic graphs (DAGs). We will assume that all hidden dimensions are \(h\). See Appendix B for more details on first-order AD.
+
+Forward mode ADEach primitives \(F_{i}\) is linearized as the Frechet (directional) derivative \( F_{i}:^{h}(^{h},^ {h})\), which computes the Jacobian-vector-product (JVP): \( F_{i}()()=} }\), where \(\) is referred to as the primal and \(\) the tangent. \( F_{i}\) form a linearized computation graph (third row in Fig. 3), that computes the JVP of the composition \(}\):
+
+\[}= F()( )=[ F_{L} F_{L-1} F_{ 1}]()().\] (2)
+
+By setting the tangent to \(\) one of the standard basis of \(^{d}\), JVP computes one column of the Jacobian \(D_{F}\), so the full Jacobian can be computed with \(d\) JVPs. Each JVP call requires \(((d,h))\) memory as only the current activation \(_{i}\) and tangent \(_{i}\) are needed to carry out the computation, and the computation complexity is usually in the same order as the forward computation graph. In the case of MLP, both the forward and the linearized graph have a complexity of \(dh+(L-1)h^{2}\).
+
+Backward mode ADEach primitives \(F_{i}\) is linearized as the adjoint of the Frechet derivative \(^{}F_{i}\) instead, which computes the vector-Jacobian-product (VJP): \(^{}F_{i}()(^{})=^{}. }|_{}\) where \(^{}\) is the cotangent. The linearized computation graph now runs in the reverse order:
+
+\[^{}}=^{}F( )(^{})=[^{}F_{1}() ^{}F_{L-1}(_{L-2})^{}F_{L}(_{L-1})](^{}),\] (3)
+
+which is also clear from Fig. 3. Furthermore, due to this reversion, we first need to do a forward pass to obtain the evaluation trace \(\{_{i}\}_{i=1}^{L}\) before we can invoke the VJPs \(^{}F_{i}\), which apparent as shown in Eq. 3. Hence the number of sequential computations is twice as much compared to forward mode. The memory requirement becomes \((d+(L-1)h)\) as we need to store the entire evaluation trace. Similar to JVP, VJP computes one row of \(J_{F}\) at a time, so the full Jacobian \(}\) can be computed using \(d^{}\) VJPs. When optimizing scalar cost functions \(():^{n}\) of the network parameters \(\), backward mode efficiently trades off memory with computation complexity as \(d^{}=1\) and only \(1\) VJP is needed to get the full Jacobian. Furthermore, all parameter \(_{i}\) can use the same cotangent \(^{}\), whereas with forward mode, separate tangent for each parameter \(_{i}\) is needed.
+
+### Inefficiency of the first-order AD for high-order derivative on inputs
+
+High-order input derivatives \(u_{}}{^{k}}\) for scalar \(u_{}\) can be implemented as repeated applications of first-order AD, but this approach will exhibit fundamental inefficiency that cannot be remedied by randomization.
+
+Repeating backward mode ADWith each repeated application of backward mode AD, the new evaluation trace will include the cotangents from the previous application of backward AD, so the length of sequential computation **doubles**. Furthermore, the size of the cotangent also grows by \(d\) times. Therefore applying backward mode AD has additional memory cost of \((d+(L-1)h)\) and
+
+Figure 1: The computation graph of computing second order gradient by repeated application of backward mode AD, for a function \(F()\) with \(4\) primitives (\(L=4\)), which computes the Hessian-vector-product. Red nodes represent the cotangent nodes in the second backward pass. With each repeated application of VJP the length of sequential computation doubles.
+
+additional computation cost of \(2dh+2(L-1)h^{2}\), which is clear from Fig. 1. In general, with \(k\) repeated applications of backward mode AD will incur \(2^{k-1}(d+(L-1)h)\) memory cost and \(2^{k}(dh+(L-1)h^{2})\) computation cost. And \(d^{k-1}\) calls are needed to evaluate the entire derivative tensor. So both memory and compute scale **exponentially** in derivative order \(k\)
+
+Repeating forward mode ADConsider \(u_{}:^{d}\). The input tangent dimension is \(d\) on the first application of forward mode AD, but on the second application, it will become \(d d\) since we are now computing the forward mode AD for \( u_{}:^{d}^{d}\). So the size of the input tangent with \(k\) repeated application is \(d^{k}\), so it grows **exponentially**. This is also inefficient.
+
+Mixed mode AD schemes are also likely inefficientSee more detail in Appendix C.
+
+### Stochastic Dimension Gradient Descent
+
+SDGD  amortizes high-dimensional differential operators by computing only a minibatch of derivatives in each iteration. It replaces a differential operator \(\) with a randomly sampled subset of additive terms, where each term only depends on a few input dimensions
+
+\[:=_{j=1}^{N_{}}_{j}}}{|J|}_{j J}_{j}:=}_{J},\] (4)
+
+where \(}_{J}\) denotes the SDGD operator that approximates the true operator \(\), \(J\) is the sampled index set, and \(|J|\) is the batch size. For example, in \(d\)-dimensional Poisson equation, \(N_{}=d\), \(=_{j=1}^{d}}{ x_{j}^{2}}\), and the additive terms are \(_{j}=}{ x_{j}^{2}}\).
+
+\(}_{J}\) are cheaper to compute than \(\) due to reduced dimensionality: for each sampled index, by treating all other input as constant we get a function with scalar input and output. For a given index set \(J\), the memory requirements are reduced from \(2^{k-1}(d+(L-1)h)\) to \(|J|(2^{k-1}(1+(L-1)h))\), and the computation complexity reduces to \(|J|2^{k}(h+(L-1)h^{2})\). This reduction is significant when \(d h\) as in the experimental setting of SDGD , but the exponential scaling in \(k\) persists.
+
+### Univariate Taylor mode AD
+
+One way to define high-order AD is by determining how the high-order Taylor expansion of a univariate function changes when mapped by primitives. Firstly, the Frechet derivative \( F\) can be rewritten to operate on a space curve \(g:^{d}\) that passes through the primal \(\), i.e. \(g(t)=\), and has tangent \(g^{}(t)=\):
+
+\[ F(g(t))(g^{}(t))=.} |_{=g(t)}g^{}(t)=}{t}[F  g](t).\] (5)
+
+This shows that the \(\) (JVP) is the same as the univariate chain rule. The tuple \(J_{g}(t):=(g(t),g^{}(t))\) can be thought of as the first-order expansion of \(g\) which lives in the tangent bundle of \(F\). Treating \(F\) as the smooth map between manifolds, we can define the pushforward \(F\) which pushes the first order expansion of \(g\) (i.e. \(J_{g}(t)\)) forward to the first order expansion of \(F g\) (i.e. \(J_{F g}(t)\)):
+
+\[F(J_{g}(t))=J_{F g}(t)=([F g](t),}{ t}[F g](t))=(F(), F()( )).\] (6)
+
+Naturally, to extend this to higher orders, one can consider the \(k\)th order expansion of the input curve \(g\), which is equivalent to the tuple \(J_{g}^{k}(t):=(g(t),g^{}(t),g^{}(t),,g^{(k)}(t))=( ,^{(1)},^{(2)},,^{k})\) known as the \(k\)-jet of \(g\) where \(^{j}\) is called the \(j\)th order tangent of \(g\). \(J_{g}^{k}\) lives in the \(k\)th order tangent bundle of \(F\), and we can define the \(k\)th-order pushforward \(^{k}F\) :
+
+\[^{k}F(J_{g}^{k}(t))= J_{F g}^{k}(t)=([F g](t),[F g](t),}{ t^{2}}[F g](t), ,}{ t^{k}}[F g](t))\] (7) \[= (F(), F()(^{(1)}),^ {2}F()(^{(1)},^{(2)}),,^{k}F( )(^{(1)},,^{(k)})),\]
+
+which pushes the \(k\)th order expansion of \(g\) (i.e. \(J_{g}^{k}\)) forward to the \(k\)th order expansion of \(F g\) (i.e. \(J_{F g}^{k}\)). \(^{k}F=}{ t^{k}}[F g](t)\) is the \(k\)-th order Frechet derivative, whose analytical formula is given by the high-order univariate chain rule known as the Faa di Bruno's formula (Eq. 43).
+
+Since \(J_{g}^{k}\) contains all information needed to evaluate \(}{ t^{k}}[F g](t)\) for any \(j k\), the map \(^{k}F\) is well-defined. \(^{k}\) defines a high-order AD: we can compute \(^{k}F\) of arbitrary composition \(F\) from the \(k\)th-order pushforward of the primitives \(^{k}F_{i}\), since \(^{k}\) is an homomorphism of the group \((\{F_{i}\},)\):
+
+\[^{k}[F_{2} F_{1}](J_{g}^{k}(t))=J_{F_{2} F_{1} g}^{k} (t)=^{k}F_{2}(J_{F_{1} g}^{k}(t))=[^{k}F_{2} ^{k}F_{1}](J_{g}^{k}(t)).\] (8)
+
+This approach of composing \(^{k}\) of primitives is also known as the Taylor mode AD. For more details on Taylor mode AD, see Appendix D.
+
+## 4 Method
+
+From the previous discussion, it is clear that the exponential scaling in \(k\) for the problem described in Eq. 1 cannot be mitigated by amortization alone. Although high-order AD methods like Taylor mode AD  can address this scaling issue, it is only defined for univariate functions. In this section, we describe a method that addresses the scaling issue in \(k\) and \(d\) simultaneously when amortizing Eq. 1 by seeing univariate Taylor mode AD as contractions of multivariate derivative tensor.
+
+### Univariate Taylor mode AD as contractions of multivariate derivative tensor
+
+\(F\) projects the Jacobian of \(F\) to \(^{d^{}}\) with a 1-jet \(J_{g}(t)\). Similarly, \(^{k}F\) contracts a set of derivative tensors to \(^{d^{}}\) with a \(k\)-jet \(J_{g}^{k}\). We can expand \(}{ t^{k}}F g\) with Eq. 43 to see the form of the contractions. For example, \( F\) is JVP, and \(^{2}F\) contains a quadratic form of the Hessian \(D_{F}^{2}\):
+
+\[^{2}F()(^{(1)},^{(2)})=}{ t^{2}}[F g](t)=D_{F}()^{(2)}+D_{F}^{2}( )_{d^{},d_{1},d_{2}}v_{d_{1}}^{(1)}v_{d_{2}}^{(1)}.\] (9)
+
+From Eq. 43, one can always find a \(J_{g}^{l}\) with large enough \(l k\) such that there exists \(k l^{} l\) with \(^{l^{}}F(J_{g}^{l^{}})=D_{F}^{k}()_{ i=1}^{k}^{(v_{i})}\) where \(v_{i}[1,k]\), by setting some tangents \(^{(v_{i})}\) to the zero vector. That is, arbitrary derivative tensor contraction is contained within a Frechet derivative of high-order, which can be efficiently evaluated through Taylor mode AD.
+
+How large \(l\) should be depends on how off-diagonal the operator is. If the operator is diagonal (i.e. contains no mixed partial derivatives), \(l=k\) is enough. If the operator is maximally non-diagonal, i.e. it is a partial derivative where all dimensions to be differentiated are distinct, then the minimum \(l\) needed is \((1+k)k/2\). For more details, please refer to Appendix F where a general procedure for determining the jet structure is discussed.
+
+### Estimating arbitrary differential operator by pushing forward random jets
+
+Next, we show how to use the above facts to construct a stochastic estimator derivative operator. Differential operators can be evaluated through derivative tensor contraction. The action of the derivative \(^{}=}{ x_{1}^{_{1}}, , x_{d}^{_{d}}}\) on function \(u\) can be identified with the derivative tensor slice \(D_{u}^{||}()_{}\). Differential operator \(\) can be written as a linear combination of derivatives: \(=_{()}C_{}^{}\), where \(()\) is the set of tensor indices representing terms included in the operator \(\). For simplicity we only consider \(k\)th order differential operator, i.e. \(||=k\) for all \(\). For scalar \(u:^{d}\)
+
+Figure 2: The computation graph of \(^{2}F\) for \(F\) with \(4\) primitives. Parameters \(_{i}\) are omitted. The first column from the left represents the input 2-jet \(J_{g}^{2}(t)=(,^{(1)},^{(2)})\), and \(^{2}F_{1}\) pushes it forward to the 2-jet \(J_{F_{1} g}^{2}(t)=(_{1},_{1}^{(1)},_{1}^{ (2)})\) which is the subsequent column. Each row can be computed in parallel, and no evaluate trace needs to be cached.
+
+we can identify a \(k\)th order differential operator \(\) with the following tensor dot product
+
+\[u()=_{()}C_{} ^{}u()=_{d_{1},,d_{k}}D^{k}_{u}( )_{d_{1},,d_{k}}C_{d_{1},,dk}()=D^{k}_{u}() (),\] (10)
+
+where \(d_{i}[1,d],i[1,k]\) is the tensor index on the \(i\)th axis,, and \(()\) is a tensor of the same shape as \(D^{k}_{u}()\) that equals \(C_{}\) when \(d_{1},,d_{k}\) matches the multi-index \(()\) and \(0\) otherwise. We call \(()\) the coefficient tensor of \(\). For example, the coefficient tensor of the Laplacian \(^{2}\) is the \(d\)-dimensional identity matrix \(\). More complicated operators can be built as \(f(,u,_{k_{1}}u,,_{k_{n}}u)\) where \(f\) is arbitrary function.
+
+_Any derivative tensor contractions \(D^{k}_{u}()()\) can be estimated through random contraction, which can be implemented efficiently as pushing forward random jets from an appropriate distribution_. With random \((^{(1)},,^{(k)})\), we have
+
+\[[D^{k}_{u}()_{d_{1},,d_{k}}v^{(v_{1})}_{d_{1}} v ^{(v_{k})}_{d_{k}}]=D^{k}_{u}()_{d_{1},,d_{k}}[v^{(v_ {1})}_{d_{1}} v^{(v_{k})}_{d_{k}}]=D^{k}_{u}() [_{i=1}^{k}^{(v_{i})}]\] (11)
+
+where \(\) denotes Kronecker product, \(v^{(v_{i})}_{d_{i}}[1,k]\) is the \(d_{i}\) dimension of the \(v_{i}\)th order tangent in the input \(k\)-jet. Eq. 11 is an unbiased estimator of the \(k\)th order operator \(u=D^{k}_{u}()()\) when
+
+\[[v^{(v_{1})}_{d_{1}} v^{(v_{k})}_{d_{k}}]=C_{d_{1},,dk}( ).\] (12)
+
+For example, the condition for unbiasedness for the Laplacian \(^{2}\) is \([^{(a)}^{(b)}]=\). As discussed, one can always find a \(J^{l}_{g}\) with large enough \(l k\) such that \(^{l}F(J^{l}_{g})=D^{k}_{F}()_{i=1}^{k}^{(v_{i})}\), so with a distribution \(p\) over the input \(l\)-jet \(J^{l}_{g}\) that satisfies the unbiasedness condition (Eq. 12), we have
+
+\[_{J^{l}_{g} p}[^{l}u(J^{l}_{g})]=[v^{(v_{1})} _{d_{1}} v^{(v_{k})}_{d_{k}}]=D^{k}_{u}()( )=u(),\] (13)
+
+which means \(u()\) can be approximated by the sample mean of the pushforwards of random \(l\)-jet drawn from \(p\), which can be computed efficiently via Taylor mode AD. We call this method _Stochastic Taylor Derivative Estimator (STDE)_. The **advantages** of STDE are:
+
+1. General: STDE can be applied to differential operators of arbitrary order and dimensionality.
+2. Scalable: The scaling issue in the dimensionality \(d\) and the derivative order \(k\) are addressed at the same time. From the example computation graph (Fig. 2) we see that, for one call to \(^{k}F\), the memory requirement has scaling of \((kd)\) and the computation complexity has scaling \(k^{2}dL\). Like first-order forward mode AD, the derivative tensor \(D^{k}_{u}\) is never fully computed and stored. Combined with randomization, the polynomial scaling in \(d\) will be removed.
+3. Parallelizable: The number of sequential computations does not grow with the order as can be seen in Fig. 2, and the computation can be trivially vectorized and parallelized since the pushforward of sample jets can be computed independently, and it uses the same computation graph (\(^{k}u\));
+
+### Constructing STDE for high-order differential operators with sparse random jets
+
+Note that all coefficient tensor has the following additive decomposition:
+
+\[()=_{d_{1},,d_{k}()}C_{d _{1},,d_{k}}_{d_{1}}_{d_{k}}\] (14)
+
+where \(_{i}\) is the \(i\)th standard basis. For example, if the input dimension \(d\) is \(3\), then \(_{2}=[0,1,0]^{}\). As discussed before, there exists a \(J^{k}_{g}\) whose pushforward under \(^{l}u\) is equivalent to contracting \(D^{k}_{u}\) with \(_{i=1}^{k}_{d_{i}}\). We call \(k\)-jet consisting of only standard basis and the zero vector \(\)_sparse_. Therefore the discrete distribution \(p\) over the _sparse_\(k\)-jets in Eq. 14 satisfies the unbiasedness condition 12
+
+\[p(_{i=1}^{k}_{d_{i}})=C_{d_{1},,d_{k}}/Z, d_{1}, ,d_{k}(),\] (15)
+
+where \(Z\) is the normalization factor and we identify \(_{i=1}^{k}_{d_{i}}\) with the corresponding \(k\)-jet \(J^{k}_{u}\).
+
+#### 4.3.1 Differential operator with easy to remove mixed partial derivatives
+
+Next, we show some concrete examples for constructing STDE with sparse random jets.
+
+LaplacianFrom Eq. 9 we know that the quadratic form of Hessian can be computed through \(^{2}\) by setting \(^{(2)}=\) and \(^{(1)}=_{j}\). Therefore, the STDE of the Laplacian operator is given by
+
+\[}_{J}u_{}()=_{j J}}{ x_{j}^{2}}u_{}()=_{j  J}^{2}u_{}()(_{j},)=_{j J}^{2}u_{}(,_{j},)_{}\] (16)
+
+where \(J\) is the sampled index set, and the subscript \(\) means taking the second-order tangent from the output jet. See example implementation in JAX in Appendix A.4.
+
+High-order _diagonal_ differential operatorsWe call a differential operator _diagonal_ if it is a linear combination of diagonal elements from the derivative tensor: \(=_{j=1}^{d}}{ x_{j}^{k}}\). From Eq. 43 we see that setting the first-order tangent \(^{(1)}\) to \(_{j}\) and all other tangents \(^{(i)}\) to the zero vector gives the desired high-order diagonal element:
+
+\[}_{J}u_{}()=_{j J} {^{k}}{_{j}^{k}}u_{}()=_{j J}^{k}u_{}()(_{j},, ).\] (17)
+
+Second-order parabolic PDEsSecond-order parabolic PDEs are a large class of PDEs. It includes the Fokker-Planck equation in statistical mechanics to describe the evolution of the state variables in stochastic differential equations (SDEs), which can be used for generative modeling . It also includes the Black-Scholes equation in mathematical finance for option pricing, the Hamilton-Jacobi-Bellman equation in optimal control, and the Schrodinger equation in quantum physics and chemistry. Its form is given by
+
+\[u(,t)+ (^{}(,t)}{^{2}}u(,t))+ u(,t)(,t)+f(t,,u(,t),^{}(,t) u(,t) )=0.\] (18)
+
+We have a second order derivative term \(((,t)(,t)^{ }}{^{2}}u(,t))\) with _off-diagonal_ term. The off-diagonals can be easily removed via a change of variable:
+
+\[((,t)(,t)^{ }}{^{2}}u(,t))=_{i=1}^{d}^{2}u(,t)((,t) _{i},).\] (19)
+
+See derivation in Appendix E. Its STDE samples over the \(d\) terms in the expression above.
+
+#### 4.3.2 Differential operators with arbitrary mixed partial derivative
+
+It is not always possible to remove the mixed partial derivatives but discussed in section 4.2, for an arbitrary \(k\)th order derivative tensor element \(D_{u}^{k}()_{n_{1},,n_{k}}\), we can find an appropriate \(l\)-jet \(J_{g}^{l}(t)\) with \(g(t)=\) such that \(^{l}u(J_{g}^{l})=D_{u}^{k}()_{n_{1},,n_{k}}\). Here we show a concrete example.
+
+2D Korteweg-de Vries (KdV) equationConsider the following 2D KdV equation
+
+\[u_{ty}+u_{xxxy}+3(u_{y}u_{x})_{x}-u_{xx}+2u_{yy}=0.\] (20)
+
+All the derivative terms can be found in the pushforward of the following jet:
+
+\[=^{13}u(,^{(1)},, ^{(13)}),\ ^{(3)}=_{x},^{(4)}=_{y},^{(7 )}=_{t},^{(i)}=, i\{3,4,7\},\\ u_{x}=_{},\ u_{y}=_{},\ u_{xx}= _{},\ u_{xy}=_{}/35,\\ u_{yy}=_{}/35,\ u_{ty}=_{}/330,\ u_{xxxy}= _{}/200200.\] (21)
+
+where the subscript \([i]\) means selecting the \(i\)th order tangent from the jet, and the prefactors are determined through Faa di Bruno's formula (Eq. 43). In this case, no randomization is needed since all the terms can be computed with just one pushforward. Alternatively, these terms can be computed with pushforwards of different jets of lower order (Appendix I.4). When input dimension \(d\) is high, randomization via STDE will provide significant speed up. We tested a few more high-order PDEs with irremovable mixed partial derivatives (see Appendix I.4), and the experimental results will be provided later.
+
+### Dense random jet and connection to HTE
+
+In section 4.3 we show how to construct STDE with the pushforward of _sparse_ random jets. It is also possible to construct STDE with _dense_ random jets, i.e. jets with tangents that are not the standard basis. For example, the classical method of Hutchinson trace estimator (HTE)  can be implemented in the STDE framework as the pushforward of isotropic dense random jets, i.e. \((,,)_{} p\) with \(_{p}[^{}]=\).
+
+We generalize the dense construction to **arbitrary second-order differential operators** using a multivariate Gaussian distribution with the eigenvalues of the corresponding coefficient tensor as its covariance. Suppose \(\) is a second-order differential operator with coefficient tensor \(\). With the eigendecomposition \(^{}=(+^{})+ =^{}\) where \(-\) is smaller than the smallest eigenvalue of \(\), we can construct a STDE for \(\):
+
+\[_{(,)}[^ {2}u()(,)]-_{(,)}[^{2}u()(, )]=D_{u}^{2}()[^{}- ]=D_{u}^{2}().\] (22)
+
+However, it is not always possible to construct dense STDE beyond the second order, even if we consider \(p\) with non-diagonal covariance. We prove this by providing a counterexample: one cannot construct an STDE for the fourth order operator \(_{i=1}^{d}}{ x^{4}}\) with dense jets. For more details on dense jets, see Appendix K. For specific high-order operators like the Biharmonic operator, it is still possible to construct STDE with dense jets which we show in Appendix J.
+
+The main differences between the sparse and the dense version of STDE are:
+
+1. sparse STDE is universally application whereas the dense STDE can only be applied to certain operators;
+2. the source of variance is different (see Appendix K.3).
+
+It is also worth noting that both the sparse and the dense versions of STDE would have similar computation costs if the batch size of random jets were the same. In general, we would suggest to use sparse STDE unless it is known a priori that the sparse version would suffer from excess variance and the dense STDE is applicable.
+
+## 5 Experiments
+
+We applied STDE to amortize the training of PINNs on a set of real-world PDEs. For the case of \(k=2\) and large \(d\), we tested two types of PDEs: inseparable and effectively high-dimensional PDEs (Appendix I.1) and semilinear parabolic PDEs (Appendix I.2). We also tested high-order PDEs (Appendix I.4) that cover the case of \(k=3,4\), which includes PDEs describing 1D and 2D nonlinear dynamics, and high-dimensional PDE with gradient regularization . Furthermore, we tested a weight-sharing technique (Appendix G), which further reduces memory requirements (Appendix I.3). In all our experiments, STDE drastically reduces computation and memory costs in training PINNs, compared to the baseline method of SDGD with stacked backward-mode AD. Due to the page limit, the most important results are reported here, and the full details including the experiment setup and hyperparameters (Appendix H) can be found in the Appendix.
+
+### Physics-informed neural networks
+
+PINN  is a class of neural PDE solver where the ansatz \(u_{}()\) is parameterized by a neural network with parameter \(\). It is a prototypical case of the optimization problem in Eq. 1. We consider PDEs defined on a domain \(^{d}\) and boundary/initial \(\) as follows
+
+\[u()=f(),,u()=g(),,\] (23)
+
+where \(\) and \(\) are known operators, \(f()\) and \(g()\) are known functions for the residual and boundary/initial conditions, and \(u:^{d}\) is a scalar-valued function, which is the unknown solution to the PDE. The approximated solution \(u_{}() u()\) is obtained by minimizing the mean squared error (MSE) of the PDE residual \(R(;)=u_{}()-f()\):
+
+\[_{}(;\{^{(i)}\}_{i=1}^{N_{r}})=}_{i=1}^{N_{r}}|u_{}(^{(i)})-f(^{(i) })|^{2}\] (24)
+
+where the residual points \(\{^{(i)}\}_{i=1}^{N_{r}}\) are sampled from the domain \(\). We use the technique from  that reparameterizes \(u_{}\) such that the boundary/initial condition \(u()=g()\) are satisfied exactly for all \(\), so boundary loss is not needed.
+
+Amortized PINNsPINN training can be amortized by replacing the differential part of the operator \(\) with a stochastic estimator like SDGD and STDE. For example, for the Allen-Cahn equation, \(u=^{2}u+u-u^{3}\), the differential part of \(\) is the Laplacian \(^{2}\). With amortization, we minimize the following loss
+
+\[_{}(;\{^{(i)}\}_{i=1}^{N_{r}},J,K) =}_{i=1}^{N_{r}}[}_{J}u_{ }(^{(i)})-f(^{(i)})][}_{K}u_{}(^{(i)})-f(^{(i)})],\] (25)
+
+which is a modification of Eq. 24. Its gradient \(_{}}{}\) is then an unbiased estimator to the gradient of the original PINN residual loss, i.e. \([_{}}{}]= _{}}{}\).
+
+### Ablation study on the performance gain
+
+To ascertain the source performance gain of our method, we conduct a detailed ablation study on the inseparable Allen-Cahn equation with a two-body exact solution described in Appendix I.1. The results are in Table 1 and 2, where the best results for each dimensionality are marked in bold. All methods were implemented using JAX unless stated. OOM indicates that the memory requirement exceeds 40GBs. Since the only change is how the derivatives are computed, the relative L2 error is expected to be of the same order among different randomization methods, as seen in Table 3 in the Appendix. We have included Forward Laplacian which is an exact method. It is expected to perform better in terms of L2 error. However, as we can see in Table 3, the L2 error is of the same order, at least in the case where the dimension is more than \(1000\).
+
+JAX vs PyTorchThe original SDGD with stacked backward mode AD was implemented in PyTorch. We reimplement it in JAX (see Appendix A.1). From Table 1 and 2, JAX provides \(\)15\(\) speed-up and up to \(\)4\(\) memory reduction.
+
+ParallelizationThe original SDGD implementation uses a for-loop to iterate through the sampled dimension (Appendix A.1). This can be parallelized (denoted as "Parallelized SDGD via HVP", details in Appendix A.2). Parallelization provides \(\)15\(\) speed up and reduction in peak memory for the JIT compilation phase. We also tested mixed mode AD (dubbed as "Forward-over-Backward SDGD"), which gives roughly the same performance as parallelized stacked backward mode, which is expected as explained in Appendix C.
+
+Forward LaplacianForward Laplacian  provides a constant-level optimization for the calculation of Laplacian operator by removing the redundancy in the AD pipeline, and we can see from
+
+  Speed (i/s) \(\) & 100 D & 1K D & 10K D & 100K D & 1M D \\   Backward mode SDGD (PyTorch)  & 55.56 & 3.70 & 1.85 & 0.23 & OOM \\  Backward mode SDGD & 40.63 & 37.04 & 29.85 & OOM & OOM \\  Parallelized backward mode SDGD & 1376.84 & 845.21 & 216.83 & 29.24 & OOM \\  Forward-over-Backward SDGD & 778.18 & 560.91 & 193.91 & 27.18 & OOM \\  Forward Laplacian  & **1974.50** & 373.73 & 32.15 & OOM & OOM \\ 
+**STDE** & 1035.09 & **1054.39** & **454.16** & **156.90** & **13.61** \\  
+
+Table 1: Speed ablation for the two-body Allen-Cahn equation.
+
+  Memory (MB) \(\) & 100 D & 1K D & 10K D & 100K D & 1M D \\   Backward mode SDGD (PyTorch)  & 1328 & 1788 & 4527 & 32777 & OOM \\  Backward mode SDGD & 553 & 565 & 1217 & OOM & OOM \\  Parallelized backward mode SDGD & 539 & 579 & 1177 & 4931 & OOM \\  Forward-over-Backward SDGD & 537 & 579 & 1519 & 4929 & OOM \\  Forward Laplacian  & **507** & 913 & 5505 & OOM & OOM \\ 
+**STDE** & 543 & **537** & **795** & **1073** & **6235** \\  
+
+Table 2: Memory ablation for the two-body Allen-Cahn equation.
+
+Table 1 and 2 that it is the best method in both speed and memory when the dimension is 100. But since it is not a randomized method, the scaling is much worse. Its computation complexity is \((d)\), whereas a randomized estimator like STDE has a computation complexity of \((|J|)\). Naturally, with a high enough input dimension \(d\), the difference in the constant prefactor is trumped by scaling. When the dimension is larger than 1000, it becomes worse than even parallelized stacked backward mode SDGD.
+
+STDECompared to the best realization of baseline method SDGD, the parallelized stacked backward mode AD, STDE provides up to 10\(\) speed up and memory reduction of at least 4\(\).
+
+## 6 Conclusion
+
+We introduce STDE, a general method for constructing stochastic estimators for arbitrary differential operators that can be evaluated efficiently via Taylor mode AD. We evaluated STDE on PINNs, an instance of the optimization problem where the loss contains differential operators. Amortization with STDE outperforms the baseline methods, and STDE also applies to a wider class of problems as it can be applied to arbitrary differential operators.
+
+ApplicabilityBesides PINNs, STDE can be applied to arbitrarily high-order and high-dimensional AD-based PDE solvers. This makes STDE more general than a branch of related methods. STDE is also more applicable than deep ritz method , weak adversarial network (WAN) , backward SDE-based solvers [3; 34; 10], deep Galerkin method , and the recently proposed forward Laplacian , which are all restricted to specific forms of second-order PDEs. STDE applies naturally to differential operators in PDEs, but it can also be applied to other problems that require input gradients. For example, adversarial attacks, feature attribution, and meta-learning, to name a few.
+
+LimitationsBeing a general method, STDE forgoes the optimization possibilities that apply to specific operators. Furthermore, we did not consider variance reduction techniques that could be applied, which can be explored in future works. Also, we observed that lowering the randomization batch size improves both speed and memory profile, but the trade-off between cheaper computation and larger variance needs further analysis. Furthermore, the method is not suited for computing the high order derivative of neural network parameter as explained in Section 3.
+
+Future worksThe key insight of the STDE construction is that the univariate Taylor mode AD contains arbitrary contraction of the derivative tensor and that derivative operators are derivative tensor contractions. This shows the connection between the fields of AD and randomized numerical linear algebra and indicates that further works in the intersection of these two fields might bring significant progress in large-scale scientific modeling with neural networks. One example would be the many-body Schrodinger equations, where one needs to compute a high-dimensional Laplacian. Another example is the high-dimensional Black-Scholes equation, which has numerous uses in mathematical finance.

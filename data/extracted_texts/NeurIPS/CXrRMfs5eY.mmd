@@ -1,0 +1,225 @@
+# PETAL: Physics Emulation Through Averaged Linearizations for Solving Inverse Problems
+
+Jihui Jin
+
+Electrical and Computer Engineering
+
+Georgia Institute of Technology
+
+Atlanta, GA 30332
+
+jihui@gatech.edu &Etienne Ollivier
+
+Mechanical Engineering
+
+Georgia Institute of Technology
+
+Atlanta, GA 30332
+
+&Richard Touret
+
+Mechanical Engineering
+
+Georgia Institute of Technology
+
+Atlanta, GA 30332
+
+&Matthew McKinley
+
+Mechanical Engineering
+
+Georgia Institute of Technology
+
+Atlanta, GA 30332
+
+&Karim G. Sabra
+
+Mechanical Engineering
+
+Georgia Institute of Technology
+
+Atlanta, GA 30332
+
+&Justin K. Romberg
+
+Electrical and Computer Engineering
+
+Georgia Institute of Technology
+
+Atlanta, GA 30332
+
+###### Abstract
+
+Inverse problems describe the task of recovering an underlying signal of interest given observables. Typically, the observables are related via some non-linear forward model applied to the underlying unknown signal. Inverting the non-linear forward model can be computationally expensive, as it often involves computing and inverting a linearization at a series of estimates. Rather than inverting the physics-based model, we instead train a surrogate forward model (emulator) and leverage modern auto-grad libraries to solve for the input within a classical optimization framework. Current methods to train emulators are done in a black box supervised machine learning fashion and fail to take advantage of any existing knowledge of the forward model. In this article, we propose a simple learned weighted average model that embeds linearizations of the forward model around various reference points into the model itself, explicitly incorporating known physics. Grounding the learned model with physics based linearizations improves the forward modeling accuracy and provides richer physics based gradient information during the inversion process leading to more accurate signal recovery. We demonstrate the efficacy on an ocean acoustic tomography (OAT) example that aims to recover ocean sound speed profile (SSP) variations from acoustic observations (e.g. eigenray arrival times) within simulation of ocean dynamics in the Gulf of Mexico.
+
+## 1 Introduction
+
+Inverse problems arise in many scientific applications where the goal is to reconstruct some unknown signal, image or volume of interest from indirect observations. The forward process, or the mapping from the data to observations, is typically well-known usually through modeling the physical process. However, inverting the model is often ill-posed or even non-invertible. More formally, let us consider the task of recovering some signal \(\) from observations \(\) that are related by some potentiallynon-linear forward model \(F\) via
+
+\[=F()+,\] (1)
+
+where \(\) encapsulates noise or other perturbations. Our forward model \(F\) represents a computational model of the underlying physics of the measurement process. Classical solutions involve modeling the forward process with extremely high accuracy and then attempting to invert a stabilized or linearized variant, which often requires heavy domain knowledge.
+
+Another approach to handle the ill-posed nature of the inversion task is to cast the problem as an optimization task and incorporate regularization. A regularizer is a measure of how well the proposed solution fits some known, and often hand-crafted, prior. This term makes the inversion well-posed by biasing towards certain solutions. The inversion is typically solved for an in iterative fashion. This process can be potentially computationally expensive due to requiring many applications of the physics based forward model. Computing the adjoint to determine a descent direction increases the computational burden even more.
+
+In this paper, we propose a novel architecture trained to emulate the physics-based forward model. The surrogate model provides a cheaper alternative for both the forward pass and descent direction calculation by leveraging existing auto-grad libraries, making iterative solvers feasible for recovering a solution. This work departs from previous works who also aim to emulate the forward model [4; 11; 33] by embedding low-fidelity forward models into the surrogate itself, thereby explicitly incorporating the physics instead of treating it as a black box. More concretely, we propose to use a set of linearizations of the forward model at a set of reference point and train a model to fuse and correct the outputs in an adaptive manner. We then use this trained model in a classical optimization framework to recover the signal given a set of observations.
+
+Concretely, our paper makes the following contributions:
+
+* We propose a novel architecture that learns to emulate the forward model. The model directly embeds physics via linearizations around a subset of reference points.
+* We introduce a learned encoder/decoder scheme to the neural adjoint method to mitigate artifacts from directly optimizing in the input space.
+* We demonstrate its efficacy for recovering solutions in a classical optimization framework on an ocean acoustic tomography (OAT) example that aims to recover ocean sound speed profile (SSP) variations from acoustic observations (e.g. eigenray arrival times) within a simulation of ocean dynamics in the Gulf of Mexico.
+
+## 2 Related Works
+
+### Iterative Inversion
+
+The task of directly inverting some potentially non-linear forward model \(F\) is often non-trivial or mathematically impossible. Instead, a more stable alternative is to iteratively solve for \(\) given some observations \(\). Classically, this is done by formulating the reconstruction as solving a non-linear least squares problem that aims to minimize
+
+\[=}-F() ^{2}.\] (2)
+
+The Gauss-Newton method solves Equation (2) by iteratively computing the Jacobian \(_{F}\) of \(F\) at the current best estimate \(^{(k)}\) and solving a set of linear equations to generate an update of the form
+
+\[^{(k+1)}=^{(k)}+(_{F}^{}_{F})^{-1}_{F}^{ }(-F(^{(k)})).\] (3)
+
+The Levenberg-Marquardt algorithm [17; 23] presents a more robust alternative to Gauss-Newton by introducing a (non-negative) damping factor \(\) leading to an update of the form
+
+\[^{(k+1)}=^{(k)}+(_{F}^{}_{F}+)^{ -1}_{F}^{}(-F(^{(k)})).\] (4)
+
+Another approach to address the ill-posed nature of \(F\) is to explicitly introduce a regularization function \(R()\) as an additional penalty term to Equation (2). The regularizer \(R\) addresses the ill-posednature by stabilizing the inversion process and biasing the solution towards those with expected or desired structure. Some common examples include the \(_{2}\) norm to encourage smaller norm solutions (similar to Equation 4), \(_{1}\) to promote sparsity, and total variation (TV) to induce homogeneous regions separated by sharp boundaries. For differentiable \(R\), the augmented optimization problem can be solved via steepest descent, computing updates of the form
+
+\[^{(k+1)}=^{(k)}+_{F}^{}(-F(^{(k)}))-  R(^{(k)}),\] (5)
+
+where \(\) is a tuned step size, \(\) is a non-negative factor controlling the strength of regularization, and \(_{F}\) is the Jacobian of \(F\) evaluated at \(^{(k)}\).
+
+However all these approaches can be undesirable in practice due to the need to re-compute the Jacobian (or a Jacobian-vector product) at each iteration. Computing a Jacobian-vector product to determine a descent direction often involves solving an auxiliary set of PDEs, which can be computationally expensive if many iterations are required to achieve an acceptable level of accuracy.
+
+Ensemble Kalman filter (EnKF) offers a Bayesian iterative approach to estimating the underlying signal [8; 12]. Rather than estimating a single instance of the signal, EnKF recursively updates an estimated distribution of the state, assuming Gaussian probability. A sample mean and covariance is calculated using an ensemble of samples that are updated iteratively via Bayesian updates. However, such a method still ultimately relies on applying the physics based forward model to each member of the ensemble, which can be prohibitively expensive for complex non-linear forward operators.
+
+### Learned Inversion
+
+An increasingly popular approach for solving inverse problems takes advantage of machine learning. Deep learning has achieved tremendous success in areas of natural language processing, computer vision and other tasks, in part due to the availability of large labelled datasets. Recent works attempt to tackle inverse problems using these data-driven methods [7; 13; 25; 29; 37; 38]. Unlike typical supervised learning tasks that attempt to learn a mapping purely from examples, deep learning for inverse problems can leverage our understanding of the physics in the forward model. One common approach to embed the physics is the so-called "Loop Unrolled" architecture heavily inspired by
+
+Figure 1: (a) Architecture of PETAL for training the forward model. The signal \(\) is passed through the _Embedded Physics_ module to generate low-fidelity physics-based predictions \(}^{1},...,}^{N}\) that are then merged in an adaptive manner through attention mechanisms with the _Learned Weighted Average_ module before being corrected with a final linear output layer \(\). An encoding layer \(_{x}\) and decoding layer \(_{x}\) are simultaneously learned. (b) The architecture rearranged for inversion. The decoding layer is moved to the input to allow for inversion in the learned lower dimensional subspace \(\). Learned modules are denoted in green.
+
+existing iterative algorithms [1; 2; 9; 10; 35; 40; 41]. The learned model alternates between taking a gradient step computed directly from existing forward models and applying a learned regularizer step. However, such approaches have to apply the forward model multiple times for a single forward pass through the architecture, making the method infeasible for more complex non-linear simulators. Our approach bypasses this obstacle by using more computationally tractable approximations of the forward model.
+
+An alternative approach to incorporating physics is termed "Physics Informed Neural Networks (PINN)" [16; 32]. These methods incorporate the governing partial differential equations directly in the loss, guiding a parameterized model towards physics-obeying solutions. However, an important distinction between PINNs and more generalized machine learning for inverse problems is that each model is trained for a _single instance_ of a PDE solve given some boundary/initial conditions and must be re-trained for any new conditions or observables (in the case of inverse problems). Every training iteration involves a PDE misfit calculation, which can be expensive and ill-posed, making scaling to larger dimensions difficult. Unlike PINNs, the linearizations we use only need to be computed once before training rather than at each iteration of the training process.
+
+Gaussian process regression (GPR) is another approach that leverages a set of references. GPR attempts to model some unknown function \(f\) given data points by assuming a multivariate normal distribution prior and interpolating between the observed samples . GPR is similar to the proposed model in that it does a distance comparison (usually through a pre-defined kernel function) with every reference point provided. However, it is designed to only take in input-output pairs and scales poorly with the number of examples, making it difficult to take advantage of large training sets. Our proposed model only needs to retain a subset of the training set for comparison purposes, but can still leverage large datasets for training a more accurate predictor.
+
+### Neural Adjoint
+
+The neural adjoint method  was proposed to tackle inverse problems with more computationally intensive forward models. A parameterized model \(G_{}\) is trained to emulate the forward model [4; 11]. This is done in a supervised learning fashion, often with a simple mean-squared error loss. Not only does this provide a cheaper/quicker alternative to the physics-based forward model, if trained with existing auto-grad libraries such as PyTorch , this also allows for efficient computation of the gradient with respect to the input, bypassing the need to explicitly solve for the adjoint when calculating the gradient.
+
+Once trained, the parameters are fixed and the model \(G_{}\) is substituted for \(F\) in Equation (2) or other similar optimization frameworks. The auto-grad libraries are then used to efficiently compute a gradient with respect to the input \(\), making it possible to iteratively solve for the best estimate \(}\) that fits some observations \(\). Existing works primarily focused on lower dimensional examples (on the order of 5-15) where the test set was drawn from the same distribution as the training set [5; 22; 28; 31; 33], thus a simple "boundary-loss" regularizer was often sufficient to produce accurate results. Direct learned inversion methods are much faster than this iterative based method, but yield only a single estimate and are susceptible to overfitting to the training set. The neural adjoint method allows for exploration of the solution space with different initializations and the incorporation of various regularizers such as \(_{1}\), \(_{2}\), or even gradient based , to guide the optimization towards specific solutions. In addition, one can also restrict the optimization to some pre-determined basis that better represents the data while reducing the dimensionality .
+
+Our proposed architecture extends the neural adjoint method in two notable ways. Existing methods are purely data-driven and thus treated like a black box [4; 33], while as our architecture explicitly incorporates knowledge of the physics-based forward model into the learned emulator in the form of linearized approximations. Tangent-linear models are also explored in , but on the surrogate in order to verify the accuracy of the learned model, while as the proposed architecture uses linearizations of the physics based forward model in the construction of the surrogate. In addition, we also propose to jointly learn a subspace to improve the accuracy of the optimization stage.
+
+## 3 Method
+
+The neural adjoint (NA) method is typically decomposed into two stages: training an emulator of the forward model and then using it for inference. We motivate and describe the proposed architecture for the forward model in Section 3.1. Next, we formulate the optimization problem that uses the trained model for inference in Section 3.2. Finally, we propose an augmentation to the optimization formulation to incorporate a learned subspace in Section 3.3.
+
+### Embedding Physics in the Learned Forward Model
+
+The neural adjoint (NA) method aims to learn an accurate emulator of the forward model to replace existing physics simulators. More formally, assume that we are given a forward model \(F:\) that maps our input \(^{m}\), where \(m\) denotes the size of the discretization, to some observations \(^{n}\), where \(n\) denotes the total number of observations. In our computational ocean tomography examples in Section 4, \(F()\) is computed using a ray tracer; in other applications, a PDE might have to be solved. We then train a neural net \(G_{}\), whose architecture is illustrated in Figure 1 and described in detail below, to approximate the mapping \(F\).
+
+We first motivate the design of the architecture by discussing the more classical approach of linearizing the forward model \(F\). Given a reference point \(_{}^{i}\), we perform a first order Taylor series expansion
+
+\[}& F(_{}^{i})+J_{F}(_{}^{i})^{}(-_{}^{i}) \\ &=_{}^{i}+_{}^{i}(-_{ }^{i}).\] (6)
+
+This linearization approximates the forward model with varying levels of accuracy depending on the proximity of the input \(\) to the reference point \(_{}^{i}\). Rather than learning the mapping from \(\) to \(\) in a pure data-driven fashion, we propose to leverage a set of these linearizations that already perform the mapping. We mitigate the modeling inaccuracies by using an ensemble of reference models rather than a single linearization. Only a small subset of linearizations need to be performed once in order to construct the proposed emulator \(G_{}\), so the additional computational cost is minimal relative to attempting to invert the actual physics based forward model \(F\) for arbitrary measurements \(\).
+
+The operation of the architecture acts as follows: Given some input \(\), we first pass \(\) through the embedded physics ensemble \(_{}^{1},...,_{}^{N}\) to produce \(N\) predicted observations \(}^{1},...,}^{N}\) through the application of Equation (6). The predicted observations are then combined through a learned weighted average module to produce the final predicted observation.
+
+A natural way to compute the weights \(w^{i}\) is by calculating the dot product similarity between the input point \(\) and the reference points \(_{}^{1},...,_{}^{N}\) used to generate the linearizations; higher similarity implies that the linearization is a better approximation and thus the prediction is more "trustworthy". We follow an approach similar to attention-based models  by learning an embedding space to
+
+Figure 2: An overview of data from a month long simulation of the (a) Gulf of Mexico. (b) Example 2D slices of the sound speed profile (top) and its deviation from the mean (bottom). The 10 slices used for experiments are separated by white lines. (c) The average SSP as a function of depth. Note that most of the fluctuations occur near the surface.
+
+perform the dot product and applying a softmax to normalize the weights. Thus for each \(}^{i}\), we compute the corresponding weight \(w^{i}\) as
+
+\[w^{i}=,_{}^{i}_{_ {x}}}{_{j},_{}^{j}_{_{x}}},\] (7)
+
+where \(_{x}\) is the learned projection for the dot product space. The predicted \(}^{i}\) get summed together using the learned weights before being passed through a final linear layer \(\). Thus the output of the proposed model is
+
+\[G_{}()=_{i}w^{i}(_{}^{i}+_{}^{i}(-_{}^{i})),\] (8)
+
+where we distinguish components related to the embedded physics module with superscripts. The encoder-decoder layers \(_{}\) and \(_{}\) are treated as the identity mapping for this section. They are described in further detail in Section 3.3. Note that the learned weights \(w^{i}\) depend on the input \(\). To prevent saturation of the learned softmax distribution, we apply spectral normalization to all \(\) projection layers (\(_{}\) and \(_{}\)). The full architecture is outlined in Figure 0(a). The model is trained using the mean squared error loss on a dataset of paired example \((_{k},_{k})\)
+
+\[_{}_{k}\|G_{}(_{k})-_{k}\|^{2}.\] (9)
+
+### Performing Inference
+
+In order to perform inference on a set of observations \(\), we solve the following optimization problem that incorporates our trained network
+
+\[}=}{}\,\|G_{}( )-\|^{2}+R().\] (10)
+
+We solve this iteratively by fixing the weights of the network and computing the gradient with respect to its input \(\). Note that this same optimization problem can be set up with the original forward model \(F\), but computing a gradient is often non-trivial and computationally expensive. By training a forward model approximation, we can leverage existing auto-grad libraries  to efficiently compute the gradient. Having an accurate descent direction is critical for solving Equation 10. However, these black box models are only trained to match outputs, and thus performing gradient descent can lead to many undesireable local minima. Due to the construction of our emulator, a convex combination of the gradients from using the individual linear forward model approximations (slightly modulated by the learned weights) arises in the calculation, providing some physics-based descent directions which may help alleviate these issues (See Appendix for derivations).
+
+Equation (10) can be solved with a variety of optimization algorithms to converge on some locally optimal \(\). Since we are substituting the forward model with an approximation, we can account for any inaccuracies by introducing a tolerance level. Once the observation loss drops below a pre-determined level, the optimization terminates early.
+
+Note that we incorporated a regularizer \(R()\) as an additional cost term. The regularizer encourages certain properties (e.g. smaller values) and helps guide the optimization towards particular solutions. In our experiments, we used \(_{2}\) as well as a Sobolev norm (\(_{2}\) norm performed on the discrete x and y gradient of our input \(\)).
+
+Finally, it should be noted that the iterative nature of this method requires that we initialize our guess with some estimate. When optimizing from scratch, a reasonable candidate would be the average from the training set. Alternatively, we can leverage an estimated \(}\) from other inverse methods by first initializing with that estimate and then refining it with the NA procedure. We note that there is an increase in computation time compared to directly learning the inverse due to the iterative nature of the algorithm, but the NA method offers certain trade-offs outlined above that might be more beneficial in practice than the single estimate provided by learned direct inverse methods.
+
+### Learning a Subspace for Reconstruction
+
+Directly inverting on the input space of neural networks often generates artifacts in the final result or gets trapped in local minima due to the highly non-convex model. One way to address this issue is by optimizing in some lower dimensional subspace, such as one determined by principle component analysis (PCA) . The PCA basis acts as a de-noiser, removing any artifacts due to the optimization and helps reduce the dimensionality, simplifying the optimization process.
+
+Rather than pre-computing a basis, we instead propose to jointly learn a linear projection and reconstruction layer along with the forward model. The model as described in Subsection 3.1 can be augmented with a linear encoder \(_{}\) and decoder \(_{}\) layer. The encoder layer projects our input \(\) onto a learned subspace, producing the latent code \(\). This code is then passed through the decoder layer to reconstruct \(}\). An additional input reconstruction loss in the form of a mean squared error loss between \(\) and \(}\) is included during training time, forcing the model to not only learn to approximate the forward model but also to learn a linear subspace of the input. We leave learning more complex non-linear encoder-decoder schemes for future work.
+
+During inference, we then optimize in this subspace. More concretely, we rearrange the proposed architecture so that the \(\) Decoder layer becomes the first input layer as shown in Figure 0(b). The optimization variable \(\) is passed through this layer to produce an estimated \(}\), that is then passed through the rest of the model as described in Section 3.1. Our optimization framework thus becomes
+
+\[}=}{}\,\|G_{}( _{})-\|^{2}+R(_{}),\] (11)
+
+where we recover our final estimate with \(}=_{}}\).
+
+## 4 Experimental Set Up
+
+Although the method described in this article should be generalizable to any forward model, we demonstrate on an ocean acoustic tomography problem. Sound speed variations in the ocean are essential for accurate predictions of sound propagation and the various acoustic applications that rely on these predictions [6; 14; 24]. Typically, the ocean sound speed is estimated using empirical formulas based on the temperature, salinity and density. However, this would require a dense sampling both spatially and temporally throughout the whole volume of interest. Alternatively, the fundamental relationship between acoustic observations (e.g. arrival time measurements) can be leveraged to indirectly estimate the volumetric spatio-temporal variability of the ocean sound speed profiles (SSPs), bypassing the need to densely sample.
+
+Ocean acoustic tomography (OAT) aims to reconstruct the SSP variations (with respect to a known reference environment) within an ocean slice given the changes in acoustic measurements from the
+
+   Model & Avg Init & LFM Init & Tik Init \\  Tik & 0.760 & — & — \\ LFM & 0.608 & 0.625 & 0.602 \\ MLP & 0.391 \(\) 0.005 & 0.395 \(\) 0.005 & 0.393 \(\) 0.005 \\ PETAL (ours) & **0.364 \(\) 0.018** & **0.357 \(\) 0.014** & **0.357 \(\) 0.014** \\   
+
+Table 1: RMSE (m/s) of inversion with various initializations.
+
+Figure 3: An example OAT forward model set up with 20 sources and 20 receivers. The direct and surface bounce paths are denoted in blue and red respectively. The average SSP influencing the arrival times at the receivers can be seen on the right.
+
+propagating acoustic waves between multiple pairs of sources and receivers . The "forward model" that computes arrival time measurements between source-receiver pairs given an SSP is fundamentally non-linear and would require solving the wave equation. However, SSP fluctuations are typically small compared to baseline values (typically \(<1\%\)). Modeling assumptions can be made to simplify (e.g. ray-tracing methods). Classical OAT methods also further simplify by linearizing the relationship between SSP perturbations and the measured variations in arrival times of stable "paths" propagating between source and receiver pairs, providing a more numerically tractable solution (inverting a linearized model) .
+
+We perform our experiments on a high fidelity month long simulation of the Gulf of Mexico as seen in Figure 2. We restrict our experiments to 10 2D range-dependent slices within the data cube (Figure 2b). The first 1000 time samples are used for training, the next 200 for validation and the remaining 239 for testing for each slice. This particular train/test/split in time was selected to mimic existing conditions (i.e. collect data for a set amount of time to train models and then deploy on future samples). Note that this creates a slightly more difficult problem due to the temporally changing dynamics in the test/validation set not present in the training set. The testset is further divided based on the variability within each slice. This is measured by the average deviation of the last 239 samples from the average of the first 1000.
+
+The ray tracer BELLHOP simulates a forward model of sound waves being emitted from each of the sources. The receivers aim to detect peaks of the observed pressure wave, corresponding to the "arrival time" of the direct path and the surface bounce path of the sound wave. The simulation is an approximation of the wave equation. Rather than solving the full partial differential equations, the wave is modeled as an eigen-ray traversing through space, reducing it to an ordinary differential equation solve along the path of the ray between the source and receiver.
+
+We experiment with two source-receiver configurations, a "dense" set up with 20 sources and receivers approximately every 50 m in depth and 5 km apart in range as shown in Figure 3. We also construct the more challenging "sparse" set up by sub-sampling in depth by a factor of 2. To counter the
+
+Figure 4: Example visualizations of predicted sound speed profiles for each method. Tik manages to recover general structure, but often gets the magnitude wrong. LFM introduces many artifacts during the optimization process due to the ill-posed matrix. MLP only captures coarse features but fails to capture subtler details like PETAL (ours).
+
+differing bathymetry between the 10 slices, we restrict ourselves to the upper 1000 m portion of the ocean (where a majority of the SSP variation lies as shown in Figure 2c) and consider only direct or surface bounce arrival time paths. The 2D SSP is discretized into a range by depth grid of \(11 231\).
+
+Thus, the linearized forward models (LFM) are of dimension \(800 2541\) (or \(200 2541\) in the sparse case), yielding an ill-posed matrix for inversion. We construct our proposed model with 10 reference SSPs: the last available SSP in the trainset (time 1000) for each of the 10 slices. Once trained, the weights are fixed and the ssp \(\) is solved for iteratively given some observations \(\). We perform the optimization in the learned subspace and with \(_{2}\) as well as Sobolev regularization. All optimized models are given a budget of 1000 gradient descent iterations with a learning rate of 50.
+
+## 5 Results
+
+We compare our proposed model against three baselines. First we compare ourselves against the pseudo-inverse performed in the PCA space and using Tikhonov Regularization as proposed in , hereby referred to as "Tik". We select the last available SSP in the train set (time 1000) for each respective slice as the reference point for linearization when evaluating on the test set. We perform PCA on the first 1000 SSPs for each respective slice to construct the basis. Next, we compare against using the linearized forward model (LFM) in an iterative method using the same regularization as the proposed model, but with the linearization around a single reference as the forward model. Similar to the Tik method, we linearize around the last available SSP in the training set for each respective slice. Finally, we compare ourselves with a simple multi-layer perceptron (MLP) trained to emulate the forward model. The MLP does not incorporate any physical information and is simply trained to map SSPs to arrival times in a black box manner. All iterative methods are initialized with: the average SSP, the Tik solution and the LFM solution.
+
+The full results are summarized in Table 1. When provided no initialization (avg), the proposed method performs the best at \(0.364 0.018\) m/s RMSE. MLP achieves the second best average performance at \(0.391 0.005\) m/s RMSE, where the loss in performance is likely due to its inability to emulate the forward model as accurately as the proposed model. Despite using the same forward model set up, LFM (optimized with different regularization) is able to outperform Tik. We hypothesize that this is due to the basis computed by applying PCA to the training set failing to generalize to the dynamics of the test set. However, when allowed to optimize further (LFM init), degradation occurs due to the inaccuracy of the forward model approximation, increasing from 0.608 to 0.625 m/s error.
+
+MLP also fails to refine the solution for both the LFM as well as the Tik initialization, suggesting that the learned non-linear forward model gets caught in local minimas despite having better initialization. Our proposed model achieved better results when initialized with the more accurate estimates, dropping the RMSE to 0.357 for both LFM and Tik initializations.
+
+Visualizations of the recovered SSPs can be seen in Figure 4. All models are able to recover the background levels and other coarse features. Tik is able to recover some finer details, but often fails to achieve the correct magnitudes. LFM introduces many artifacts due to the ill-posed forward matrix, an issue mitigated by using a subspace in Tik and PETAL. MLP is able to capture some of the finer details, but also suffers from artifacts introduced during the non-convex optimization.
+
+Table 2 breaks down the accuracy into further sub categories. Note that the level of variability does not always correlate with the performance of each method. For examples, PETAL performs the worst on the dense case with low variability with average initialization at 0.365 m/s RMSE. However, when provided with the Tik initialization (that performed better on the low variability scenario), it is able to achieve the best RMSE of 0.339 m/s. The sparse source/receiver scenario shows a degradation in performance across all methods as expected given the less observations available to each model. However, trends are still upheld with learned surrogates MLP and PETAL outperforming classical linearization based solutions and PETAL performing the best overall.
+
+## 6 Ablations
+
+In this section, we explore which design decisions contribute to the overall success of PETAL. More specifically, we try to determine whether the learned weighted averaging, learned transformation of the predicted arrival times or the learned encoding/decoding of the SSP are all necessary components.
+
+The baseline will be the proposed model which incorporates all three design choices. We compare this against (1) the average of all reference linearizations (A-LFM), (2) weighted average of linearizations (WA-LFM), (3) weighted average combined optimized in the learned subspace (WA-LFM + Dec), and (4) a learned weighted average network (WAN). A full summary as well as the average RMSE on a test set can be found in Table 3.
+
+This study shows that each component is essential in the success of the proposed model. A-LFM performs the worst overall, though still noticeably better than the single LFM presented in Table 1, suggesting that incorporating more references is crucial for representing the varied dynamics present in the test set. Simply adjusting the weights of the average (WA-LFM) as learned by a fully trained PETAL model already leads to an improvement in performance, dropping the RMSE from 0.585 to 0.577. Incorporating the learned SSP subspace improves even further, dropping the RMSE to 0.508. Learning an AT transform allows the surrogate model to better approximate the true model, leading to a more dramatic improvement in RMSE at 0.372 for WAN. And finally, incorporating all three components leads to the best performance overall at an RMSE of 0.343
+
+## 7 Conclusions
+
+In this study, we propose a novel architecture to embed physics in learned surrogate models by incorporating linearizations around a set of reference points. We also include an encoder-decoder structure to learn a subspace to optimize in when solving inverse problems, mitigating issues arising from the non-convex optimization. We demonstrate the efficacy of our approach on an Ocean Acoustic Tomography example, outperforming classical methods as well as learned forward models that do not incorporate any known physics. We validate the necessity of each component in an ablation study, confirming that each contributes to the success of the proposed model.

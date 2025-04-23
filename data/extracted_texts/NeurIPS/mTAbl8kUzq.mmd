@@ -1,0 +1,191 @@
+# LiteVAE: Lightweight and Efficient Variational Autoencoders for Latent Diffusion Models
+
+**Seyedmorteza Sadat1, Jakob Buhmann2, Derek Bradley2, Otmar Hilliges1, Romann M. Weber2**
+
+1ETH Zurich, 2DisneyResearchStudios
+
+{seyedmorteza.sadat,otmar.hilliges}@inf.ethz.ch
+
+{jakob.buhmann,derek.bradley,romann.weber}@disneyresearch.com
+
+###### Abstract
+
+Advances in latent diffusion models (LDMs) have revolutionized high-resolution image generation, but the design space of the autoencoder that is central to these systems remains underexplored. In this paper, we introduce LiteVAE, a new autoencoder design for LDMs, which leverages the 2D discrete wavelet transform to enhance scalability and computational efficiency over standard variational autoencoders (VAEs) with no sacrifice in output quality. We investigate the training methodologies and the decoder architecture of LiteVAE and propose several enhancements that improve the training dynamics and reconstruction quality. Our base LiteVAE model matches the quality of the established VAEs in current LDMs with a six-fold reduction in encoder parameters, leading to faster training and lower GPU memory requirements, while our larger model outperforms VAEs of comparable complexity across all evaluated metrics (rFID, LPIPS, PSNR, and SSIM).
+
+Figure 1: An overview of LiteVAE. The input image is first decomposed into multi-level wavelet coefficients, and each wavelet sub-band is separately processed via a feature-extraction network. The features are then combined via a feature-aggregation module to compute the final latent code, which is then transformed back into the image space by the decoder. We use a lightweight UNet architecture (top right) without spatial down/upsampling for feature extraction and aggregation. The decoder is a fully convolutional network similar to that in the Stable Diffusion VAE . LiteVAE’s design allows it to be significantly more efficient than standard VAEs in LDMs while maintaining high reconstruction quality.
+
+Introduction
+
+Latent diffusion models (LDMs)  have recently assumed dominance in the field of high-resolution image generation, primarily due to their scalability and training stability over pixel-space diffusion. The training process of LDMs involves two separate stages. In the first, an expressive variational autoencoder (VAE) is trained to transform the raw pixels of an image into a more compact latent representation. In the second, a diffusion model is trained on the latent representations of training images. While numerous studies have investigated the scalability and dynamics of the diffusion component in LDMs [48; 33], the autoencoder element has received far less attention.
+
+The VAE in LDMs is not only computationally demanding to train but also affects the efficiency of the diffusion training phase due to the resource requirements of querying a large encoder network for computing the latent codes. For example, as the autoencoder operates on high-resolution images, the VAE encoder of Stable Diffusion 2.1 uses \(135.59\) GFLOPS compared with \(86.37\) for the diffusion UNet.1 This becomes an even greater concern for video diffusion models, as the encoder then needs to provide the latents for a batch of frames instead of a single image .
+
+A common workaround for this resource burden is to precompute and cache the latent codes for the entire dataset to avoid having to use the autoencoder during diffusion training. However, in addition to its initial overhead, this approach eliminates the possibility of using on-the-fly techniques, such as data augmentation, which have been shown to improve the training and performance of diffusion models . Using a large encoder also adds noticeable overhead in applications that are based on pretrained latent diffusion models. For example, when training 3D models through score distillation of 2D LDMs , the process necessitates backpropagating gradients through the LDM encoder, which is computationally intensive . Beyond the computational aspects, improving the reconstruction quality of the autoencoder also improves the quality of generated images, as the autoencoder provides an upper bound on the generation quality [50; 13].
+
+With these issues in mind, we investigated improving the efficiency of LDMs through their core VAE component with the goal of preserving overall quality. We show that with the help of the 2D discrete wavelet transform (DWT), we can considerably simplify the encoder network in LDMs. This leads to our proposal of LiteVAE, a new autoencoder design for LDMs, which has superior compute/quality trade-offs compared with standard VAEs.
+
+LiteVAE consists of a lightweight feature-extraction module to compute features from the wavelet coefficients and a feature-aggregation module to combine these multiscale features into a unified latent code. A decoder then converts the latent code back to an image. An overview of the LiteVAE pipeline is shown in Figure 1.
+
+We chose the wavelet transform due to its proven ability to represent rich, compact image features , and we argue that the wavelet decomposition simplifies the encoder's task by facilitating the learning of meaningful features. We examine the design space of LiteVAE in depth and propose several variations on the network architecture and training setup that further boost reconstruction quality and training efficiency.
+
+Through extensive experimentation, we show that LiteVAE considerably reduces the computational cost of the standard VAE encoder while maintaining the same level of reconstruction quality. In addition, LiteVAE provides better reconstruction quality when compared with a VAE of comparable complexity. We also perform an analysis on the latent space learned by LiteVAE and show that it is similar to that of a regular VAE.
+
+To summarize, our main contributions in this paper are as follows: (i) We introduce LiteVAE, a more efficient and lightweight VAE for LDMs with similar reconstruction quality. This leads to faster training of the autoencoder and higher throughput when training latent diffusion models. (ii) We explore the design space of LiteVAE and propose variations that further enhance reconstruction quality and improve its training dynamics. (iii) We perform extensive experimental analyses on the design choices and computational efficiency of LiteVAE and empirically verify its superior compute efficiency compared to a regular VAE.
+
+Related work
+
+Diffusion models and LDMsScore-based diffusion models [64; 65; 24; 66] are a class of generative models that learn the data distribution by reversing a forward destruction process that gradually adds Gaussian noise to the data. These models have recently achieved state-of-the-art generation performance on a number of diverse tasks, including unconditional and conditional image generation [46; 10; 32], text-to-image synthesis [53; 60; 55; 1; 13], video generation [4; 3; 19], image-to-image translation [59; 39], and audio generation [7; 36; 28].
+
+While diffusion models were originally proposed for operating in the ambient image space, Rombach et al.  advocated for following the same methodology in the latent space of a frozen, pre-trained VAE. Following this, a number of advancements have been proposed to enhance latent diffusion models, including architecture improvements [48; 16; 33], training setups [21; 32], and sampling techniques [23; 25; 58]. In contrast to these proposed methods, our work focuses on the first stage of LDMs and aims at improving the architecture and efficiency of the VAE component.
+
+Zhu et al.  recently proposed an improved decoder for the Stable Diffusion VAE that better preserves the details of conditional inputs for tasks such as in-painting. In contrast, our focus in this paper is mainly on the efficiency and properties of the _entire_ VAE in LDMs, and our method is not restricted to conditional scenarios. Dai et al.  also introduced FFT features as input to the VAE for better reconstruction quality. However, their work does not address efficiency, and it can be seen as complementary to ours since FFT features can be combined with our DWT approach to further refine the encoder's initial representation.
+
+Wavelet transformThe wavelet transformation [5; 42] is a classic spatial-frequency decomposition of a signal that has gained popularity in numerous computer vision tasks, including denoising [6; 45], image and video compression [62; 67; 54; 41], super-resolution [18; 27], and image restoration [14; 40; 73]. More recently, wavelets have been integrated into generative adversarial networks [15; 71] and pixel-space diffusion models for high-resolution image synthesis [26; 49; 20]. Building on these advancements, we investigate the use of DWT to enhance the efficiency and characteristics of VAEs in LDMs, addressing an underexplored area in the literature.
+
+## 3 Background
+
+This section includes a brief overview of deep autoencoders and the wavelet transform. A summary of diffusion models is given in Appendix C.
+
+Deep autoencodersDeep autoencoders consist of an encoder network \(\) that maps an image to a latent representation and a decoder \(\) that reconstructs the data from the latent code. More specifically, given an input image \(^{H W 3}\), convolutional autoencoders aim to find a latent vector \(()^{H/f W/f n_{z}}\) such that \((())\), where \(f\) is the spatial downsampling scale and \(n_{z}\) is the number of latent channels.
+
+The training of autoencoders mainly consists of a reconstruction loss \(_{}((()),)\) between the input image and the reconstructed image, and a regularization term \(_{}(())\) on the latents. \(_{}\) is typically a combination of \(_{1}\) and perceptual loss , and the regularization \(_{}\) can be enforced via Kullback-Leibler (KL) divergence  relative to a reference distribution, typically the standard Gaussian. The regularization term forces the latent space to have a better structure for other applications, such as generative modeling. Following Esser et al. , it is also common to train a discriminator \(D\) with an adversarial loss \(_{}\) that differentiates the real images \(\) from the reconstructions \((())\) for more photorealistic outputs. The overall training loss is then equal to
+
+\[_{}=_{}+_{} _{}+_{}_{},\] (1)
+
+where the \(\)'s are weighting hyperparameters. Esser et al.  also proposed an adaptive weighting strategy for \(_{}\) given by
+
+\[_{}=_{}\|}{\|_{}\|+}\] (2)
+
+for a small \(>0\) to balance the relative gradient norm of the adversarial loss with that of the reconstruction loss.
+
+Discrete wavelet transformWavelet transforms are a signal processing technique for extracting spatial-frequency information from input data. Wavelets are characterized by a low-pass filter \(L\) and a high-pass filter \(H\). For 2D signals, four filters are defined via \(LL^{}\), \(LH^{}\), \(HL^{}\), and \(HH^{}\). Given an input image \(\), the 2D wavelet transform decomposes \(\) into a low-frequency sub-band \(_{L}\) and three high-frequency sub-bands \(\{_{H},_{V},_{D}\}\) capturing horizontal, vertical, and diagonal details. For an image of size \(H W\), each wavelet sub-band is of size \(H/2 W/2\). Multi-resolution analysis is achievable by iteratively applying the wavelet transform to \(_{L}\) at each level. Wavelet transforms are also invertible, and one can reconstruct the original image \(\) from the sub-bands \(\{_{L},_{H},_{V},_{D}\}\) using the inverse wavelet transform. Additionally, the Fast Wavelet Transform (FWT)  enables the computation of wavelet sub-bands with linear complexity relative to the number of pixels in \(\). Consistent with the recent literature [15; 49], we use Haar basis as the wavelet filter.
+
+## 4 Method
+
+In this section, we describe our design of a more efficient VAE for LDMs and discuss our modifications to the network architectures and the training setup that lead to better reconstruction quality and training efficiency. To motivate our approach, Figure 2 shows that when visualizing the latent code learned by the Stable Diffusion VAE (SD-VAE), the code is itself image-like, with a strong similarity to the input. This observation leads us to explore whether the learning of these latent representations can be simplified by applying a fast image-processing function to the input images prior to encoding. We opt for the discrete wavelet transform (DWT) as the image-processing function due to its image-like structure, proven effectiveness in extracting rich, compact features from images, and wide applicability in image-processing tasks such as image compression.
+
+### Model design
+
+We now propose LiteVAE, a wavelet-based autoencoder that reaches the reconstruction quality of standard VAEs with much lower complexity. Our method consists of three main components (see also Figure 1):
+
+**Wavelet processing:** Each image \(\) is first processed via a multi-level DWT to get the corresponding wavelet coefficients \(\{^{l}_{L},^{l}_{H},^{l}_{V},^{l}_{D}\}\) at level \(l\). To achieve an \(8\) downsampling, we use three wavelet levels (i.e., \(l\{1,2,3\}\)). These features extract multiscale information from \(\).
+
+**Feature extraction and aggregation:** The wavelet coefficients \(\{^{l}_{L},^{l}_{H},^{l}_{V},^{l}_{D}\}\) are then separately processed via a feature-extraction module \(_{l}\) to compute a multiscale set of feature maps \(_{l}(\{^{l}_{L},^{l}_{H},^{l}_{V},^{l}_{D} \})\). The features are then combined via a feature-aggregation module \(_{}\) that takes in the output of each \(_{l}\) and computes the latent \(\). We use a UNet-based architecture similar to the ADM model  without spatial down/upsampling layers for feature extraction and aggregation. (See Appendix B for a discussion of the importance of these learned modules.)
+
+**Image reconstruction:** Finally, a decoder network \(\) processes the latent code \(\) and computes the reconstructed image \(}=()\). We use the same decoder network as in SD-VAE for \(\).
+
+The model is then trained end-to-end to learn the parameters of \(\{_{l}\}\), \(_{}\), and \(\). Because different wavelet levels already contain enough information about the images, we can use lightweight networks for the feature extraction and aggregation steps. Hence, LiteVAE essentially combines the computational benefits of DWT with the expressiveness of a learned encoder. Please refer to Appendices F and G for implementation details.
+
+### Self-modulated convolution
+
+In addition to improving the encoder, we observe that the intermediate feature maps learned by the decoder are relatively imbalanced, with certain areas having significantly stronger magnitudes. An example of this issue is shown in Figure 3. Consistent with Karras et al. , we argue that this issue
+
+Figure 2: RGB visualization of the first three channels of a SD-VAE latent code.
+
+is due to excessive group normalization layers  in the decoder architectures typically used in autoencoders, since such layers potentially destroy any information found in the magnitudes of the features relative to each other .
+
+We propose a modified version of modulated convolution  instead of group normalization to avoid imbalances. Instead of modulating the convolution layers via a data-dependent style vector, we allow the convolution layer to learn the corresponding scales for each feature map. We call this operation self-modulated convolution (SMC). SMC modifies the convolution weights \(w_{ijk}\) according to
+
+\[w^{}_{ijk}=w_{ijk}}{(s_{i}w_{ijk})^{2}+}}\] (3)
+
+for \(>0\), where \(s_{i}\) is a learnable parameter, and \(\{i,j,k\}\) spans the input feature maps, output feature maps, and the spatial dimension of the convolution. Our experiments show that using SMC in the decoder balances the feature maps and also improves the final reconstruction quality due to better training dynamics. Two examples of the decoder feature maps after using SMC are shown in Figure 3.
+
+### Training improvements
+
+Besides the network architecture, we also introduce the following modifications that further enhance the training dynamics and reconstruction quality of LiteVAE. We verify the effect of these modifications in Sections 5 and 6.
+
+Training resolutionWhile the autoencoders in LDMs are typically trained on 256\(\)256 data (similar to SD-VAE), we observe that the bulk of the training of LiteVAE can be effectively conducted at a lower 128\(\)128 resolution. Our experiment suggests that pretraining at this lower resolution followed by a fine-tuning stage at the full resolution achieves similar reconstruction quality while requiring significantly less compute for most of the training. We later show in Appendix D.8 that this improvement is also generally applicable to the standard VAE models.
+
+Improving the adversarial setupWe replace the PatchGAN discriminator used in Stable Diffusion with a UNet-based model for pixel-wise discrimination . We also notice that the adaptive weight (Equation (2)) for the adversarial loss update does not introduce any benefit and can be removed for more stable training, especially in mixed-precision setups.
+
+Additional loss functionsWe also introduce two high-frequency reconstruction loss terms based on the wavelet transform and Gaussian blurring . Let \(\) be the input image and \(}\) the corresponding reconstruction. For the wavelet term, we compute the Charbonnier loss  between the high-frequency DWT sub-bands \(\{_{H},_{V},_{D}\}\) and \(\{}_{LH},}_{HL},}_{HH}\}\). For the Gaussian loss, given a Gaussian filter \(h\), we compute the \(_{1}\) loss between \(-h()\) and \(}-h(})\).
+
+Figure 3: Two examples of the feature maps from the final block of the decoder before and after removing group normalization layers. Using SMC blocks instead of group normalization allows the model to learn more balanced feature maps. The image is best viewed when zoomed in.
+
+## 5 Experiments
+
+This section presents a comprehensive empirical evaluation of LiteVAE, demonstrating its superior trade-off between computational efficiency and quality relative to standard VAEs. We further explore the properties of LiteVAE along with the changes proposed in Section 4. For each experiment, all models in comparison are trained with the exact same training setup, including the loss functions and the discriminator, to ensure a fair comparison.
+
+Evaluation metricsWe follow the same evaluation pipeline as in Rombach et al.  and use reconstruction Frechet Inception Distance (rFID)  as the main metric to measure the quality and realism of autoencoder outputs due to its alignment with human judgment. For completeness, we also report PSNR, SSIM, and LPIPS . As FID is sensitive to small implementation details , we recompute the metrics as much as possible based on released checkpoints to have a fair comparison between different models.
+
+Main resultsWe first demonstrate that LiteVAE matches or exceeds the performance of standard VAEs across various datasets and latent dimensions, as shown in Table 1. Notably, the model employed for this table utilizes approximately one-sixth of the encoder parameters compared to the VAE model (6.75M vs 34.16M) and hence trains faster. Also, one example of the reconstruction quality and the learned latent representation by LiteVAE is given in Figure 4. We notice that LiteVAE maintains the image-like latent codes, similar to the SD-VAE latent in Figure 2.
+
+   Dataset & Latent dim & Model & rFID \(\) & LPIPS \(\) & PSNR \(\) & SSIM \(\) \\   &  & VAE & 0.88 & 0.089 & 28.08 & **0.85** \\  & & LiteVAE & **0.74** & **0.085** & **28.36** & **0.85** \\   &  & VAE & 0.47 & **0.109** & 28.16 & 0.81 \\  & & LiteVAE & **0.41** & 0.117 & **28.33** & **0.82** \\   &  & VAE & 4.54 & **0.164** & 24.25 & 0.69 \\  & & LiteVAE & **4.40** & **0.164** & **24.49** & **0.71** \\    &  & VAE & **0.94** & **0.069** & 29.25 & 0.86 \\  & & LiteVAE & **0.94** & **0.069** & **29.45** & **0.87** \\   &  & VAE & 0.89 & 0.160 & 25.83 & 0.73 \\  & & LiteVAE & **0.87** & **0.157** & **26.02** & **0.74** \\    &  & VAE & **0.23** & 0.073 & 30.41 & 0.86 \\   & & LiteVAE & **0.23** & **0.072** & **30.91** & **0.88** \\   
+
+Table 1: Comparison between LiteVAE and VAE in terms of reconstruction quality across different datasets and latent dimensions. LiteVAE achieves better or similar reconstruction quality while having considerably fewer parameters in the encoder (34.16M for the VAE and 6.75M for LiteVAE). All models use a downscaling factor of \(f=8\) and are trained from scratch with similar training configs (including the choice of loss functions and discriminator).
+
+Figure 4: An example of the autoencoder reconstruction alongside the learned latent code by LiteVAE. We observe that LiteVAE maintains the image-like structure of SD-VAE.
+
+Increasing model complexityIn Table 2 we show the scalability of LiteVAE as we increase the complexity of the feature-extraction and feature-aggregation blocks. We note that the reconstruction performance strictly improves by using more encoder parameters, and our large models outperform a standard VAE of similar complexity across all metrics. Hence, we conclude that LiteVAE offers superior scalability w.r.t. the model size.
+
+Scaling down the encoder in VAEsTable 2(b) also indicates that the naive approach of scaling down the encoder in standard VAEs does not perform on par with our method in terms of reconstruction quality. Thus, we conclude that LiteVAE takes better advantage of the encoder parameters than normal VAEs, mainly due to the wavelet processing step that provides the encoder with a rich representation from the beginning.
+
+Computational costTable 3 presents a comparison of the computational costs between LiteVAE and the Stable Diffusion VAE encoder. LiteVAE-B requires considerably less GPU memory and offers nearly double the throughput. This reduction in computational complexity allows the usage of larger batch sizes when training the autoencoder, as shown to be beneficial by Podell et al. , and leads to better hardware utilization for diffusion training in the second stage of LDMs since fewer resources should be devoted to computing the latent input for the diffusion model.
+
+Removing group normalization in the decoderWe qualitatively showed in Figure 3 that group normalization in the decoder causes imbalanced feature maps in the network and that SMC can remove such artifacts. Here we also quantitatively show in Table 4 that replacing group normalization with SMC leads to better reconstruction quality. Additionally, we demonstrate in Appendix D.7 that removing the imbalanced feature maps results in less scale dependency in the final model.
+
+Training resolutionWe next demonstrate the feasibility of pretraining LiteVAE at a lower resolution of 128\(\)128 followed by a fine-tuning step on 256\(\)256 images. To illustrate this, we compare a model trained for 150k steps at full resolution (256-full) with one trained for 100k steps at 128 and an additional 50k steps at 256 (128-tuned). As shown in Table 5, the 128-tuned model even slightly outperforms the model fully trained at the higher resolution. We also note that fine-tuning is essential, as the model trained solely on 128\(\)128 images for 150k steps (128-full) performs worse than the other two. This experiment implies that the model can learn most of the semantics at lower resolutions and recover additional higher-frequency contents in the fine-tuning stage. This pretraining technique reduced the overall wall-clock time of our training runs at 256\(\)256 resolution by more than a factor of two.
+
+Scale dependencyFigure 5 demonstrates that compared to the standard VAEs, LiteVAE is less prone to performance degradation when evaluating the model at different resolutions. We hypothesize
+
+Table 2: Comparison of the scalability of LiteVAE with a standard VAE across different model sizes. (a) LiteVAE matches the performance of the VAE with significantly fewer parameters and outperforms VAEs of similar complexity. (b) A naive downscaling of the VAE performs worse than LiteVAE. All models use the same decoder. More architecture details are provided in Appendix F.
+
+   Encoder & Params (M) & GPU Memory (MB) & Throughput (img/sec) \\  VAE & 34.16 & 8860 & 68 \\ LiteVAE-S & 1.03 & 1324 & 384 \\ LiteVAE-B & 6.75 & 3155 & 129 \\ LiteVAE-M & 32.75 & 12130 & 42.24 \\ LiteVAE-L & 41.425 & 12130 & 41.6 \\   
+
+Table 3: Comparing the complexity of our encoder with the encoder from the Stable Diffusion VAE for a batch size of 32. The values are measured on one Quadro RTX 6000.
+
+that as our model learns features on top of multi-resolution wavelet coefficients, it is able to learn more scale-independent features compared to a standard encoder and leave the specific details of each scale to the initial wavelet processing step.
+
+Analysis of the LiteVAE latent spaceWe also analyzed the characteristics of the latent space of LiteVAE. Qualitative inspection of Figures 2 and 4, which are representative of the results that hold across our data, show that our latent space and SD-VAE share a similar image-like structure. Separately, we also examined the statistical distance between our model's latent space and pure Gaussian noise. The intuition here is that, since a diffusion model will have to form a path from pure Gaussian noise to our model's latent space, we do not want that path to be longer than the path a diffusion model has to form between Gaussian noise and the Stable Diffusion latent space. To this end, we compute the maximum mean discrepancy (MMD)  between latent codes from LiteVAE and samples from a standard Gaussian and compare the result with that observed for the SD-VAE (See Table 6). Here the MMD serves as a proxy measure for the path length between these distributions. In all tested cases, over a variety of RBF kernel bandwidths, our latent space is closer to Gaussian noise than that of SD-VAE.
+
+Lastly, we trained two diffusion models on the FFHQ and CelebA-HQ datasets and compared their performance with standard VAE-based LDMs. The diffusion model architecture used for this experiment is a UNet identical to the original model from Rombach et al. . Table 7 shows that the diffusion models trained in the latent space of LiteVAE perform similarly to (or slightly better than) the standard LDMs. Additionally, Figure 6 includes some generated examples from our FFHQ model. These results suggest that diffusion models are also capable of modeling the latent space of LiteVAE.
+
+   \(\) & SD-VAE & LiteVAE \\ 
+25 & 8.67\(\)0.10 & **1.44\(\)0.28** \\
+50 & 28.90\(\)0.49 & **7.94\(\)0.19** \\
+100 & 10.77\(\)0.29 & **5.14\(\)0.19** \\
+250 & 1.78\(\)0.06 & **1.09\(\)0.04** \\
+500 & 0.44\(\)0.02 & **0.28\(\)0.01** \\   
+
+Table 6: Comparing MMD between LiteVAE latent space and a standard Gaussian vs SD-VAE latent space for different RBF kernels. LiteVAE is statistically closer to a standard Gaussian.
+
+   \(\) & SD-VAE & LiteVAE \\ 
+25 & 8.67\(\)0.10 & **1.44\(\)0.28** \\
+50 & 28.90\(\)0.49 & **7.94\(\)0.19** \\
+100 & 10.77\(\)0.29 & **5.14\(\)0.19** \\
+250 & 1.78\(\)0.06 & **1.09\(\)0.04** \\
+500 & 0.44\(\)0.02 & **0.28\(\)0.01** \\   
+
+Table 6: Comparing MMD between LiteVAE latent space and a standard Gaussian vs SD-VAE latent space for different RBF kernels. LiteVAE is statistically closer to a standard Gaussian.
+
+   Training Config & rFID \(\) & LPIPS \(\) & PSNR \(\) & SSIM \(\) \\ 
+256-full & 0.75 & 0.153 & 26.10 & 0.73 \\
+128-full & 0.97 & 0.162 & 25.90 & 0.72 \\
+128-tuned & **0.73** & **0.147** & **26.22** & **0.74** \\   
+
+Table 5: Effect of pretraining the autoencoder at lower resolutions. We observe that training at 128\(\)128 followed by fine-tuning at 256\(\)256 performs best.
+
+Figure 5: Comparing the performance of LiteVAE with a normal VAE across different resolutions. LiteVAE shows less degradation in all metrics.
+
+   \(\) & SD-VAE & LiteVAE \\ 
+25 & 8.67\(\)0.10 & **1.44\(\)0.28** \\
+50 & 28.90\(\)0.49 & **7.94\(\)0.19** \\
+100 & 10.77\(\)0.29 & **5.14\(\)0.19** \\
+250 & 1.78\(\)0.06 & **1.09\(\)0.04** \\
+500 & 0.44\(\)0.02 & **0.28\(\)0.01** \\   
+
+Table 7: Comparison between diffusion models trained in the latent space of a standard VAE  vs the latent space of LiteVAE. We observe that both models perform similarly in terms of generation quality.
+
+## 6 Ablation studies
+
+We next present our main ablation studies to determine the individual impact of the changes proposed in Section 4. We use the ImageNet 128\(\)128 model with a latent size of 32\(\)32\(\)12 as the baseline for all ablations. Further ablation studies on other design choices in LiteVAE are provided in Appendix D.
+
+Removing adaptive weight for \(_{}\)Table 8 demonstrates that we can safely remove the adaptive weight for the adversarial loss (Equation (2)) and still slightly improve the metrics. Figure 7 also shows the relative norm of the gradient of the adversarial loss compared to the reconstruction loss for both adaptive and constant \(_{}\). We observe that using adaptive \(_{}\) leads to more imbalanced gradient ratios, and hence less stable training, especially for mixed-precision scenarios. Accordingly, we exclusively use a constant weight for the adversarial loss in our experiments.
+
+High-frequency loss functionsTable 9 shows the effect of adding high-frequency losses based on Gaussian filtering and the wavelet transform. The addition of these high-frequency loss terms during training consistently improves all reconstruction metrics.
+
+Choice of the discriminatorWe finally show that using a UNet-based discriminator  outperforms both PatchGAN and StyleGAN discriminators used in previous works [55; 72] in terms of rFID while having comparable performance for other metrics. We also empirically noted that using a UNet discriminator resulted in more stable training across different runs and hyperparameters. The full comparison for this experiment is given in Table 10.
+
+Conclusion
+
+In this paper, we presented LiteVAE, a new design concept for autoencoders based on the multi-resolution wavelet transform. LiteVAE can match the performance of standard VAEs while requiring significantly less compute. We also analyzed the design space and training of this proposed family of autoencoders and offered several modifications that further improve the final reconstruction quality and training dynamics of the base model. Overall, LiteVAE offers more flexibility in terms of performance/compute trade-off and outperforms the naive approach of making the VAE encoder smaller. Our current work is focused on improving efficiency in the models responsible for encoding the latent representation of natural images, and whether the efficiency benefits of LiteVAE extend to other domains is a question we leave to follow-up work. Although we introduced LiteVAE in the context of LDMs, we hypothesize that its application is not confined to this scenario. We consider the extension of LiteVAE to other autoencoder-based generative modeling schemes (e.g., tokenization) a promising avenue for further research.

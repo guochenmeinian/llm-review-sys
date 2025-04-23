@@ -1,0 +1,197 @@
+# Diffusion Forcing: Next-token Prediction Meets Full-Sequence Diffusion
+
+Boyuan Chen
+
+MIT CSAIL
+
+boyuanc@mit.edu &Diego Marti Monso
+
+Technical University of Munich
+
+diego.marti@tum.de &Yilun Du
+
+MIT CSAIL
+
+yilundu@mit.edu &Max Simchowitz
+
+MIT CSAIL
+
+msimchow@mit.edu &Russ Tedrake
+
+MIT CSAIL
+
+russt@mit.edu &Vincent Sitzmann
+
+MIT CSAIL
+
+sitzmann@mit.edu
+
+Work done as a visiting student at MIT.
+
+###### Abstract
+
+This paper presents Diffusion Forcing, a new training paradigm where a diffusion model is trained to denoise a set of tokens with _independent_ per-token noise levels. We apply Diffusion Forcing to sequence generative modeling by training a causal next-token prediction model to generate one or several future tokens without fully diffusing past ones. Our approach is shown to combine the strengths of next-token prediction models, such as variable-length generation, with the strengths of full-sequence diffusion models, such as the ability to guide sampling to desirable trajectories. Our method offers a range of additional capabilities, such as (1) rolling-out sequences of continuous tokens, such as video, with lengths past the training horizon, where baselines diverge and (2) new sampling and guiding schemes that uniquely profit from Diffusion Forcing's variable-horizon and causal architecture, and which lead to marked performance gains in decision-making and planning tasks. In addition to its empirical success, our method is proven to optimize a variational lower bound on the likelihoods of all subsequences of tokens drawn from the true joint distribution. Project website: https://boyuan.space/diffusion-forcing/
+
+## 1 Introduction
+
+Probabilistic sequence modeling plays a crucial role in diverse machine learning applications including natural language processing [6; 47], video prediction [31; 69] and decision making [3; 22]. Next-token prediction models in particular have a number of desirable properties. They enable the generation of sequences with varying length [32; 21; 37] (generating only a single token or an "infinite" number of tokens via auto-regressive sampling), can be conditioned on varying amounts of history [21; 37], support efficient tree search[70; 23; 25], and can be used for online feedback control [22; 3].
+
+Current next-token prediction models are trained via _teacher forcing_, where the model predicts the immediate next token based on a ground truth history of previous tokens. This results in two limitations: (1) there is no mechanism by which one can guide the sampling of a sequence to minimize a certain objective, and (2) current next-token models easily become _unstable_ on continuous data. For example, when attempting to auto-regressively generate a video (as opposed to text  or vector-quantized latents ) past the training horizon, slight errors in frame-to-frame predictions accumulate and the model diverges.
+
+_Full-sequence diffusion_ seemingly offers a solution. Commonly used in video generation and long-horizon planning, one directly models the joint distribution of a fixed number of tokens by diffusing their concatenation [31; 1], where the noise level is identical across all tokens. They offer _diffusion guidance_[30; 16] to guide sampling to a desirable sequence, invaluable in decision-making (planning) applications [36; 34]. They further excel at generating continuous signals such as video . However, full-sequence diffusion is universally parameterized via non-causal, unmasked architectures. In addition to restricting sampling to full sequences, as opposed to variable length generation, we show that this limits the possibilities for both guidance and subsequence generation (Figure 1). Further, we demonstrate that a naive attempt at combining the best of both worlds by training a next-token prediction model for full-sequence diffusion leads to poor generations, intuitively because it does not model the fact that small uncertainty in an early token necessitates high uncertainty in a later one.
+
+In this paper, we introduce _Diffusion Forcing_ (DF), a training and sampling paradigm where each token is associated with a _random, independent_ noise level, and where tokens can be denoised according to arbitrary, independent, per-token schedules through a shared next-or-next-few-token prediction model. Our approach is motivated by the observation that noising tokens is a form of _partial masking_--zero noise means a token is unmasked, and complete noise fully masks out a token. Thus, DF forces the model to learn to "unmask" any collection of variably noised tokens (Figure 2). Simultaneously, by parameterizing predictions as a composition of next-token prediction models, our system can flexibly generate varying length sequences as well as compositionally generalize to new trajectories (Figure 1).
+
+We implement DF for sequence generation as _Causal Diffusion Forcing_ (CDF), in which future tokens depend on past ones via a causal architecture. We train the model to denoise all tokens of a sequence at once, with an independent noise level per token. During sampling, CDF gradually denoises a sequence of Gaussian noise frames into clean samples where different frames may have different noise levels at each denoising step. Like next-token prediction models, CDF can generate variable-length sequences; unlike next-token prediction, it does so stabilly from the immediate next token to thousands of tokens in the future - even for continuous tokens. Moreover, like full-sequence diffusion it accepts guidance towards high-reward generations. Synergistically leveraging causality, flexible horizon, and variable noise schedules, CDF enables a new capability, Monte Carlo Guidance (MCG), that dramatically improves the sampling of high-reward generations compared to non-causal full-sequence diffusion models. Fig. 1 overviews these capabilities.
+
+In summary, our contributions are: (1) We propose Diffusion Forcing, a new probabilistic sequence model that has the flexibility of next-token prediction models while being able to perform long-horizon guidance like full-sequence diffusion models. (2) Taking advantage of Diffusion Forcing's unique capabilities, we introduce a novel decision-making framework that allows us to use Diffusion Forcing as simultaneously a _policy_ () and as a _planner_ (). (3) We formally prove that, under appropriate conditions, optimizing our proposed training objective maximizes a lower bound on the likelihood of the joint distribution of _all sub-sequences_ observed at training time. (4) We empirically evaluate CDF across diverse domains such as video generation, model-based planning, visual imitation learning, and time series prediction, and demonstrate CDF's unique capabilities,
+
+Figure 1: **Diffusion Forcing capabilities.** Today, different applications such as language modeling , planning , or video generation [31; 69] rely on _either_ auto-regressive next-token prediction _or_ full-sequence diffusion, according to their respective unique capabilities. The proposed Diffusion Forcing is a novel sequence generative model that enjoys key strengths of both model types.
+
+such as stabilizing long-rollout autoregressive video generation, composing sub-sequences of those observed at training time with user-determined memory horizon, Monte Carlo Guidance, and more.
+
+## 2 Related Work and Preliminaries
+
+We discuss related work and preliminaries for our core application, sequence generative modeling; see Appendix D for further literature review.
+
+Our method unifies two perspectives on sequence modeling: Bayesian filtering along the time axis, denoted by subscript \(t\), and diffusion along an "uncertainty" (or noise level) axis denoted by superscript \(k\). In the following, we denote observations as \(\) and latent states as \(\).
+
+**Bayesian Filtering.** Given a Hidden Markov Model (HMM) defined by latent states \(_{t}\) and observations \(_{t}\), a Bayes filter is a probabilistic method for estimating latent states recursively over time from incoming observations. A prior model \(p(_{t+1}|_{t})\) infers a belief over the next state given only the current state, and an observation model infers a belief over the next observation given the current latent state \(p(_{t}|_{t})\). When a new observation is made, a posterior model \(p(_{t+1}|_{t},_{t+1})\) provides an updated estimation of the next latent state \(_{t+1}\). When trained end-to-end with neural networks [22; 23], latent states are not an estimate of any physical quantity, but a sufficiently expressive latent that summarizes past observations for predicting future observations \((_{t^{}})_{t^{}>t}\) in the sequence.
+
+**Diffusion Models.** Diffusion models [56; 28] have proven to be highly expressive and reliable generative models. We review their essentials here. Let \(q()\) denote a data distribution of interest, and let \(^{0} q\). We consider a forward diffusion process that gradually adds Gaussian noise to a data point over a series of time steps. This process is modeled as a Markov chain, where the data at each step \(k\) is noised incrementally:
+
+\[q(^{k}|^{k-1})=(^{k};}^{k-1},_{k})\] (2.1)
+
+where \(\) is the normal distribution and \(_{k}\) is the variance of the noise added at each step controlled by a schedule \(\{_{k}(0,1)\}_{k=1}^{K}\). The process continues until the data is converted into pure noise at \(^{K}\). The reverse process is also a Markov chain and attempts to recreate the original data from the noise with a parameterized model \(p_{}\):
+
+\[p_{}(^{k-1}|^{k})=(^{k-1}; (^{k},k),_{k}),\] (2.2)
+
+where the mean \(\) is a model with a neural network, and where it is shown  that one can set the covariance to the identity scaled by a fixed constant \(_{k}\) depending on \(k\). Adopting the standard
+
+Figure 2: **Method Overview.** Diffusion Forcing trains causal sequence neural networks (such as an RNN or a masked transformer) to denoise flexible-length sequences where each frame of the sequence can have a _different_ noise level. In contrast, next-token prediction models, common in language modeling, are trained to predict a single next token from a _ground-truth_ sequence (teacher forcing ), and full-sequence diffusion, common in video generation, train non-causal architectures to denoise all frames in a sequence at once with the _same_ noise level. Diffusion Forcing thus _interleaves_ the time axis of the sequence and the noise axis of diffusion, unifying strengths of both alternatives and enabling completely new capabilities (see Secs. 3.2,3.4).
+
+exposition, we reparametrize the mean \(\) in terms of noise prediction \(=(_{t}})^{-1}_{t}^{k_{t}}-_{t}}\). This leads  to the following least squares objective:
+
+\[()=_{k,^{0},}[\| ^{k}-_{}(^{k},k)\|^{2}],\] (2.3)
+
+where \(^{k}=_{t}}^{0}+_{t} }^{k}\) and \(^{k}(0,)\). One can then sample from this model via Langevin dynamics \(^{k-1}_{k}}}(_{t}^{ k}-}{_{t}}}_{}( _{t}^{k},k)+_{k})\).
+
+**Guidance of Diffusion Models.** Guidance [30; 16] allows biasing diffusion generation towards desirable predictions at sampling time. We focus on classifier guidance : given a classifier \(c(y|^{k})\) of some desired \(y\) (e.g. class or success indicator), one modifies the Langevin sampling  gradient \(_{}(^{k},k)\) to be \(_{}(^{k},k)-_{k}}_{x^{ k}} c(y|^{k})\). This allows sampling from the joint distribution of \(\) and class label \(y\) without the need to train a conditional model. Other energies such as a least-squares objective comparing the model output to a desirable ground truth have been explored in applications such as decision making [16; 36].
+
+**Next-Token Prediction Models.** Next-token prediction models are sequence models that predict the next frame \(_{t+1}\) given past frames \(_{1:t}\). At training time, one feeds a neural network with \(_{1:t}\) and minimizes \(||}-||^{2}\) for continuous data or a cross-entropy loss for discrete data . At sampling time, one samples the next frame \(}_{t+1}\) following \(p(_{t+1}|_{1:t})\). If one treats \(}_{t+1}\) as \(_{t+1}\), one can use the same model to predict \(_{t+2}\) and repeat until a full sequence is sampled. Unlike full-sequence diffusion models, next-token models do not accept multi-step guidance, as prior frames must be fully determined to sample future frames.
+
+**Diffusion Sequence Models.** Diffusion has been widely used in sequence modeling.  use full-sequence diffusion models to achieve controllable text generation via guidance, such as generating text following specified parts of speech.  trains full-sequence diffusion models to synthesize short videos and uses a sliding window to roll out longer conditioned on previously generated frames.  uses full-sequence diffusion models as planners in offline reinforcement learning. This is achieved by training on a dataset of interaction trajectories with the environment and using classifier guidance at sampling time to sample trajectories with high rewards towards a chosen goal.  modifies auto-regressive models to denoise the next token conditioned on previous tokens. It trains with teacher forcing  and samples next-token auto-regressively for time series data. Most similar to our work is AR-Diffusion , which trains full-sequence text diffusion with a causal architecture with linearly dependent noise level along the time axis. We provide a detailed comparision between this approach and ours in Appendix D.
+
+## 3 Method
+
+### Noising as partial masking
+
+Recall that _masking_ is the practice of occluding a subset of data, such as patches of an image  or timesteps in a sequence [15; 48], and training a model to recover unmasked portions. Without loss of generality, we can view any collection of tokens, sequential or not, as an ordered set indexed by \(t\). Training next-token prediction with teacher forcing can then be interpreted as masking each token \(_{t}\) at time \(t\) and making predictions from the past \(_{1:t-1}\). Restricted to sequences, we refer to all these practices as _masking along the time axis_. We can also view full-sequence forward diffusion, i.e., gradually adding noise to the data \(_{1:T}^{0}_{1:T}\), as a form of _partial masking_, which we refer to as _masking along the noise axis_. Indeed, after \(K\) steps of noising, \(_{1:T}^{K}\) is (approximately) pure white noise without information about the original data.
+
+We establish a unified view along both axes of masking (see Fig. 2). We denote \(_{1:T}\) for a sequence of tokens, where the subscript indicates the time axis. As above, \(_{t}^{k_{t}}\) denotes \(_{t}\) at noise level \(k_{t}\) under the forward diffusion process (2.1); \(_{t}^{0}=\) is the unnoised token, and \(_{t}^{K}\) is white noise \((0,)\). Thus, \((_{t}^{k_{t}})_{1 t T}\) denotes a sequence of noisy observations where each token has a _different_ noise level \(k_{t}\), which can be seen as the degree of _partial masking_ applied to each token through noising.
+
+### Diffusion Forcing: different noise levels for different tokens
+
+_Diffusion Forcing_ (DF) is a framework for training and sampling arbitrary sequence lengths of noisy tokens \((_{t}^{k_{t}})_{1 t T}\), where critically, _the noise level \(k_{t}\) of each token can vary by time step_. In this paper, we focus on time series data, and thus instantiate Diffusion Forcing with causal architectures (where \(_{t}^{k_{t}}\) depends only on past noisy tokens), which we call _Causal Diffusion Forcing_ (CDF). For simplicity, we focus on a minimal implementation with a vanilla Recurrent Neural Network (RNN) . Potential transformer implementation of Diffusion Forcing is also possible but we defer its discussion to Appendix C.1.
+
+The RNN with weights \(\) maintains latents \(_{t}\) capturing the influence of past tokens, and these evolve via dynamics \(_{t} p_{}(_{t}|_{t-1},_{t}^{ k_{t}},k_{t})\) with a recurrent layer. When an incoming noisy observation \(_{t}^{k_{t}}\) is made, the hidden state is updated in a Markovian fashion \(_{t} p_{}(_{t}|_{t-1},_{t}^ {k_{t}},k_{t})\)2. When \(k_{t}=0\), this is the posterior update in Bayes filtering; whereas when \(k_{t}=K\) (and \(_{t}^{K}\) is pure noise and thus uninformative), this is equivalent to modeling the "prior distribution" \(p_{}(_{t}_{t-1})\) in Bayes filtering. Given latent \(_{t}\), an observation model \(p_{}(_{t}^{0}|_{t})\) predicts \(_{t}\).
+
+```
+1:Input: Model \(\), scheduling matrix \(\), initial latent \(_{0}\), guidance cost \(c()\).
+2:Initialize\(_{1},,_{T}(0,_{K}^{2}I)\).
+3:for row \(m=M-1,...,0\)do
+4:for\(t=1,,T\)do
+5:\(_{t}^{} p_{}(_{t}_{t-1},_{t},_{m+1,t})\).
+6:\(k_{m,t}\), \((0,)\).
+7:\(_{t}^{}}{}}( _{t}-}{}}_{}( _{t}^{},_{t},k))+_{k}\)
+8: Update \(_{t}_{t}^{}\).
+9:endfor
+10:\(L=\)MSELoss\(([_{1},...,_{n}],[_{1},...,_{n}])\)
+11: Backprop with \(L\) and update \(\)
+12:endloop ```
+
+**Algorithm 2** DF Sampling with Guidance
+
+**Training.** The dynamics model \(p_{}(_{t}|_{t-1},_{t}^{k_{t}},k_{t})\) and the observation model \(p_{}(_{t}^{0}|_{t})\) together form a RNN unit. Such unit has the same input-output behavior as a standard conditional diffusion model, using a conditioning variable \(_{t-1}\) and a noisy token \(_{t}^{k_{t}}\) as input to predict the noise-free \(_{t}=_{t}^{0}\) and thus, indirectly, the noise \(^{k_{t}}\) via affine reparametrization . We can thus directly train (Causal) Diffusion Forcing with the conventional diffusion training objective. We parameterize the aforementioned unit in terms of noise prediction \(_{}(_{t-1},_{t}^{k_{t}},k_{t})\). We then find parameters \(\) by minimizing the loss
+
+\[_{t} p_{}(_{t}| _{t-1},_{t}^{k_{t}},k_{t})}{} _{t=1}^{T}\|_{t}-_{ }(_{t-1},_{t}^{k_{t}},k_{t})\|^{2},\] (3.1)
+
+where we sample \(k_{1:T}\) uniformly from \([K]^{T}\), \(_{1:T}\) from our training data, and \(_{t}(0,_{k}^{2}\,I)\) in accordance with the forward diffusion process (see Algorithm 1 for pseudocode). Importantly, the loss (3.1) captures essential elements of Bayesian filtering and conditional diffusion. In Appendix B.1, we further re-derive common techniques in diffusion model training for Diffusion Forcing, which proves extremely useful for video prediction experiments. In Appendix C.2, we discuss the need of sampling \(k_{1:T}\) uniformly. Finally, we prove the validity of this objective stated informally in the following Theorem 3.1 in Appendix A.
+
+**Theorem 3.1** (Informal).: _The Diffusion Forcing training procedure (Algorithm 1) optimizes a reweighting of an Evidence Lower Bound (ELBO) on the expected log-likelihoods \( p_{}((_{t}^{k_{t}})_{1 t T})\), where the expectation is averaged over noise levels \(k_{1:T}[K]^{T}\) and \(_{t}^{k_{t}}\) noised according to the forward process. Moreover, under appropriate conditions, optimizing (3.1) also maximizes a lower bound on the likelihood for all sequences of noise levels, simultaneously._We remark that a special case of 'all sequences of noise levels' are those for which either \(k_{t}=0\) or \(k_{t}=K\); thus, one can mask out _any prior token_ and DF will learn to sample from the correct conditional distribution, modeling the distribution of all possible sub-sequences of the training set.
+
+**Sampling.** Diffusion Forcing sampling is depicted in Algorithm 2 and is defined by prescribing a noise schedule on a 2D \(M T\) grid \([K]^{M T}\); columns correspond to time step \(t\) and rows indexed by \(m\) determine noise-level. \(_{m,t}\) represents the desired noise level of the time-step \(t\) token for row \(m\). To generate a whole sequence of length \(T\), initialize the tokens \(_{1:T}\) to be white noise, corresponding to noise level \(k=K\). We iterate down the grid row-by-row, denoising left-to-right across columns to the noise levels prescribed by \(\). By the last row \(m=0\), the tokens are clean, i.e. their noise level is \(_{0,t} 0\). Appendix B.5 discusses corner cases of this scheme; the hyperparameters \((_{k},_{k},_{k})\) are set to their standard values . The matrix \(\) specifies how fast each token gets denoised at every step of sequence diffusion. Since Diffusion Forcing is trained to denoise tokens of all sequences of noise levels, \(\) can be designed to flexibly achieve different behaviors without re-training the model.
+
+### New Capabilities in Sequence Generation
+
+We now explain the new capabilities this flexible sampling paradigm has to offer.
+
+**Stabilizing autoregressive generation.** For high-dimensional, continuous sequences such as video, auto-regressive architectures are known to diverge, especially when sampling past the training horizon. In contrast, Diffusion Forcing can stably roll out long sequences even beyond the training sequence length by updating the latents using the previous latent associated with slightly "noisy tokens" for some small noise level \(0<k K\). Our experiments (Sec. 4.1) illustrates the resulting marked improvements in long-horizon generation capabilities; App. C.4 provides further intuition.
+
+**Keeping the future uncertain.** Beginning from a sequence of white noise tokens \([_{1}^{K},_{2}^{K},_{3}^{K}]^{}\), we may denoise the first token fully and the second token partially, yielding \([_{1}^{0},_{2}^{K/2},_{3}^{K}]^{}\), then \([_{1}^{0},_{2}^{0},_{3}^{K/2}]^{}\), and finally denoising all tokens fully to \([_{1}^{0},_{2}^{0},_{3}^{0}]^{}\). Interpreting the noise level as uncertainty, this "zig-zag" sampling scheme intuitively encodes the immediate future as more certain than the far future. Sec. 3.4 describes how this leads to more effective sequence guidance.
+
+**Long-horizon Guidance.** In Line 10 of Algorithm 2, one may add guidance to the partially diffused trajectory \(_{1:T}\) as in Sec. 2. Due to the dependency of future tokens on the past, guidance gradients from future tokens can propagate backwards in time. The unique advantage of Diffusion Forcing is that, because we can diffuse future tokens without fully diffusing the past, the gradient guides the sampling of _past_ tokens, thereby achieving long-horizon guidance while respecting causality. We elaborate on implementation details in Appendix C.3. As we show in Section 4.2, planning in this manner significantly outperforms guided full-sequence diffusion models.
+
+### Diffusion Forcing for Flexible Sequential Decision Making
+
+The capabilities offered by Diffusion Forcing motivate our novel framework for sequential decision making (SDM), with key applications to robotics and autonomous agents. Consider a Markov Decision Process defined by an environment with dynamics \(p(_{t+1}|_{t},_{t})\), observation \(p(_{t}|_{t})\) and reward \(p(_{t}|_{t},_{t})\). The goal is to train a policy \((_{t}|_{1:t})\) such that the expected cumulative reward of a trajectory \([_{t=1}^{T}_{t}]\) is maximized. We assign tokens \(_{t}=[_{t},_{t},_{t+1}]\). A trajectory is a sequence \(_{1:T}\), possibly of variable length; training is conducted as in Algorithm 1. At each step \(t\) of execution, past (noise-free) tokens \(_{1:t-1}\) are summarized by a latent \(_{t-1}\). Conditioned on this latent, we sample, via Algorithm 2, a plan \(}_{t:t+H}\), with \(}_{t}=[}_{t},}_{t},}_{t+1}]^{}\) containing predicted actions, rewards and observations. \(H\) is a look-ahead window, analogous to future predictions in model predictive control . After taking planned action \(}_{t}\), the environment produces a reward and next observation \(_{t+1}\), yielding next token \(_{t}=[}_{t},_{t},_{t+1}]^{}\). The latent is updated according to the posterior \(p_{}(_{t}|_{t-1},_{t},0)\). Our framework enables functionality as both _policy_ and _planner_:
+
+**Flexible planning horizon.** Diffusion Forcing (a) can be deployed on _tasks of variable horizon_, because each new action is selected sequentially, and (b) its lookahead window \(H\) can be shortened to lower latency (using Diffusion Forcing as a _policy_), or lengthened to perform long-horizon _planning_ (via guidance described below), without re-training or modifications of the architecture. Note that (a) is not possible for full-sequence diffusion models like Diffuser  with full-trajectory generation horizons, whereas diffusion policies  need fixed, small lookahead sizes, precluding (b).
+
+**Flexible reward guidance.** As detailed in Appendix C.3, Diffusion Forcing can plan via guidance using any reward (in place of \( c\)) specified over future steps: this includes dense per-time step rewards on the entire trajectory \(_{t=1}^{T}_{t}\), dense rewards on a future lookahead \(_{t^{}=t}^{t+H}_{t}\), and sparse rewards indicating goal completion \(-\|_{T}-\|^{2}\). Per-time step policies cannot take advantage of this latter, longer horizon guidance.
+
+**Monte Carlo Guidance (MCG), future uncertainty.** Causal Diffusion Forcing allows us to influence the generation of a token \(_{t}^{k}\) by guidance on the whole distribution of future \(_{t+1:T}\). Instead of drawing a single trajectory sample to calculate this guidance gradient, we can draw multiple samples of the future and average their guidance gradients. We call this Monte Carlo Guidance. In the spirit of so-called shooting methods like MPPI , \(_{t}^{k}\) is then guided by the expected reward over the distribution of all future outcomes instead of one particular outcome. The effect of MCG is enhanced when combined with sampling schedules that keep the noise level of future tokens high when denoising immediate next tokens (e.g. the zig-zag schedule described in Sec. 3.3), accounting for greater uncertainty farther into the future. Appendix C.5 further justifies the significance of MCG, and why Diffusion Forcing uniquely takes advantage of it.
+
+## 4 Experiments
+
+We extensively evaluate Diffusion Forcing's merits as a generative sequence model across diverse applications in video and time series prediction, planning, and imitation learning. Please find the dataset and reproducibility details in the Appendix, as well as video results on the project website.
+
+### Video Prediction: Consistent, Stable Sequence Generation and Infinite Rollout.
+
+We train a convolutional RNN implementation of Causal Diffusion Forcing for video generative modeling on videos of Minecraft gameplay  and DMLab navigation . At sampling time, we
+
+Figure 3: **Video Generation. Among tested methods, Diffusion Forcing generations are uniquely temporally consistent and do not diverge even when rolling out well past the training horizon. Please see the project website for video results.**
+
+perform auto-regressive rollout with stabilization proposed in Sec. 3.3. We consider two baselines, both leveraging the same exact RNN architecture: a next-frame diffusion baseline trained with teacher forcing  as well as a causal full-sequence diffusion model. Figure 3 displays qualitative results of roll-outs generated by Diffusion Forcing and baselines starting from unseen frames for both datasets. While Diffusion Forcing succeeds at stably rolling out even far beyond its training horizon (e.g. \(1000\) frames), teacher forcing and full-sequence diffusion baselines diverge quickly. Further, within the training horizon, we observe that full-sequence diffusion suffers from frame-to-frame discontinuity where video sequences jump dramatically, while Diffusion Forcing roll-outs show ego-motion through a consistent 3D environment. This highlights the ability of Diffusion Forcing to stabilize rollouts of high-dimensional sequences without compounding errors.
+
+### Diffusion Planning: MCG, Causal Uncertainty, Flexible Horizon Control.
+
+Decision-making uniquely benefits from Diffusion Forcing's capabilities. We evaluate our proposed decision-making framework in a standard offline RL benchmark, D4RL . Specifically, we benchmark Diffusion Forcing on a set of 2D maze environments with sparse reward. An agent is tasked with reaching a designated goal position starting from a random starting position. In Appendix E.5 we provide a detailed description of the environment. The benchmark provides a dataset of _random walks_ through mazes (thus stochastic). We train one model per maze.
+
+We benchmark the proposed decision-making framework 3.4 with state-of-the-art offline RL methods and the recently introduced Diffuser , a diffusion planning framework. See Fig. 1 for qualitative and quantitative results: DF outperforms Diffuser and all baselines across all \(6\) environments.
+
+**Benefit of Monte Carlo Guidance.** The typical goal for an RL problem is to find actions that maximize the _expected_ future rewards, which we achieve through MCG. Full-sequence diffusion models such as Diffuser do not support sampling to maximize expected reward, as we formally derive in Appendix C.5. To understand MCG's importance, we ablate it in Table 1. Removing MCG guidance degrades our performance, though Diffusion Forcing remains competitive even then.
+
+   &  &  &  &  &  &  &  \\  Maze2D & U-Maze & 33.2 & 5.7 & 47.4 & 113.9 \(\) 3.1 & 6.3 \(\) 2.1 & 110.1 \(\) 3.9 & **116.7 \(\) 2.0** \\ Maze2D & Medium & 10.2 & 5.0 & 34.9 & 121.5 \(\) 2.7 & 13.5\(\)2.3 & 136.1 \(\) 10.2 & **149.4 \(\) 7.5** \\ Maze2D & Large & 5.1 & 12.5 & 58.6 & 123.0 \(\) 6.4 & 6.3 \(\)2.1 & 142.8 \(\) 5.6 & **159.0 \(\) 2.7** \\   & 16.2 & 7.7 & 47.0 & 119.5 & 8.7 & 129.67 & **141.7** \\  Multi2D & U-Maze & 41.2 & - & 24.8 & 128.9 \(\) 1.8 & 32.8\(\)1.7 & 107.7 \(\) 4.9 & **119.1 \(\) 4.0** \\ Multi2D & Medium & 15.4 & - & 12.1 & 127.2 \(\) 3.4 & 22.0\(\)2.7 & 145.6 \(\) 6.5 & **152.3 \(\) 9.9** \\ Multi2D & Large & 8.0 & - & 13.9 & 132.1 \(\) 5.8 & 6.9 \(\)1.7 & 129.8 \(\) 1.5 & **167.1 \(\)2.7** \\   & 21.5 & - & 16.9 & 129.4 & 20.6 & 127.7 & **146.2** \\  
+
+Table 1: **Diffusion Forcing for Planning. (top)** During sampling, Diffusion Forcing allows each time step to be denoised on different noise schedules, enabling us to account for causal uncertainty during guided planning. Diffusion Forcing keeps the far future more uncertain than the near future while Diffuser  puts them at the same noise level during sampling. (bottom) Quantitatively, Diffusion Forcing achieves the highest average reward across runs. Diffuser fails dramatically when executing the actually generated actions, requiring a hand-crafted PD controller (indicated by the asterisk) and ignoring generated actions.
+
+**Benefit of Modeling Causality.** Unlike pure generative modeling, sequential decision-making takes actions and receives feedback. Due to compounding uncertainty, the immediate next actions are more important than those in the far future. Though Diffuser and subsequent models are trained to generate sequences of action-reward-state tuples \([_{t},_{t},_{t}]\), directly executing the actions will lead to a trajectory that deviates significantly from the generated states. In other words, the generated states and actions are not causally consistent with each other. To address this shortcoming, Diffuser's implementation ignores the generated actions and instead relies on a hand-crafted PD controller to infer actions from generated states. In Table 1, we see that Diffuser's performance drops dramatically when directly executing generated actions. In contrast, Diffusion Forcing's raw action generations are self-consistent, outperforming even actions selected by combining Diffuser's state predictions with a handcrafted PD controller.
+
+**Benefit of Flexible Horizon.** Many RL tasks have a fixed horizon, requiring the planning horizon to shrink as an agent makes progress in the task. Diffusion Forcing accomplishes this by design, while full-sequence models like Diffuser perform poorly even with tweaks, as we explain in Appendix C.6.
+
+### Controllable Sequential Compositional Generation
+
+We demonstrate that by only modifying the sampling scheme, we can flexibly compose sub-sequences of sequences observed at training time. We consider a dataset of trajectories on a 2D, square plane, where all trajectories start from one corner and end up in the opposite corner, forming a cross shape. As shown in Fig. 1, when no compositional behavior is desired, one can let DF keep full memory, replicating the cross-shaped distribution. When one desires compositionality, one can let the model generate shorter plans without memory using MPC, leading to the stitching of the cross's sub-trajectories, forming a V-shaped trajectory. Due to limited space, we defer the result to Appendix E.2.
+
+### Robotics: Long horizon imitation learning and robust visuomotor control
+
+Finally, we illustrate that Diffusion Forcing (DF) opens up new opportunities in the visuomotor control of real-world robots. Imitation learning  is a popular technique in robotic manipulation where one learns an observation-to-action mapping from expert demonstrations. However, the lack of memory often prevents imitation learning from accomplishing long-horizon tasks. DF not only alleviates this shortcoming but also provides a way to make imitation learning robust.
+
+**Imitation Learning with Memory.** We collect a dataset of videos and actions by teleoperating with a Franka robot. In the chosen task, one needs to swap the position of an apple and an orange, using a third slot. See Fig. 4 for an illustration. The initial positions of the fruits are randomized such that there are two possible goal states. As illustrated in Fig. 4, when one fruit is in the third slot, the desired outcome cannot be inferred from the current observation--a policy must remember the initial configuration to determine which fruit to move. In contrast to common behavior cloning methods, DF naturally incorporates memory in its latent state. We found that DF achieves \(80\%\) success rate while diffusion policy , a state-of-the-art imitation learning algorithm without memory, fails.
+
+Figure 4: In our real robot task, a robot arm is asked to swap the slots of two fruits using a third slot. Since the fruits are input in random slots at the beginning, one cannot determine the next steps from a single observation without knowledge of the initial placement of the fruits. As illustrated in (a) and (b), the upper observation is the same but the desired outcome illustrated below can vary—the task thus requires remembering the initial configuration. In addition, as shown in (c), the same model that generates actions also synthesizes realistic video from just a single frame.
+
+**Robustness to missing or noisy observations.** Because it incorporates principles from Bayes filtering, Diffusion Forcing can perform imitation learning while being robust to noisy or missing observations. We demonstrate this by adding visual distractions and even fully occluding the camera during execution. DF allows us to easily indicate these observations as "noisy" by using \(k>0\), in which case DF relies heavily on its prior model to predict actions. Consequently, the success rate is only lowered by \(4\%\) to \(76\%\). In contrast, a next-frame diffusion model baseline attains a success rate of \(48\%\): it must treat perturbed observations as ground truth and suffers out-of-distribution error.
+
+**Potential for pre-training with video.** Finally, in parallel to generating actions, Fig. 4 illustrates that Diffusion Forcing is capable of generating a video of the robot performing the task given only an initial frame, unifying diffusion policy/imitation learning and video generative modeling and paving the way to pre-training on unlabeled video.
+
+### Time Series Forecasting: Diffusion Forcing is a Good General-purpose Sequence Model
+
+In Appendix E, we show that DF is competitive with prior diffusion  and transformer-based  work on multivariate time series forecasting, following the experimental setup of .
+
+## 5 Discussion
+
+**Limitations.** Our current causal implementation is based on an RNN. Applications to higher-resolution video or more complex distributions likely require large transformer models following instructions in Appendix C.1. We do not investigate the scaling behavior of Diffusion Forcing to internet-scale datasets and tasks.
+
+**Conclusion.** In this paper, we introduced Diffusion Forcing, a new training paradigm where a model is trained to denoise sets of tokens with independent, per-token noise levels. Applied to time series data, we show how a next-token prediction model trained with Diffusion Forcing combines the benefits of both next-token models and full-sequence diffusion models. We introduced new sampling and guidance schemes that lead to dramatic performance gains when applied to tasks in sequential decision making. Future work may investigate the application of Diffusion Forcing to domains other than time series generative modeling, and scale up Diffusion Forcing to larger datasets.

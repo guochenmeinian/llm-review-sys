@@ -1,0 +1,211 @@
+# Exploiting Activation Sparsity with Dense to
+
+Dynamic-k Mixture-of-Experts Conversion
+
+ Filip Szatkowski
+
+IDEAS NCBR
+
+Warsaw University of Technology
+
+&Bartosz Wojcik
+
+IDEAS NCBR
+
+Jagiellonian University
+
+&Mikolaj Piorczynski
+
+Warsaw University of Technology
+
+&Simone Scardapane
+
+Sapienza University of Rome
+
+Equal contributionCorresponding author: b.wojcik@doctoral.uj.edu.plFaculty of Mathematics and Computer Science, Doctoral School of Exact and Natural Sciences
+
+###### Abstract
+
+Transformer models can face practical limitations due to their high computational requirements. At the same time, such models exhibit significant activation sparsity, which can be leveraged to reduce the inference cost by converting parts of the network into equivalent Mixture-of-Experts (MoE) layers. Despite the crucial role played by activation sparsity, its impact on this process remains unexplored. We demonstrate that the efficiency of the conversion can be significantly enhanced by a proper regularization of the activation sparsity of the base model. Moreover, motivated by the high variance of the number of activated neurons for different inputs, we introduce a more effective dynamic-\(k\) expert selection rule that adjusts the number of executed experts on a per-token basis. To achieve further savings, we extend this approach to multi-head attention projections. Finally, we develop an efficient implementation that translates these computational savings into actual wall-clock speedup. The proposed method, Dense to Dynamic-\(k\) Mixture-of-Experts (D2DMoE), outperforms existing approaches on common NLP and vision tasks, reducing inference cost by up to 60% without significantly impacting performance.
+
+## 1 Introduction
+
+Transformers have become a predominant model architecture in various domains of deep learning such as machine translation , language modeling [6; 31], and computer vision [7; 21]. The widespread effectiveness of Transformer models in various applications is closely related to their ability to scale efficiently with the number of model parameters , prompting researchers to train progressively larger and larger models [45; 19]. However, the considerable computational demands of these models often restrict their deployment in practical settings with limited resources.
+
+At the same time, Transformer models exhibit considerable activation sparsity in their intermediate representations , which suggests that most of their computations are redundant. Conditional computation methods can reduce these unnecessary costs by using only a subset of the model parameters for any given input . In particular, Mixture-of-Experts (MoE) layers , consisting of multiple experts that are sparsely executed for any input token, are an effective way to decouple the number of parameters of the model from its computational cost . As shown by , many pre-trained dense Transformer models can be made more efficient by converting their FFN blocks into MoE layers, a process they call _MoEfication_.
+
+**Contributions of this paper**: We consider the following research question: what is the _optimal_ way to convert a generic Transformer model into an equivalent sparse variant? We identify a series of weaknesses of the MoEfication process limiting the resulting accuracy-sparsity tradeoff, and propose corresponding mitigations as follows. We call the resulting algorithm Dense to Dynamic-\(k\) Mixture-of-Experts (D2DMoE) and outline it in Figure 1.
+
+1. First, we analyze the relationship between the activation sparsity of the starting model and the efficiency of the final MoE model. We show that computational savings are directly related to sparsity levels, and we correspondingly enforce higher activation sparsity levels before conversion through a lightweight fine-tuning process, which leads to a substantially improved cost-to-performance trade-off.
+2. We identify the router training scheme in the original MoEfication algorithm as a limitation of the conversion process. We propose to frame the router training as a regression problem instead, hence our routers directly predict the norm of the output of each expert.
+3. We show that Transformer models exhibit significant variance of the number of activated neurons, and standard top-\(k\) expert selection in the MoE layers is inefficient. We propose an alternative dynamic-\(k\) expert selection scheme that adjusts the number of activated experts on a per-token basis. This approach enables the model to efficiently allocate compute between easy and hard inputs, increasing the overall efficiency.
+4. We generalize the conversion method to any standalone linear layer including gated MLP variants commonly found in modern LLMs [45; 42] and projections in Multi-Head Attention (MHA) layers (which often account for over 30% of total computations in Transformer models ). For MHA, we propose a replacement procedure in which every dense layer is substituted by a two-layer MLP module trained to imitate the output of the original layer.
+
+We evaluate D2DMoE across benchmarks in text classification, image classification, and language modeling, demonstrating significant improvements in cost-performance trade-offs in all cases. D2DMoE is particularly well-suited for contemporary hardware, as evidenced by our efficient GPU implementation, which we contribute alongside our proposed method.
+
+## 2 Motivation
+
+MoE models have gained a lot of traction over the last years as an effective architecture to decouple the parameter count from the computational cost of the models . In a MoE layer, hard sparsity is usually enforced _explicitly_ by applying a top-\(k\) operation on the outputs of a trainable gating layer. However, many recent works [53; 2; 30] have shown that most Transformers, when trained at scale, build _intrinsically_ sparse and modular representations. Zhang et al.  proposed to leverage this naturally emerging modularity with MoEfication - a method that converts dense transformer models into MoE models by grouping FFN weights into experts and subsequently learning small routers that determine which experts to activate. Models converted with MoEfication are able to preserve the performance of the original dense models while using only a fraction of their computational cost. However, we believe that the MoEfication procedure is not optimal, and therefore aim to obtain dense-to-sparse conversion schemes that obtain a better cost-performance trade-off.
+
+Figure 1: Key components of D2DMoE: (a) We enhance the activation sparsity in the base model. (b) We convert FFN layers in the model to MoE layers with routers that predict the contribution of each expert. (c) We introduce dynamic-\(k\) routing that selects the experts for execution based on their predicted contribution.
+
+Intuitively, a MoE converted from a sparser base model would be able to perform the original function using a smaller number of experts. To validate this hypothesis, we perform MoEfication on different variants of GPT2-base4 with varying activation sparsity levels and show the results in Figure 1(a). As expected, MoEfication performs better with sparser models. We further investigate the per-token mean and the variance of non-zero neurons in the base and sparsified model, and show the results in Figure 1(b). Observe that different layers use a different number of neurons on average. Moreover, the variance of the number of activated neurons is quite high and becomes even more significant in the sparsified model. This means that static top-\(k\) gating as used in MoEfication is not optimal for dense-to-MoE converted models, and a more flexible expert assignment rule that would be able to handle the high per-token and per-layer variance could be beneficial to the efficiency of such models, as illustrated at Figure 1(c). Such dynamic-k gating requires routers that reliably predict the contribution of each expert. We observe that routers obtained through MoEfication do not accurately reflect this contribution. Moreover, their router training procedure depends on the strict sparsity of the model guaranteed by the ReLU activation function. Therefore, we design a novel router training scheme that directly predicts the contribution of each expert and generalizes to the broader family of activation functions. We combine the proposed components (sparsity enforcement, expert contribution routing, and dynamic-\(k\) gating) into a single method that we call Dense to Dynamic-\(k\) Mixture-of-Experts (D2DMoE), which we describe in detail in the next Section.
+
+## 3 Method
+
+D2DMoE reduces the computational cost of the model by splitting every MLP module into a MoE layer. In this section, we describe all of its components in detail. A high-level overview of the entire procedure is presented in Figure 1. The conversion process can be optionally preceded by MHA projection layer replacement (Sec. 3.5), which allows us to apply the same transformation pipeline on all replacement modules.
+
+### Enforcing activation sparsity
+
+We expect that enforcing higher levels of activation sparsity may allow for the execution of an even smaller number of experts, resulting in overall computational savings. To this end, we induce activation sparsity by fine-tuning the model with an additional loss term that induces activation sparsity . We apply the _square Hoyer_ regularization [22; 17] on the activations of the model:
+
+\[_{s}(x)=_{l=1}^{L}|a_{i}^{l}|)^{2}}{ _{i}{a_{i}^{l}}^{2}},\] (1)
+
+Figure 2: (a) Cost-accuracy tradeoff for a _MoEfied_ GPT-2 model obtained starting from models with different levels of activation sparsity. Sparsification correlates with the model performance. (b) Distribution of non-zero activations in the FFN layers in GPT-2-base on OpenWebText, with and without the sparsity enforcement phase. Both models exhibit significant variance, and the mean-to-variance ratio increases in the sparsified model. (c) We propose to exploit the variation in activations through a dynamic-\(k\) routing procedure that adapts the number of experts allocated to a sample.
+
+where \(a^{l}\) is the activation vector from the middle layer of the \(l\)-th MLP for input \(x\), and \(L\) is the total number of MLPs in the model. Overall, the model is trained with the following cost function:
+
+\[(x)=_{}(,y)+_{s}(x)\] (2)
+
+where \(_{}\) is cross-entropy loss, and \(\) is the hyperparameter that controls the strength of sparsity enforcement. We find that the pre-trained models recover the original performance with only a fraction of the original training budget (eg. 1B tokens for GPT2-base or Gemma-2B, which is less than 1% of the tokens used for pretraining).
+
+### Expert clustering
+
+We split the two-layer MLP modules into experts using the parameter clustering method proposed by Zhang et al. . Assuming the MLP layers are composed of weights \(_{1}\), \(_{2}\) and corresponding biases \(_{1}\), \(_{2}\), we treat the weights of each neuron from \(_{1}\) as features and feed them into the balanced \(k\)-means algorithm  that groups neurons with similar weights together. Then, we use the resulting cluster indices to split the first linear layer \(_{1}\), the first bias vector \(_{1}\), and the second linear layer \(_{2}\) into \(n\) experts of the same size. The second bias \(_{2}\) is not affected by this procedure.
+
+MoEfication process was designed for standard two-layered MLPs . Recent LLMs [45; 42] have shifted towards _gated_ FFNs, where the activation is realized through a Gated Linear Unit (GLU) , which contains an additional weight matrix for the gate projections. To adapt the expert clustering procedure described above to gated FFN layers, we cluster the weights of the gating matrix \(}\) instead of \(}\), and use the obtained indices to divide the weights of the two other layers. We provide more intuition and details on our method for gated FFNs in Appendix G.
+
+### Expert contribution routing
+
+In a standard MoE-based model, the gating networks are trained in an end-to-end manner. Contrary to this, we train each gating network independently. We propose to frame the problem of training the router as a regression task and directly predict the \(^{2}\)-norm of the output of each expert with the router. Formally, given an input token \(z\), we train D2DMoE router \(R\) to minimize the following loss:
+
+\[_{r}(z)=_{i}^{n}(R(z)_{i}-\|E_{i}(z)\|)^{2}\] (3)
+
+where \(E_{i}\) is the \(i\)-th expert. We use a small two-layer neural network as the router \(R\) and apply an absolute value activation function to ensure non-negative output. This regression-based formulation is still compatible with the commonly used top-\(k\) expert selection, but enables more precise attribution of the contribution of each expert, as we show later in the experimental section.
+
+Note that Zhang et al.  also trains each routing network independently, but their method constructs artificial labels for each input, and then subsequently trains the router as a classifier. We discuss the differences in detail in Appendix A.
+
+### Dynamic-\(k\) gating
+
+Commonly used MoE layers always execute top-\(k\) experts for each token, where \(k\) is a predefined hyperparameter. This means that, regardless of the difficulty of the input, the model spends the same amount of compute on each batch  or token . While this may be appropriate if the model is trained with the same restriction, it is suboptimal for a model that was converted from a dense model, as we show in Section 2.
+
+Since our router directly predicts the \(^{2}\)-norm of the output of each expert, we propose a dynamic-\(k\) expert selection method that skips experts for whom the router predicts relatively small output norms. Given a router output vector \(R(z)\), we select a hyperparameter \(\) and define the expert selection rule \(G\) for the \(i\)-th element as:
+
+\[G(z)_{i}=1&R(z)_{i} R(z)\\ 0&R(z)_{i}< R(z)\] (4)
+
+Note that as \(\) increases, the number of executed experts and the overall computational cost decrease. We emphasize that after model deployment \(\) can be adjusted without retraining.
+
+### Conversion of standalone dense layers
+
+A significant amount of computing in deep neural networks is often spent on dense layers that are not followed by any activation function. Dense-to-sparse-MoE conversion methods cannot reduce the costs of such layers due to a lack of activation sparsity. This determines an upper bound on the possible computational savings. To overcome it, we substitute dense layers with small MLPs with approximately the same computational cost and number of parameters. Each MLP is trained to imitate the output of the original dense layer given the same input by minimizing the mean squared error between the two (akin to a distillation loss).
+
+In our case, for Transformer architectures, we substitute projection matrices along with their biases in every MHA layer, as depicted in Figure 3. This means that the final model has four MoE layers in the MHA layer and one MoE layer in the FFN layer (either plain or gated) for each Transformer block. Note that we do not modify the computation of the scaled dot-product attention itself and this scheme can be applied to any standalone dense layer.
+
+## 4 Experiments
+
+To analyze the impact of our method, we evaluate its performance on language modeling, text classification, and image classification. We obtain performance versus computational cost characteristics for each method by evaluating the methods with different inference hyperparameters (either \(\) described in Section 3.4 for D2DMoE or number of experts \(k\) for MoEfication; we mark them on the plots with dot markers). We report the computational cost of each method in FLOPs, as it is a device-independent metric that has been shown to correlate well with latency . In addition, we measure the wall-clock execution time of an efficient implementation of our method.
+
+For MoEfication, we follow the procedure described by Zhang et al.  by converting the activation functions of the pre-trained model to ReLU and then fine-tuning the model. In the case of D2DMoE, we also replace activation functions with ReLU, except for Section 5.4, where we demonstrate that our method performs well also with GELU. To provide a fair comparison, the total training data budget is always the same between different methods. See Appendix J for a detailed description of our setup. The source code for our experiments is available at: https://github.com/bartwojcik/D2DMoE.
+
+### Image classification
+
+Vision Transformer  is one of the most popular architectures in computer vision. Since our method applies to any Transformer model, we evaluate it on the popular ImageNet-1k  dataset. We use a pre-trained ViT-B checkpoint as the base model and compare D2DMoE with MoEfication in terms of the computational cost versus accuracy trade-off. For broader comparison, we also evaluate the state-of-the-art early-exit method Zero-time Waste (ZTW) , as well as our re-implementation of A-ViT, an efficient token dropping method proposed by Yin et al. . Our results, presented in Figure 3(a), demonstrate the significant gains from applying our method over MoEfication.
+
+Figure 4: FLOPs-performance tradeoff comparison of our method and MoEfication  on CV and NLP benchmarks. We also include early-exit (ZTW, ) and token dropping baselines (A-ViT, ) for classification. Our method outperforms these baselines across multiple computational budgets.
+
+Figure 3: Multi-Head Attention projection conversion scheme.
+
+### Text classification
+
+We evaluate our method with BERT-base  on the CARER dataset  that contains text samples categorized into 6 different emotion categories. We compare the accuracy versus FLOPs trade-off for D2DMoE, MoEfication, and ZTW. We show the results in Figure 3(b). The performance of MoEfication gradually deteriorates and completely collapses when the number of executed experts approaches zero. In comparison, D2DMoE maintains the original performance for a wide range of computational budgets, and the performance drop starts at a significantly lower budget. While early-exiting performs well for the lowest budgets, it obtains worse results than D2DMoE at medium budgets and suffers from a gradual performance decline.
+
+### Language modeling
+
+We evaluate our method on language modeling and compare it with MoEfication using GPT-2-base  and Gemma-2B . We initialize GPT-2 models from a publicly available OpenAI checkpoint pre-trained on a closed-source WebText dataset and use OpenWebText  in all of our experiments. For Gemma-2B, we also start from the publicly available pretrained model and evaluate its language capabilities on the C4 dataset  after finetuning. For both models, we use around 1B tokens for the finetuning phase (less than 1% of the cost of original pretraining) and 8-16M tokens for router training. We report the results in this section without the MHA projection replacement, as this task is highly sensitive to changes in attention layers, leading to noticeable loss degradation. For more training details, see Appendix J.3
+
+We present test losses for D2DMoE and MoEfication at different compute budgets for GPT-2-base and Gemma-2B in Figures 3(c) and 3(d) respectively. Our method outperforms the baseline at every computational budget. The loss of D2DMoE plateaus for higher budget levels, while the baseline displays consistently worse results whenever we lower the computational budget. Notably, for the larger Gemma-2B model our method performs well for most compute budgets, while the performance of MoEfication collapses. The failure of MoEfication can be explained by the emergence of massive activations in large models , which makes it unable to learn reliable routing, as we analyze in more detail in Appendix E.
+
+We also provide a downstream evaluation of our Gemma models on the BoolQ dataset. We take the base model, which achieves 68.40% zero-shot evaluation accuracy, and convert it to MoE with D2DMoE and MoEfication. In Table 1, we report the relative accuracy of the models at different compute budgets. Our method largely retains the performance across multiple compute budgets, while the performance of MoEfication decreases significantly. This shows that the loss-vs-FLOPs results for D2DMoE and MoEfication directly translate to downstream performance on language tasks.
+
+### Execution latency
+
+For any model acceleration method to be practically useful, it must reduce end-to-end inference execution time on modern GPU hardware. To achieve this, we implement the forward pass of our MoE-layer in the Triton intermediate language , and employ several optimizations for our implementation, including an efficient memory access pattern, kernel fusion, and configuration auto-tuning. As suggested by Tan et al. , our implementation also avoids unnecessary copies when grouping tokens.
+
+We verify the performance of our implementation for a single D2DMoE layer (\(24\) experts with expert dimensionality \(128\)) layer
+
+   Compute budget & 100\% & 90\% & 80\% & 70\% & 60\% & 50\% & 25\% & 10\% \\  MoEfication & 100\% & 92.24\% & 92.19\% & 92.15\% & 88.79\% & 75.40\% & 86.70\% & 77.53\% \\
+**D2DMoE** & **100\%** & **99.68\%** & **99.37\%** & **98.69\%** & **97.60\%** & **94.34\%** & **92.75\%** & **90.89\%** \\   
+
+Table 1: Relative downstream performance of D2DMoE and MoEfication on BoolQ dataset. Our method only starts to degrade at around 70% compute budget, while MoEfication gradually decreases.
+
+Figure 5: Single D2DMoE layer execution wall-clock time.
+
+in isolation by comparing it with the corresponding MLP module (inner dimensionality \(3072\)) on an NVIDIA A100 GPU. We fill a tensor of size \([256 197 768]\) (batch size, sequence length, and hidden dimension, respectively) filled with Gaussian noise and use it as input to both modules. The gating network of D2DMoE is included in measurements, but the decisions are overridden with samples from a Bernoulli distribution, and we control how many experts are executed on average by changing the Bernoulli probability. The results, presented in Figure 5, show that our implementation scales linearly with the number of executed experts, and has negligible overhead. Our method can be almost three times as fast as standard MLP while preserving 99% of the original accuracy. In Appendix C we provide additional wall-clock measurement results along with a more detailed description of our implementation.
+
+### Compatibility with model compression techniques
+
+To accelerate inference D2DMoE leverages input-dependent activation sparsity, a property inherent to almost every Transformer model. However, interaction between D2DMoE and other popular network acceleration techniques, such as pruning  or quantization [13; 28], is unclear. We evaluate D2DMoE in combination with such techniques to demonstrate their complementarity.
+
+First, we evaluate D2DMoE applied on top of networks pruned with CoFi, a structured pruning technique introduced by Xia et al. . CoFi removes redundant neurons, attention heads, and sub-layers to achieve the desired sparsity ratio, and then subsequently fine-tunes the reduced network. We first prune the base model with CoFi to the desired sparsity level, apply D2DMoE to it, and then evaluate both models on QNLI . In Figure 6, we show that D2DMoE successfully accelerates inference even on networks pruned to high sparsity levels.
+
+In Figure 7, we also investigate the applicability of D2DMoE to quantized models using dynamic post-training quantization from PyTorch5 on BERT trained on the CARER dataset. Our method is robust to 8- and 16-bit quantization and exhibits only slight variations in performance after quantization. As FLOPs do not take bit width into account, we show quantized models in the same FLOPs range as the original model. In Appendix C, we also present wall-clock time measurements for quantized D2DMoE.
+
+## 5 Analysis
+
+In this section, we present in detail additional experiments that provide insights into the performance of our method. Additionally, in Appendix E we analyze the performance of MoEfication with Gemma, in Appendix F we provide the results of router architecture analysis, in Appendix H we conduct experiments corresponding to the ones in Section 5.5 with GELU function, and in Appendix I we show additional visualizations for expert activation patterns.
+
+### Expert selection patterns
+
+The dynamic-\(k\) rule introduces variability in the allocation of the computational budget along the model depth. To explore its scale, we investigate the distribution of the number of executed experts, with and without the activation sparsification phase. In Figure 7(a), we show the histograms of the number of activated experts for each FFN layer of the BERT-base model trained on the CARER dataset (additional results are available in the appendix in Appendix I). As expected, the model with enforced activation sparsity requires fewer experts for a given threshold. Both base and sparsified models exhibit significant variance in the number of activated neurons across different layers, which justifies the dynamic-\(k\) selection and indicates that computational adaptability mechanisms are crucial for efficient inference in Transformer-based models.
+
+Figure 6: D2DMoE applied to models pruned with CoFi.
+
+Figure 7: D2DMoE applied to quantized models.
+
+D2DMoE also allows the model to allocate different computational resources to various layers. We expect the model to allocate more compute to tokens containing information relevant to the current task. Since each token position in a ViT model corresponds to a separate and non-overlapping part of the input image, we can easily plot a heatmap to indicate the regions of the image where the model spends its computational budget. In Figure 7(b) we present such an analysis for our converted ViT-B model. As expected, the dynamic-\(k\) routing enables the model to minimize the computational effort spent on regions that contain insignificant information.
+
+### Ablation study
+
+Since our method consists of several steps, the positive impact of each one of them may not be evident. To show the significance of every component, we perform an ablation study by incrementally adding each component to the baseline method. We take a BERT-base model and evaluate the ablated variants in the same setting as described in Section 4.2. The results of this experiment are presented in Figure 8(a). As expected, each ablated version of the method improves upon the previous one. The sparsity enforcement phase leads to enhanced performance compared to plain MoEfication. Alternative router training objective and dynamic-\(k\) expert assignment further improve the results, but - as the method only operates on the FFN layer - the computational cost cannot go below the cost of the remaining part of the model. Extending D2DMoE to MHA projection layers allows our method to reduce the computational cost further, and the resulting full method retains the accuracy of the original model at around twice fewer FLOPs than MoEfication.
+
+### Base model activation sparsity
+
+To justify our proposed activation sparsity phase, we investigate the impact of the activation sparsity of the base dense model on the performance MoE obtained with our method. We conduct a study similar to the one presented in Figure 1(a): we train multiple base models with different activation sparsity enforcement loss weights \(\) and convert them to Mixture-of-Experts models with our method.
+
+The results, shown in Figure 8(b), highlight the positive correlation between the activation sparsity and the performance of the converted MoE, as higher sparsity in the base model always translates to better performance for D2DMoE. This is consistent with results previously observed for MoEfication. However, our method achieves better results for every base model in all cases, proving that regression routing and dynamic-\(k\) selection better utilize the induced sparsity.
+
+### Sparsification and reliance on the activation function
+
+Activation sparsity works focus their analysis on networks with ReLU activation, as other functions (such as GELU or SiLU) do not guarantee exact sparsity. When analyzing non-ReLU models, such
+
+Figure 8: D2DMoE allows for a dynamical allocation of computation for each layer and each input independently. a) Per-layer distribution of the number of executed experts on CARER dataset in D2DMoE with \(=0.01\) for a standard model (top) and a sparsified model (bottom). Sparsification leads to a significantly lower number of selected experts. b) Computational load maps of selected ImageNet-1k samples for our converted ViT-B model with \(=0.0025\). D2DMoE allocates its computational budget to semantically important regions of the input.
+
+works require fine-tuning with the activation function changed to ReLU (_relufication_) [52; 27], which limits their practical applicability. We hypothesize that relfication is not necessary and the models with many near-zero activations effectively function similarly to standard ReLU-based models. To evaluate this hypothesis, we extend the sparsity enforcement scheme to the commonly used GELU activation by penalizing the model for pre-activation values larger than a certain threshold. We first transform the pre-activation values as \(z^{}=(0,z-d)\), where \(z\) is the pre-activation value and \(d\) is a displacement hyperparameter. Then, we apply the loss from Equation (1) on \(z^{}\). This transformation penalizes only pre-activation values larger than \(d\), and as a result, the model learns to produce values that effectively become negligible post-activation. We empirically find that \(d=-10\) works well with GELU as the output below this value is near zero.
+
+To validate our hypothesis, we follow the methodology from Section 4.3 and we train ReLU- and GELU-based GPT-2 with and without sparsity enforcement loss. We show the results in Figure 8(c). D2DMoE with a sparsified GELU-based model performs similarly to a sparsified ReLU-based model, while the performance of the non-sparsified GELU-based variant collapses. Within ReLU-based models, the sparsification still enhances the performance of D2DMoE, but the improvements are less drastic, and the behavior of our method does not significantly change as in the case of GELU. This shows sufficient activation sparsity enforcement relieves the model from the dependence on ReLU.
+
+### Impact of expert granularity
+
+A crucial hyperparameter in D2DMoE is the selection of expert size. Smaller experts may allow a more granular selection of executed neurons, likely resulting in a lower computational cost. However, decreasing the expert size increases the number of experts, which translates to a larger router, potentially negating any computational gains. To study the impact of this hyperparameter on our method, we evaluate D2DMoE on GPT-2 with different expert sizes, and show the results in Figure 8(d).
+
+We observe that our method generally performs better with smaller experts. Those results differ from the ones presented in , where the expert size is significantly higher. The positive correlation between granularity and performance can be explained by the increased levels of activation sparsity in our model, which requires significantly fewer activated neurons (experts). As expected, the performance decreases for the extreme choice of expert size equal to 1 due to significantly higher routing costs. We include additional results for expert granularity with GELU activation in Appendix H.
+
+## 6 Related Work
+
+Mixture-of-Experts.MoE layers were introduced as an efficient way to further increase the capacity of deep neural networks applied for NLP tasks, initially in LSTM models , and later in Transformers . Since then, they have also been applied to computer vision [33; 5]. MoE layers have gained significant popularity primarily due to their excellent scaling properties [8; 3]. Nonetheless, training such models is challenging, primarily because gating decisions must be discrete to ensure sparse expert selection. Various methods of training were proposed, some of which include reinforcement learning , weighting the expert output by the probability to allow computation of the gradient of the router , or using the Sinkhorn algorithm . Some of those approaches also suffer
+
+Figure 9: Analysis experiments with D2DMoE. (a) Impact of different phases of our method. Each phase improves upon the baseline. (b) Sparsification improves the cost-accuracy trade-off of the final D2DMoE model. (c) Sparsification allows us to apply our method to GELU-based model without significant drops in performance. (d) Smaller experts display favorable performance and allow for larger computational savings.
+
+from the possibility of load imbalance and therefore require auxiliary losses or alternative expert selection methods [9; 54]. Interestingly, in many cases fixed routing functions perform similarly to trainable routers , which suggests that current solutions are largely suboptimal. MoE models can also be derived from pre-trained dense models by splitting the model weights into experts and independently training the routers for each layer [52; 57], which avoids most of the problems present in end-to-end training.
+
+Activation sparsity in Transformers.Li et al.  show that ReLU-based Transformer models produce sparse activations in their intermediate representations, an effect that is prevalent across architectures, layers, and modalities. They propose a simple rule for keeping only top-\(k\) activations in each MLP layer, which results in a model with comparable performance. Similarly, Mirzadeh et al.  demonstrate that ReLU activation function in LLMs encourages ensuing activation sparsity that can be leveraged to skip redundant computations. Tuli and Jha  take a step further and design a dedicated Transformer architecture accelerator that also exploits activation sparsity, while Liu et al.  proposes to predict activation sparsity structure in LLMs and reduce the model latency by skipping redundant computations. Jaszczur et al.  demonstrate that it is possible to train Transformer models from scratch with a fixed level of activation sparsity and obtain similar performance. Finally, a related line of works focuses on sparsity in the attention distributions instead of intermediate representations . None of the above-mentioned methods explore induced activation sparsity as a way to increase computational gains, nor do they address variance of the number of sparse activations on a per-token basis.
+
+## 7 Conclusion
+
+We introduce Dense to Dynamic-\(k\) Mixture-of-Experts (D2DMoE), a novel approach that induces activation sparsity to improve the efficiency of Transformer-based models by converting their layers to Mixture-of-Experts (MoE). We demonstrate the interplay between the activation sparsity of dense models and the efficiency of converted MoEs. Moreover, we introduce regression-based router training and dynamic-\(k\) routing, which enable our method to efficiently utilize the induced sparsity. Finally, we show how dense-to-sparse-MoE conversion approaches can be extended to MHA projections and gated MLPs. Our approach is compatible with the existing Transformer architectures and significantly improves upon existing MoE conversion schemes. Our findings contribute to the ongoing efforts to make Transformer models more efficient and accessible for a wider range of applications, especially in resource-constrained environments.
+
+## Limitations and Broader Impact
+
+While D2DMoE displays promising results in reducing the computational cost of inference in Transformer models, a few limitations should be acknowledged. Our proposed sparsity enforcement and router training phases require additional training time. This overhead, while small, must be considered when evaluating the benefits of our approach. Moreover, we demonstrate improved performance over existing approaches on common NLP and CV tasks, but the scope of our experiments is restricted due to limited access to computational resources. Further research is needed to explore its applicability to extremely large models.
+
+Our work focuses primarily on fundamental machine learning research and we do not see any specific risks or ethical issues associated with our method. Nevertheless, we recognize the potential for misuse of machine learning technology and advocate for responsible AI practices to mitigate such risks.

@@ -1,0 +1,155 @@
+# Sparse maximal update parameterization: A holistic approach to sparse training dynamics
+
+Nolan Dey  Shane Bergsma  Joel Hestness
+
+Cerebras Systems
+
+{nolan,joel}@cerebras.net
+
+###### Abstract
+
+Several challenges make it difficult for sparse neural networks to compete with dense models. First, setting a large fraction of weights to zero impairs forward and gradient signal propagation. Second, sparse studies often need to test multiple sparsity levels, while also introducing new hyperparameters (HPs), leading to prohibitive tuning costs. Indeed, the standard practice is to re-use the learning HPs originally crafted for dense models. Unfortunately, we show sparse and dense networks do not share the same optimal HPs. Without stable dynamics and effective training recipes, it is costly to test sparsity at scale, which is key to surpassing dense networks and making the business case for sparsity acceleration in hardware. A holistic approach is needed to tackle these challenges and we propose sparse maximal update parameterization (SuPar) as one such approach. For random unstructured static sparsity, SuPar ensures activations, gradients, and weight updates all scale independently of sparsity level. Further, by reparameterizing the HPs, SuPar enables the same HP values to be optimal as we vary both sparsity level and model width. HPs can be tuned on small dense networks and transferred to large sparse models, greatly reducing tuning costs. On large-scale language modeling, SuPar shows increasing improvements over standard parameterization as sparsity increases, leading up to 11.9% relative loss improvement at 99.2% sparsity. A minimal implementation of SuPar is available at https://github.com/EleutherAI/nanoGPT-mup/tree/super.
+
+## 1 Intro
+
+_Sparsity_ has emerged as a key technique to mitigate the increasing computational costs of training and inference in deep neural networks. This work focuses on _weight sparsity_, whereby a significant fraction of model weights are kept at zero. It has long been known that dense neural networks can be heavily pruned _after_ training . With the goal of reducing costs _during_ training, recent work has explored static weight sparsity from initialization. In this work we focus on random unstructured static sparsity, which has re-emerged as a surprisingly effective strategy . This type of sparsity can be accelerated by CPUs, Cerebras, Graphcore, and SambaNova. Furthermore, GPUs and TPUs support 2:4 block structured sparsity which is quite similar to 50% unstructured sparsity.
+
+Unfortunately, several challenges have hindered progress in weight-sparse neural networks. First, sparsity impairs signal propagation during training . Second, with today's techniques, sparse training is costly. Sparse techniques typically introduce extra hyperparameters (HPs), e.g., number of pruning iterations at initialization , and it is common to train models across different sparsity levels. Since tuning should be performed at each level and the search space grows exponentially with the number of HPs, the tuning costs essentially "defeat the purpose" of sparsity, i.e., to _reduce_ computation . Finally, today there is only a nascent ecosystem of hardware acceleration for unstructured sparsity, so most researchers get little sparsity benefit when tuning.
+
+These costs have led to the standard practice of _simply re-using HPs that were previously optimized for the baseline dense models_ (Section 2). One might hope that sparse models thrive with the same learning rates and other HPs as their dense counterparts. Unfortunately, they do not: optimal HPs _systematically_ vary with sparsity level (Figure 2, left). With impaired training dynamics, prohibitive tuning cost, and lacking the established training recipes enjoyed by dense models, it is often inefficient to train sparse networks at scale (Figure 2).
+
+To remedy this situation, we propose sparse maximal update parameterization (SuPar, pronounced "soo-pahr"), a novel, holistic approach to stabilize sparse training dynamics. SuPar fulfills the Feature Learning Desiderata (Section 3) by parameterizing weight initialization and learning rates with respect to change in width _and_ sparsity level. As a generalization of maximal update parameterization (uP) [64; 63], SuPar enjoys well-controlled activation, gradient, and weight update scales in expectation, avoiding exploding or vanishing signal when changing both sparsity and model width.
+
+By reparameterizing HPs in this way, SuPar enables the same HP values to be optimal as sparsity varies (Figure 2, right). We therefore enjoy uTransfer: we can tune small proxy models and transfer optimal HPs directly to models at scale. In fact, we discovered our uP HPs, tuned for dense models in prior work (and equivalent to SuPar with sparsity=0%), correspond to the optimal learning rate and initial weight variance for _all_ sparse models tuned in this paper! As sparsity increases, our formulation shows the standard parameterization (SP) and uP suffer from vanishing signal, further clarifying prior observations of gradient flow issues in sparse networks. The improvements enabled by SuPar set the Pareto-frontier best loss across sparsity levels. Figure 3 previews this improvement for large language models trained from compute-optimal configurations . Here, SuPar benefits grow with increasing sparsity, to 11.9% better loss than SP and 1.9% better loss than uP at 99.2% random unstructured sparsity. See Section 4.3 for details on this experiment.
+
+## 2 Related work
+
+Sparse training landscapeSparse training can be divided into static sparsity, where the connectivity is fixed (our focus) and dynamic sparsity, where the sparsity mask can evolve . We use _unstructured_ sparsity, though our approach generalizes to structured approaches where a particular sparsity pattern increases efficiency on specific hardware [67; 26; 38; 14; 29; 1]. Unstructured connectivity may be based on both random pruning [40; 18; 57; 33; 58] and various pruning-at-initialization criteria [32; 60; 61; 56; 7]. Liu et al.  found that as models scale, the relative performance of randomly pruned networks grow. Furthermore, Frantar et al.  found the optimal level of sparsity increases with the amount of training data. Together, these findings suggest that as neural networkscontinue to get wider and deeper, and trained on more and more data, very sparse randomly-pruned networks may emerge as an attractive option.
+
+Improving sparse training dynamicsMany prior works identify various sparse training dynamics issues. In particular, prior works note sparsity impacts weight initialization [35; 31; 49; 11], activation variance , gradient flow [61; 37; 57; 11; 1], and step sizes during weight updates . These prior works each only address a subset of these issues in targeted ways, often showing benefits to sparse model training loss. We advocate for a holistic approach, and discuss the relationship between these prior works and our approach in Section 5 after describing and evaluating \(\).
+
+Sparse sensitivity to HPsDue to the costs of training with fixed weight sparsity, re-using dense HPs is standard practice. Such re-use is typically indicated in appendices or supplemental materials, e.g., [40; 32; 35; 31; 16; 60; 61; 56; 13; 7; 18; 57; 33; 58]. Also, dynamic sparsity approaches often compare to fixed sparsity; these baselines are likewise reported to re-use the dense HPs [2; 41; 10; 34; 11; 59]. However, some prior work has suggested such training is sensitive to HPs, e.g., learning rates [35; 57], learning rate schedules , or training length , although systematic tuning was not performed. For dynamic sparse training (DST), it is also conventional to re-use dense HPs, whether in dense-to-sparse [37; 15] or sparse-to-sparse (evolving mask) training [2; 8; 34; 11; 59]. As with fixed sparsity, work here has also suggested sensitivity to HPs, e.g., to dropout and label smoothing . DST may also benefit from extra training steps  or smaller batch sizes , although in DST this may mainly be due to a greater number of opportunities for connectivity exploration .
+
+## 3 Sparse maximal update parameterization (\(\))
+
+We now provide background, motivation, and derivation for \(\), first introducing notation (Section 3.1) and then defining Feature Learning Desiderata (Section 3.2) with a brief overview of \(\) (Section 3.3). Finally we motivate \(\) and provide an overview of the parameterization (Section 3.4).
+
+### Notation
+
+The operations for a single sparse training step are illustrated in Figure 4. The definition and dimensions are: batch size \(B\), learning rate \(\), loss function \(\), forward pass function \(\), input dimension \(d_{}\), input activations \(^{B d_{}}\), input activation gradient \(}{}=_{} ^{B d_{}}\), output dimension \(d_{}\), output activations \(^{B d_{}}\), output activation gradient \(}{}=_{} ^{B d_{}}\), weights \(^{d_{} d_{}}\), initialization variance \(_{W}\) for weights \(\), weight update \(^{d_{} d_{}}\), and \(^{B d_{}}\) is the effect of the weight update on output activations: \(=()\). Unless otherwise specified, \(\{0,1\}^{d_{} d_{}}\) is an unstructured random static mask with sparsity \(s\) and density \(=1-s\). When changing model scale or sparsity, we refer to a width multiplier \(m_{d}=}}{d_{,}}=}}{d_ {,}}\) and density multiplier \(m_{}=}}\).
+
+If we apply sparsity to a linear layer (i.e., \(\) is a fully-connected layer), our aim is to control:
+
+1. **Forward pass:**\(=(,)=( )\).
+
+Figure 4: The three operations associated with training a layer with weights that perform the function \(\): Forward activation calculation, backward gradient propagation, and the weight update.
+
+2. **Backward pass:**\(_{}=(_{})( )^{}\).
+3. **Effect of weight update \(\) on \(\):**\(=()\)1. 
+### Feature learning: Defining the goal of \(\)P and \(\)Par
+
+Prior works [64; 63; 65] introduce the Feature Learning Desiderata (FLD) to ensure stable training dynamics as width is varied. Building on prior works, we include gradients \(_{}\) in the desiderata.
+
+**Feature Learning Desiderata (FLD):** For layer \(l\) and token \(i\), we desire that \(\|_{i}^{l}\|_{2}=(}}),\|_{} _{i}^{l}\|_{2}=(}}),\|_{i} ^{l}\|_{2}=(}}), i, l\).
+
+Recall that if all the entries of some vector \(^{n}\) are some constant \(c\), then \(\|\|_{2}=()\) with respect to width \(n\). Therefore we can satisfy the FLD by ensuring the _typical element size_ of \(\), \(_{}\), and \(\) is \((1)\) with respect to **some variable(s)** we would like to scale. Variables to scale include width [64; 63; 65], depth [66; 4], and sparsity (this work). The FLD prescribes a **holistic** signal propagation approach of controlling each of the three operations in a training step, not a subset2.
+
+### Maximal update parameterization (\(\)P)
+
+Here we provide a brief overview of maximal update parameterization (\(\)P) [64; 63; 65]. With the standard parameterization (SP), Yang and Hu  show the scale of activations throughout training increases as model width increases, motivating the development of \(\)P. \(\)P [64; 63] is defined as the unique parameterization that satisfies the FLD by ensuring the _typical element size_ of \(\), \(_{}\), and \(\) is \((1)\)**with respect to change in width \(m_{d}\). The FLD can also be satisfied by controlling the spectral norm of weights . \(\)P enables \(\)Transfer: the optimum learning rate, initialization weight variance, scalar multipliers, and learning rate schedule all remain consistent as width is increased for \(\)P models . \(\)Transfer can be leveraged to take a _tune small, train large_ approach where hyperparameters are extensively tuned for a small model then transferred, enabling reduced tuning budgets and superior tuning for large models compared to standard practice.
+
+### Sparse maximal update parameterization (\(\)Par)
+
+Yang et al.  show activation magnitudes explode with increasing model width. In Figure 5 we show sparsity has the opposite effect: increasing sparsity causes shrinking activation magnitudes.
+
+Figure 5: Mean absolute value activations for attention and feed forward blocks after training step \(t\) (10 seeds). In SP and \(\)P models, decreasing density causes activations to vanish (note axes on log-scale). In \(\)Par models, density has little effect on activation scales and there is no vanishing.
+
+SuPar is defined as the unique parameterization that satisfies the FLD by ensuring the _typical element size_ of \(\), \(_{}\), and \(\) is \((1)\)**with respect to change in width \(m_{d}\) and change in density \(m_{}\)**. SuPar enables stable activation scales across sparsity levels (Figure 5, right). In this section, we walk through the changes required to control each of the three operations in a sparse training step, providing an overview of the SuPar derivation. We focus on the AdamW  optimizer used in our experiments. For a more detailed derivation, including both SGD and Adam, see Appendix D.
+
+Forward pass at initializationTo ensure the _typical element size_ of \(\) is \((1)\) with respect to change in width \(m_{d_{}}\) and change in density \(m_{}\), we can control the mean and variance of \(_{ij}\). Since at initialization \([]=0\), \([]=0\), and \(\), the mean is controlled. The variance of \(_{ij}\) can be written as:
+
+\[(_{ij})=m_{d_{}}m_{}_{ }_{W}^{2}(()+[]^{2})\] (1)
+
+To ensure \((_{ij})\) scales independent of \(m_{d_{}}\) and \(m_{}\), we choose \(_{}^{2}=,}^{2}}{m_{d_{ }}m_{}}\).
+
+Backward gradient pass at initializationTo ensure the _typical element size_ of \(_{}\) is \((1)\) with respect to change in width \(m_{d_{}}\) and change in density \(m_{}\), we can control the mean and variance of \(_{}\). Since at initialization \([]=0\), \([_{}]=0\) and the mean is controlled3. The variance of \(_{}_{ij}\) can be written as:
+
+\[(_{}_{ij})=m_{d_{}}d_{}m_{}_{}_{}^{2}(_{ })\] (2)
+
+To ensure \((_{}_{ij})\) scales independent of \(m_{d_{}}\) and \(m_{}\), we choose \(_{}^{2}=,}^{2}}{m_{d_{ }}m_{}}\). Typically \(m_{d_{}}=m_{d_{}}\), allowing the same \(_{}^{2}\) to control both forward and backward scales.
+
+Effect of Adam weight update \(\) on \(\)To ensure the _typical element size_ of \(\) is \((1)\) with respect to change in width \(m_{d_{}}\) and change in density \(m_{}\). By the law of large numbers, the expected size of each element can be written as:
+
+\[[_{ij}] m_{d_{}}m_{ }_{}[_{ik}(^{T }_{t}_{b}^{B}_{ik}^{t}_{}_{bj} ^{t}}{^{T}_{t}_{b}^{B}(_{ik}^{t}_{ }_{bj}^{t})^{2}}})],(d_{})\] (3)
+
+To ensure \(_{ij}\) and \(\|\|_{F}\) are scale invariant to \(m_{d_{}},m_{}\), we choose \(=}}{m_{d_{}}m_{}}\).
+
+Implementation summaryTable 1 summarizes the differences between SP, uP, and SuPar. Since we only sparsify hidden weights, SuPar matches uP for input, output, bias, layer-norm, and attention logits. Also note width multipliers \(m_{d}\) and density multipliers \(m_{}\) are usually the same for all layers, allowing simplified notation. This correction is equivalent to uP  when \(=1\) and \(m_{}=1\). The correction to hidden weight initialization we derive is similar to the sparsity-aware initialization in prior work [35; 49; 11]. SuPar should also easily extend to 2:4 sparsity patterns because, in expectation, the rows and columns of \(M^{l}\) should have equal density. A minimal implementation of SuPar is available at https://github.com/EleutherAI/nanoGPT-mup/tree/supar.
+
+## 4 SuPar Training Results
+
+Here, we present empirical results showing the effectiveness of SuPar over SP and uP when training sparse models. When using SP or uP, optimal HPs drift as we change the sparsity level, possibly leading to inconclusive or even reversed findings. SuPar has stable optimal HPs across both model width and sparsity level, and we show it improves over SP and uP across different scaling approaches. Taken together, we see that SuPar sets the Pareto frontier best loss across all sparsities and widths,
+
+[MISSING_PAGE_FAIL:6]
+
+### Studying SupPar indicates how some sparse scaling techniques appear to work
+
+So far, we see SupPar can transfer optimal HPs across sparsity levels, but we have also designed it to transfer HPs across different model widths (hidden sizes), similar to up. Here, we further demonstrate that SupPar transfers optimal HPs across width. More generally, sparse scaling that keeps a fixed number of non-zero weights per neuron allows SP and up to also transfer HPs.
+
+Figure 9 shows learning rate transfer tests when changing both the model's hidden size, \(d_{}\), and sparsity level in a common scaling approach called _Iso-Parameter scaling_. Iso-Parameter scaling keeps the model's number of non-zero parameters approximately the same, as width and sparsity are varied5. Here, we see the common result that SP models starting from dense HPs _do_ tend to significantly improve as we increase width and sparsity. Note, though, the optimal learning rate for each sparsity level still shifts. When we correct dense HPs using up or SupPar, the dense baseline significantly improves, but only SupPar shows consistent loss improvement and stable HPs.
+
+Based on the SupPar formulation: When the number of non-zero weights per neuron (WPN) in the network is the same, up and SupPar become synonymous, because initialization and learning rate adjustment factors will be constant (i.e., \(d_{}==O(1)\)). Optimized SP HPs will also tend to work well. We define this new scaling setting, which we call Iso-WPN, to verify this hypothesis. In Figure 11, we test SP HPs with Iso-WPN scaling and see the optimal learning rate stays consistently between \(2^{-7}\) and \(2^{-6}\) with roughly aligned curves (we omit similar up and SupPar plots for space, because their corrections are the same). The conclusion is that when scaling SP models in an Iso-WPN sparse setting, HPs should maintain similar training dynamics. More generally, as WPN decreases
+
+Figure 8: Summarizing loss results from Figure 6 with the optimal learning rate for each parameterization and sparsity.
+
+Figure 7: Across sparsity \(s\), SP and up show unstable optimal initialization. SupPar is stable (3 seeds).
+
+Figure 9: SupPar ensures stable optimal learning rate in Iso-Parameter sparse + wide scaling (3 seeds).
+
+(e.g., by increasing sparsity), the optimal learning rate will tend to increase proportionally, and vice versa6.
+
+Figures 5, 6, 7, and 9 show SuPar is the only parameterization that ensures stable activation scales and stable optimal HPs across model widths and sparsities, satisfying the FLD.
+
+### SuPar scaling to large language model pretraining
+
+We conclude this section reflecting on the demonstration of SuPar improvements in a large-scale language model. We train 610M parameter models starting from a Chinchilla  compute-optimal training configuration with 20 tokens per parameter from the SlimPajama dataset. This larger model--with hidden size 2048, 10 layers, and attention head size 64--permits sweeping over a larger range of sparsity levels, so we test up to 99.2% sparsity (density \(2^{-7}\)).
+
+Figure 3 shows validation loss for each parameterization as we sweep sparsity levels. Additionally, in Table 2, we evaluate the models from Figure 3 on five downstream tasks: ARC-easy, lambada, RACE, PIQA, and BoolQ, which collectively test for common sense reasoning, world knowledge, and reading comprehension. As sparsity increases, results across pretraining loss and average downstream task accuracy consistently show SP and uP fall farther behind SuPar. Since these models are trained with a large number of tokens, we attribute the widening loss gap mostly to increasingly under-tuned learning rates for SP and uP as sparsity increases-the weight updates lose gradient information throughout training. Figure 8 shows retuning SP and uP could recover some of the gap to SuPar, but that could be costly: These runs take 3-6 hours on a Cerebras CS-3 system (or \(>9\) days on an NVIDIA A100 GPU).
+
+Finally, returning to the Iso-Parameter scaling setting, Figure 10 shows losses for 111M parameter models trained on 1B tokens and scaled up while using dense optimal HPs. The SP and uP models experience detuning as sparsity increases, allowing SuPar to achieve superior losses7.
+
+### Dynamic sparsity hyperparameter transfer
+
+In Figure 12 we test the transfer of optimal learning rate across sparsity levels for two popular dynamic sparse training methods: Rigging the Lottery (RigL) 8 and Gradual Magnitude Pruning (GMP) 9. We show that none of SP, uP, or SuPar achieve transfer of optimal learning rate across sparsity levels. For SP and uP we see that higher sparsity levels have higher optimal learning rates.
+
+This is because sparsity reduces activation and gradient scales such that a larger learning rate is needed to counteract this. SuPar sees the opposite trend where higher sparsity levels have lower optimal learning rates, indicating that SuPar is "overcorrecting".
+
+Dynamic sparse methods can make updates to the weight mask such that the distribution of unmasked/non-zero weights changes to something non-Gaussian, which prevents SuPar from being correct in expectation. Compared to random pruning, a mask obtained from magnitude pruning will better preserve the size of activations and gradients seen in the dense network. Since SuPar assumes weights are drawn from a Gaussian distribution, SuPar ends up "overcorrecting" the initialization and learning rate. In future work it would be impactful to develop a parameterization which generalizes SuPar to work for an arbitrary sparse training algorithm.
+
+## 5 Discussion
+
+To improve sparse training, prior works make targeted corrections which arise from observations that sparsity can cause degraded activation, gradient, and/or weight update signal propagation. We review these observations and corrections to advocate for holistic control of sparse training dynamics.
+
+Sparsifying Can Cause Vanishing ActivationsEvci et al.  note that by initializing weights using dense methods (e.g., [17; 21]), the "vast majority" of sparse networks have vanishing activations. Lasby et al. [29; App. A] analyze activation variance as a guide for selecting structured sparsity. The FLD suggest activation norms be measured and controlled with respect to sparsity, so activation variance can be considered a proxy to whether sparsity might negatively impact training dynamics. Evci et al.  ultimately initialize variances via neuron-specific sparse connectivity, while Liu et al.  and Ramanujan et al.  propose scaling weight variances proportional to layer sparsity. These corrections, however, only target controlling activations but not weight updates.
+
+Gradient Flow Partially Measures the Weight Update \(\)DesideratumSparsity also impairs _gradient flow_--the magnitude of the gradient to the weights--during training [11; 1]. Since gradient flow is measured using the norm of the weight gradients, it measures a piece of the weight update. Unfortunately, gradient flow does not directly measure the effect of the weight update step, which can also involve adjustments for things like optimizer state (e.g., momentum and velocity), the learning rate, and weight decay. Prior works propose techniques to improve gradient flow during sparse
+
+Figure 12: For dynamic sparse training methods RigL and GMP, none of SP, \(\)P, or SuPar achieve stable optimal learning rate across sparsity (3 seeds). Missing points indicate diverged training runs.
+
+training and pruning by adjusting individual hyperparameters or adding normalization . However, these techniques might overlook the effects of the optimizer and learning rates in weight updates. Notably, Tessera et al. _do_ consider some of these effects, but their proposed techniques maintain gradient flow only in the Iso-Parameter scaling setting rather than arbitrary sparsification.
+
+Frantar et al. [15, App. A.1] also endeavor to control weight updates, where they observe diminished step sizes when optimizing sparse networks with Adafactor . They correct this by computing Adafactor's root-mean-square scaling adjustments over _unpruned_ weights and updates. However, such normalization does not prevent activations from scaling with model width . In this sense, sparsity-aware fixes to Adafactor can improve dynamics, but will not address instability holistically. In Figure 14 we show the \(\) LR correction alone is not even sufficient to achieve stable optimal \(\).
+
+Weight Initialization Only Controls Dynamics at InitializationWe noted works above that adjust sparse weight initializations . Additionally, Lee et al.  explore orthogonal weight initialization , both before pruning (to ensure SNIP  pruning scores are on a similar scale across layers) and after (to improve trainability of the sparse network). While adjusting weights can improve sparse training dynamics at initialization, such adjustments are insufficient to stabilize signals _after multiple steps of training_, in the same way that standard weight initializations fail to stabilize training of dense networks. In Figure 13 we show the \(\) init. alone is not even sufficient to achieve stable optimal \(_{W}\).
+
+## 6 Limitations
+
+As Section 4.4 shows, \(\) requires further extension for dynamic sparse training due to unpredictable changes in weight distributions. The same applies to methods which prune at initialization or after pretraining in a non-random fashion. Iterative magnitude pruning (IMP) is an interesting case since it involves rewinding weights back to their initial values while maintaining the same mask . If the IMP mask at initialization still allows the non-zero weights to have a Gaussian distribution, then \(\) would apply to this case. Therefore, it's possible \(\)_could_ prevent "HP detuning" in later IMP iterations, and _potentially_ improve IMP losses, though we do not explore this. \(\) would also work for random structured pruning of entire neurons at initialization because this case simply reduces to training with a narrower dense model.
+
+For weight sparsity more generally, the most pressing limitation is the lack of hardware acceleration . While new software  continues to better leverage existing hardware, the growth of software and hardware co-design is also encouraging , as effective sparsity techniques can be specifically optimized in deep learning hardware. But to effectively plan hardware, we need to train and test sparse prototypes at next-level sizes, at scales where the optimum sparsity level may be higher than in current networks . Performing such _scaling law_-style studies requires incredible resources even for dense models with well-established training recipes . As \(\) reduces training and tuning costs, it can help unlock these studies and guide future hardware design.
+
+Finally, the scaling factors for the weight update need to be derived for each optimizer, which might limit the usability of \(\) in practice. For a discussion of the broader impacts of \(\), see Appendix A.
+
+## 7 Conclusion
+
+Nobody said training with sparsity was easy. We showed that with the standard parameterization and \(\), increasing sparsity level directly correlates with vanishing activations. Impaired training dynamics prevent sparse models from sharing the same optimal hyperparameters, suggesting prior results based on re-use of dense HPs merit re-examination. In contrast, by holistically controlling the training process, \(\) prevents vanishing activations and enables HP transfer (across both width and sparsity). LLMs trained with \(\) improve over \(\) and the standard parameterization. As such, we hope \(\) makes things a little easier for sparsity research going forward.

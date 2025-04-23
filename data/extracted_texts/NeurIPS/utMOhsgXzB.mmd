@@ -1,0 +1,188 @@
+# BendVLM: Test-Time Debiasing of Vision-Language Embeddings
+
+Walter Gerych\({}^{1}\) Haoran Zhang\({}^{1}\) Kimia Hamidieh\({}^{1}\) Eileen Pan\({}^{1}\)
+
+Maanas Sharma\({}^{1}\) Thomas Hartvigsen\({}^{2}\) Marzyeh Ghassemi\({}^{1}\)
+
+\({}^{1}\)MIT, \({}^{2}\)University of Virginia
+
+{wgerych, haoranz, hamidieh, eileenp, maanas, mghassem}@mit.edu, hartvigsen@virginia.edu
+
+###### Abstract
+
+Vision-language model (VLM) embeddings have been shown to encode biases present in their training data, such as societal biases that prescribe negative characteristics to members of various racial and gender identities. VLMs are being quickly adopted for a variety of tasks ranging from few-shot classification to text-guided image generation, making debiasing VLM embeddings crucial. Debiasing approaches that fine-tune the VLM often suffer from catastrophic forgetting. On the other hand, fine-tuning-free methods typically utilize a "one-size-fits-all" approach that assumes that correlation with the spurious attribute can be explained using a single linear direction across all possible inputs. In this work, we propose Bend-VLM, a nonlinear, fine-tuning-free approach for VLM embedding debiasing that tailors the debiasing operation to each unique input. This allows for a more flexible debiasing approach. Additionally, we do not require knowledge of the set of inputs _a priori_ to inference time, making our method more appropriate for online, open-set tasks such as retrieval and text guided image generation.1
+
+## 1 Introduction
+
+**Background.** Pretrained foundation Vision-language models (VLMs) such as CLIP , BLIP , and LLaVA  have seen wide adoption for tasks like image retrieval , zero and few-shot classification [33; 4], text-guided image generation , and facial recognition . But VL models also encode societal biases [5; 27; 43; 49; 53]. As more and more systems rely on CLIP, the encoded representational harm [12; 3; 15; 52] can lead to allocative harm [34; 46; 14; 51; 16; 29], such as Black individuals being three times more likely to be misclassified into a nonhuman category by computer vision systems .
+
+**State of the art.** Debiasing VLMs is an active area of research [6; 10; 20; 19; 50; 28]. One common approach is finetuning the embedding models to remove spurious correlations [59; 2; 42]. However, finetuning often decreases accuracy and generalizability of foundation models --a significant drawback as these models are commonly used for zero-shot tasks. Most existing finetuning-free methods learn debiasing transformations of the initial text embeddings, but typically use one-size-fits-all _linear_ debiasing functions that apply the same fixed transformation to every input [6; 10; 50].
+
+While recent work has explored nonlinear VLMs , their method assumes access to the set of classes at test-time, requiring the debiasing training pipeline to be rerun if a query for a new class ismade. This is a major limitation in practice because many tasks VLMs are used for are often naturally _open-set_, where the classes to be evaluated for at test-time are unknown prior to inference.
+
+**Problem Definition.** We study online, open-set debiasing for VLM embeddings. In this setup, we only have access to a VLM, along with a single-modal image dataset. This image dataset is only for the purpose of "training", and is not the dataset that the downstream task will work on. We assume that this dataset, which we call the _reference_ dataset, has labels for the protected attribute(s) of interest. During test-time, we receive online input queries one at a time. These queries are also open-set, meaning that the classes or concepts they refer to are not known to us beforehand. For instance, the query may be "a photo of a nurse", but we do not have knowledge that nurse is a potential class of interest before receiving the query. Our goal is to debias the query embedding from the VLM in such as way that it does not more strongly associate the query embedding with any protected attribute value over another. For instance, the embedding for "a photo of a nurse" should not be more associated with images of women than with men.
+
+**Challenges.** Online, open-set VLM debiasing is a challenging task. First, we must overcome _catastrophic forgetting_--a solution that debiases the embeddings, but degrades performance. Second, the interaction between protected attributes and query classes may be _nonlinear and instance-dependent_. For example, the transformation required to remove the gender bias from the embedding of "nurse" is likely not the same as the one to untangle gender bias associated with the embedding of "handyman". Third, queries from _open-set classes_ means that our approach must be flexible enough to remove the association of protected attributes from classes unknown prior to inference time. Lastly, _online_ settings demand computational efficiency and thus rule out refitting the debiasing component for each now class or query.
+
+**Proposed approach.** We propose **Bias** Elimination with **N**onlinear **D**ebiasing of **V**ision **L**anguage **M**odels (Bend-VLM), a test-time VLM debiasing method that leaves the VLM's weights unchanged, being efficient enough for online streaming queries. By using the easy-to-get pre-debiasing reference dataset with protected attributes, Bend-VLM allows for unsupervised test-time debiasing. On a high level, Bend-VLM consists of two main parts:
+
+First, given an online query, we generate augmented queries that introduce protected attribute information. For example, given "a photo of a nurse" we generate "a photo of a {ATTRIBUTE} nurse", filling in {ATTRIBUTE} with male/female/nonbinary for gender debiasing, for instance. We get these augmented queries from a small language model, and use them to find the directions in the embedding space for that specific query that are most associated with the protected attribute. Given these directions, we project the embedding such that it is orthogonal to the protected attribute dimension, resulting in the first-stage debiased representation.
+
+For the second step, we make use of the reference image dataset. We find the images in this dataset that are most associated with the query, and then subset them by protected attribute value. We find an updated, debiased query representation by solving a constrained optimization equation with the goal of finding an embedding with minimal distance to the first-stage debiased representation while being equally similar to the example images for each attribute value. For instance, we find an embedding that is equally similar to the nearest images for each gender. The resulting embedding will have little to no excess association with any of the debiased protected attribute values over any other. The output can then be passed to the downstream task.
+
+**Contributions.**
+
+* We introduce Bend-VLM, a novel test-time VLM debiasing approach that does not require finetuning.
+* We propose a technique for finding local attribute subspaces specific to each query on-the-fly.
+* We introduce a novel method for equalization by using a reference image dataset.
+* We experimentally evaluate for classification, retrieval, and image captioning settings, showing Bend-VLM consistently outperforms the compared approaches.
+
+## 2 Problem Definition
+
+Let \((,,,)\) be an (_image, text, class, attribute_) tuple distributed according to \(P_{M} P_{T} P_{C} P_{A}\), a joint distribution over images, texts, classes, and attributes. Using the running example of nurses,a realization of \(\) could be an image of a nurse, \(\) the text "a photo of a nurse", \(\) the class nurse, and \(\) a protected attribute such as gender. Importantly, we do not assume that \(\), the support of \(P_{C}\), is known. This means we do not know what classes the user will query for during inference, and do not have access to a training set with these class labels.
+
+Let \(f_{}^{T}:^{d}\) represent the text embedding model (e.g., CLIP's image encoder) and \(f_{}^{M}:^{d}\) represent the image encoder, where \(\) and \(\) are the text and image domain, respectively. We will use \(f_{}=\{f_{}^{T},f_{}^{M}\}\) when referring to the VL model in general, rather than its modality-specific encoders. \(f_{}\) is used to obtain \(df_{}^{M}(),f_{}^{T}()\), where \(d(,)\) is a distance metric such as _cosine distance_. In practice, these (_image_, _text_) distance scores are used for zero-shot classification or image retrieval.
+
+Let \(_{c}\) be a textual instance relating to class \(\). For instance, class \(\) could be nurse and \(_{c}\) "a picture of a nurse". Then, **our goal is to obtain a text embedding \(_{c}^{*}^{d}\) that is Class Confonidally Fair**.
+
+**Definition 1** (Class Confonidally Fair (CCF)).: _A text embedding \(_{c}^{*}\) is Class Confonidally Fair for embedding model \(f_{}\), class \(\), and metric \(d\) if for all \(_{i}\), \(_{j}\) the following holds:_
+
+\[_{|_{i},}d(f_{}^{M}(^{}),_{c}^{*})=_{^{}|_{j},} d(f_{}^{M}(^{}),_{c}^{*}).\]
+
+Intuitively, a text embedding is CCF for class \(\) if the expected similarity between the text representation and _relevant_ image embeddings -- image embeddings that are also associated with class \(\) -- is independent of the protected attribute value \(\). For instance, an embedding of the query "a picture of a nurse" is CCF if its expected similarity score for pictures of _female_ nurses is equal to the expected similarity score for _male_ nurses.
+
+We also define **Class Confonidally Fair Distance** as a measure from how far off an embedding is from being CCF:
+
+**Definition 2** (Class Confonidally Fair Distance).: _The Class Confonidally Fair Distance for a text embedding \(_{c}\) class \(\), and metric \(d\) is given by:_
+
+\[d_{CCF}(_{c},)=||_{|_{i},}d(f_ {}^{M}(^{}),_{c})-_{^{}| _{j},}d(f_{}^{M}(^{}),_{c}) ||_{1}.\]
+
+Figure 1: Overview of our two-step Bend-VLM method. In this example, the initial query embedding of doctor is more strongly associated with males, and the CCF distance is \(0.10\). After performing debiasing step 1, Orthogonalizing the Embedding, the embedding is modified to remove bias along the gender direction defined by “male doctor” and “female doctor”. This still results in a CCF distance of \(0.05\). We then perform the second debiasing step, where the query embedding is again modified to be equidistant to the relevant male and female images. The final representation achieves the optimal distance of \(\).
+
+The CCF distance of \(_{c}\) is \(0\) if and only if \(_{c}\) is CCF. In practice, we can't exactly compute the expectations in the CCF distance definition. Instead, these expectations can be replaced with the average distances from relevant samples in the evaluation dataset.
+
+Reference and Target Datasets. In practice, we assume that we have a dataset \(D_{}=\{(_{i},_{i})\}_{i=1}^{N}\) consisting of \(N\) images with labeled attributes. For instance, \(D_{}\) could be a dataset of pictures of people with corresponding gender, race, or age labels2. We focus on both the _image retrieval_ and _zero-shot classification_ setting. This _reference_ dataset will be used to obtain debiased text embedding, as we describe in detail in the following section. We refer to the downstream dataset to be used in retrieval or zero-shot applications as the _target_ dataset \(D_{}=\{_{j}\}_{j=1}^{N_{}}\). \(D_{}\) is not available prior to inference.
+
+**For retrieval**, we assume that \(D_{}\) is an unlabeled dataset of images, such that we want to retrieve images from this dataset that relate to streaming, open-set queries. For instance, the queries can be free-form text searches coming from a search engine user. In this open-set scenario the set of classes \(\) is unknown -- we do not know what classes users will search for _a priori_.
+
+**For zero-shot classification**, we likewise focus on the streaming, open-set scenario. Images from \(D_{}\) will be compared against a set of texts \(\{_{c0},_{c1},,_{cK}\}\) for the purpose of classification, where this set of texts relates to classes \(_{1},_{2},,_{K}\), where \(\) is unknown to us and potentially variable. For instance, a user may first wish to obtain zero-shot predictions of hair color of the portraits in \(D_{}\), and later wish to obtain predictions of whether the individuals have eyeglasses.
+
+In both settings, we make the simplifying assumption that each user query \(_{c}\) does not explicitly reference the protected attribute of interest. For instance, the query is "a picture of a nurse", not "a picture of a male nurse" -- and thus it is desirable for the query embedding to _not_ be more associated with a particular gender. In the case where the query _does_ contain explicit reference to \(\) -- "a picture of a male nurse" -- it is straightforward to abstain from debiasing by using a language model to filter out these queries, or by checking for explicit attribute terms 3.
+
+## 3 Methodology
+
+On a high level, our Bend-VLM approach consists of a two-phase debiasing pipeline. We perform an initial debiasing pass by first employing the classic approach of orthogonalizing \(f_{}()\) to the attribute subspace \(\)[24; 9]. However, unlike most prior works, we do _not_ assume that the attribute subspace is globally constant for all queries; it may be the case that the direction in the embedding space corresponding to gender that differentiates "a picture of a male nurse" from "a picture of a female nurse" may not be equivalent to the gender direction between "a picture of a baby boy" and "a picture of a baby girl". We find these _local attribute subspaces_ using our AttributeAugment module to obtain attribute augmented versions of \(\). After this first phase, we are left with the partially-debiased embedding \(_{c}^{}\).
+
+Our second and final debiasing pass consists of equalizing the distances between the embedding and relevant images from the reference dataset \(D_{ref}\) belonging to each attribute class. We obtain the final debiased embedding \(_{c}^{*}\) through an analytical solution to a constrained optimization equation.
+
+### Step 1: Making The Embedding Orthogonal To Local Attribute Subspace
+
+Orthogonalizing text embeddings with respect to an attribute subspace, such as setting embedding dimensions corresponding to gender or race equal to zero, is a classic approach used for standard text embeddings [24; 9] and has recently shown promise in debiasing VL models . Whereas existing approaches typically find a single attribute subspace for instances, we find local attribute subspaces in addition to the global subspace.
+
+Let \(_{c}\) be the initial text query coming in to the system. We then obtain \(_{c,a_{i}}\) for all \(_{i}\). For instance, if \(\) refers to gender and \(_{c}=\) "a picture of a nurse", then we would obtain "a picture of a male nurse" and "a picture of a female nurse" for \(_{c,a_{male}}\) and \(_{c,a_{female}}\), respectively. We draw each \(_{c,a_{i}}\) from our AttributeAugment module: \(\{_{c,a_{i}}\}_{i}=(_{c,a_{i}}; )\). In practice, we use an LLM to instantiate AttributeAugment. In a lower resource setting, AttributeAugment could feasibly be implemented through simpler text processing techniques to identify the subject of the query and insert corresponding attribute strings before the subject; e.g. inserting "male" and "female" before the subject for gender debiasing.
+
+Let \(A\) be a matrix whose columns are \(f_{}^{T}(_{c,a_{i}})-f_{}^{T}(_{c})\) for \(i=1||\). To combat potential noise from estimating the local attribute subspace, we additionally include generic attribute text embeddings into the columns of \(A\) as well. For instance, for gender debiasing we include the embeddings of "a picture of a man" and "a picture of a woman". We then obtain the initial debiased embedding \(_{c}^{}\) as:
+
+\[_{c}^{}=Vf_{}^{T}(_{c}),\]
+
+where \(V=I-A(A^{}A)^{-1}A^{}\) is the orthogonal projection matrix of \(A\).
+
+Importantly, despite \(_{c}^{}\) being orthogonal to the local attribute subspace it is _not_ necessarily equally similar to the image embeddings of relevant instances when conditioned on the "debiased" attribute.
+
+[Orthogonalization does not yield Class Conditional Fairness.] The following does not hold in general:
+
+\[_{|_{i},c}d(f_{}^{M}(^{ }),_{c}^{})=_{^{}|_{ j},c}d(f_{}^{M}(^{}),_{c}^{}).\]
+
+We show an example of this in Figure 1, where we see that step 1 does not result in significantly improved CCF distances. To mitigate this, we propose a second debiasing step.
+
+### Step 2: Using Reference Images To Equalizing the Text Embedding
+
+In this second stage, we equalize the distances between the images in \(D_{}\) and the debiased embedding \(_{c}^{}\), with the goal of making relevant images from each attribute group equally similar to the text embedding. Let \(D_{}(_{i},)\) be images in the reference dataset that are associated with attribute class \(_{i}\) and class \(\). We want to find the embedding \(_{c}^{*}\) that satisfies the following set of conditions \(\):
+
+\[=\{_{j} D_{}(_{i},)}d(f_{}^{M}(_{j},_{c}^{*}))}{|D_{}(_{i}, )|}=_{k} D_{}(_{1},)}d(f_{ }^{M}(_{k},_{c}^{*}))}{|D_{}(_{1},)|} \}_{i=1||}\]
+
+These constraints say that the average distance between relevant image embeddings should be equal for all attribute value splits. For example, the distance between the embedding of "a picture of a nurse" and relevant male images should match the distance between the embedding and relevant female images.
+
+Note that since we do not assume access to context labels for \(D_{}\), it is not immediately obvious on how to obtain each \(D_{}(_{i},)\). Instead, \(D_{}(_{i},)\) is by selecting \(n\) images with attribute value \(_{i}\) that are most similar to the query embedding \(_{c}^{}\). The value of \(n\) could be found using change-point detection, such that \(n\) is the value where the elbow in the plot of similarity over indexes sorted by similarity score . A less sophisticated approach -- but one we find works well in practice -- is to simple chose \(n\) as a hyperparameter, and use the same value for each attribute and query.
+
+Finding any embedding that satisfies \(\) is not enough, since we want to ensure that the debiased embedding does not lose information unrelated to the protected attribute \(\). This means we want to find a debiased embedding with minimal distance to the previous embedding. We want to find a \(_{c}^{*}\) that minimizes distance to the first-pass debiased \(_{c}^{}\):
+
+\[_{}=d_{c}^{*},_{c}^{}\]
+
+We thus find \(_{c}^{*}\) by solving the following constrained optimization equation:
+
+\[_{c}^{*}=*{arg\,min}_{_{c}^{*}}_{},.\] (1)
+
+Equation 1 has a simple analytical solution for the binary attribute case, when \(d(,)\) is cosine distance and each embedding has unit norm length.
+
+**Lemma 2**.: _The value of \(_{c}^{*}\) that minimizes the distance from the initial embedding \(z_{c}^{}\) while satisfying the image-embedding fairness constraint is:_
+
+\[_{c}^{*}=_{c}^{}-(_{2},)+ (_{1},)}{||_{c}^{}-(_{2},)+ (_{1},)||_{2}},\]
+
+_where \(\) is given by:_
+
+\[=_{1},)_{c}^{}-(_{2}, )_{c}^{}}{2(_{2},)(_{1}, )-(_{2},)(_{2},)-(_{1},)(_{1},)},\]
+
+_and \((_{i},)=(_{i},)|}_{_{j}  D_{ref}(_{i},)}_{j}\) is the average embedding of \(D_{ref}(_{i},)\)._
+
+As the requirement that the embeddings have unit norm length simplifies the analytical solution, we add in this norm constraint \(\{||_{c}^{*}||_{2}=1\}\) to the set \(\). In the case where the protected attribute is not binary, \(_{c}^{*}\) can be found using a constrained optimization solver .
+
+After obtaining the result of this final debiasing step, our modified embedding can then be passed along to a downstream task such as retrieval or zero-shot classification on a target dataset \(D_{}\), or used to condition another model such as a text to image generator.
+
+## 4 Experiments
+
+Datasets.We compare our Bend-VLM to existing debiasing approaches on the FairFace, CelebA, and UTKFace datasets. Each dataset contains pictures of people. CelebA has gender annotations, while FairFace and UTKFace have both gender and race labels.
+
+Models.We evaluate the ability of the debiasing approaches to improve the performance of the CLIP-ViT-Base-Patch16 (CLIP-ViT-B-P16) and CLIP-ViT-Large-Patch14 (CLIP-ViT-L-P14) VLMs. For image captioning, we use ClipCap  pretrained on Conceptual Captions , which uses a ViT-B/32 architecture. We use Mistral-7B-Instruct-v0.2 for our AttributeAugment module.
+
+Compared Methods.We compare Bend-VLM against the following debiasing methods:
+
+* **Baseline CLIP** is simply the original CLIP model (e.g. ViT-B-P16 or ViT-L-P14) without any debiasing steps. This acts as our baseline.
+* **Orthogonal Projection (Orth-Proj.)** debiases the query embedding by making the embedding orthogonal to the global spurious attribute subspace (e.g. making the embedding orthogonal to the directions in the embedding space most correlated with gender).
+* **Orthogonal Calibration (Orth-Cal.)** likewise makes the embedding orthogonal to the global spurious attribute subspace, but introduces an additional regularization term to encourage attribute-augmented versions of the query to be close together after projection.
+* **DebiasCLIP** finetunes a CLIP model to remove spurious attribute bias. The authors have released the weights for DebiasCLIP trained to do gender debiasing on CLIP-ViT-B-P16, but have not made their training code available. This means we compare against this method only when evaluating on experiments that use CLIP-ViT-B-P16. Note that while the released DebiasCLIP model was trained for gender debiasing, we also include it in evaluations for race debiasing but do not expect it to be competitive in these settings.
+
+Implementation details.We do a 50/50 split of each dataset for the reference and target datasets. We additionally create 5 folds for the target dataset so that we can compute confidence intervals for all methods. We chose \(n=100\) when selecting the \(n\) most relevant images for computing each \(D_{}(_{i},)\) (see Section 3.2). We use the default value of \(=1000\) for Orth-Cal. and Orth-Proj.'s main hyperparameter. During retrieval, we always sample 500 images from the target dataset. Our reference and target datasets are drawn from the pre-established training split of each dataset.
+
+Evaluation metrics.We measure \(KL[_{}||P_{}]\), the KL divergence between the attribute prior \(P_{}\) (e.g. the true distribution of genders in the target dataset) and \(_{}\), the empirical distribution of
+
+[MISSING_PAGE_FAIL:7]
+
+[MISSING_PAGE_EMPTY:8]
+
+### Debiasing Image Captioning
+
+In this experiment, we evaluate the effect of Bend-VLM on debiasing automatic image captioning. We study ClipCap  (ViT-B/32 vision encoder, pretrained on Conceptual Captions ), as it is one of the few captioning methods which takes in only the final layer embedding vector, as opposed to BLIP  or LLaVA , which take in the sequence of embeddings from the ViT.
+
+We hand picked 20 images that we observed to have significantly negative or harmful captions generated from the Baseline CLIP embeddings. After debiasing with Bend-VLM, we performed a manual inspection and determined that 6 out of the 20 had less harmful captions after debiasing, 3 had increased harm, and 11 were equal to the original captions.
+
+Next, we randomly sample \(1600\) images from FairFace's validation set that result in captions containg any of the following negative words: [ "abandoned", "murder", "h homeless", "acuse", "kill", "anime", "arrest", "surprised", "blood", "shot", "pregnant", "intoxicat", "charged", "bad day", "permanently surprised", "bandage", "hit", "wilful", "no idea", "prison", "abuse", "attack" ]. We then perform automated sentiment analysis using CLIP. Table 5 shows that Bend-VLM decreases the average negative sentiment per race, and makes this average more equal between the races.
+
+## 5 Limitations and Broader Impact
+
+Bend-VLM requires a reference dataset with protected attribute annotations, which is not feasible for every scenario. In our current implementation, our AttributeSwap module requires the use of a relatively small 7B LLM. This could still incur too much computational overhead for very resource-constrained settings. Additionally, our evaluation datasets are not perfect. They contain only binary gender labels, but there is a large population of people who don't identify that way. Moreover, the race and gender labels are not from self-identification, meaning they are only a noisy signal for identity. We believe that our method overall takes a step towards understanding and mitigating biases, and can still be directly extended to support a more nuanced solution to the extreme challenges of mitigating social biases.
+
+## 6 Related Works
+
+Biases in Vision-Language Models. Vision-Language models have become increasingly widespread in recent years [33; 35; 37; 36]. However, these models are known to suffer from
+
+  
+**Method** & **KL Divergence \(\)** & **MaxSkew \(\)** \\  Baseline CLIP & 0.606 \(\) 0.043 & 0.155 \(\) 0.016 \\  Orth-Proj. & 0.826 \(\) 0.020 & 0.211 \(\) 0.014 \\  Orth-Cal. & 0.877 \(\) 0.021 & 0.226 \(\) 0.005 \\  Bend-VLM (Without Step 1) & 0.594 \(\) 0.074 & 0.146 \(\) 0.029 \\  Bend-VLM (Without Step 2) & 0.873 \(\) 0.024 & 0.223 \(\) 0.006 \\  Bend-VLM (Full Method) & 0.837 \(\) 0.035 & 0.193 \(\) 0.024 \\   
+
+Table 4: Debiasing FairFace with respect to HairColor queries with respect to gender, but evaluated on race.
+
+    & White & East Asian & Latino\_Hispanic & Southeast Asian & Black & Indian & Middle Eastern & Max Disparity \\  Baseline CLIP & 0.640 & 0.495 &.568 & 0.534 & 0.525 & 0.656 & 0.624 & 0.161 \\ Bend-VLM & **0.355** & **0.290** & **0.360** & **0.321** & **0.309** & **0.385** & **0.355** & **0.095** \\   
+
+Table 5: Average negative sentiment scores for the generated FairFace captions. Lower is better.
+
+spurious correlations  and can be biased towards certain races and genders . Studies have shown that biases in these models can stem from the datasets they are trained on. For example, Agarwal et al.  found that the CLIP model associates "white" text labels less accurately with white individuals than with individuals from other racial groups, and images of people labeled as Black are more likely to be mislabeled as animals. Additionally, Dehouche  identified gender bias in CLIP when prompted with gender-neutral text, and Wolfe et al.  noted that multiracial individuals are more likely to be assigned minority racial labels. The biases embedded in these models reflect the biases present in the training data, which often include offensive and stereotypical content [7; 8; 47; 39].
+
+Debiasing Vision-Language Models. Recent advancements in debiasing vision, language, and vision-language models have led to various methods for mitigating biases, ranging from data augmentation and balancing  to model-level adjustments such as adversarial training . For instance, Wang et al.  proposed removing dimensions in the CLIP embedding correlated with gender attributes, while Berg et al.  used prompt learning via an adversarial approach to debias CLIP models. Other techniques include learning additive residual image representations  and improving robustness to spurious correlations in CLIP via employing contrastive learning  and spurious-aware fine-tuning . Friedrich et al.  developed a look-up table for fair text-to-image diffusion models. Similarly, Kong et al.  addressed test-time bias in image retrieval by downsampling the majority class in query results, and the Adept framework  use debiasing prompts for text embeddings. Chuang et al.  reduced bias without extensive fine-tuning by orthogonalizing embedding dimensions associated with protected attributes. Kim et al.  emphasized the importance of addressing gender and racial biases in vision-language models. Despite these efforts, achieving effective debiasing without extensive retraining remains challenging. In contrast, our approach, which is fully zero-shot and does not depend on any downstream dataset or model training, aims to provide a more scalable solution to debiasing vision-language models, especially in open-set scenarios where only a piece of text is provided, rather than multiple classes.
+
+## 7 Conclusion
+
+This work proposes a test-time VLM debiasing method that does not require finetuning, and is able to perform query-specific nonlinear debiasing rather than a one-size-fits-all approach. Our experiments on removing race and gender bias in retrieval, classification, and image captioning indicate that our method consistently decreases bias while improving worst group performance. We found that our method consistently matches the accuracy of the best performing compared method, while significantly decreasing bias beyond all compared methods. We hope that our method inspires more work on efficient, nonlinear debiasing techniques for VLMs.
+
+## 8 Acknowledgments
+
+This work was supported in part by a National Science Foundation (NSF) 22-586 Faculty Early Career Development Award (#2339381), a Gordon & Betty Moore Foundation award & a Google Research Scholar award. Thomas Hartvigsen's contribution was funded in part by the National Security Data & Policy Institute, Contracting Activity #2024-24070100001.

@@ -1,0 +1,203 @@
+# LISA: Layerwise Importance Sampling for Memory-Efficient Large Language Model Fine-Tuning
+
+Rui Pan\({}^{}\), Xiang Liu\({}^{}\), Shizhe Diao\({}^{}\), Renjie Pi\({}^{}\), Jipeng Zhang\({}^{}\),
+
+**Chi Han\({}^{}\), Tong Zhang\({}^{}\)**
+
+\({}^{}\)University of Illinois Urbana-Champaign
+
+\({}^{}\)The Hong Kong University of Science and Technology(Guangzhou)
+
+\({}^{}\)NVIDIA \({}^{}\)The Hong Kong University of Science and Technology
+
+{ruip4, chihan3, tozhang}@illinois.edu
+
+xliu886@connect.hkust-gz.edu.cn {sdaoaa, rpi, jzhanggr}@ust.hk
+
+Equal Contribution.
+
+###### Abstract
+
+The machine learning community has witnessed impressive advancements since large language models (LLMs) first appeared. Yet, their massive memory consumption has become a significant roadblock to large-scale training. For instance, a 7B model typically requires at least 60 GB of GPU memory with full parameter training, which presents challenges for researchers without access to high-resource environments. Parameter efficient fine-tuning techniques such as Low-Rank Adaptation (LoRA) have been proposed to alleviate this problem. However, in most large-scale fine-tuning settings, their performance does not reach the level of full parameter training because they confine the parameter search to a low-rank subspace. Attempting to complement this deficiency, we investigate the layerwise properties of LoRA on fine-tuning tasks and observe an unexpected but consistent skewness of weight norms across different layers. Utilizing this key observation, a surprisingly simple training strategy is discovered, which outperforms both LoRA and full parameter training in a wide range of settings with memory costs as low as LoRA. We name it Layerwise **I**mportance **S**ampled **A**damW (**LISA**), a promising alternative for LoRA, which applies the idea of importance sampling to different layers in LLMs and randomly freeze most middle layers during optimization. Experimental results show that with similar or less GPU memory consumption, LISA surpasses LoRA or even full parameter tuning in downstream fine-tuning tasks, where LISA consistently outperforms LoRA by over \(10\%\)-\(35\%\) in terms of MT-Bench score while achieving on-par or better performance in MMLU, AGIEval and WinoGrande. On large models, specifically LLaMA-2-70B, LISA surpasses LoRA on MT-Bench, GSM8K, and PubMedQA, demonstrating its effectiveness across different domains.
+
+## 1 Introduction
+
+Large language models (LLMs) like ChatGPT excel in tasks such as writing documents, generating complex code, answering questions, and conducting human-like conversations . With LLMs being increasingly applied in diverse task domains, domain-specific fine-tuning has emerged as a critical strategy to enhance their downstream capabilities [2; 3; 4; 5]. Nevertheless, these methods are typically time-intensive and consume substantial computational resources, posing significant challenges to the development of large-scale models . For example, continual pre-training typicallyrequires several weeks even with multiple 80 GB GPUs. To reduce costs, Parameter-Efficient Fine-Tuning (PEFT) techniques have been proposed to minimize the number of trainable parameters.
+
+These techniques include adapter weights , prompt weights , and LoRA . Among these, LoRA stands out as one of the most widely adopted due to its unique ability to merge the adaptor back into the base model parameters, significantly enhancing efficiency. However, LoRA's superior performance in fine-tuning tasks has yet to reach a point that universally surpasses full parameter fine-tuning in all settings [10; 11]. In particular, it has been observed that LoRA tends to falter on large-scale datasets during continual pre-training , which raises doubts about the effectiveness of LoRA under those circumstances. We attribute this to LoRA's much fewer trainable parameters compared to the base model, which limits the representation power of LoRA training.
+
+To overcome this shortcoming, we delve into LoRA's training statistics in each layer, aspiring to bridge the difference between LoRA and full-parameter fine-tuning. Surprisingly, we discover that LoRA's layerwise weight norms have an uncommonly skewed distribution, where the bottom layer and/or the top layer occupy the majority of weights during the update. In contrast, the other self-attention layers only account for a small amount, which means different layers have different importance when updating. This key observation inspires us to "sample" different layers by their importance, which matches the idea of importance sampling [13; 14].
+
+As a natural consequence, this strategy brings forth our **L**ayerwise **I**mportance **S**ampled **A**dam (**LISA**) algorithm, where by selectively updating only essential LLM layers and leaving others untouched, LISA enables training large-scale language models (\( 65\)B parameters) with less or similar memory consumption as LoRA. Furthermore, fine-tuned on downstream tasks, LISA outperformed both LoRA and conventional full-parameter fine-tuning approaches by a large margin, indicating the large potential of LISA as a promising alternative to LoRA.
+
+We summarize our key contributions as follows,
+
+* We discover the phenomenon of skewed weight-norm distribution across layers in LoRA, which implies the varied importance of different layers in large-scale LLM training.
+* We propose the Layerwise Importance Sampled AdamW (LISA), a simple optimization method capable of scaling up to over \(70\)B LLMs with less or similar memory cost as LoRA.
+* We demonstrate LISA's effectiveness in fine-tuning tasks for modern LLMs, where it outperforms LoRA by \(10\%\)-\(35\%\) in MT-Bench and achieves better performance in multiple benchmarks. In addition, LISA exhibits much better convergence behaviors than LoRA. LISA even outperforms full parameters training under certain settings. Similar performance gain is observed across different sized models (\(7\)B-\(70\)B) and tasks, including instruction following, medical QA, and math problems.
+
+## 2 Related Work
+
+### Large Language Models
+
+In the realm of natural language processing (NLP), the Transformer architecture has been a revolutionary technique, initially known for its effectiveness in machine translation tasks . With the inception of models like BERT  and GPT-2 , the approach shifted towards pre-training on extensive corpora, which led to significant performance enhancements in downstream fine-tuning tasks [2; 18; 19; 20; 21; 22; 23; 24; 25; 26; 27]. However, the growing number of parameters in these models results in a huge GPU memory consumption, rendering the fine-tuning of large scale models (\( 65\)B) infeasible under low resource scenarios. This has prompted a shift towards more efficient training of LLMs.
+
+Figure 1: Training loss of LLaMA-2-7B on Alpaca GPT-4.
+
+### Parameter-Efficient Fine-Tuning
+
+Parameter-efficient fine-tuning (PEFT) methods adapt pre-trained models by fine-tuning only a subset of parameters. In general, PEFT methods can be grouped into three classes: 1) Prompt Learning methods [8; 28; 29; 30; 31; 32; 33], 2) Adapter methods [7; 9; 34; 35; 36; 37; 38], and 3) Selective methods [39; 40; 41; 39]. Prompt learning methods emphasize optimizing the input token or input embedding with frozen model parameters, which generally has the least training cost among all three types. Adapter methods normally introduce an auxiliary module with much fewer parameters than the original model, and updates are only applied to the adapter module during training. Compared with them, selective methods are more closely related to LISA, which focuses on optimizing a fraction of the model's parameters without appending extra modules. Recent advances in this domain have introduced several notable techniques through layer freezing. AutoFreeze  offers an adaptive mechanism to identify layers for freezing automatically and accelerates the training process. FreezeOut  progressively freezes intermediate layers, significantly reducing training time without notably affecting accuracy. The SmartFRZ  framework utilizes an attention-based predictor for layer selection, substantially cutting computation and training time while maintaining accuracy. However, none of these layer-freezing strategies has been widely adopted in the context of Large Language Models due to their inherent complexity or non-compatibility with modern memory reduction techniques [43; 44; 27] for LLMs.
+
+### Low-Rank Adaptation (LoRA)
+
+In contrast, the Low-Rank Adaptation (LoRA) technique is much more prevalent in common LLM training . LoRA reduces the number of trainable parameters by employing low-rank matrices, thereby lessening the computational burden and memory cost. One key strength of LoRA is its compatibility with models featuring linear layers, where the decomposed low-rank matrices can be merged back into the original model. This allows for efficient deployment without changing the model architecture. As a result, LoRA can be seamlessly combined with other techniques, such as quantization  or Mixture of Experts . Despite these advantages, LoRA's performance is not universally comparable with full parameter fine-tuning. There have been tasks in  that LoRA performs much worse than full parameter training on. This phenomenon is especially evident in large-scale pre-training settings , where to the best of our knowledge, only full parameter training was adopted for successful open-source LLMs [21; 22; 23; 46; 47; 26; 27].
+
+### Large-scale Optimization Algorithms
+
+In addition to approaches that change model architectures, there have also been efforts to improve the efficiency of optimization algorithms for LLMs. One such approach is layerwise optimization, a concept with roots extending back several decades. Notably,  introduced an effective layer-by-layer pre-training method for Deep Belief Networks (DBN), demonstrating the benefits of sequential layer optimization. This idea was expanded by researchers like [49; 50], who illustrated the advantages of a greedy, unsupervised approach to pre-training each layer of deep networks. In the context of large batch training, [51; 52] developed LARS and LAMB to improve generalization and mitigate the performance declines associated with large batch sizes. Despite these innovations, Adam [53; 54; 55; 27] and AdamW  continue to be the predominant optimization methods used in most LLM settings.
+
+Recently, other attempts have also been made to reduce the training cost of LLMs. For example, MeZO  adopted zeroth order optimization, bringing significant memory savings during training. However, it also incurred a considerable performance drop in multiple benchmarks, particularly in complex fine-tuning scenarios. Regarding acceleration, Sophia  incorporates clipped second-order information into the optimization, obtaining non-trivial speedup on LLM training. The significant downsides are its intrinsic complexity of Hessian estimation and unverified empirical performance in large-size models (e.g., \( 65\)B). In parallel to our work,  proposed GaLore, a memory-efficient training strategy that reduces memory cost by projecting gradients into a low-rank compact space. Yet the performance has still not surpassed full-parameter training in fine-tuning settings. To sum up, LoRA-variant methods [9; 11; 59] with AdamW  is still the dominant paradigm for large-size LLM fine-tuning, the performance of which still demands further improvements.
+
+Method
+
+### Motivation
+
+To understand how LoRA achieves effective training with only a few parameters, we conducted empirical studies on multiple models, especially observing the weight norms across various layers. We fine-tune it on the Alpaca-GPT4 dataset . During the training, we meticulously recorded the mean weight norms of each layer \(\) at every step \(t\) after updates, i.e.
+
+\[^{()}()=_{ t=1}^{T}\|_{t}^{()}\|_{2}\]
+
+Figure 2 presents these findings, with the x-axis representing the layer id, from embedding weights to the final layer, and the y-axis quantifying the weight norm. The visualization reveals one key trend:
+
+* The embedding layer or the language modeling (LM) head layer exhibits significantly larger weight norms than intermediary layers in LoRA, often by a factor of hundreds. This phenomenon, however, was not salient under full-parameter training settings.
+
+This observation indicates that the update emphasis of LoRA and full parameter training differ significantly, which can be attributed to the difference in their learned knowledge. For example, in embedding layers, tokens with similar meanings, i.e., synonyms, can be projected into the same embedding space and converted to similar embeddings. LoRA may capture this similarity in language and "group" them in the low-dimension space, allowing frequent features of language meanings to be promptly identified and optimized. The price is LoRA's limited representation power restricted by its intrinsic low-rank space, as we can see from the comparison with LISA in image generation tasks (Appendix A.1), where LoRA memorizes and learns details much slower than LISA. Other possible explanations can also justify this phenomenon. Despite various interpretations of this observation, one fact remains clear: _LoRA values layerwise importance differently from full parameter tuning_.
+
+### Layerwise Importance Sampled AdamW (LISA)
+
+To exploit the discovery above, we aspire to simulate LoRA's updating pattern via sampling different layers to freeze. This way, we can avoid LoRA's inherent deficiency of limited low-rank representation ability and emulate its fast learning process. Intuitively, given the same global learning rates across layers, layers with small weight norms in LoRA should also have small sampling probabilities to unfreeze in full-parameter settings so the expected learning rates across iterations can stay the same. This is exactly the idea of importance sampling [13; 14], where instead of applying layerwise different learning rates \(\{_{t}\}\) in full-parameter settings to emulate LoRA's updates \(\{_{t}\}\), we apply sampling and instead get the same expected parameter update
+
+\[_{t}^{()}=_{t}^{()}}^{( )}}{^{()}}_{t}^{()}=^{( )},p^{()}=}^{()}}{^{()}}\]
+
+Figure 2: Layer-wise weight norms during training of GPT2 and LLaMA-2-7B Model with LoRA and Full Parameters training.
+
+This gives rise to our Layerwise Importance Sampling AdamW method, as illustrated in Algorithm 1. In practice, since all layers except the bottom and top layer have small weight norms in LoRA, we adopt \(\{p_{}\}_{=1}^{N_{L}}=\{1.0,/N_{L},/N_{L},,/N_{L},1.0\}\) in practice, where \(\) controls the expected number of unfreeze layers during optimization, and the embedding layer \(E\) and head layer \(H\) remain active. Intuitively, \(\) serves as a compensation factor to bridge the difference between LoRA and full parameter tuning, letting LISA emulate a similar layerwise update pattern as LoRA. To further control the memory consumption in practical settings, we instead randomly sample \(\) layers every time to upper-bound the maximum number of unfrozen layers during training.
+
+```
+0: number of layers \(N_{L}\), number of iterations \(T\), sampling period \(K\), number of sampled layers \(\), initial learning rate \(_{0}\)
+1:for\(i 0\) to \(T/K-1\)do
+2: Freeze all layers except the embedding and language modeling head layer
+3: Randomly sample \(\) intermediate layers to unfreeze
+4: Run AdamW for \(K\) iterations with \(\{_{t}\}_{t=ik}^{ik+k-1}\)
+5:endfor ```
+
+**Algorithm 1** Layerwise **I** Importance **S**ampling **A**damW (**LISA**)
+
+## 4 Experimental Results
+
+We conducted peak GPU memory experiments to demonstrate LISA's memory efficiency and showcase its comparable or lower memory cost than LoRA.
+
+SettingsTo reasonably estimate the memory cost, we randomly sample prompts from the Alpaca dataset  and limit the maximum output token length to 1024. We focus on two key hyperparameters: LoRA's rank and LISA's number of activation layers. For other hyperparameters, a mini-batch size of 1 was consistently used across five LLMs from 120M to 70B parameters, deliberately excluding other GPU memory-saving techniques such as gradient checkpointing , offloading , and flash attention . All memory-efficiency experiments are conducted on 4\(\) NVIDIA Ampere Architecture GPUs with 80G memory.
+
+ResultsUpon examining Table 1, it is evident that the LISA configuration, particularly when enhanced with both the embedding layer (E) and two additional layers (E+H+2L), demonstrates a considerable reduction in GPU memory usage when fine-tuning the LLaMA-2-70B model, as compared to the LoRA method. Specifically, the LISA E+H+2L configuration shows a decrease to 75G of peak GPU memory from the 79G required by the
+
+    & Vanilla &  &  \\  Model & - & 128 & 256 & 512 & E+H & E+H+2L & E+H+4L \\  GPT2-small & 3.8G & 3.3G & 3.5G & 3.7G & 3.3G & 3.3G & 3.4G \\ TinyLama & 13G & 7.9G & 8.6G & 10G & 7.4G & 8.0G & 8.3G \\ Mistral-7B & 59G & 23G & 26G & 28G & 21G & 23G & 24G \\ LLaMA-2-7B & 59G & 23G & 26G & 28G & 21G & 23G & 24G \\ LLaMA-2-70B* & OOM & 79G & OOM & OOM & 71G & 75G & 79G \\   
+
+Table 1: The chart illustrates peak GPU memory consumption for various model architectures and configurations, highlighting differences across models. The LISA configuration is specifically labeled in the table: “E” denotes the embedding layer, “H” represents the language modeling head layer, and “2L” indicates two additional intermediate layers. *: Model parallelism is applied for the 70B model.
+
+Figure 3: GPU memory consumption of LLaMA-2-7B with different methods and batch size 1.
+
+LoRA Rank 128 configuration. This efficiency gain is not an isolated incident; a systematic memory usage decrease is observed across various model architectures, suggesting that LISA's method of activating layers is inherently more memory-efficient.
+
+In Figure 3, it is worth noticing that the memory reduction in LISA allows LLaMA-2-7B to be trained on a single RTX4090 (24GB) GPU, which makes high-quality fine-tuning affordable even on a laptop computer. In particular, LISA requires much less activation memory consumption than LoRA since it does not introduce additional parameters brought by the adaptor. LISA's activation memory is even slightly less than full parameter training since pytorch  with deepspeed  allows deletion of redundant activations before backpropagation.
+
+On top of that, a reduction in memory footprint from LISA also leads to an acceleration in speed. As shown in Figure 4, LISA provides almost \(2.9\) speedup when compared with full-parameter training, and \( 1.5\) speedup against LoRA, partially due to the removal of adaptor structures. It is worth noticing that the reduction of memory footprint in both LoRA and LISA leads to a significant acceleration of forward propagation, emphasizing the importance of memory-efficient training.
+
+### Moderate Scale Fine-Tuning
+
+LISA can achieve this significant memory saving while still obtaining competitive performance under the fine-tuning setting.
+
+SettingsTo demonstrate the superiority of LISA over LoRA, we evaluate them on the instruction-following fine-tuning task with the Alpaca GPT-4 dataset , which consists of 52k conversation pairs generated by GPT-4 . The effectiveness of fine-tuning was evaluated on multiple benchmarks: MT-Bench  features 80 high-quality, multi-turn questions designed to assess LLMs on multiple aspects; MMLU  includes a total of 57 tasks with 14,079 questions covering a broad spectrum of world knowledge; AGIEval  serves as a human-centric benchmark for general abilities, comprising 9,316 instances; WinoGrande  is a large-scale dataset for commonsense reasoning, consisting of 44,000 instances designed to challenge models' understanding of the context and commonsense knowledge.
+
+In our experiments, we assessed three baseline models: TinyLlama , Mistral-7B , and LLaMA-2-7B . These models, varying in size ranging from 1B to 7B parameters, provide a
+
+   Model & Method & MMLU (5-shot) & AGIEval (3-shot) & WinoGrande (5-shot) \\   & Vanilla & 25.50 & 19.55 & 59.91 \\  & LoRA & 25.81 \(\) 0.07 & 19.82 \(\) 0.11 & 61.33 \(\) 0.09 \\  & Galore & 25.21 \(\) 0.06 & 21.19 \(\) 0.07 & 61.09 \(\) 0.12 \\  & **LISA** & **26.02 \(\) 0.13** & **21.71 \(\) 0.09** & 61.48 \(\) 0.08 \\  & FT & 25.62 \(\) 0.10 & 21.28 \(\) 0.07 & **62.12 \(\) 0.15** \\   & Vanilla & 60.12 & 26.79 & 79.24 \\  & LoRA & 61.78 \(\) 0.09 & 27.56 \(\) 0.07 & 78.85 \(\) 0.11 \\  & Galore & 57.87 \(\) 0.08 & 26.23 \(\) 0.05 & 75.85 \(\) 0.13 \\  & **LISA** & **62.09 \(\) 0.10** & **29.76 \(\) 0.09** & **78.93 \(\) 0.08** \\  & FT & 61.70 \(\) 0.13 & 28.07 \(\) 0.12 & 78.85 \(\) 0.12 \\   & Vanilla & 45.87 & 25.69 & 74.11 \\  & LoRA & 45.50 \(\) 0.07 & 24.73 \(\)0.04 & 74.74 \(\) 0.09 \\  & Galore & 45.56 \(\) 0.05 & 24.39 \(\) 0.11 & 73.32 \(\) 0.12 \\  & **LISA** & **46.21 \(\) 0.12** & 26.06 \(\) 0.08 & **75.30 \(\) 0.11** \\   & FT & 45.66 \(\) 0.09 & **27.02 \(\) 0.10** & 75.06 \(\) 0.13 \\   
+
+Table 2: Results of different methods on MMLU, AGIEval, and WinoGrande, measured by accuracy.
+
+diverse representation of decoder-only models. For hyper-parameters, we adopt a rank of 128 for LoRA and E+H+2L for LISA in this section, with full details available in Appendix B.
+
+ResultsTable2 and 3 present a detailed comparison on moderate-scale LLMs. The baselines include Full-parameter Training (FT), Low-Rank Adaptation (LoRA)  and Gradient Low-Rank Projection (Ga-Lore) . The results demonstrate that LISA consistently outperforms other fine-tuning methods in most evaluation tracks, indicating its robustness and effectiveness across diverse tasks and model architectures. LISA is particularly effective in instruction following tasks, where a large gap is observed when compared with other baseline methods. LISA even outperforms Full-parameter Training, suggesting that an implicit regularization effect is present when the number of unfrozen layers is restricted, which is similar to dropout . According to more results in stable diffusion and detailed MT-Bench scores, we found that LISA outperforms LoRA mostly in memorization tasks, such as depicting high-resolution image details in image generation, or Writing or Humanities tasks in instruction following. This implies that LISA's performance improvement may majorly come from the ability to memorize long-tailed patterns, while LoRA is better at multi-hop reasoning with limited knowledge. For more details, please refer to Appendix A.1 and A.2.
+
+### Moderate Scale Continual Pre-training
+
+Continual pre-training is crucial for enabling models to adapt to new data and domains. To evaluate LISA's efficacy in the continual pre-training scenario, we experiment on the mathematics domain in comparison with Full-parameter Training.
+
+SettingsWe adopt the mathematics corpus OpenWebMath  for constructing the continual pre-training dataset. Specifically, we extracted a high-quality subset from it which contains 1.5 billion tokens. Full details are explained in Appendix B.2. After continual pre-trainig, we then apply the same fine-tuning procedure on the GSM8K  training set, which comprises 7473 instances.
+
+ResultsTable 4 shows that LISA is capable of achieving on-par or even better performance than full-parameter training with much less memory consumption. Specifically, LISA requires only half of the memory cost compared to full-parameter training. This indicates a better balance between computational efficiency and model performance is achieved by LISA. According to our experience, reducing the number of unfrozen layers to half the original size leads to no worse or even better performance during continual pretraining, while requiring much less memory consumption.
+
+### Large Scale Fine-Tuning
+
+To further demonstrate LISA's scalability on large-sized LLMs, we conduct additional fine-tuning experiments on LLaMA-2-70B .
+
+SettingsOn top of the aforementioned instruction-following tasks in Section 4.2, we use extra domain-specific fine-tuning tasks on mathematics and medical QA benchmarks. The GSM8K dataset , comprising 7473 training instances and 1319 test instances, is used for the mathematics
+
+   Model & Method & GSM8K \(\) & Mem. \(\) \\   & Vanilla & 2.26 & - \\  & **LISA** & **3.56** & **8G** \\  & FT & 3.26 & 13G \\   & Vanilla & 14.40 & - \\  & **LISA** & **22.21** & **26G** \\   & FT & 22.21 & 59G \\  
+
+Table 4: Comparison of Moderate Scale Model Continual Pre-training on OpenWebMath Dataset.
+
+   Model & Method & MT-Bench \(\) \\   & Vanilla & 1.25 \\  & LoRA & \(1.90 0.14\) \\  & Galore & \(\) \\  & **LISA** & \(2.57 0.25\) \\  & FT & \(2.21 0.16\) \\   & Vanilla & 4.32 \\  & LoRA & \(4.41 0.09\) \\  & Galore & \(4.36 0.16\) \\  & **LISA** & \(\) \\  & FT & \(4.64 0.12\) \\   & Vanilla & 3.29 \\  & LoRA & \(4.45 0.15\) \\   & Galore & \(4.63 0.09\) \\   & **LISA** & \(\) \\   & FT & \(4.75 0.16\) \\   
+
+Table 3: Different methods on MT-Bench.
+
+domain. For the medical domain, we select the PubMedQA dataset  is artificially generated QA training instances and 1K test instances.
+
+Evaluation on the PubMedQA dataset  is conducted in a 5-shot prompt setting, while the GSM8K dataset  assessment was conducted using Chain-of-Thought (CoT) prompting, following recent studies [75; 76; 77]. Regarding hyperparameters, as detailed in the section 4.1, we utilize the rank 256 for LoRA and the configuration E+H+4L for LISA. Further information is available in Appendix B.
+
+ResultsAs shown in Table 5, LISA consistently produces better or on-par performance when compared with LoRA. Furthermore, LISA again surpasses full-parameter training in instruction-tuning tasks, providing strong evidence to support LISA's scalability under large-scale training scenarios. More results are available in Appendix A.2.
+
+### Ablation Studies
+
+Hyperparameters of LISAThe two key hyperparameters of LISA are the number of sampling layers \(\) and sampling period \(K\). To obtain intuitive and empirical guidance of those hyperparameter choices, we conduct ablation studies using TinyLlama  and LLaMA-2-7B  models with the Alpaca-GPT4 dataset. The configurations for \(\), such as E+H+2L, E+H+8L, were denoted as \(=2\) and \(=8\). As for the sampling period \(K=T/n\), \(T=122\) representing the maximum training step within our experimental framework. The findings, presented in Table 6, reveal that both \(\) and \(K\) markedly affect the LISA algorithm's performance. Specifically, a higher \(\) value increases the quantity of trainable parameters, albeit with higher memory costs. On the other hand, an optimal \(K\) value facilitates more frequent layer switching, thereby improving performance to a certain threshold, beyond which the performance may deteriorate. Generally, the rule of thumb is: _More sampling layers and higher sampling period lead to better performance_. For a detailed examination of loss curves and MT-Bench results, refer to Appendix A.4.
+
+Sensitiveness of LISAAs LISA is algorithmically dependent on the sampling sequence of layers, it is intriguing to see how stable LISA's performance is under the effect of randomness. For this purpose, we further investigate LISA's performance variance over three distinct runs, each with a different random seed for layer selection. Here, we adopt TinyLlama, LLaMA-2-7B, and Mistral-7B models with the Alpaca-GPT4 dataset while keeping all other hyperparameters consistent with those used in the instruction following experiments in section 4.2. As shown in Table 7, LISA is quite resilient to different random seeds, where the performance gap across three runs is within \(0.13\), a small value compared to the
+
+    &  &  & MT-Bench \\  & & & Score \\   &  & 2.44 \\  & & \([T/25]\) & **2.73** \\  & 2 & \([T/5]\) & 2.64 \\  & & \(T\) & 2.26 \\   & & \([T/125]\) & 2.59 \\  & 8 & \([T/25]\) & **2.81** \\  & & \([T/5]\) & 2.74 \\  & & \(T\) & 2.53 \\   &  & 4.86 \\  & 2 & \([T/25]\) & **4.91** \\   & 2 & \([T/5]\) & 4.88 \\   & & \(T\) & 4.64 \\    & & \([T/125]\) & 4.94 \\   & 8 & \([T/25]\) & **5.11** \\   & & \([T/5]\) & 5.01 \\   & & \(T\) & 4.73 \\   
+
+Table 6: Different LISA hyperparameters combinations. All settings adopt learning rate \(_{0}=10^{-5}\). Here \(\) stands for sampling layers, \(K\) stands for sampling period.
+
+   Model & Seed 1 & Seed 2 & Seed 3 \\  TinyLlama & 2.57 & 2.55 & 2.60 \\ Mistral-7B & 4.85 & 4.82 & 4.82 \\ LLaMA-2-7B & 4.94 & 4.92 & 4.89 \\   
+
+Table 7: The MT-Bench scores derived from varying random seeds for layer selection.
+
+   Method & MT-Bench\(\) & GSM8K\(\) & PubMedQA\(\) \\  Vanilla & 5.19 & 54.8 & 83.0 \\ LoRA & 6.10 & 59.4 & 90.8 \\ LISA & **6.72** & 61.1 & **91.6** \\ FT & 6.25 & **67.1** & 90.8 \\   
+
+Table 5: Different methods on MT-Bench, GSM8K, and PubMedQA score for LLaMA-2-70B.
+
+performance gains over baseline methods. For more ablation experiment on LISA hyperparameters, please refer to Appendix A.4.
+
+## 5 Discussion
+
+Theoretical Properties of LISACompared with LoRA, which introduces additional parameters and leads to changes in loss objectives, layerwise importance sampling methods enjoy nice convergence guarantees in the original loss. For layerwise importance sampled SGD, similar to gradient sparsification [78; 55], the convergence can still be guaranteed for unbiased estimation of gradients with increased variance. The convergence behavior can be further improved by reducing the variance with appropriately defined importance sampling strategy . For layerwise importance sampled Adam, theoretical results in [79; 55] prove its convergence in convex objectives. If we denote \(f\) as the loss function and assume that the stochastic gradients are bounded, then based on , we know that AdamW optimizing \(f\) aligns with Adam optimizing \(f\) with a scaled regularizer, which can be written as
+
+\[f^{}() f()+^ {},\]
+
+where \(\) is a finite positive semidefinite diagonal matrix. Following existing convergence results of RBC-Adam (Corollary 1 in ), we have the convergence guarantee of LISA in Theorem 1.
+
+**Theorem 1**: _Let the loss function \(f\) be convex and smooth. If the algorithm runs in a bounded convex set and the stochastic gradients are bounded, the sequence \(\{_{t}\}_{t=1}^{T}\) generated by LISA admits the following convergence rate:_
+
+\[_{t=1}^{T}f^{}(_{t})-f^{}_{* }(}),\]
+
+_where \(f^{}_{*}\) denotes the optimum value of \(f^{}\)._
+
+Memorization and ReasoningIn our instruction following experiments in Appendix A.1 and A.2, we observe that LISA is much better than LoRA at memorization-centered tasks, such as Writing or depicting image details, while this gap is much smaller in reasoning-centered tasks like Code or Math. It is an intriguing observation since LISA emphasizes more on layer-wise width and restricts the depth of learned parameters, while LoRA focuses more on depth and restricts the representation space in each layer. It may suggest that width is crucial for memorization, while depth is important for reasoning, a similar phenomenon that echos the intuition of . Based on the same intuition, it may be possible to combine the benefits of both and bring forth an even better PEFT method.
+
+## 6 Conclusion
+
+In this paper, we propose Layerwise Importance Sampled AdamW (LISA), an optimization algorithm that randomly freezes layers of LLM based on a given probability. Inspired by observations of LoRA's skewed weight norm distribution, a simple and memory-efficient freezing paradigm is introduced for LLM training. This paradigm achieves significant performance improvements over LoRA on downstream fine-tuning tasks with various models, including LLaMA-2-70B. Further experiments on domain-specific training also demonstrate its effectiveness, showing LISA's huge potential as a promising alternative to LoRA for LLM training.
+
+## Limitations
+
+The major bottleneck of LISA is the same as LoRA, where during optimization, the forward pass still requires the model to be presented in the memory, leading to significant memory consumption. This limitation shall be compensated by approaches similar to QLoRA , where we intend to conduct further experiments to verify its performance.
+
+In addition, as suggested by the theoretical intuition, the strategy of E+H+2L in Section 4.2 and E+H+4L in Section 4.4 may not be the optimal importance sampling strategy, given it still sampledintermediate layers in a uniformly random fashion. We anticipate the optimizer's efficiency will be further improved when considering data sources and model architecture in the importance sampling procedure.

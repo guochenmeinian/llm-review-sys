@@ -1,0 +1,215 @@
+# FINALLY: fast and universal speech enhancement
+
+with studio-like quality
+
+ Nicholas Babaev
+
+Samsung Research
+
+&Kirill Tamogashev
+
+Samsung Research
+
+&Azat Saginbaev
+
+Samsung Research
+
+&Ivan Shchekotov
+
+Samsung Research
+
+&Hanbin Bae
+
+Samsung Research
+
+&Hosang Sung
+
+Samsung Research
+
+&WonJun Lee
+
+Samsung Research
+
+&Hoon-Young Cho
+
+Samsung Research
+
+&Pavel Andreev
+
+Samsung Research
+
+Equal contribution. Correspondence to p.andreev@samsung.com.
+
+###### Abstract
+
+In this paper, we address the challenge of speech enhancement in real-world recordings, which often contain various forms of distortion, such as background noise, reverberation, and microphone artefacts. We revisit the use of Generative Adversarial Networks (GANs) for speech enhancement and theoretically show that GANs are naturally inclined to seek the point of maximum density within the conditional clean speech distribution, which, as we argue, is essential for the speech enhancement task. We study various feature extractors for perceptual loss to facilitate the stability of adversarial training, developing a methodology for probing the structure of the feature space. This leads us to integrate WavLM-based perceptual loss into MS-STFT adversarial training pipeline, creating an effective and stable training procedure for the speech enhancement model. The resulting speech enhancement model, which we refer to as FINALLY, builds upon the HiFi++ architecture, augmented with a WavLM encoder and a novel training pipeline. Empirical results on various datasets confirm our model's ability to produce clear, high-quality speech at 48 kHz, achieving state-of-the-art performance in the field of speech enhancement. Demo page: https://samsunglabs.github.io/FINALLY-page/
+
+## 1 Introduction
+
+Speech recordings are often contaminated with background noise, reverberation, reduced frequency bandwidth, and other distortions. Unlike classical speech enhancement (Ephraim and Malah, 1984; Pascual et al., 2017), which considers each task separately, universal speech enhancement (Serra et al., 2022; Su et al., 2021; Liu et al., 2022) aims to restore speech from all types of distortions simultaneously. Thus, universal speech enhancement seeks to generalize across a wide range of distortions, making it more suitable for real-world applications where multiple distortions may coexist.
+
+Recent studies have categorized the problem of speech enhancement as a task of learning the clean speech distribution conditioned on degraded signals (Lemercier et al., 2023; Serra et al., 2022; Richter et al., 2023). This problem is often addressed using diffusion models (Ho et al., 2020; Song et al., 2020), which are renowned for their exceptional ability to learn distributions. Diffusion models have recently achieved state-of-the-art results in universal speech enhancement (Serra et al., 2022).
+
+However, the impressive performance of diffusion models comes with the high computational cost of their iterative inference process.
+
+It is important to note that the speech enhancement problem does not require the model to learn the entire conditional distribution. In practice, when presented with a noisy speech sample, the goal is often to obtain the most probable clean speech sample that retains the lexical content and voice of the original. This contrasts with applications such as text-to-image synthesis (Ramesh et al., 2022; Lee et al., 2024; Rombach et al., 2022), where the objective is to generate a variety of images for each text prompt due to the higher level of uncertainty and the need for diverse options to select the best image. For most speech enhancement applications, such as voice calls and compensation for poor recording conditions, capturing the entire conditional distribution is not necessary. Instead, it is more important to retrieve the most likely sample of this distribution (the main mode), which might be a simpler task.
+
+Diffusion models' main advantage over generative adversarial networks (GANs) (Goodfellow et al., 2014) is their ability to capture different modes of the distribution. However, we argue that this property is not typically required for the task of speech enhancement and may unnecessarily complicate the operation of the neural network. Conversely, we show that GANs tend to retrieve the main mode of the distribution--precisely what speech enhancement should typically do.
+
+Therefore, in this work, we revisit the GAN framework for speech enhancement and demonstrate that it provides rapid and high-quality universal speech enhancement. Our model outperforms both diffusion models and previous GAN-based models, achieving an unprecedented level of quality on both simulated and real-world data.
+
+Our main contributions are as follows:
+
+1. We theoretically analyse the adversarial training with the least squares GAN (LS-GAN) loss and demonstrate that a generator predicting a single sample per input condition (producing a conditional distribution that is a delta function) is incentivized to select the point of maximum density. Therefore, we establish that LS-GAN training can implicitly regress for the main mode of the distribution, aligning with the objectives of the speech enhancement problem.
+2. We investigate various feature extractors as backbones for perceptual loss and propose criteria for selecting an extractor based on the structure of its feature space. These criteria are validated by empirical results from a neural vocoding task, indicating that the convolutional features of the WavLM neural network(Chen et al., 2022) are well-suited for perceptual loss in speech generation.
+3. We develop a novel model for universal speech enhancement that integrates the proposed perceptual loss with MS-STFT discriminator training (Defossez et al., 2023) and enhances the architecture of the HiFi++ generator (Andreev et al., 2022) by combining it with a self-supervised pre-trained WavLM encoder (Chen et al., 2022). Our final model delivers state-of-the-art performance on real-world data, producing high-quality, studio-like speech at 48 kHz.
+
+## 2 Mode Collapse and Speech Enhancement
+
+The first question that we address is **what is the practical purpose of a speech enhancement model**. The practical goal of a speech enhancement model is to restore the audio signal containing the speech characteristics of the original recording, including the voice, linguistic content, and prosody. Thus, loosely speaking, the purpose of the speech enhancement task for many applications is not "generative" in its essence, in the sense that the speech enhancement model should not generate new speech content but rather "refine" existing speech as if it was recorded in ideal conditions (studo-like quality). From the mathematical point of view, this means that the speech enhancement model should retrieve the most probable reconstruction of the clean speech \(y\) given the corrupted version \(x\), i.e., \(y=_{y}p_{}(y|x)\).
+
+This formulation re-considers the probabilistic speech enhancement formulation, which is widely used in the literature. In such formulation, the speech enhancement model is aimed to capture the entire conditional distribution \(p_{}(y|x)\). This formulation might be especially appealing in situations with high generation ambiguity, e.g., a low SNR scenario where clean speech content could not be restored unambiguously. In this case, the speech enhancement model could be used to generate multiple reconstructions, the best of which is then selected by the end user. However, we note that this formulation might be redundant and not particularly relevant for many practical applications since the ambiguity in generation can be resolved by more straightforward means such as conditioning on linguistic content (Koizumi et al., 2023c).
+
+In practice, for many applications, a more natural way of formalizing speech enhancement is to treat it as a regression problem which aims at predicting the point of highest probability of the conditional distribution \(_{y}p_{}(y|x)\). This formulation has the advantage of simplifying the task, since finding the highest mode of the distribution might be significantly easier than learning the entire distribution. Therefore, the speech enhancement models built for this formulation are likely to be more efficient after deployment since they solve a simpler task. We note that in the context of speech enhancement, the speed of inference is always of major concern in practice.
+
+Given this formulation, we argue that the framework of generative adversarial networks (GANs) is more naturally suited for the speech enhancement problem than diffusion models. We show that GAN training naturally leads to the mode-seeking behaviour of the generator, which aligns with the formulation introduced above. Additionally, GANs enjoy one forward pass inference, which is in contrast to the iterative nature of diffusion models.
+
+Let \(p_{g}(y|x)\) be a family of waveform distributions produced by the generator \(g_{}(x)\). Mao et al. (2017) showed that training with Least Squares GAN (LS-GAN) leads to the minimization of the Pearson \(^{2}\) divergence \(^{2}_{}(p_{g}\|}+p_{g}}{2})\). We propose that if \(p_{g}(y|x)\) approaches \((y-g_{}(x))\) under some parametrization, the minimization of this divergence leads to \(g_{}(x)=_{y}p_{}(y|x)\). This means that if the generator deterministically predicts the clean waveform from the degraded signal, the LS-GAN loss encourages the generator to predict the point of maximum \(p_{}(y|x)\) density. We note that although prior work by (Li & Farnia, 2023) demonstrated the mode-covering property for the optimization of Pearson \(^{2}\) divergence, our result pertains to a deterministic generator setting, which is outside the scope of analysis provided by Li & Farnia (2023).
+
+To prove this result, we consider the delta function as a limit of indicator density functions \(p_{g}^{}(y|x)=^{n}/2^{n}_{y-g_{}(x)[-1/,1/ ]^{n}}\), i.e., \(p_{g}^{}(y|x)=^{n}/2^{n}\) if \(y-g_{}(x)[-1/,1/]^{n}\) and 0 otherwise, where \(n\) is the number of dimensions of \(y\). Note that \( p_{g}^{}(y|x)\,dy=1\) for any positive \(\) and \(_{+}p_{g}^{}(y|x)=(y-g_{}(x))\). This approximation of the delta function by such a limit is practical due to the finite precision arithmetic used within computers; in other words, the delta function within computer arithmetic is actually an indicator function.
+
+**Proposition 1**.: _Let \(p_{}(y|x)>0\) be a finite and Lipschitz continuous density function with a unique global maximum and \(p_{g}^{}(y|x)=^{n}/2^{n}_{y-g_{}(x)[-1/,1/ ]^{n}}\), then_
+
+\[_{+}*{arg\,min}_{g_{}(x)}\,^{ 2}_{}(p_{g}^{}||(p_{}+p_{g}^{})/2)=* {arg\,max}_{y}p_{}(y|x)\] (1)
+
+Thus, LS-GAN training under ideal conditions should lead to the solution \(g_{}(x)=*{arg\,max}_{y}p_{}(y|x)\) for the generator. In practice, however, success is highly dependent on technicalities, such as additional losses to stabilize training and architectures of neural networks. Below, we address these questions by revisiting the notion of perceptual loss for audio generation and assessing the effectiveness of neural architectures.
+
+## 3 Perceptual Loss for Speech Generation
+
+Adversarial training is known for its instability issues (Brock et al., 2018). It often leads to suboptimal solutions, mode collapse, and gradient explosions. For paired tasks, including speech enhancement, adversarial losses are often accompanied by additional regressive losses to stabilize training and guide the generator towards useful solutions (Kong et al., 2020; Su et al., 2020). In the context of GAN mode-seeking behaviour discussed above, regressive losses could be seen as a merit to push the generator towards the "right" (most-probable) mode. Therefore, finding an appropriate regression loss to guide adversarial training is of significant importance.
+
+Historically, initial attempts to apply deep learning methods to speech enhancement were based on treating this problem as a predictive task (Defossez et al., 2020; Hao et al., 2021; Chen et al., 2022a;Isik et al., 2020). Following the principle of empirical risk minimization, the goal of predictive modelling is to find a model with minimal average error over the training data. Given a noisy waveform or spectrogram, these approaches attempt to predict the clean signal by minimizing point-wise distance in waveform and spectrum domains or jointly in both domains, thus treating this problem as a predictive task. However, given the severe degradations applied to the signal, there is an inherent uncertainty in the restoration of the speech signal (i.e., given the degraded signal, the clean signal is not restored unambiguously), which often leads to oversmoothing (averaging) of the predicted speech. A similar phenomenon is widely known in computer vision (Ledig et al., 2017).
+
+One promising idea to reduce the averaging effect is to choose an appropriate representation space for regression, which is less "entangled" than waveform or spectrogram space. In simpler terms, the regression space should be designed so that averaged representation of sounds that are indistinguishable to humans (such as the same phoneme spoken by the same speaker with the same prosody) is still representation of this sound (see Appendix B.1).
+
+We formulate two heuristic rules to compare different regression spaces based on their structure:
+
+* **Clustering rule:** Representations of identical speech sounds should form one cluster that is separable from clusters formed by different sounds.
+* **SNR rule:** Representations of speech sounds contaminated by different levels of additive noise should move away from the cluster of clean sounds monotonically with the increase in the noise level.
+
+The clustering rule ensures that minimizing the distance between samples in the feature space causes the samples to correspond to the same sound. The SNR rule ensures that minimizing the distance between features does not contaminate the signal with noise, meaning noisy samples are placed distantly from clean samples.
+
+In practice, we check these conditions by the following procedure:
+
+1. We sample identical speech sounds with a multi-speaker VITS text-to-speech model (Kim et al., 2021). We define the group of waveforms corresponding to the same sound as 0.5-second waveform segments generated by the same speaker with the same text and the same phoneme duration (i.e., the stochastic duration predictor is used only once for each group). Thus, the waveform variation is produced due to sampling of latents from the prior distribution. We note that we do not explicitly fix the prosody; however, we observed that prosody variation was low by default and the sounds generated by this procedure were mostly perceptually indistinguishable from each other while corresponding to different waveform realizations. Overall, we define 354 groups of sounds with 80 speakers saying 177 different phrases, 2 different speakers for each phrase; we sample 20 samples for each group, totalling 7080 waveform segments corresponding to 354 groups.
+
+Figure 1: Illustration of heuristic rules for feature space structure. The Clustering rule (left) states that representations of the same speech sound should form clusters. The SNR rule (right) states that noise samples should deviate from the centre of the cluster as the amount of noise increases. Illustrations created using real samples are presented in Figure 8, Figure 7
+
+2. Each waveform segment is then mapped to the feature space, and the resulting tensors are flattened to obtain a vector for each sample. The vectors are clustered using K-means clustering (MacQueen et al., 1967), the number of clusters is set to the number of groups (354). After clustering, we compute the Rand index (Rand, 1971) of the clustering produced by K-means with the clustering induced by initial groups of sounds splits. We treat the resulting number as a way to measure the adherence to the **clustering rule**.
+3. Each waveform segment within a group is randomly mixed with noise at SNR levels ranging from 10 to 20 dB. The segments are then mapped to the feature space to obtain a vector for each sample. For each noisy sample, we compute the Euclidean distance between its features and the centre of the clean feature cluster. After that, we compute the negative Spearman's rank correlation between the SNR level and the distance from the sample to the centre of the cluster. The negative correlations are averaged over all groups of sounds, and the resulting number is treated as a quantitative measure of adherence to the **SNR rule**.
+
+Using these metrics, we assess the effectiveness of different feature spaces formed by several speech feature extractors, as well as conventional representations of speech. Namely, we produce features by Wav2Vec 2.0 (Baevski et al., 2020), WavLM (Chen et al., 2022), the encoder of EnCodec (Defossez et al., 2023), and CDPAM (Manocha et al., 2021). As a conventional representation, we use waveform and spectrogram features. For Wav2Vec 2.0 and WavLM, we consider the output of the last transformer layer and the output of the convolutional encoder as separate cases. We also train a HiFi-GAN generator (Kong et al., 2020) with each feature type used as a representation for mean squared error loss computation on a neural vocoding task. To assess experimentally the suitability of the feature space to be used as a loss function for waveform generation, we report MOS scores for samples generated by vocoders trained with each feature map. The results are presented in Table 1.
+
+As can be seen, the features extracted by the convolutional encoder of the WavLM model present the best performance according to both our internal metrics and MOS score on the neural vocoding task. We have also tested the other layers of WavLM but did not observe significant improvements when using other layers (see Appendix B.4). Empirically, we have found that if WavLM-conv feature loss is used together with spectrogram loss (L1-distance magnitudes of STFT), the performance on the vocoding task increases significantly, likely due to the looseness of the WavLM representation (Appendix B.1). Without any adversarial training, the WavLM-conv+L1-STFT loss (LMOS-loss, Equation (2)) achieves an MOS score of \(4.31 0.08\), approaching the original adversarially trained HiFi GAN generator which achieves \(4.69 0.05\) (Appendix B.3).
+
+## 4 Finally
+
+### Architecture
+
+Our method is based on HiFi++ (Andreev et al., 2022). The HiFi++ generator is a four-component neural network consisting of SpectralUNet, Upsampler, WaveUNet, and SpectralMaskNet modules. SpectralUNet is responsible for initial preprocessing of audio in the spectral domain using two-dimensional convolutions. The Upsampler is a HiFi-GAN generator-based module that increases the temporal resolution of the input tensor, mapping it to the waveform domain. WaveUNet performs
+
+   Feature & Rand score (\(\)) & Negative correlation (\(\)) & MOS (\(\)) \\ space & (Clustering rule) & (SNR rule) & (Vocoding) \\  Waveform & \(0.00 0.00\) & \(0.31 0.02\) & Failed \\ Spectrogram & \(0.00 0.00\) & \(0.08 0.03\) & \(1.78 0.08\) \\ Wav2Vec 2.0 & \(0.25 0.03\) & \(0.19 0.03\) & \(1.65 0.08\) \\ Wav2Vec 2.0-conv & \(0.94 0.01\) & \(0.78 0.02\) & \(2.23 0.09\) \\ WavLM & \(0.46 0.05\) & \(0.46 0.03\) & \(1.71 0.07\) \\ WavLM-conv & \(\) & \(\) & \(\) \\ EnCodec & \(0.55 0.03\) & \(0.67 0.03\) & \(1.80 0.08\) \\ CDPAM & \(0.00 0.00\) & \(0.17 0.03\) & Failed \\   
+
+Table 1: Comparison of different features using Clustering rule, SNR rule, and MOS on neural vocoding.
+
+post-processing in the waveform domain and improves the output of the Upsampler by incorporating phase information gleaned directly from the raw input waveform. Finally, SpectralMaskNet is applied to perform spectrum-based post-processing and, thus, remove any possible artefacts that remained after WaveUNet. Thus, the model alternates between time and frequency domains, allowing for effective audio restoration.
+
+We introduce two modifications to the HiFi++ generator's architecture. First, we modify the generator by incorporating WavLM-large model output (last hidden state of the transformer) as an additional input to the Upsampler. Prior works (Hung et al., 2022; Byun et al., 2023) have demonstrated the usefulness of Self-Supervised Learning (SSL) features for speech enhancement tasks, and we validate this by observing significant performance gains from using SSL features. Second, we introduce the Upsample WaveUNet at the end of the generator. This module acts as a learnable upsampler of the signal sampling rate. For its architecture, we use the WaveUNet with an additional convolutional upsampling block in the decoder that upsamples the temporal resolution by 3 times. This allows the model to output a 48 kHz signal while taking a 16 kHz signal as input.
+
+### Data and training
+
+We use LibriTTS-R (Koizumi et al., 2023), DAPS-clean (Mysore, 2014) as the sources of clean speech data. LibriTTS-R is used at 16 kHz, while DAPS at 48 kHz. Noise samples were taken from the DNS dataset (Dubey et al., 2022). After mixing with noise, we apply several digital distortion effects (see Appendix D.2 for details).
+
+We train the model in three stages. The first two stages concentrate on restoring the original speech content, and the final stage aims to enhance the aesthetic perception of the speech. The multi-stage approach is necessary due to the characteristics of the employed datasets: the LibriTTS-R dataset has a lot of samples but limited perceptual quality, whereas the DAPS dataset is high-quality but contains a smaller number of samples. Consequently, we utilize the LibriTTS-R dataset for learning speech content restoration and the DAPS dataset for aesthetic stylization.
+
+The loss functions that we use can be written as follows:
+
+\[_{}()=}_{x,y p (x,y)}[100\|(y)-(g_{}(x))\|_{2}^{2}+\||(y)|- |(g_{}(x))|\|_{1}],\] (2) \[_{}()=}_{}()+_{} _{}()+_{}_{ }()}^{}+_{}_{}()}_{}\] (3) \[_{}(_{i})=_{}(_{i}), i=1,,k.\] (4)
+
+Here, \(\) denotes the WavLM-Conv feature mapping, \(g_{}(x)\) denotes the generator neural network with parameters \(\), \(_{}()\) denotes the LS-GAN generator loss (Mao et al., 2017), \(()\) denotes the combined generator loss, \(_{}(_{i})\) denotes the LS-GAN discriminator (Mao et al., 2017) loss for the \(i\)-th discriminator with parameters \(_{i}\), \(_{}\) denotes the feature matching loss (Kumar et al., 2019; Defossez et al., 2023), \(_{}\) denotes the human feedback loss, and \(_{}\) denotes the corresponding loss
+
+Figure 2: FINALLY model architecture.
+
+weights. Following Defossez et al. (2023), we employ 5 discriminators with STFT window lengths of \(\) for the 2nd stage and 5 discriminators with STFT window lengths of \(\) for the 3rd stage, which allows for the capture of spectral information at different resolutions.
+
+**Stage 1**: Firstly, we train the FINALLY architecture without Upsample WaveUNet (we refer to this truncated architecture as FINALLY-16) at a 16 kHz sampling rate on the LibriTTS-R dataset. We train the model with the proposed LMOS regression loss to provide the generator with a better initialization before adversarial training.
+
+**Stage 2**: Second, we start adversarial training of FINALLY-16 with MS-STFT discriminators (Defossez et al., 2023) and the LMOS loss. The learning of the generator undergoes a linear warm-up to give the discriminators time to learn meaningful representations. At this stage, we focus the generator on producing a reliable reconstruction of linguistic content by assigning larger values for LMOS and feature matching losses (\(_{}=0.4\), \(_{}=20\), \(_{}=20\)).
+
+**Stage 3**: Lastly, we attach Upsample WaveUNet to FINALLY-16 and start adversarial training of the FINALLY model to produce 48 kHz output. We subsample 48 kHz waveforms of the DAPS dataset and apply distortions to form the 16 kHz input. The discriminators are initialized randomly, and the learning rate for the generator undergoes a warm-up similar to the second stage. This stage is focused on producing the final output; therefore, we focus the generator on perceptual quality by increasing the relative weight of GAN loss (\(_{}=5\), \(_{}=15\), \(_{}=0.5\)) and introducing additional human feedback loss \(_{}\), which is based on UTMOS and PESQ metrics. The UTMOS loss (Saeki et al., 2022) is based on a neural network model that simulates subjective MOS metric results. On the other hand, the PESQ loss2 delivers a differentiable version of the PESQ metric (Rix et al., 2001b), as presented by Kim et al. (2019); Martin-Donas et al. (2018). Both UTMOS and PESQ help enhance speech aesthetic quality, as they incorporate insights from human preference studies. These metrics are differentiable with respect to their inputs, making them suitable for use as loss functions (multiplied by negative constants) \(_{}=-20_{}-2 _{}\), \(_{}=1\).
+
+## 5 Related Work
+
+Self-supervised features for speech enhancementSeveral works have employed self-supervised (SSL) features (Baevski et al., 2020; Chen et al., 2022b; Hsu et al., 2021) for training of speech enhancement models as intermediate representation (Wang et al., 2024; Koizumi et al., 2023c), auxiliary space for loss computation (Sato et al., 2023; Hsieh et al., 2020; Close et al., 2023a,b) or input features (Hung et al., 2022; Byun et al., 2023). Sato et al. (2023); Close et al. (2023a,b); Hsieh et al. (2020) proposed to use features of self-supervised models as an auxiliary space for regression loss computation. In our work, we similarly study the effect of SSL features on speech enhancement models; however, our study systematically compares different feature backbones and develops criteria for probing the structure of different feature spaces. In particular, we show that features of the WavLM's convolutional encoder are the most effective for the loss function, while recent work (Sato et al., 2023) has used the outputs of transformer layers. Close et al. (2023a,b) proposed a similar loss function for speech enhancement based on convolutional features of HuBERT (Hsu et al., 2021), our work can be considered as extension of this work as we show that additional spectrogram loss greatly benefits the quality and provide experimental evidence for the advantages of LMOS-loss usage for adversarial training.
+
+GAN-based approachesThe HiFi GAN works (Su et al., 2020, 2021) consider a GAN-based approach to speech enhancement, which is similar to ours. Importantly, these works base their generator architectures on feed-forward WaveNet (Rethage et al., 2018), a fully-convolutional neural network that operates at full input resolution, leading to slow training and inference times. We show that our model is able to achieve superior quality compared to this model while being much more efficient.
+
+Koizumi et al. (2023c) proposes to use w2v-BERT features (Chung et al., 2021) as intermediate representations for speech restoration. The features extracted from the noisy waveform are processed by a feature cleanser which is conditioned on the text representation extracted from transcripts via PnG-BERT, and speaker embedding extracted from the waveform. The feature cleanser is trained to minimize a regression loss between w2v-BERT features extracted from the clean signal and the predicted ones. At the second stage, the WaveFit vocoder is trained to synthesize a waveform based on the predicted features (Koizumi et al., 2023a). An important difference with our work is that the method uses a text transcript, while our model does not. Despite this difference, we show that our model delivers better perceptual quality as reported by human listeners (Appendix C).
+
+Diffusion-based approachesThe recent success of diffusion-based generative models has led to their use in a wide array of applications, including speech enhancement. Numerous studies (Lemercier et al., 2023; Welker et al., 2022; Richter et al., 2023; Lay et al., 2023) have applied diffusion models in various configurations to generate high-fidelity, clear speech from noisy input. For instance, Welker et al. (2022); Richter et al. (2023) introduced a novel stochastic diffusion process to design a generative model for speech enhancement in the complex STFT domain for speech denoising and dereverberation. In the UNIVERSE study (Serra et al., 2022), the authors propose a diffusion model for universal speech enhancement. They create a paired dataset using 55 different distortions and train a conditional diffusion model on it. Although their model performs well in terms of quality, it requires up to 50 diffusion steps to produce the final audio. The authors demonstrate that the number of steps can be reduced; however, the effect of this reduction on perceptual quality remains somewhat unclear. In our experiments, we show that our model can achieve similar results with just a single forward pass.
+
+## 6 Results
+
+### Evaluation
+
+We evaluate our models using the following sources of data:
+
+**VoxCeleb Data**: 50 audio clips selected from VoxCeleb1 (Nagrani et al., 2017) to cover the Speech Transmission Index (STI) range of 0.75-0.99 uniformly and balanced across male and female speakers.
+
+**UNIVERSE Data**: 100 audio clips randomly generated by the UNIVERSE (Serra et al., 2022) authors from clean utterances sampled from VCTK and Harvard sentences, together with noises/backgrounds from DEMAND and FSDnoisy18k. The data contains various artificially simulated distortions including band limiting, reverberation, codec, and transmission artefacts. Please refer to (Serra et al., 2022) for further details. The validation data of UNIVERSE is artificially simulated from clean speech recordings using the same pipeline that the authors utilized for training. Therefore, we must note that the comparison is conducted in a manner advantageous to UNIVERSE, since our data simulation pipeline is different.
+
+**VCTK-DEMAND**: we use validation samples from popular Valentini denoising benchmark (Valentini-Botinhao et al., 2017). This dataset is used for a broad comparison with a wide range of speech enhancement models. The test set (824 utterances) includes artificially simulated noisy samples from 2 speakers with 4 SNR (17.5, 12.5, 7.5, and 2.5 dB).
+
+We utilize DNSMOS (Reddy et al., 2022), UTMOS (Saeki et al., 2022), and WV-MOS (Andreev et al., 2022) as non-intrusive metrics to objectively assess the samples generated by our speech enhancement model on the VoxCeleb dataset. The non-intrusive nature of these metrics is essential since the dataset comprises recordings from real-life scenarios, lacking ground-truth samples.
+
+In addition, we compute the Phoneme Error Rate (PhER) and Word Error Rate (WER) by comparing ground truths with the generated samples (see Appendix E for details) for both the UNIVERSE and VCTK-DEMAND datasets. For subjective quality assessment, we conduct 5-point Mean Opinion Score (MOS) tests. All audio clips are normalized to ensure volume differences do not influence the raters' evaluations. The raters are required to be English speakers using appropriate listening equipment (more details in Appendix F).
+
+The Real-Time Factor (RTF) is determined by measuring the processing time (in seconds) for a 10-second audio segment on a V100 GPU and then dividing this time by 10. All confidence intervals are calculated using bootstrapping method.
+
+We also evaluate our model on the VCTK-DEMAND dataset (Valentini-Botinhao et al., 2017) with additional metrics such as PESQ (Rix et al., 2001a), STOI (Taal et al., 2011), and SI-SDR (Roux et al., 2018). These metrics are included to ensure consistent comparison with previous works.
+
+### Comparison with existing approaches
+
+We consider BBED (Lay et al., 2023), STORM (Lemercier et al., 2023), and UNIVERSE (Serra et al., 2022) diffusion models, along with Voicefixer and DEMUCS regression models, as our baselines. In addition, we consider our closest competitor, HiFi-GAN-2, as a GAN-based baseline. The data for comparison with HiFi-GAN-2 and UNIVERSE were taken from their demo pages, since the authors did not release any code. We conduct comparisons with BBED, STORM, Voicefixer, DEMUCS, and HiFi-GAN-2 on real-world VoxCeleb1 samples and the comparison with UNIVERSE on the simulated data, provided by the authors of this work. The results are presented in Table 2. We also compare these models on VCTK-DEMAND dataset, results can be found in Table 3. We complement this table by two additional models: MetricGAN+ (Fu et al., 2021) and DB-AIAT (Yu et al., 2021).
+
+Importantly, our study confirms the observation from Serra et al. (2022) that speech enhancers based on generative models significantly outperform regression-based approaches. Our model performs comparably in terms of perceptual MOS quality to all the considered baselines, while being more than five times as efficient as the closest competitors, HiFi-GAN-2 and UNIVERSE. We have also found that our model is less prone to hallucinating linguistic content than UNIVERSE, delivering a lower Phoneme Error Rate (PhER) value.
+
+Lastly, we would like to comment on the results in Table 3. Our model outperforms baselines in subjective evaluation and no-reference metrics, e.g. UTMOS, but underperforms in terms of PESQ (Rix et al., 2001a), STOI (Taal et al., 2011) and SI-SDR (Roux et al., 2018). Notably, there are numerous works consistently reporting low correlation of reference-based metrics with human perceptual judgment (Manocha et al., 2022; Manjunath, 2009; Andreev et al., 2022). In particular, the study (Manocha et al., 2022) reports that no-reference metrics (including DNSMOS, reported in our work) correlate significantly better with human perception and therefore have higher relevance for objective comparison between methods. Furthermore, in our study, we report the MOS score, which directly reflects human judgments of restoration quality.
+
+    \\  Model & MOS (\(\)) & UTMOS (\(\)) & WV-MOS (\(\)) & DNSMOS (\(\)) & - & RTF (\(\)) \\  Input & 3.46 \(\) 0.07 & 2.76 \(\) 0.13 & 2.90 \(\) 0.16 & 2.72 \(\) 0.11 & - & - \\ VoiceFixer & 3.41 \(\) 0.07 & 2.60 \(\) 0.09 & 2.79 \(\) 0.09 & 3.08 \(\) 0.06 & - & 0.02 \\ DEMUCS & 3.79 \(\) 0.07 & 3.51 \(\) 0.08 & 3.72 \(\) 0.08 & 3.27 \(\) 0.04 & - & 0.08 \\ STORM & 3.75 \(\) 0.06 & 3.29 \(\) 0.08 & 3.54 \(\) 0.09 & 3.17 \(\) 0.04 & - & 1.05 \\ BBED & 3.97 \(\) 0.06 & 3.30 \(\) 0.10 & 3.47 \(\) 0.08 & 3.23 \(\) 0.04 & - & 0.43 \\ HiFi-GAN-2 & 4.47 \(\) 0.05 & 3.67 \(\) 0.09 & **3.96 \(\) 0.06** & **3.32 \(\) 0.03** & - & 0.50 \\ Ours & **4.63 \(\) 0.04** & **4.05 \(\) 0.07** & **3.98 \(\) 0.06** & **3.31 \(\) 0.04** & - & **0.03** \\   \\  Model & MOS (\(\)) & UTMOS (\(\)) & WV-MOS (\(\)) & DNSMOS (\(\)) & PhER (\(\)) & RTF (\(\)) \\  Input & 2.87 \(\) 0.05 & 2.27 \(\) 0.28 & 1.72 \(\) 0.61 & 2.25 \(\) 0.19 & 0.31 \(\) 0.05 & - \\ Ground Truth & 4.39 \(\) 0.05 & 4.26 \(\) 0.06 & 4.28 \(\) 0.06 & 3.33 \(\) 0.04 & 0 & - \\ UNIVERSE & 4.10 \(\) 0.07 & 3.89 \(\) 0.15 & 3.85 \(\) 0.12 & **3.23 \(\) 0.07** & 0.20 \(\) 0.04 & 0.5 \\ Ours (16 kHz) & 3.99 \(\) 0.07 & **4.21 \(\) 0.10** & **4.43 \(\) 0.07** & **3.25 \(\) 0.05** & **0.14 \(\) 0.03** & **0.03** \\ Ours & **4.23 \(\) 0.07** & **4.21 \(\) 0.10** & **4.43 \(\) 0.08** & **3.25 \(\) 0.05** & **0.14 \(\) 0.03** & **0.03** \\   
+
+Table 2: Comparison with prior work on Voxceleb and UNIVERSE validation data.
+
+   Model & MOS (\(\)) & UTMOS (\(\)) & WV-MOS (\(\)) & DNSMOS (\(\)) & PSEQ (\(\)) & STOI (\(\)) & SI-SDR (\(\)) & WER (\(\)) \\  Input & \(3.18 0.07\) & \(3.06 0.14\) & \(2.99 0.24\) & \(2.53 0.10\) & \(1.98 0.17\) & \(0.92 0.01\) & \(8.4 1.2\) & \(0.09 0.03\) \\  MetricGAN+ & \(3.75 0.06\) & \(3.62 0.09\) & \(3.89 0.10\) & \(2.95 0.05\) & \(3.14 0.10\) & \(0.93 0.01\) & \(8.6 0.7\) & \(0.10 0.04\) \\ DiEMUCS & \(3.95 0.06\) & \(3.95 0.05\) & \(4.37 0.06\) & \(3.14 0.04\) & \(3.04 0.12\) & **0.95 \(\) 0.01** & \(18.5 0.6\) & **0.07 \(\) 0.03** \\ HiFi+GAN- & \(4.08 0.05\) & \(3.89 0.06\) & \(4.36 0.06\) & \(3.10 0.04\) & \(2.90 0.12\) & **0.95 \(\) 0.01** & \(17.9 0.6\) & \(0.08 0.03\) \\ HiFi-GAN-2 & \(4.13 0.05\) & \(3.99 0.05\) & \(4.26 0.05\) & \(3.12 0.05\) & \(3.14 0.12\) & **0.95 \(\) 0.01** & \(18.6 0.6\) & **0.07 \(\) 0.03** \\ DB-AIAT & \(4.22 0.05\) & \(4.02 0.05\) & \(4.38 0.06\) & \(3.18 0.04\) & **3.26 \(\) 0.12** & **0.96 \(\) 0.01** & **19.3 \(\) 0.8** & **0.07 \(\) 0.03** \\ Ours (16 kHz) & **4.41 \(\) 0.04** & **4.32 \(\) 0.02** & **4.87 \(\) 0.05** & **3.22 \(\) 0.04** & **2.94 \(\) 0.10** & \(0.92 0.01\) & \(4.6 0.3\) & **0.07 \(\) 0.03** \\ Ours (48 kHz) & **4.66 \(\) 0.04** & **4.32 \(\) 0.02** & **4.87 \(\) 0.05** & **3.2 \(\) 0.04** & \(2.94 0.10\) & \(0.92 0.01\) & \(4.6 0.3\) & **0.07 \(\) 0.03** \\  GT (16 kHz) & \(4.26 0.05\) & \(4.07 0.04\) & \(4.52 0.04\) & \(3.16
+
+### Ablation study
+
+To validate the improvements proposed in this work, we conduct an ablation study assessing the effectiveness of the design choices made.
+
+Firstly, we compare the LMOS loss against two other regression losses in the context of training a small speech enhancement model (10 times smaller than the final model; please see the Appendix E.2 for details). The first regression loss is the Mel-Spectrogram loss, which was proposed by Kong et al. (2020). As the second alternative, we employ the Reconstruction loss (RecLoss) proposed by Defossez et al. (2023). It consists of a combination of L1 and L2 distances between mel-spectrograms computed with different resolutions. For these experiments, we conducted a grid search for the weights of each reconstruction loss (details are in Appendix E.2) and report results for the best option in Table 4.
+
+The other proposed improvements bring incremental gains in perceptual MOS quality. Firstly, we add the features of the WavLM encoder as an additional input to HiFi++. Next, we scale the architecture by increasing the number of channels within the model. After that, we concatenate the Upsample WaveUNet with the FINALLY-16 architecture and implement the 3rd stage of training on the DAPS-clean dataset (48 kHz). Finally, we use additional human feedback losses (HF Loss) during the 3rd stage to further improve perceptual quality.
+
+Since Table 4 does not clearly demonstrate the advantages of using the WavLM (Chen et al., 2022b) encoder in terms of MOS, we provide additional ablation study on more challenging UNIVERSE (Serra et al., 2022) validation dataset. The results of these additional experiments, presented in Table 5, clearly demonstrate the importance of WavLM encoder.
+
+## 7 Conclusion
+
+In conclusion, we theoretically demonstrate that LS-GAN training encourages the selection of the point of maximum density within the conditional clean speech distribution, aligning naturally with the objectives of speech enhancement. Our empirical investigation identifies WavLM as an effective backbone for perceptual loss, supporting adversarial training. By integrating WavLM-based perceptual loss into the MS-STFT adversarial training pipeline and enhancing the HiFi++ architecture with a WavLM encoder, we develop a novel speech enhancement model, FINALLY, which achieves state-of-the-art performance, producing clear and high-quality speech at 48 kHz.
+
+    & Loss & MOS (\(\)) & UTMOS (\(\)) & WV-MOS (\(\)) & DNSMOS (\(\)) \\     } \\  } & input & \(3.46 0.07\) & \(2.77 0.14\) & \(2.88 0.16\) & \(2.72 0.11\) \\   & w/o reg. loss & \(3.71 0.08\) & \(3.05 0.09\) & \(2.70 0.11\) & \(3.18 0.06\) \\  & w/ L1Spec & \(4.15 0.06\) & \(3.45 0.08\) & \(3.41 0.07\) & \(\) \\  & w/ RecLoss & \(4.07 0.06\) & \(3.46 0.07\) & \(3.43 0.06\) & \(\) \\  & w/ LMOS & \(4.20 0.05\) & \(3.48 0.08\) & \(3.58 0.06\) & \(3.26 0.04\) \\   & + WavLM enc. & \(4.21 0.06\) & \(3.65 0.08\) & \(3.75 0.05\) & \(3.26 0.04\) \\  & + Scaling & \(4.30 0.05\) & \(3.83 0.07\) & \(\) & \(3.21 0.05\) \\     } \\  } & + 3rd stage & \(4.59 0.05\) & \(3.78 0.07\) & \(\) & \(\) \\  & + HF Loss & \(\) & \(\) & \(\) & \(\) \\   
+
+Table 4: Ablation study (VoxCeleb real data).
+
+    & MOS (\(\)) & UTMOS (\(\)) & WV-MOS (\(\)) & DNSMOS (\(\)) & PhER (\(\)) \\  w/o WavLM & \(3.49 0.08\) & \(3.33 0.18\) & \(3.80 0.15\) & \(\) & \(0.27 0.04\) \\ w/ WavLM & \(\) & \(\) & \(\) & \(\) & \(\) \\   
+
+Table 5: Ablation of WavLM encoder on UNIVERSE validation data.

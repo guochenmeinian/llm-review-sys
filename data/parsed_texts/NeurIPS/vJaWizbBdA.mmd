@@ -1,0 +1,654 @@
+# ERBench: An Entity-Relationship based
+
+Automatically Verifiable Hallucination Benchmark for Large Language Models
+
+Jio Oh\({}^{\ast}\)1 Soyeon Kim\({}^{\ast}\)1 Junseok Seo\({}^{1}\) Jindong Wang\({}^{2}\) Ruochen Xu\({}^{3}\)
+
+Xing Xie\({}^{2}\) Steven Euijong Whang\({}^{1}\)1
+
+\({}^{1}\)KAIST \({}^{2}\)Microsoft Research Asia \({}^{3}\)Microsoft Azure
+
+Equal contribution {harryoh99, purplehibird}@kaist.ac.kr. \({}^{\dagger}\)Corresponding author \(\langle\)swhang@kaist.ac.kr\(\rangle\)
+
+###### Abstract
+
+Large language models (LLMs) have achieved unprecedented performances in various applications, yet evaluating them is still challenging. Existing benchmarks are either manually constructed or are automatic, but lack the ability to evaluate the thought process of LLMs with arbitrary complexity. We contend that _utilizing existing relational databases based on the entity-relationship (ER) model is a promising approach for constructing benchmarks_ as they contain structured knowledge that can be used to question LLMs. Unlike knowledge graphs, which are also used to evaluate LLMs, relational databases have _integrity constraints_ that can be used to better construct complex in-depth questions and verify answers: (1) _functional dependencies_ can be used to pinpoint critical keywords that an LLM must know to properly answer a given question containing certain attribute values; and (2) _foreign key constraints_ can be used to join relations and construct multi-hop questions, which can be arbitrarily long and used to debug intermediate answers. We thus propose ERBench, which uses these integrity constraints to convert any database into an LLM benchmark. ERBench supports continuous evaluation as databases change, multimodal questions, and various prompt engineering techniques. In our experiments, we construct LLM benchmarks using databases of multiple domains and make an extensive comparison of contemporary LLMs. We show how ERBench can properly evaluate any LLM by not only checking for answer correctness, but also effectively verifying the rationales by looking for the right keywords.
+
+## 1 Introduction
+
+Large Language Models (LLMs) [1; 2] have become prevalent and are increasingly popular in a wide range of applications, including natural language processing, chatbots, content generation, and information retrieval, to name a few. However, a fundamental issue of LLMs is hallucination [3; 4; 5; 6], which refers to the phenomenon that LLMs generate fake, unverified, or non-existent information especially for knowledge-related and safety-critical applications. Hallucination remains one of the most severe issues that should be addressed, and we focus on factual hallucination.
+
+To address factual hallucination, it is necessary to develop benchmarks that are comprehensive, intricate, automatically verifiable, and can be scaled efficiently. One approach is to construct manual benchmarks by human annotators [7; 8; 9; 10], which are expensive and not scalable. Another approach is to automatically construct evaluation samples using knowledge graphs [11] by converting triples to simple factual questions or use existing QA datasets [12]. Although these benchmarks may scale asthe answers can be verified automatically and updated with more knowledge, their questions are still simplistic or unmodifiable, thus lacking the ability to evaluate on intricate tasks.
+
+We contend that utilizing existing relational databases is a promising approach to construct a benchmark that has both merits. Until now, many LLM benchmarks have been constructed based on knowledge graphs. Although these benchmarks can scale, the main limitation is that the questions tend to be simplistic as they are based on triples. In comparison, relational databases contain structured data where they have schema information and follow the entity-relationship (ER) model, which supports various integrity constraints that make sure the data is well formed. A schema can be designed using traditional ER diagrams or more recent notions like UMLs. By using a database's schema, records, and integrity constraints, it is possible to construct arbitrarily-long multi-hop questions based on multiple relations that also have clear automatically-verifiable answers based on the integrity constraints. Using databases thus opens up opportunities to extensively evaluate LLMs on a vast amount of knowledge in a principled fashion.
+
+In this paper, we propose **ERBench**, an LLM benchmark based on the ER model. ERBench supports complex questions and are automatically verifiable (see Fig. 1). The questions can be automatically constructed using ER diagrams. For example, if a movie's length is determined by its _title_ and _year_, and the ER diagram shows the entity movie with three attributes _title_, _year_, and _length_, then one can ask an LLM _Does the movie titled Star Wars produced in 1977 run for more than 60 minutes?_. We use two popular integrity constraints - functional dependencies (FDs) and foreign key constraints (FKCs) to make the questions verifiable. FDs are used to infer an attribute's value based on other attribute values. In our example, if the FD _title_, _year_\(\rightarrow\)_director_, _length_ holds for movies, then the director and length of _Star Wars (1977)_ are determined (_George Lucas_ and _121 minutes_, respectively). We can construct both binary and multiple-choice questions asking for the inferred values. A foreign key is a set of attributes in one relation that refers to the primary key of another relation, which identifies records, and an FKC ensures that the foreign key values actually exist in the other relation. Using FKCs, ERBench can support questions with increasing complexity by generating multi-hop questions via joining multiple relations that have FKCs and inferring longer FDs that span them.
+
+ERBench is also extensible in terms of data, modality, and prompting. First, ERBench can be easily updated as its underlying database changes and thus support continuous evaluation. Second, ERBench supports multimodal questions where one can replace attribute text values with other data types like images. Third, we can further diversify the questions using recent techniques like chain-of-thought [13], few-shot prompting [14], and knowledge augmentation [15, 16, 17]. ERBench can thus evaluate any improved LLM.
+
+We conduct extensive experiments using \(5\) public databases and evaluate several popular LLMs: GPT-3.5 [18], GPT-4 [1], Llama-270B-Chat [19], Gemini-Pro [2], Claude-3-Sonnet [20], and Mistral-7B-Instruct [21]. We perform comprehensive analyses in terms of answer and rationale accuracies and hallucination rates using single-hop, multi-hop, and multimodal questions and also perform prompt engineering and fine-tuning. We show how ERBench can effectively evaluate any LLM by
+
+Figure 1: ERBench constructs questions from a relational database using its schema, records, and integrity constraints and automatically verifies the LLM responses.
+
+not only checking for answer correctness, but also effectively verifying their rationales by looking for the critical keywords that should be mentioned.
+
+**Summary of Contributions.** (1) We propose ERBench, the first LLM benchmark to systematically utilize relational databases to construct complex questions where the model reasoning can be automatically verified. (2) We show how any database can be converted to a benchmark using its schema, records, and integrity constraints. (3) We extensively evaluate contemporary LLMs using ERBench and demonstrate how ERBench is effective and scalable, remaining relevant over time.
+
+## 2 Preliminaries
+
+LLM Factual HallucinationWe would like to evaluate LLMs in terms of their hallucination levels. We define hallucination as generated content that is nonsensical or unfaithful to the provided source content [22]. Hallucination may occur because the data sources are flawed in various ways or the data is utilized imperfectly and cannot be recalled properly [22]. In any case, we are interested in whether an LLM not only gives correct answers, but also has the correct thought process and thus consider hallucination on two levels: (1) The LLM gives a wrong answer. For example, if the question asks whether Firenze and Florence are the same city, the answer is _Yes_ (Firenze is the Italian name of Florence), and _No_ is considered as hallucination. (2) The LLM gives a correct answer, but with a wrong rationale. If the answer is _Yes_, but the rationale is that both cities are in the United States, then this is considered as hallucination as well. We note that recent hallucination benchmarks like Head-to-Tail [11] are good at evaluating (1), but are not designed to evaluate (2). Our key idea is to utilize relational databases to generate questions that can be used to evaluate both (1) and (2).
+
+Relational DatabasesWe utilize relational databases, which are based on the ER model. A relation consists of a schema containing attributes and records containing the attribute values. When designing a schema, a typical approach is to start with an intuitive ER diagram or UML to determine which entities and relationships are needed and how they are connected with each other. For example, the movie ER diagram in Fig. 1 has three entity sets _Movie_, _Star_, and _Director_. In addition, there could be relationships, e.g., _Stars-in_ between _Movie_ and _Star_ and _Directed-by_ between _Movie_ and _Director_. The resulting schema of the database could then be _Movie_(_title, year, director, length_), _StarsIn_(_name_, _age_), and _Director_(_name_, _birth year_).
+
+The relations usually have integrity constraints. A _functional dependency_ (FD) is a relationship between two sets of attributes \(X\) and \(Y\) where the \(X\) values determine the \(Y\) values. For example, Fig. 1 shows the FD _title, year \(\rightarrow\) director, length_ because a movie's title and year can be used to identify the movie, which in turn determines its director and length. Likewise, there is another FD _name \(\rightarrow\) birth year_ where the director name determines his or her birth year. We denote an FD as \(X\to Y\) and use it to evaluate the LLM's rationale as we explain later. A _foreign key constraint_ (FKC) is a set of attributes in one relation that refers to the primary key attributes in another relation, which is used to identify records. Fig. 1 shows that the _director_ attribute of _Movie_ is a foreign key to the _name_ attribute of _Director_. Using a foreign key, we can also join two relations and construct FDs that span them. In Fig. 1, the FD _title, year \(\rightarrow\) birth year_ is a result of joining the _Movie_ and _Director_ relations and combining the first two _Movie_ and _Director_ FDs. This multi-relation FD construction enables us to construct questions with arbitrary complexity as we explain later.
+
+The integrity constraints thus determine the correctness of records, and our idea is to utilize them to verify the LLM responses as well. A natural question to ask is whether the integrity constraints themselves are always correct. Since the integrity constraints are determined by the database owner, it is the owner's responsibility to determine if they should hold in general.
+
+## 3 ERBench
+
+We explain how ERBench utilizes FDs to construct two types of questions - binary and multiple-choice - and automatically verifies LLM responses. We then explain how complex multi-hop questions are constructed by joining relations with FKCs and expanding the FDs. Finally, ERBench can be extended to diverse data types, modalities, and prompt engineering.
+
+### Binary and Multiple-choice Question Construction using FDs
+
+Given a relation \(R\) and an FD \(X\to Y\), we can specify the \(R.X\) values and ask a question involving the \(R.Y\) values. For example, using the database in Fig. 1, we can ask the question \(q_{1}\): _For the movie with the title \(\langle\)Harry Potter and the Philosopher's Stone\(\rangle\) produced in \(\langle\)2001\(\rangle\), is the length larger than \(\langle\)100\(\rangle\) minutes?_. Optionally, the question can be generated by an LLM using the ER diagram.
+
+We can construct binary questions where the answers are _Yes_ or _No_. We do allow an LLM to answer _Unsure_ if it is not confident about its answers in order to significantly reduce hallucinations [11]. Hence, similar to Head-to-Tail [11], we use the prompt _Answer the following question in yes or no, and then explain why. Say unsure if you don't know and then explain why_. Note that we ask for further explanation to also verify the LLM's rationale. For \(q_{1}\) above, the correct answer is _Yes_ as the movie is 152 minutes long.
+
+We can also construct multiple-choice questions where we provide several correct options and one incorrect option, which the LLM needs to figure out. The correct options can be generated using any FD. The incorrect option can be generated by choosing one FD \(X\to Y\) where we know the correct \(Y\) value and choosing a different \(Y\) value from the relation. Optionally, to check whether the LLM is not just guessing, we can also add the option _None of the above_ and make it the correct answer. If we extend \(q_{1}\) above, a correct option would be _The movie length is 152 minutes_, while an incorrect one can be constructed by replacing the 152 minutes with another length in the relation.
+
+### Automatic Verification of LLM Responses
+
+When verifying an LLM response, ERBench checks if both the answer and rationale are correct. The answer checking is straightforward where we check if the LLM selected the right binary or multiple-choice option. To check the rationale, we look for the inferred values of the FD applied on the current record. For example, let us assume the FD _released year, star, director \(\to\) title_. If we ask the binary question \(q_{2}\): _Is there a movie, released in (2001), starring \(\langle\)Emma Watson\(\rangle\) where \(\langle\)Chris Columbus\(\rangle\) is the director?_, we not only look for the answer _Yes_, but also the movie title _Harry Potter_ within the rationale. The checking for multiple-choice questions is similar.
+
+We may run into an entity resolution problem where the LLM mentions an entity that is essentially the same as the inferred one, but is written differently. In the above example, we may be looking for _Harry Potter_, but the LLM mentions _Harry J. Potter_, which contains the middle initial of _Harry Potter_. We perform entity resolution based on heuristics including conventional string matching. Another possible solution is to use an LLM itself for the matching. While ChatGPT has indeed been used to replace human judgement [11], we also believe this may give an unfair advantage to GPT compared to other LLMs and choose not to use this method.
+
+### Multi-hop Question Construction using FKCs
+
+We can increase the complexity of a question by making it a multi-hop question [23; 24], which can be used to test whether an LLM can think in multiple steps. We use the straightforward extension of joining multiple relations to implement the multiple hops. The relations must have foreign key relationships so that the FDs can span the relations. Given two relations \(R(X,Y)\) and \(S(Y,Z)\) where \(R\)'s key is \(X\), suppose there is a foreign key constraint from \(R.Y\) to \(S.Y\). For any tuple \(e\) representing an entity in \(R\), we can ask a question only using its \(X\) and \(Z\) values to see if the LLM knows the hidden \(Y\) value. For example, by joining the _Movie_ and _Director_ relations in Fig. 1, we can construct the 2-hop question \(q_{3}\): _Was the director who directed the movie \(\langle\)Harry Potter and the Philosopher's Stone\(\rangle\) that was released in \(\langle\)2001\(\rangle\) born in the \(\langle\)1950s\(\rangle\)?_. Here \(e\) is the original _Harry Potter and the Philosopher's Stone_ movie, and the hidden \(Y\) value is _Chris Columbus_. If the LLM knows _Chris Columbus_, then it should be able to confirm that his birth year is _1958_, while giving _Yes_ as an answer. Notice that the verification of multi-hop questions is exactly the same as for single-hop questions. Thus, we can construct arbitrarily-complex, but automatically-verifiable questions.
+
+### Extensions
+
+ERBench is extensible in terms of data, modality, and prompting. ERBench supports continuous evaluation in the sense that if the underlying databases change, ERBench can be updated automatically by simply reflecting the record updates to the questions as well. As LLMs need to be evaluatedwith newer data over time, it is important that the benchmark itself is also updatable. ERBench can also support multimodal data by making the underlying database multimodal. For example, we can replace a text attribute in a relation with an image and then pose the same question to the LLM. Finally, LLMs can use any prompt engineering techniques and still be evaluated with ERBench. We highlight the ones we use in our experiments: (1) Chain-of-thought [13] is a step-by-step approach of prompting and is more likely to give an LLM better context for answering the question; (2) Few-shot prompting [14] provides demonstrations to the LLM to give it more context before answering questions; and (3) Knowledge augmentation [15; 16; 17] utilizes a search engine to augment the generated answer with search results. Note that ERBench is orthogonal to whatever prompt engineering is used.
+
+## 4 Experiments
+
+We test the performances of LLMs on questions based on databases that are constructed from public data. We evaluate LLMs based on whether their answers and rationales are both correct.
+
+**LLMs Compared.** We compare GPT-3.5 [18], GPT-4 [1], Llama2-70B-Chat [19], Gemini-Pro [2], Claude-3-Sonnet [20], and Mistral-7B-Instruct [21]. For multimodal LLMs, we evaluate GPT-4V [1] and Gemini-Pro-Vision [2]. We access the LLMs through Hugging Face, Microsoft Azure AI Studio APIs, the Google Gemini API, or Anthropic's API. To exclude randomness in the LLM responses, we set all the temperature parameters to zero.
+
+**Datasets and Functional Dependencies.** We perform experiments on \(5\) datasets representing different domains and call them _Movie_[25], _Soccer_[26], _Airport_[27], _Music_[28], and _Book_[29] (see Sec. A.1 for details). We also use separate _Director_, _Club_ and _Olympic_ relations that are joined with the _Movie_ and _Soccer_ relations for multi-hop questioning. All the data we use are available on Kaggle or public Github repositories. Table 1 and Table 8 (in Sec. A.2) show the FDs we use to verify the LLM responses for binary and multiple-choice questions, respectively.
+
+**Performance Measures.** We utilize existing LLM hallucination measures [11] and newly introduce two measures involving rationale evaluation. All four measures are useful for accurately analyzing LLM hallucinations (see Sec. B.1 for details).
+
+* _Answer Accuracy_ (**A**) [11]: Portion of LLM responses that are correct.
+* _Rationale Accuracy_ (**R**): Portion of responses whose rationales contain the FD-inferred values.
+* _Answer-Rationale Accuracy_ (**AR**): Portion of responses that are not only correct, but also contain FD-inferred values in their rationales.
+* _Hallucination Rate_ (**H**) [11]: Portion of responses that are incorrect, excluding those where LLMs admit uncertainty in their responses (e.g., _Unsure_). Specifically, \(\textbf{H}\!=\!1\!-\!\textbf{A}\!-\!\textbf{M}\), where **M** denotes the percentage of LLM responses that admit they cannot answer the given question (i.e., _missing rate_). A lower **H** value is better.
+
+**Measuring Performance based on Internal Knowledge.** When measuring LLM performances, we also take into account their internal knowledge of the entities within the questions. That is, if an LLM is hallucinating on a question because it simply does not know the entity mentioned (e.g., the entity may not exist in its training data) we may want to skip that question for evaluation. We can assess an LLM's knowledge by directly prompting if it knows an entity (e.g., _Do you know about the movie "Harry Potter"?_; see more details in Sec. B.2). For our datasets, the numbers of known entities per LLM are shown in Sec. B.3. For a fair evaluation, we perform three types of evaluations: (1) each LLM is evaluated only with questions with entities that it has knowledge of; (2) all LLMs are evaluated with questions that all the LLMs have knowledge of; and (3) all LLMs are evaluated
+
+\begin{table}
+\begin{tabular}{c l l} \hline \hline
+**Dataset** & **FD** & **Example Question** \\ \hline \hline \multirow{2}{*}{_Movie_} & _released year, star, director_ & _Is there a movie, released in (2009), starring \(\langle\)CCH Pounder\(\rangle\)_ \\  & \(\rightarrow\) _movie title_ & _where \(\langle\)James Cameron\(\rangle\) is the director?_ \\ \hline \multirow{2}{*}{_Soccer_} & _nationality, club, jersey number_ & _Is there a soccer player from \(\langle\)Portugal\(\rangle\) who played for_ \\  & \(\rightarrow\) _player name (2019 year only)_ & \(\langle\)_lwentus\(\rangle\) with uniform number \(\langle\)7_ in \(\langle\)_lwentus\(\rangle\) in 2019?_ \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: FDs and binary questions of two datasets. See Sec. A.2 for examples of other datasets.
+
+with all questions, regardless of their knowledge. Due to space constraints, we only present results of (1), and the (2) and (3) results can be found in Sec. B.4.
+
+### Results for Single-hop Questions
+
+Table 2 shows the LLM performances using single-hop binary and multiple-choice questions on the 5 datasets. We first explain how we construct the questions and then analyze the LLM performances.
+
+**Binary Questions.** We use the basic questions in Table 1 and expect a _Yes_ answer. In addition, we construct negated versions of these questions and expect a _No_ answer. For example, we can negate a basic question for the _Movie_ dataset in Table 1 as _Is it true that there are no movies released in \(\langle 2009\rangle\), starring \(\langle\)CCH Pounder\(\rangle\) where \(\langle\)James Cameron\(\rangle\) is the director?_. The reason we always negate a basic question instead of say changing one of its attribute values into an incorrect one is to still perform the FD-based verification. If the question cannot utilize FDs anymore, we can no longer just look for inferred values, but need to analyze the entire LLM response to verify the rationale. Table 2 shows that GPT-4 tends to have superior performances, especially in terms of **A** and **R**. Gemini-Pro and Claude-3-Sonnet have lower **A** and **R**, but also low **H**. All three LLMs along with GPT-3.5 have worse performances for the negated questions. Llama2 and Mistral, on the other hand, tend to give trivial _No_ answers for most questions, which results in high performances on the negated questions, but low performances on the basic ones.
+
+**Multiple-choice Questions.** For the multiple-choice questions, we generate 2-4 choices using the attributes on the right-hand side of the FDs, with one incorrect choice using the construction in Sec. 3.1. For each question, we generate three versions with rephrased choices (e.g., "born in US" can be rephrased to "birthplace is US" and "place of birth is US") and report the averaged LLM performance to account for prompt sensitivity (see Sec. A.2 for more details). Table 2 shows that most LLMs perform better on multiple-choice questions than on binary questions, with Claude-3-Sonnet showing a particularly notable improvement. GPT-3.5 and Gemini-Pro show similar performances, and GPT-4 often results in the best performances. Llama2 and Mistral perform well for the _Movie_
+
+\begin{table}
+\begin{tabular}{l c c c c c c c c c c c c c c c} \hline \hline  & & \multicolumn{3}{c}{**Movie**} & \multicolumn{3}{c}{**Soccer**} & \multicolumn{3}{c}{**Airport**} & \multicolumn{3}{c}{**Music**} & \multicolumn{3}{c}{**Book**} \\ \cline{3-13}
+**Model** & **Metric** & BN\({}^{\circ}\) & BN\({}^{\circ}\) & MC & BN\({}^{\circ}\) & BN\({}^{\circ}\) & MC & BN\({}^{\circ}\) & BN\({}^{\circ}\) & MC & BN\({}^{\circ}\) & BN\({}^{\circ}\) & MC & BN\({}^{\circ}\) & BN\({}^{\circ}\) & MC \\ \hline \hline \multirow{4}{*}{GPT-3.5} & **A** & **.85** &.06 &.97 &.35 &.00 &.83 &.13 &.00 &.71 &.58 &.20 &.91 & **.77** &.01 & **.55** \\  & **R** &.81 &.11 &.96 &.28 &.02 &.60 &.01 &.00 &.44 &.36 &.18 &.68 &.13 &.01 & **.55** \\  & **A** & **.80** &.05 &.96 &.24 &.00 &.55 &.01 &.00 &.44 &.34 &.14 &.66 &.12 &.00 &.12 \\  & **H** (1) & **.15** &.94 &.03 &.64 &.10 &.17 &.67 &.97 &.29 &.27 &.76 &.09 &.05 &.94 &.45 \\ \hline \multirow{4}{*}{GPT-4} & **A** &.65 &.51 &.97 &.47 &.19 & **.91** &.68 &.11 & **.96** & **.83** &.63 & **.97** &.41 &.02 &.48 \\  & **R** &.81 &.76 &.97 & **.70** &.49 & **.69** & **.23** & **.16** & **.90** & **.74** & **.56** &.87 & **.21** &.02 &.34 \\  & **AR** &.64 &.50 &.97 & **.41** &.17 & **.69** & **.20** & **.03** & **.90** & **.68** & **.54** &.86 & **.19** &.01 & **.34** \\  & **H** (1) &.35 &.47 &.03 &.38 &.04 &.02 &.32 &.80 & **.04** &.15 &.01 & **.01** &.08 &.01 & **.01** \\ \hline \multirow{4}{*}{Llama2} & **A** &.05 & **1.0** &.93 &.02 & **1.0** & n/a &.00 & **1.0** & n/a &.76 & **1.0** &.91 &.02 & **1.0** & n/a \\  & **R** &.53 & **.92** &.97 &.18 & **.62** & n/a &.00 &.02 & n/a &.31 &.29 &.71 &.02 &.05 & n/a \\  & **AR** &.05 & **.92** &.91 &.02 & **.62** & n/a &.00 &.02 & n/a &.29 &.29 &.67 &.00 & **.05** & n/a \\  & **H** (1) &.95 & **.00** &.07 &.98 & **.00** & n/a & 1.0 & **.00** & n/a &.24 & **.00** &.09 &.98 & **.00** & n/a \\ \hline \multirow{4}{*}{Gemini-Pro} & **A** &.28 &.00 &.92 &.01 &.00 &.89 &.00 &.00 &.76 &.51 &.02 &.89 &.00 &.00 &.47 \\  & **R** &.66 &.27 &.97 &.06 &.05 &.55 &.00 &.00 &.33 &.14 &.05 &.55 &.00 &.00 &.13 \\  & **AR** &.26 &.00 &.92 &.00 &.00 &.51 &.00 &.00 &.33 &.11 &.01 &.54 &.00 &.00 &.11 \\  & **H** (1) &.40 & 1.0 &.08 & **.17** &.29 &.11 & **.00** &.42 &.24 & **.02** &.10 &.11 & **.01** &.01 &.53 \\ \hline \multirow{4}{*}{Claude-3-Sonnet} & **A** &.30 &.15 & **.99** &.21 &.01 & n/a &.52 &.01 &.91 &.46 &.38 & **.97** &.24 &.00 & n/a \\  & **R** & **.87** &.86 & **.99** &.36 &.02 & n/a &.08 &.07 &.80 &.30 &.23 & **.93** &.18 & **.06** & n/a \\ -Sonnet & **AR** &.29 &.15 & **.99** &.17 &.01 & n/a &.05 &.01 &.76 &.26 &.23 & **.90** &.14 &.00 & n/a \\  & **H** (1) &.70 &.83 & **.01** &.30 & **.00** & n/a & **.00** & **.00** &.09 &.33 &.01 &.03 &.10 &.00 & n/a \\ \hline \multirow{4}{*}{Mistral} & **A** &.48 & **1.0** &.72 & **.54** &.99 &.44 & **.71** & **1.0** &.13 &.41 &.96 &.56 &.16 &.98 &.40 \\  & **R** &.54 &.66 &.75 &.10 &.18 &.21 &.00 &.00 &.09 &.03 &.04 &.37 &.01 &.01 &.04 \\ \cline{1-1}  & **AR** &.31 &.66 &.64 &.06 &.18 &.19 &.00 &.00 &.05 &.03 &.04 &.14 &.00 &.01 &.
+
+dataset among the 5 datasets. We also extend the multiple-choice questions with a _None of the above_ option and show that the LLM performances tend to decrease as the proportion of this option increases (see more details in Sec. B.6).
+
+Instead of trying to rank LLMs by performance, we would like to make observations from a benchmark perspective: (1) rationale accuracy (**R**) tends to be worse than answer accuracy (**A**) and (2) the LLM performances vary significantly across question types, even when using the same entities. We thus conclude that there is much room for improvement for LLM rationale and that LLM benchmarking should always involve diverse questions for a comprehensive analysis.
+
+### Rationale Verification Accuracy
+
+We evaluate ERBench's effectiveness in evaluating an LLM's rationale. ERBench's main strategy is to utilize FDs to pinpoint critical keywords that must appear in an LLM's rationale. However, there are inevitable corner cases, where a rationale contains the right keyword, but is incorrect. To see if these cases are frequent, we manually inspect 500 randomly-chosen responses per model for single-hop questions across all datasets and see if ERBench correctly evaluates the rationales. Table 3 shows that ERBench's correctness is higher than 95.5% on average and higher than 92% for any model. We also perform an error analysis of these results and larger-scale experiments by comparing ERBench with GPT-Judge [7] in Sec. B.5, which show similar results.
+
+### Results for Multi-hop Questions
+
+For the multi-hop questions, we construct 2-hop and 3-hop questions for the _Movie_ and _Soccer_ datasets, respectively, using the construction in Sec. 3.3 (see more details in Sec. B.7). Since we are evaluating multiple steps of the LLM's reasoning, we also extend the **R** and **AR** measures as follows:
+
+* **R**-ext: We compute the portion of rationales that occur in the \(i^{th}\) hop that are correct, for each \(i\in\) [1, \(\ldots\), total # hops]. We then take the average of these portions.
+* **AR**-ext: We compute the **AR** value of answers and rationales that occur in the \(i^{th}\) hop, for each \(i\in\) [1, \(\ldots\), total # hops], in order to analyze any "snowball effect" [30] on how early hop reasoning errors affect the final accuracy.
+
+Table 4 shows the LLM performances on the two datasets. Compared to the single-hop question results, most LLMs naturally have worse answer and rationale accuracies. Even if the answer accuracies are high, the rationale accuracies are low, underscoring the need to evaluate LLM rationales. Using Chain-of-Thought prompting [13] (denoted as "+ CoT") has mixed results where the demonstrations sometimes guide the LLMs to retrieve better knowledge about entities, but may also add unintended biases. Finally, the **AR**-ext results show that the **AR** performance does not decrease for more hops, which means that answering the early hops correctly is important. In Sec. B.8, we also show the importance of the correctness of initial hops to avoid any snowballing of incorrectness.
+
+### Results for Multimodal Questions
+
+We explore the extensibility of ERBench by incorporating multimodality, specifically images, into GPT-4V and Gemini-Pro-Vision. Using the multimodal question construction in Sec. 3.4, we introduce multimodality in single-hop questions of the two datasets: _Movie_ and _Soccer_. We replace each _title_ attribute value with a movie poster image in _Movie_ dataset and each _club_ attribute value with a soccer club logo in _Soccer_ dataset (see the actual prompts in Sec. C.1). The results are shown in Table 5. Overall, the integration of image modality tends to improve the performance compared to Table 2. The improvements are more pronounced when using Gemini-Pro-Vision. ERBench is thus also effective in evaluating multimodal models.
+
+\begin{table}
+\begin{tabular}{c c c c c c c c} \hline \hline \multicolumn{2}{c}{} & \multicolumn{3}{c}{**Movie**} & \multicolumn{3}{c}{**Soccer**} \\ \cline{2-7}
+**Model** & **Metric** & \(\text{BN}_{(7)}\) & \(\text{BN}_{(80)}\) & MC & \(\text{BN}_{(7)}\) & \(\text{BN}_{(80)}\) & MC \\ \hline \hline \multirow{4}{*}{GPT-4V} & **A** & **.93** & **.95** & **.92** &.45 & **.45** & **.90** \\  & **R** & **.97** & **.97** & **.85** & **.40** & **.38** & **.67** \\  & **AR** & **.91** & **.93** & **.84** & **.38** & **.38** & **.64** \\  & **H** (i) & **.06** & **.05** & **.06** & **.07** & **.00** & **.03** \\ \hline \multirow{4}{*}{Gemini} & **A** &.82 &.17 &.59 & **.67** &.01 &.68 \\  & **R** &.95 &.94 &.73 &.38 &.20 &.56 \\ \cline{1-1}  -Pro-V & **AR** &.78 &.16 &.58 &.34 &.01 &.43 \\ \cline{1-1}  & **H** (i) &.18 &.83 &.41 &.31 &.97 &.32 \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: LLM performances using multimodal questions on 2 datasets.
+
+\begin{table}
+\begin{tabular}{c c c c c c c} \hline \hline \multicolumn{2}{c}{**GPT-3.5 GPT-4 LIam2**} & **Gemini** & **Claude-3 Mistral** \\ \hline \hline Acc (\%) & 97.4 & 94.4 & 92.8 & 94.8 & 96.8 & 97.0 \\ \hline \end{tabular}
+\end{table}
+Table 3: ERBench’s manual verification accuracy.
+
+### Results on Prompt Engineering Methods
+
+We further diversify our questions using prompt engineering techniques for a more extensive evaluation of LLMs. In Sec. 4.3, we use chain-of-thought [13] techniques in multi-hop questions to encourage step-by-step reasoning and observe improved LLM performances (Table 4). In addition, we use few-shot prompting [14] in single-hop questions where we provide 8 (2-4) demonstrations before asking each binary (multiple-choice) question (see detailed demonstration prompts in Sec. C.2). Table 23 in Sec. B.9 shows that the demonstrations indeed improve LLM performances for both types of questions for most domains. Finally, we implement a simple version of knowledge augmentation [15] using the LangChain API [31], which adds a background knowledge passage of entities from Wikipedia before each prompt. Surprisingly, we often observe a degradation in LLM performance as the passage may actually mislead the LLM instead of help it; see Table 24 and Sec. B.10 for a more detailed analysis.
+
+### Results for Fine-tuning
+
+We analyze how fine-tuning affects LLM performance using ERBench. We use GPT-3.5 and fine-tune it for 2 epochs on (1) 3,000 entities of the _Soccer_ dataset and (2) the combination of 4 datasets - _Movie_, _Soccer_, _Music_, and _Book_ - to check whether data from different distributions can improve LLM performance. We then observe how its performances on the 5 datasets change. We use similar questions as in Sec. C.2. As a result, Table 6 shows that fine-tuning is mostly helpful across all datasets, but there is still room for improvement. Interestingly, increasing the number of datasets for fine-tuning does not necessarily lead to an increase in performance compared to just fine-tuning on the _Soccer_ dataset, although there is still a boost compared to not fine-tuning. Similar to Sec. 4.3, some prompts for fine-tuning occasionally add unintended biases to the model.
+
+## 5 Related Work
+
+There are many benchmarks that evaluate LLM responses, and we categorize them by what they evaluate and whether they scale. There are also LLM hallucination detection methods that are more focused on improving the LLMs instead of evaluating them, and we summarize them in Sec. C.
+
+\begin{table}
+\begin{tabular}{l l c c c c c c c c} \hline \hline  & & \multicolumn{4}{c}{**Movie \& Director**} & \multicolumn{4}{c}{**Soccer \& Olympic**} \\  & & \multicolumn{2}{c}{w/o CoT} & \multicolumn{2}{c}{w/ CoT} & \multicolumn{2}{c}{w/ CoT} & \multicolumn{2}{c}{w/ CoT} \\ \cline{3-10}
+**Model** & **Metric** & BN(\({}_{\text{NT}}\)) & BN(\({}_{\text{NT}}\)) & BN(\({}_{\text{NT}}\)) & BN(\({}_{\text{NT}}\)) & BN(\({}_{\text{NT}}\)) & BN(\({}_{\text{NT}}\)) & BN(\({}_{\text{NT}}\)) & BN(\({}_{\text{NT}}\)) \\ \hline \hline \multirow{3}{*}{GPT-3.5} & **A** &.74 &.00 &.36 &.54 &.81 &.82 &.59 &.76 \\  & **R\({}_{\text{ext}}\)** &.92 &.92 &.95 &.79 &.09 &.15 &.67 &.60 \\  & **AR\({}_{\text{ext}}\)** &.73.70 &.00/.00 &.35/.34 &.53/.50 &.01/.05/.03 &.00/.00 &.47/.54/.54 &.28/.31/.31 \\  & **H** (i) &.21 &.96 &.62 &.27 &.17 &.18 &.33 &.21 \\ \hline \multirow{3}{*}{GPT-4} & **A** &.59 &.40 & **.80** &.66 &.46 &.55 &.79 &.70 \\  & **R\({}_{\text{ext}}\)** & **.98** & **.98** & **.98** & **.98** &.59 &.60 & **.80** & **.80** \\  & **AR\({}_{\text{ext}}\)** &.59/.59 &.40/.39 & **.80**/.79 &.66/.65 &.38/.42/.41 &.18/.19/.19 &.52/.55/.55 & **.68/.73/.73** \\  & **H** (i) &.41 &.60 &.20 &.34 &.25 &.13 &.20 &.29 \\ \hline \multirow{3}{*}{Llama2} & **A** &.02 & **1.0** &.79 &.06 & **.88** &.12 &.84 &.33 \\  & **R\({}_{\text{ext}}\)** &.95 &.95 &.97 &.95 &.25 &.30 &.47 &.56 \\  & **AR\({}_{\text{ext}}\)** &.02/.02 & **.98**/.**92 &.78/.77 &.06/.05 &.00/.00/.00 &.44/.55/.44 &.12/.14/.13 &.45/.62/.62 \\  & **H** (i) &.98 & **.00** &.21 &.94 &.12 &.88 &.15 &.65 \\ \hline \multirow{3}{*}{Gemini-Pro} & **A** &.19 &.01 &.31 &.02 &.00 &.00 &.18 &.41 \\  & **R\({}_{\text{ext}}\)** &.42 &.60 &.40 &.28 &.01 &.07 &.60 &.46 \\  & **AR\({}_{\text{ext}}\)** &.19/.19 &.01/.01 &.31/.30 &.02/.01 &.00/.00/.00 &.00/.00/.00 & **.66/.73/.75** &.16/.15/.21 \\  & **H** (i) &.02 &.33 & **.00** &.20 & **.00** & **.00** &.60 &.15 \\ \hline \multirow{3}{*}{Claude-3} & **A** &.44 &.57 &.56 &.02 &.57 & **1.0** &.21 &.14 \\  & **R\({}_{\text{ext}}\)** &.95 &.95 &.96 &.95 &.58 &.26 &.39 &.27 \\ -Sonnet & **AR\({}_{\text{ext}}\)** &.44/.42 &.57/.55 &.56/.53 &.02/.02 &.21/.23/.18 &.33/.34/.33 &.58/.60/.59 &.39/.40/.40 \\ \cline{1-1}  & **H** (i) &.50 &.37 &.44 &.97 &.20 &.18 &.22 &.14 \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: LLM performances using the binary basic (BN(\(\gamma\))) and binary negated (BN(\({}_{\text{NT}}\))) multi-hop questions w/wo CoT prompting on 2 datasets. We exclude Mistral as it knows too few entities (less than 20), resulting in mostly “n/a” values; see Sec. B.3 for the # of entities known by each LLM. For each question type, we mark the best performance in bold among all models w/wo CoT prompting.
+
+Many benchmarks evaluate factual knowledge of LLMs, which can be (1) general [7; 32; 33; 34; 35; 36; 37; 38; 39; 40; 8; 9; 41] or (2) specialized, where the questions are about medicine and healthcare [42; 43], certain languages [44; 45], financial tasks [46], or car systems [47]. In comparison, ERBench can be applied to any domain as long as its underlying database reflects the knowledge of that domain.
+
+Another line of benchmarks evaluates specific functionalities or qualities of LLMs. Functionality evaluations assess LLM performance on tasks such as long text generation [48; 49], semantic role identification [50], knowledge location [51], report or knowledge generation [52; 53; 54], text summarization [55; 56], attributing answers [57], fact checking [58], and multitasking [59]. Quality evaluations, on the other hand, focus on aspects like consistency [60; 61] and reliability [62; 12; 63; 64] of LLM responses. ERBench aligns most closely with fact-checking and reliability, but the key contribution is the automatic evaluation of both model answers and rationales.
+
+Recent scalable LLM benchmarks utilize existing QA datasets [12; 10] or knowledge graphs [11] to automatically generate questions at scale. For example, one can easily convert subject-predicate-object triples in a knowledge graph into a question that asks for the object. However, these approaches fail to verify the thought process of LLMs as they only check whether the final answers are correct. In comparison, ERBench is the first to utilize relational databases for LLM evaluation and can perform automatic rationale verification and systematic multi-hop question generation by leveraging database integrity constraints. We provide a more detailed comparison with benchmarks based on knowledge graphs in Sec. C.
+
+## 6 Conclusion
+
+We proposed ERBench, which pioneers a new direction of LLM benchmark construction by systematically converting any relational database based on the ER model to an LLM benchmark. ERBench starts from a schema and generates questions using an ER diagram and ensures that the LLM responses can be automatically verified using functional dependencies in a principled fashion. In addition, ERBench uses foreign key constraints to join relations and construct multi-hop questions, which can be arbitrarily complex and used to evaluate the intermediate answers of LLMs. Finally, ERBench is extensible in terms of data, modality, and prompt engineering. We generated our own LLM benchmark in \(5\) domains and performed comprehensive analyses in terms of answer and rationale accuracies and hallucination rates using single, multi-hop, and multimodal questions and also performed prompt engineering and fine-tuning. Overall, ERBench is effective in evaluating any LLM's thought process by pinpointing critical keywords.
+
+Societal Impact & LimitationERBench can perform comprehensive evaluations of LLMs, which can help LLM users make informed choices. ERBench's limitation is that it only checks for critical keywords to verify LLM rationales. Although we demonstrated that this strategy is very effective, an interesting future work is to verify rationales based on their entire contents.
+
+\begin{table}
+\begin{tabular}{l c c c c c c c c c c c} \hline \hline  & & \multicolumn{3}{c}{**Movie**} & \multicolumn{3}{c}{**Soocer**} & \multicolumn{3}{c}{**Airport**} & \multicolumn{3}{c}{**Music**} & \multicolumn{2}{c}{**Book**} \\ \cline{3-11}
+**Model** & **Metric** & BN\({}_{(V)}\) & BN\({}_{(S)}\) & BN\({}_{(V)}\) & BN\({}_{(N)}\) & BN\({}_{(N)}\) & BN\({}_{(N)}\) & BN\({}_{(N)}\) & BN\({}_{(N)}\) & BN\({}_{(N)}\) & BN\({}_{(N)}\) & BN\({}_{(N)}\) \\ \hline \hline \multirow{4}{*}{GPT-3.5} & A &.85 &.06 &.35 &.00 &.13 &.00 &.58 &.20 &.77 &.01 \\  & **R** &.81 &.11 &.28 &.02 &.01 &.00 &.36 &.18 &.13 &.01 \\  & **AR** &.80 &.05 &.24 &.00 &.01 &.00 &.34 &.14 &.12 &.00 \\  & **H** (\(\downarrow\)) &.15 &.94 &.64 & 1.0 &.67 &.97 &.27 &.76 & **.05** &.94 \\ \hline \multirow{4}{*}{GPT-3.5} & A &.88 & **.89** &.92 &.92 & **.94** &.91 & **.93** & **.93** & **.94** &.68 \\  & R &.93 & **.95** &.75 &.71 & **.09** & **.08** & **.61** & **.55** &.09 &.10 \\  + FT w/ Soccer & AR &.84 & **.86** &.70 &.66 & **.09** & **.08** & **.60** & **.54** &.09 &.09 \\  & **H** (\(\downarrow\)) &.12 & **.11** &.08 &.08 & **.06** &.09 & **.07** & **.07** &.06 &.32 \\ \hline \multirow{4}{*}{GPT-3.5} & A & **.95** &.34 & **.97** & **.96** &.51 & **1.0** &.20 &.91 &.50 & **.95** \\  & **R** & **.98** & **.95** & **.81** & **.78** &.07 &.07 &.53 &.53 & **.17** & **.17** \\ + FT w/ 4 Datasets & AR & **.93** &.34 & **.78** & **.75** &.05 &.07 &.16 &.49 & **.13** & **.17** \\  & **H** (\(\downarrow\)) & **.05** &.65 & **.03** & **.04** &.49 & **.00** &.80 &.09 &.50 & **.05** \\ \hline \hline \end{tabular}
+\end{table}
+Table 6: GPT-3.5 performances on (1) only the _Soocer_ dataset and (2) the combined dataset of _Movie_, _Soocer_, _Music_, and _Book_. See Sec. B.3 for the number of entities known by GPT-3.5 after fine-tuning. Lower **H** values are better, whereas higher **A**, **R**, and **AR** values are better.
+
+## Acknowledgments and Disclosure of Funding
+
+This research was supported by the MSIT(Ministry of Science, ICT), Korea, under the Global Research Support Program in the Digital Field program)(RS-2024-00436680) supervised by the IITP(Institute for Information & Communications Technology Planning & Evaluation). This project is supported by Microsoft Research Asia and the resource is supported by the Microsoft Accelerating Foundation Models Research (AFMR) Program.
+
+## References
+
+* [1] OpenAI. Gpt-4 technical report, 2023.
+* [2] Gemini Team and Rohan Anil. Gemini: A family of highly capable multimodal models. 11 2023.
+* [3] Yue Zhang, Yafu Li, Leyang Cui, Deng Cai, Lemao Liu, Tingchen Fu, Xinting Huang, Enbo Zhao, Yu Zhang, Yulong Chen, et al. Siren's song in the ai ocean: A survey on hallucination in large language models. _arXiv preprint arXiv:2309.01219_, 2023.
+* [4] Lei Huang, Weijiang Yu, Weitao Ma, Weihong Zhong, Zhangyin Feng, Haotian Wang, Qianglong Chen, Weihua Peng, Xiaocheng Feng, Bing Qin, et al. A survey on hallucination in large language models: Principles, taxonomy, challenges, and open questions. _arXiv preprint arXiv:2311.05232_, 2023.
+* [5] Hongbin Ye, Tong Liu, Aijia Zhang, Wei Hua, and Weiqiang Jia. Cognitive mirage: A review of hallucinations in large language models. _arXiv preprint arXiv:2309.06794_, 2023.
+* [6] Vipula Rawte, Amit Sheth, and Amitava Das. A survey of hallucination in large foundation models. _arXiv preprint arXiv:2309.05922_, 2023.
+* [7] Stephanie Lin, Jacob Hilton, and Owain Evans. Truthfulqa: Measuring how models mimic human falsehoods. In _ACL_, pages 3214-3252, 2022.
+* [8] Aarohi Srivastava, Abhinav Rastogi, Abhishek Rao, Abu Awal Md Shoeb, Abubakar Abid, Adam Fisch, Adam R. Brown, Adam Santoro, Aditya Gupta, Adria Garriga-Alonso, Agnieszka Kluska, Aitor Lewkowycz, Akshat Agarwal, Alethea Power, Alex Ray, Alex Warstadt, Alexander W. Kocurek, Ali Safaya, Ali Tazarv, Alice Xiang, Alicia Parrish, Allen Nie, Aman Hussain, Amanda Askell, Amanda Dsouza, Ameet Rahane, Anantharaman S. Iyer, Anders Andreassen, Andrea Santilli, Andreas Stuhlmuller, Andrew M. Dai, Andrew La, Andrew K. Lampinen, Andy Zou, Angela Jiang, Angelica Chen, Anh Vuong, Animesh Gupta, Anna Gottardi, Antonio Norelli, Anu Venkatesh, Arash Cholamidavoodi, Arfa Tabassum, Arul Menezes, Arun Kriubarajan, Asher Mullokandov, Ashish Sabharwal, Austin Herrick, Avia Efrat, Aykut Erdem, Ayla Karakas, and et al. Beyond the imitation game: Quantifying and extrapolating the capabilities of language models. _CoRR_, abs/2206.04615, 2022.
+* [9] Mirac Suzgun, Nathan Scales, Nathanael Scharli, Sebastian Gehrmann, Yi Tay, Hyung Won Chung, Aakanksha Chowdhery, Quoc V. Le, Ed Chi, Denny Zhou, and Jason Wei. Challenging big-bench tasks and whether chain-of-thought can solve them. In _ACL_, pages 13003-13051, 2023.
+* [10] Junyi Li, Xiaoxue Cheng, Xin Zhao, Jian-Yun Nie, and Ji-Rong Wen. Halueval: A large-scale hallucination evaluation benchmark for large language models. In _EMNLP_, pages 6449-6464, 2023.
+* [11] Kai Sun, Yifan Ethan Xu, Hanwen Zha, Yue Liu, and Xin Luna Dong. Head-to-tail: How knowledgeable are large language models (llm)? A.K.A. will lms replace knowledge graphs? _CoRR_, abs/2308.10168, 2023.
+* [12] Xiaodong Yu, Hao Cheng, Xiaodong Liu, Dan Roth, and Jianfeng Gao. Automatic hallucination assessment for aligned large language models via transferable adversarial attacks. _CoRR_, abs/2310.12516, 2023.
+
+* [13] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Brian Ichter, Fei Xia, Ed H. Chi, Quoc V. Le, and Denny Zhou. Chain-of-thought prompting elicits reasoning in large language models. In _NeurIPS_, 2022.
+* [14] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. _Advances in neural information processing systems_, 33:1877-1901, 2020.
+* [15] Gregoire Mialon, Roberto Dessi, Maria Lomeli, Christoforos Nalmpantis, Ramakanth Pasunuru, Roberta Raileanu, Baptiste Roziere, Timo Schick, Jane Dwivedi-Yu, Asli Celikyilmaz, Edouard Grave, Yann LeCun, and Thomas Scialom. Augmented language models: a survey. _CoRR_, abs/2302.07842, 2023.
+* [16] Yuchen Zhuang, Yue Yu, Kuan Wang, Haotian Sun, and Chao Zhang. Toolqa: A dataset for LLM question answering with external tools. _CoRR_, abs/2306.13304, 2023.
+* [17] Tu Vu, Mohit Iyyer, Xuezhi Wang, Noah Constant, Jerry W. Wei, Jason Wei, Chris Tar, Yun-Hsuan Sung, Denny Zhou, Quoc V. Le, and Thang Luong. Freshlms: Refreshing large language models with search engine augmentation. _CoRR_, abs/2310.03214, 2023.
+* [18] OpenAI. Chatgpt. https://chat.openai.com, 2022.
+* [19] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas Blecher, Cristian Canton Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes, Jeremy Fu, Wenyin Fu, Brian Fuller, Cynthia Gao, Vedanuj Goswami, Naman Goyal, Anthony Hartshorn, Saghar Hosseini, Rui Hou, Hakan Inan, Marcin Kardas, Viktor Kerkez, Madian Khabas, Isabel Kloumann, Artem Korneev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier Martinet, Todor Mihaylov, Pushkar Mishra, Igor Molybgo, Yixin Nie, Andrew Poulton, Jeremy Rezenstein, Rashi Rungta, Kalyan Saladi, Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian, Xiaoqing Ellen Tan, Binh Tang, Ross Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng Yan, Iliyan Zarov, Yuchen Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien Rodriguez, Robert Stojnic, Sergey Edunov, and Thomas Scialom. Llama 2: Open foundation and fine-tuned chat models, 2023.
+* [20] Anthropic. Introducing the next generation of claude. https://www.anthropic.com/news/claude-3-family, 2024.
+* [21] Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chaplot, Diego de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile Saulnier, Lelio Renard Lavaud, Marie-Anne Lachaux, Pierre Stock, Teven Le Scao, Thibaut Lavril, Thomas Wang, Timothee Lacroix, and William El Sayed. Mistral 7b, 2023.
+* [22] Lei Huang, Weijiang Yu, Weitao Ma, Weihong Zhong, Zhangyin Feng, Haotian Wang, Qianglong Chen, Weihua Peng, Xiaocheng Feng, Bing Qin, and Ting Liu. A survey on hallucination in large language models: Principles, taxonomy, challenges, and open questions. _CoRR_, abs/2311.05232, 2023.
+* [23] Alon Talmor and Jonathan Berant. The web as a knowledge-base for answering complex questions. _arXiv preprint arXiv:1803.06643_, 2018.
+* [24] Johannes Welbl, Pontus Stenetorp, and Sebastian Riedel. Constructing datasets for multi-hop reading comprehension across documents. _Transactions of the Association for Computational Linguistics_, 6:287-302, 2018.
+* [25] Himanshu Sekhar Paul. Imdb movie ratings dataset. https://www.kaggle.com/datasets/thedevastator/imdb-movie-ratings-dataset, 2018.
+* [26] Stefano Leone. Fifia 20 complete player dataset. https://www.kaggle.com/datasets/stefanoleone992/fifa-20-complete-player-dataset, 2019.
+* [27] Mike Borsetti. Flights and airports data. https://www.https://github.com/mwgg/Airports, 2020.
+
+* [28] Luan Moura. Music dataset : 1950 to 2019. https://www.kaggle.com/datasets/saurabhshahane/music-dataset-1950-to-2019, 2021.
+* [29] Elvin Rustamov. Books dataset. https://www.kaggle.com/datasets/elvinrustam/books-dataset, 2023.
+* [30] Muru Zhang, Ofir Press, William Merrill, Alisa Liu, and Noah A Smith. How language model hallucinations can snowball. _arXiv preprint arXiv:2305.13534_, 2023.
+* [31] Harrison Chase. LangChain, October 2022. URL https://github.com/langchain-ai/langchain.
+* [32] Tianyu Liu, Yizhe Zhang, Chris Brockett, Yi Mao, Zhifang Sui, Weizhu Chen, and Bill Dolan. A token-level reference-free hallucination detection benchmark for free-form text generation. In _ACL_, pages 6723-6737, 2022.
+* [33] Xiang Yue, Boshi Wang, Ziru Chen, Kai Zhang, Yu Su, and Huan Sun. Automatic evaluation of attribution by large language models. In _EMNLP_, pages 4615-4635, 2023.
+* [34] Peter Hase, Mona T. Diab, Asli Celikyilmaz, Xian Li, Zornitsa Kozareva, Veselin Stoyanov, Mohit Bansal, and Srinivasan Iyer. Methods for measuring, updating, and visualizing factual beliefs in language models. In _EACL_, pages 2706-2723, 2023.
+* [35] Pouya Pezeshkpour. Measuring and modifying factual knowledge in large language models. _CoRR_, abs/2306.06264, 2023.
+* [36] Jifan Yu, Xiaozhi Wang, Shangqing Tu, Shulin Cao, Daniel Zhang-li, Xin Lv, Hao Peng, Zijun Yao, Xiaohan Zhang, Hanming Li, Chunyang Li, Zheyuan Zhang, Yushi Bai, Yantao Liu, Amy Xin, Nianyi Lin, Kaifeng Yun, Linlu Gong, Jianhui Chen, Zhili Wu, Yunjia Qi, Weikai Li, Yong Guan, Kaisheng Zeng, Ji Qi, Hailong Jin, Jinxin Liu, Yu Gu, Yuan Yao, Ning Ding, Lei Hou, Zhiyuan Liu, Bin Xu, Jie Tang, and Juanzi Li. Kola: Carefully benchmarking world knowledge of large language models. _CoRR_, abs/2306.09296, 2023.
+* [37] Dor Muhlgay, Ori Ram, Inbal Magar, Yoav Levine, Nir Ratner, Yonatan Belinkov, Omri Abend, Kevin Leyton-Brown, Amnon Shashua, and Yoav Shoham. Generating benchmarks for factuality evaluation of language models. _CoRR_, abs/2307.06908, 2023.
+* [38] Shiqi Chen, Yiran Zhao, Jinghan Zhang, I-Chun Chern, Siyang Gao, Pengfei Liu, and Junxian He. FELM: benchmarking factuality evaluation of large language models. _CoRR_, abs/2310.00741, 2023.
+* [39] Shiping Yang, Renliang Sun, and Xiaojun Wan. A new benchmark and reverse validation method for passage-level hallucination detection. In _EMNLP_, pages 3898-3908, 2023.
+* [40] Xuming Hu, Junzhe Chen, Xiaochuan Li, Yufei Guo, Lijie Wen, Philip S. Yu, and Zhijiang Guo. Do large language models know about facts? _CoRR_, abs/2310.05177, 2023.
+* [41] Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William W. Cohen, Ruslan Salakhutdinov, and Christopher D. Manning. Hotpotqa: A dataset for diverse, explainable multi-hop question answering. In _EMNLP_, pages 2369-2380, 2018.
+* [42] Ankit Pal, Logesh Kumar Umapathi, and Malaikannan Sankarasubbu. Med-halt: Medical domain hallucination test for large language models. In _CoNLL_, pages 314-334, 2023.
+* [43] Muhammad Aurangzeb Ahmad, Ilker Yaramis, and Taposh Dutta Roy. Creating trustworthy llms: Dealing with hallucinations in healthcare AI. _CoRR_, abs/2311.01463, 2023.
+* [44] Qinyuan Cheng, Tianxiang Sun, Wenwei Zhang, Siyin Wang, Xiangyang Liu, Mozhi Zhang, Junliang He, Mianqi Huang, Zhangyue Yin, Kai Chen, and Xipeng Qiu. Evaluating hallucinations in chinese large language models. _CoRR_, abs/2310.03368, 2023.
+* [45] Xun Liang, Shichao Song, Simin Niu, Zhiyu Li, Feiyu Xiong, Bo Tang, Zhaohui Wy, Dawei He, Peng Cheng, Zhonghao Wang, and Haiying Deng. Uhgeval: Benchmarking the hallucination of chinese large language models via unconstrained generation. _CoRR_, abs/2311.15296, 2023.
+
+* [46] Haoqiang Kang and Xiao-Yang Liu. Deficiency of large language models in finance: An empirical examination of hallucination. _CoRR_, abs/2311.15548, 2023.
+* [47] Mobashir Sadat, Zhengyu Zhou, Lukas Lange, Jun Araki, Arsalan Gundroo, Bingqing Wang, Rakesh Menon, Md. Rizwan Parvez, and Zhe Feng. Delucionqa: Detecting hallucinations in domain-specific question answering. In _EMNLP_, pages 822-835, 2023.
+* [48] Sewon Min, Kalpesh Krishna, Xinxi Lyu, Mike Lewis, Wen-tau Yih, Pang Wei Koh, Mohit Iyyer, Luke Zettlemoyer, and Hannaneh Hajishirzi. Factscore: Fine-grained atomic evaluation of factual precision in long form text generation. In _EMNLP_, pages 12076-12100, 2023.
+* [49] Zican Dong, Tianyi Tang, Junyi Li, Wayne Xin Zhao, and Ji-Rong Wen. BAMBOO: A comprehensive benchmark for evaluating long text modeling capacities of large language models. _CoRR_, abs/2309.13345, 2023.
+* [50] Jing Fan, Dennis Aumiller, and Michael Gertz. Evaluating factual consistency of texts with semantic role labeling. In _*SEM@ACL_, pages 89-100, 2023.
+* [51] Yiming Ju and Zheng Zhang. Klob: a benchmark for assessing knowledge locating methods in language models. _CoRR_, abs/2309.16535, 2023.
+* 14th International Workshop, MLMI 2023, Held in Conjunction with MICCAI 2023, Vancouver, BC, Canada, October 8, 2023, Proceedings, Part II_, volume 14349 of _Lecture Notes in Computer Science_, pages 214-223, 2023.
+* [53] Fan Gao, Hang Jiang, Moritz Blum, Jinghui Lu, Yuang Jiang, and Irene Li. Large language models on wikipedia-style survey generation: an evaluation in NLP concepts. _CoRR_, abs/2308.10410, 2023.
+* [54] Liang Chen, Yang Deng, Yatao Bian, Zeyu Qin, Bingzhe Wu, Tat-Seng Chua, and Kam-Fai Wong. Beyond factuality: A comprehensive evaluation of large language models as knowledge generators. In _EMNLP_, pages 6325-6341, 2023.
+* [55] Philippe Laban, Wojciech Kryscinski, Divyansh Agarwal, Alexander R. Fabbri, Caiming Xiong, Shafiq Joty, and Chien-Sheng Wu. Llms as factual reasoners: Insights from existing benchmarks and beyond. _CoRR_, abs/2305.14540, 2023.
+* [56] Derek Tam, Anisha Mascarenhas, Shiyue Zhang, Sarah Kwan, Mohit Bansal, and Colin Raffel. Evaluating the factual consistency of large language models through news summarization. In _ACL_, pages 5220-5255, 2023.
+* [57] Guido Zuccon, Bevan Koopman, and Razia Shaik. Chatgpt hallucinates when attributing answers. In _SIGIR_, pages 46-51, 2023.
+* [58] Han Cao, Lingwei Wei, Mengyang Chen, Wei Zhou, and Songlin Hu. Are large language models good fact checkers: A preliminary study. _CoRR_, abs/2311.17355, 2023.
+* [59] Yejin Bang, Samuel Cahyawijaya, Nayeon Lee, Wenliang Dai, Dan Su, Bryan Wilie, Holy Lovenia, Ziwei Ji, Tiezheng Yu, Willy Chung, Quyet V. Do, Yan Xu, and Pascale Fung. A multitask, multilingual, multimodal evaluation of chatgpt on reasoning, hallucination, and interactivity. _CoRR_, abs/2302.04023, 2023.
+* [60] Jian Xie, Kai Zhang, Jiangjie Chen, Renze Lou, and Yu Su. Adaptive chameleon or stubborn cloth: Unraveling the behavior of large language models in knowledge clashes. _CoRR_, abs/2305.13300, 2023.
+* [61] Jirui Qi, Raquel Fernandez, and Arianna Bisazza. Cross-lingual consistency of factual knowledge in multilingual language models. In _EMNLP_, pages 10650-10666, 2023.
+* [62] Xiang Chen, Duanzheng Song, Honghao Gui, Chengxi Wang, Ningyu Zhang, Fei Huang, Chengfei Lv, Dan Zhang, and Huajun Chen. Unveiling the siren's song: Towards reliable fact-conflicting hallucination detection. _CoRR_, abs/2310.12086, 2023.
+
+* [63] Lingbo Mo, Boshi Wang, Muhao Chen, and Huan Sun. How trustworthy are open-source llms? an assessment under malicious demonstrations shows their vulnerabilities. _CoRR_, abs/2311.09447, 2023.
+* [64] Muru Zhang, Ofir Press, William Merrill, Alisa Liu, and Noah A. Smith. How language model hallucinations can snowball. _CoRR_, abs/2305.13534, 2023.
+* [65] Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc V Le, Ed H. Chi, Sharan Narang, Aakanksha Chowdhery, and Denny Zhou. Self-consistency improves chain of thought reasoning in language models. In _ICLR_, 2023.
+* [66] Yao Fu, Hao Peng, Ashish Sabharwal, Peter Clark, and Tushar Khot. Complexity-based prompting for multi-step reasoning. In _ICLR_, 2023.
+* [67] Tianyi Zhang, Varsha Kishore, Felix Wu, Kilian Q. Weinberger, and Yoav Artzi. Bertscore: Evaluating text generation with BERT. In _ICLR_, 2020.
+* [68] Nuno Miguel Guerreiro, Elena Voita, and Andre F. T. Martins. Looking for a needle in a haystack: A comprehensive study of hallucinations in neural machine translation. In Andreas Vlachos and Isabelle Augenstein, editors, _EACL_, pages 1059-1075, 2023.
+* [69] Jinlan Fu, See-Kiong Ng, Zhengbao Jiang, and Pengfei Liu. Gptscore: Evaluate as you desire. _CoRR_, abs/2302.04166, 2023.
+* [70] James Thorne, Andreas Vlachos, Oana Cocarascu, Christos Christodoulopoulos, and Arpit Mittal. The fact extraction and verification (FEVER) shared task. _CoRR_, abs/1811.10971, 2018.
+* [71] Nayeon Lee, Belinda Z. Li, Sinong Wang, Wen-tau Yih, Hao Ma, and Madian Khabsa. Language models as fact checkers? _CoRR_, abs/2006.04102, 2020.
+* [72] Shi-Qi Yan, Jia-Chen Gu, Yun Zhu, and Zhen-Hua Ling. Corrective retrieval augmented generation. _CoRR_, abs/2401.15884, 2024.
+* [73] Saurav Kadavath, Tom Conerly, Amanda Askell, Tom Henighan, Dawn Drain, Ethan Perez, Nicholas Schiefer, Zac Hatfield-Dodds, Nova DasSarma, Eli Tran-Johnson, Scott Johnston, Sheer El Showk, Andy Jones, Nelson Elhage, Tristan Hume, Anna Chen, Yuntao Bai, Sam Bowman, Stanislav Fort, Deep Ganguli, Danny Hernandez, Josh Jacobson, Jackson Kernion, Shauna Kravec, Liane Lovitt, Kamal Ndousse, Catherine Olsson, Sam Ringer, Dario Amodei, Tom Brown, Jack Clark, Nicholas Joseph, Ben Mann, Sam McCandlish, Chris Olah, and Jared Kaplan. Language models (mostly) know what they know. _CoRR_, abs/2207.05221, 2022.
+* [74] Potsawee Manakul, Adian Liusie, and Mark J. F. Gales. Selfcheckgpt: Zero-resource black-box hallucination detection for generative large language models. In Houda Bouamor, Juan Pino, and Kalika Bali, editors, _EMNLP_, pages 9004-9017, 2023.
+* text datasets informed by cyclic evaluation. In _Proceedings of the 2024 Joint International Conference on Computational Linguistics, Language Resources and Evaluation (LREC-COLING 2024)_, pages 3782-3803, Torino, Italia, May 2024. ELRA and ICCL.
+* [76] Xinze Li, Yixin Cao, Liangming Pan, Yubo Ma, and Aixin Sun. Towards verifiable generation: A benchmark for knowledge-aware language model attribution. _arXiv preprint arXiv:2310.05634_, 2023.
+* [77] Chao Feng, Xinyu Zhang, and Zichu Fei. Knowledge solver: Teaching llms to search for domain knowledge from knowledge graphs. _arXiv preprint arXiv:2309.03118_, 2023.
+* [78] Cheng Qian, Xinran Zhao, and Sherry Tongshuang Wu. " merge conflicts!" exploring the impacts of external distractors to parametric knowledge graphs. _arXiv preprint arXiv:2309.08594_, 2023.
+* [79] Xanh Ho, Anh-Khoa Duong Nguyen, Saku Sugawara, and Akiko Aizawa. Constructing a multi-hop qa dataset for comprehensive evaluation of reasoning steps. _arXiv preprint arXiv:2011.01060_, 2020.
+
+Appendix - More Details on Datasets and Functional Dependencies
+
+### More Details on Datasets
+
+Continuing from Sec. 4, we provide more details on the 5 datasets utilized in our experiments.*
+
+* _Movie_[25]: We use a relation with the attributes _movie title_, _released year_, _director_, _country of origin_, _genre_ and _4 main stars_. For multi-hop questioning, we join this relation with a separate _Director_ relation with the attributes _director name_ and _birth year_. We generate the _Director_ relation using the crawled data from Wikipedia.
+* _Soccer_[26]: We use a relation with the attributes _player name_, _club_, _jersey number_, _nationality_, and _league_. For multi-hop questioning, we join this relation with a separate _Club_ relation with the attributes _club name_ and _located city_, and _Olympic_ relation with the attributes _city name_ and _hosted years_. Note that the _Olympic_ relation encompasses information pertaining to the Summer Olympics; for the sake of brevity, we refer to it simply as _Olympic_. We generate the _Club_ and _Olympic_ relation using the crawled data from Wikipedia.
+* _Airport_[27]: We use a relation with the attributes _airport name_, _shortcode_, _latitude_, _longitude_, _located city_, and _country code_.
+* _Music_[28]: We use a relation with the attributes _music title_, _artist name_, _released year_, and _genre_.
+* _Book_[29]: We use a relation with the attributes _book title_, _author_, _published date_, and _publisher name_.
+
+We note that personal information included in the above datasets, such as the names of soccer players and movie stars, are all sourced from publicly available and reputable resources like official soccer league websites and online movie databases. Additionally, we have ensured that the datasets do not contain any offensive content.
+
+### Functional Dependencies and Question Templates
+
+Continuing from Sec. 4, we provide the functional dependencies and example questions used in our binary questions and multiple-choice questions in Table 7 and Table 8, respectively. As noted in the main text, our main focus is to transform existing relational databases into questions, and the performance of an LLM on these questions may vary depending on the data fidelity of a given database.
+
+\begin{table}
+\begin{tabular}{c l l} \hline \hline
+**Dataset** & **FD** & **Example Question** \\ \hline \hline \multirow{2}{*}{_Movie_} & _director_, _star_, _released year_ & _Is there a movie, released in \(\langle 2009\rangle\), starring \(\langle\)CCH Pounder_\(\rangle\) \\  & \(\rightarrow\) _movie title_ & _where (James Cameron) is the director?_ \\ \hline \multirow{2}{*}{_Soccer_} & _club, jersey number, nationality_ & _Is there a soccer player from \(\langle\)Portugal\(\rangle\) who played for_ \\  & \(\rightarrow\) _player name (2019 year only)_ & \(\langle\)_Jwentus\(\rangle\) with uniform number \(\langle 7\rangle\) in \(\langle\)Jwentus\(\rangle\) in 2019?_ \\ \hline \multirow{2}{*}{_Airport_} & _latitude_, _longitude_ & _Is there an airport located at latitude \(\langle\)-34.7833\(\rangle\) and_ \\  & \(\rightarrow\) _airport name_ & _longitude (-72.0508)?_ \\ \hline \multirow{2}{*}{_Music_} & _music title_, _released year_ & _Is there an artist or group who song a song titled_ \\  & \(\rightarrow\) _artist name_ & _(“Day After Day”) in \(\langle\)1971\(\rangle\)?_ \\ \hline \multirow{2}{*}{_Book_} & _author, published date_ & _Is there a book written by \(\langle\)Adams, Stacy Hawkins\(\rangle\) that was_ \\  & \(\rightarrow\) _book title_ & _published in \(\langle\)October, 2004\(\rangle\)?_ \\ \hline \hline \end{tabular}
+\end{table}
+Table 7: FDs and binary question examples of the 5 datasets.
+
+[MISSING_PAGE_FAIL:16]
+
+### Assessing Internal Knowledge of LLMs
+
+Continuing from Sec. 4, we provide more details on our approach to assess an LLM's internal knowledge. We directly ask the LLM if it knows about an entity and its attributes in a given relation. Here, the goal is not to assess if the LLMs have a deep, philosophical understanding of the entity, but rather to evaluate their mechanical abilities to represent and describe the entity and its attributes. The input prompts for these questions to assess known entities are different for binary and multiple-choice questions, as we explain below. For simplicity, let us assume that we have a _Movie_ relation with an FD _title_, _year_\(\rightarrow\)_director_, _length_.
+
+**Binary Questions.** For the binary questions, we use one input prompt per entity that concatenates the following questions:
+
+* One question that asks the left-hand side (LHS) attributes of the FD
+* Multiple questions that ask the right-hand side (RHS) attributes of the FD
+
+For example, for the _Movie_ relation, we use one input prompt _"Do you know about the movie \(\langle\)title\(\rangle\) released in \(\langle\)year\(\rangle\)? If yes, is the movie directed by \(\langle\)director\(\rangle\)? If yes, does the movie have the length \(\langle\)length\(\rangle\)?"_. Due to the concatenation, we can check whether the LLM knows all attribute values of
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**CASE STUDY FOR GLAUDE-3-SONNET, MUSIC DATASET** \\ \hline
+**Q:** Is there an artist or group who sang a song titled that’s the way love goes in 1993? \\
+**A:** Yes \\
+**R:** The song was recorded by American singer **Janet Jackson** and released as the lead single from her fifth \\ studio album, “janet.”... \\ \hline \hline \end{tabular}
+\end{table}
+Table 11: Case study where **AR** is needed. Here, the model’s answer and rationale are both correct. We would like to be more conservative and only measure the cases when both the answer and rationale are correct. The **AR** metric is used for this purpose. The gold rationale is in bold text.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**CASE STUDY FOR GLAUDE-3-SONNET, MUSIC DATASET** \\ \hline
+**Q:** Is there an artist or group who sang a song titled that’s the way love goes in 1993? \\
+**A:** Yes \\
+**R:** The song was recorded by American singer **Janet Jackson** and released as the lead single from her fifth \\ studio album, “janet.”... \\ \hline \hline \end{tabular}
+\end{table}
+Table 12: Case study where **H** is needed. Here, the answer is not given by the model. If an LLM is not sure about its answer, it may be better to not give one at all [11]. The **H** metric is used to measure the proportion of incorrect outputs while ignoring such non-answers.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**CASE STUDY FOR GLAUDE-3-SONNET, MUSIC DATASET** \\ \hline
+**Q:** Is there an artist or group who sang a song titled that’s the way love goes in 1993? \\
+**A:** Yes \\
+**R:** The song was recorded by American singer **Janet Jackson** and released as the lead single from her fifth \\ studio album, “janet.”... \\ \hline \hline \end{tabular}
+\end{table}
+Table 10: Case study where **A** is incorrect, and **R** is correct. Here, the model’s answer is incorrect, but its rationale contains the right keyword “Titanic”. Again, we would like to distinguish the answer and rationale performances by using the **A** and **R** metrics, respectively.
+
+[MISSING_PAGE_FAIL:18]
+
+[MISSING_PAGE_FAIL:19]
+
+[MISSING_PAGE_FAIL:20]
+
+### More Extended Multiple-Choice Question Results
+
+Continuing from Sec. 4.1, we provide results of extending the multiple-choice questions with the _None of the above_ option. Fig. 2 shows the resulting performance of GPT-3.5 and GPT-4 on the 3 datasets. Both GPT-3.5 and GPT-4 show decreased answer accuracies as the proportion of _None of the above_ options increases. Notably, GPT-4 demonstrates a more stable performance compared to GPT-3.5 where the answer accuracy decreases by no more than 4%.
+
+### Multi-hop Question Construction
+
+Continuing from Sec. 4.3, we provide more details on the multi-hop question construction. For multi-hop analysis, we construct 2-hop and 3-hop questions by joining relations using foreign key constraints (FKCs) as outlined in Sec. 3.3. For 2-hop questions, we join two relations - _Movie_ and _Director_ - using an FKC on the director's name (i.e., _director_ in _Movie_ and _director name_ in _Director_). For 3-hop questions, we join three relations - _Soccer_, _Club_, _Olympic_ - using the two FKCs: (1) club name to join _Soccer_ and _Club_ (i.e., _club_ in _Soccer_ and _club name_ in _Club_) and (2) city name to join _Club_ and _Olympic_ (i.e., _located city_ in _Club_ and _city name_ in _Olympic_; see more dataset details in Sec. A.1). Given the joined relations, we ask questions to infer foreign key values along with the targeted answer - see example questions in Table 20.
+
+### More Analyses on Multi-Hop Question Results
+
+Continuing from Sec. 4.3, we further highlight ERBench's advantages by providing more analyses on the multi-hop dataset in Sec. 4.3. We introduce two metrics:
+
+* \(\mathbf{Pr}(\boldsymbol{r_{i+1}}|\boldsymbol{r_{i}})\): the conditional probability of the rationale at hop \(i+1\) being correct given that the rationale at hop \(i\) is incorrect
+
+The results are shown in Table 21. \(\mathbf{Pr}(\boldsymbol{r_{i+1}}|\boldsymbol{r_{i}})\) is significantly higher than \(\mathbf{Pr}(\boldsymbol{r_{i+1}}|\boldsymbol{\neg r_{i}})\) for all cases, which means that hop \(i\)'s correctness largely influences hop \(i+1\)'s correctness. Thus it is important for initial hops to be correct to avoid any snowballing of incorrectness.
+
+We observe that for Gemini on the Movie & Director dataset, the correctness of a prior hop has relatively less influence on the correctness of subsequent hops. We provide a representative case
+
+\begin{table}
+\begin{tabular}{c l l} \hline \hline
+**Dataset** & **FD** & **Example Question** \\ \hline \hline _Movie \& Director_ & Movie: _movie title_\(\rightarrow\) _director_ (**FK**) & _Was the director who directed the movie titled_ \\  & Director: _director name_\(\rightarrow\) _birth year_ & _(Avatar) that was released in \(\langle\)2009\(\rangle\) born_ \\  & & _in the \(\langle\)1950s\(\rangle\)?_ \\ \hline _Soccer \& Olympic_ & Soccer: _player name_\(\rightarrow\) _club_ (**FK**) _(in 2019)_ & _Did the city, where the soccer club, \(\langle\)L. Messi\(\rangle\)_ \\  & Club: _club name_\(\rightarrow\) _located city_ (**FK**) & _played for in 2019, is located in, hosted the_ \\  & Olympic: _city name_\(\rightarrow\) _hosted year_ & _Summer Olympics?_ \\ \hline \hline \end{tabular}
+\end{table}
+Table 20: FDs, FKs, and binary multi-hop question examples of the 2 datasets.
+
+Figure 2: GPT-3.5 and GPT-4 answer accuracy across domains with varying portions of the _None of the above_ option for multiple-choice questions.
+
+study in Table 22, where Gemini correctly retrieves the director's name (hop 1) of the corresponding movie, but fails to retrieve his birth year (hop 2) and thus fails to reason across multi-hops.
+
+### More Few-Shot Prompting Results
+
+Continuing from Sec. 4.5, we provide more details of the few-shot results. When evaluating Mistral, we reduce the size of each dataset to 150 entities due to its extensive inference time. For the binary questions, the numbers of entities known by Mistral in the _Movie_, _Soccer_, _Airport_, _Music_, and _Book_ datasets are 72, 81, 150, 123, and 86, respectively. For the multiple-choice questions, the numbers are 140, 99, 140, 62, and 62, respectively. Table 23 shows the LLM performances in the few-shot setting on the 5 datasets. Compared to the single-hop results in Table 2, the demonstrations in few-shot setting significantly improve the performances of most LLMs, especially for the binary negated prompts. Rather than comparing performances among LLMs, we highlight the overall improvements, as the relative performances among LLMs can greatly vary depending on the quantities and qualities of the given demonstrations. For clarity, we also present all the demonstration prompts of the 5 datasets used in our experiments in Sec. C.2.
+
+\begin{table}
+\begin{tabular}{l l} \hline \hline
+**CASE STUDY FOR GEMINI, MOVIE \& DIRECTOR DATASET** \\ \hline
+**Q:** Was the director who directed the movie titled Pirates of the Caribbean: On Stranger Tides that was released in 2011 born in the 1960s? \\
+**R:** The director of Pirates of the Pirates of the Caribbean: On Stranger Tides is Rob Marshall. There is no publicly available information about his date of birth, so it is not possible to say for sure whether he was born in the 1960s. \\ _(However, Gemini does know the birth year of Rob Marshall if we ask separately.)_ \\
+**Q:** Which year was the director Rob Marshall born in? \\
+**A:** 1960. \\ \hline \hline \end{tabular}
+\end{table}
+Table 21: LLM performances for additional analyses using binary basic and negated multi-hop question w/wo CoT prompting on 2 datasets – see Sec. B.8 for details. All the numbers for the _Movie & Director_ dataset (2-hop) denote \(\mathbf{Pr(r_{2}|r_{1})}\). For the _Soccer & Olympic_ dataset (3-hop), the numbers on the left are the values for \(\mathbf{Pr(r_{2}|r_{1})}\), while those on the right are \(\mathbf{Pr(r_{3}|r_{2})}\). “n/a” means the denominator of the metric is too small for the result to be meaningful(less than 4). For each question type, we mark the best performance in bold among all models w/wo CoT prompting.
+
+\begin{table}
+\begin{tabular}{l l c c c c c c c c} \hline \hline  & & \multicolumn{3}{c}{**Movie \& Director**} & \multicolumn{3}{c}{**Soccer \& Olympic**} \\  & & w/o CoT & w/ CoT & & w/o CoT & w/ CoT \\
+**Model** & **Metric** & BN\({}_{\text{N}^{\text{o}}}\) & BN\({}_{\text{N}^{\text{o}}}\) & BN\({}_{\text{N}^{\text{r}}}\) & BN\({}_{\text{N}^{\text{o}}}\) & BN\({}_{\text{N}^{\text{o}}}\) & BN\({}_{\text{N}^{\text{o}}}\) & BN\({}_{\text{N}^{\text{o}}}\) \\ \hline \hline GPT-3.5 & \(\Pr(r_{i+1}|r_{i})\) &.95 & **.96** &.93 &.95 & **1.0/.57** &.95/.79 & **1.0/1.0** & **1.0/**.94 \\  & \(\mathbf{Pr(r_{i+1}|-r_{i})}\) &.04 &.03 & **.06** &.00 &.10/.00 &.15/.00 &.33/.04 &.31/.02 \\ \hline GPT-4 & \(\Pr(r_{i+1}|r_{i})\) &.96 & **.96** & **.97** &.95 &.99/.96 &.99/.97 & **1.0/**.98** & **1.0/**.97 \\  & \(\mathbf{Pr(r_{i+1}|-r_{i})}\) & n/a & n/a & n/a & n/a & 35/.00 &.27/.00 & **52**/.00 & **55**/.00 \\ \hline Llam2 & \(\Pr(r_{i+1}|r_{i})\) &.92 &.93 & **.97** &.92 & **1.0/.85** & **1.0/.81** & **1.0/**.95** & **1.0/**.93 \\  & \(\mathbf{Pr(r_{i+1}|-r_{i})}\) &.00 &.00 &.00 &.00 &.35/.00 &.18/.00 &.24/.02 &.20/**.04** \\ \hline Gemini & \(\Pr(r_{i+1}|r_{i})\) &.71 &.61 &.61 &.34 & **1.0/n/a** &.96/.90 & **1.0/**.98** & **1.0/**.73 \\ -Pro & \(\mathbf{Pr(r_{i+1}|-r_{i})}\) &.01 &.03 &.00 &.00 &.00/.00 &.01/.00 &.28/**.07** &.11/.00 \\ \hline Claude-3 & \(\Pr(r_{i+1}|r_{i})\) &.90 &.92 &.93 &.92 &.99/.88 &.97/.94 & **1.0/**.98** & **1.0/**.98** \\ -Sonnet & \(\mathbf{Pr(r_{i+1}|-r_{i})}\) & n/a & **.22** & n/a & **.22** &.22/.00 &.03/.00 &.05/.00 &.02/.00 \\ \hline \hline \end{tabular}
+\end{table}
+Table 22: Case study for which the model fails to retrieve correct information for the subsequent hop, even when it successfully retrieves relevant information for the prior hop. **Q:** is the prompt that we input to the model, **R:** is the model’s rationale, and **A:** is the model’s answer. Gemini knows that the director of the corresponding movie is Rob Marshall, but fails to retrieve his birth year. One interesting point is that Gemini knows the birth year of the director, when asked separately.
+
+### Knowledge Augmentation Results
+
+Continuing from Sec. 4.5, we provide more results on knowledge augmentation. We implement a simple knowledge augmentation method using the LangChain API [31], which adds a short summary of an entity or attribute's Wikipedia page to its corresponding single-hop questions used in Sec. 4.1. We also inject the following system prompt to avoid excessive reliance on external texts: _The first few passages are hints, that may not contain all relevant information. Answer the following question with your own knowledge getting help from the first few passages if possible_.
+
+Table 24 shows the resulting performances of GPT-3.5 and GPT-4 on the 2 datasets. Compared to the single-hop results, the performances degrade for the binary questions, but improve for the multiple-choice questions. We note that knowledge augmentation can be more challenging in the binary questions compared to the multiple-choice questions, as an entity is explicitly mentioned in the multiple-choice questions (e.g., _What is the false option of entity \(e\)?_), but not in the binary questions (e.g., _Is there an entity which has the attribute values of \(x\) and \(y\)?_). These results show how ERBench can properly stress test knowledge augmentation approaches, which may perform well on one question type, but not necessarily on others.
+
+## Appendix C Appendix - More Related Work
+
+Continuing from Sec. 5, we provide additional related work.
+
+LLM Hallucination Detection MethodsWe summarize LLM hallucination detection methods that focus more on improving the LLMs instead of evaluating them. First, there are methods [67, 68, 69] that use intrinsic uncertainty metrics like token probability and entropy to detect hallucinations. However, access to token-level probability distributions of LLM responses may be difficult, especially if only a limited external API is provided. In comparison, ERBench does not rely on such metrics. Next, there are methods [70, 71] that retrieve relevant information from external databases to provide
+
+\begin{table}
+\begin{tabular}{c c c c c c c c c c c c c c c c} \hline \hline  & & \multicolumn{3}{c}{**Movie**} & \multicolumn{3}{c}{**Soccer**} & \multicolumn{3}{c}{**Airport**} & \multicolumn{3}{c}{**Music**} & \multicolumn{3}{c}{**Book**} \\
+**Model** & **Metric** & BN(\%) & BN(\%) & MC & BN(\%) & BN(\%) & MC & BN(\%) & BN(\%) & MC & BN(\%) & BN(\%) & MC & BN(\%) & BN(\%) & MC \\ \hline \hline \multirow{4}{*}{GPT-3.5} & **A** & **.79** &.70 &.95 &.81 &.63 &.86 &.21 &.20 &.71 &.80 &.77 &.93 &.91 &.76 &.57 \\  & **R** &.87 &.69 &.96 &.72 &.60 &.70 &.04 &.03 &.44 &.47 &.43 &.66 &.22 &.20 &.22 \\  & **AR** & **.75** &.66 &.95 &.60 &.48 &.68 &.02 &.02 &.44 &.45 &.42 &.66 &.21 &.18 &.21 \\  & **H** (\(\lambda\)) & **.21** &.30 &.05 &.18 &.35 &.14 &.79 &.78 &.29 &.18 &.22 &.07 &.03 &.22 &.43 \\ \hline \multirow{4}{*}{GPT-4} & **A** &.62 &.65 &.98 &.68 &.59 & **.94** &.84 &.91 & **.97** & **.82** &.89 & **.98** &.61 &.40 & **.89** \\  & **R** & **.90** & **.82** &.98 & **.82** & **.80** & **.86** & **.24** & **.24** & **.91** &.78 & **.76** &.87 &.35 & **.31** & **.57** \\  & **AR** &.61 &.64 &.98 &.62 & **.51** & **.86** & **.24** & **.24** & **.91** & **.72** & **.72** & **.87** & **.27** & **.17** & **.57** \\  & **H** (\(\lambda\)) &.38 &.35 &.02 &.32 &.41 & **.06** &.16 &.09 & **.03** & **.17** &.11 & **.02** &.30 &.56 & **.11** \\ \hline \multirow{4}{*}{Llama2} & **A** &.67 &.74 &.96 & **.88** &.62 & n/a & **1.0** &.50 & n/a &.81 &.57 &.94 & **.95** &.24 & n/a \\  & **R** &.75 &.69 &.95 &.59 &.43 & n/a &.01 &.00 & n/a & **.81** &.57 & **.94** & **.95** &.24 & n/a \\  & **AR** &.61 &.66 &.94 &.54 &.37 & n/a &.01 &.00 & n/a &.34 &.24 &.71 &.09 &.04 & n/a \\  & **H** (\(\lambda\)) &.33 &.26 &.04 &.12 &.38 & n/a & **.00** &.50 & n/a &.19 &.43 &.06 &.04 &.76 & n/a \\ \hline \multirow{4}{*}{Gemini-Pro} & **A** &.20 &.04 &.96 &.74 &.24 &.91 &.40 &.00 &.72 &.74 &.59 &.88 &.88 &.20 &.55 \\  & **R** &.53 &.62 &.95 &.56 &.41 &.68 &.01 &.00 &.35 &.17 &.16 &.54 &.11 &.09 &.13 \\  & **AR** &.19 &.03 &.95 &.48 &.13 &.67 &.01 &.00 &.35 &.15 &.11 &.54 &.11 &.05 &.13 \\  & **H** (\(\lambda\)) &.59 &.96 &.04 & **.10** &.67 &.09 & **.00** &.46 &.28 &.19 &.38 &.12 & **.01** &.72 &.45 \\ \hline \multirow{4}{*}{Claude-3} & **A** &.47 &.41 & **.99** &.79 &.58 & n/a &.85 &.69 &.92 &.61 &.47 &.91 &.66 &.28 & n/a \\  & **R** &.80 &.72 & **.99** &.74 &.65 & n/a &.08 &.07 &.79 &.37 &.29 &.88 &.25 &.14 & n/a \\ -Sonnet & **AR** &.46 &.40 & **.93** & **.63** &.46 & n/a &.08 &.06 &.78 &.37 &.28 &.81 &.24 &.14 & n/a \\  & **H** (\(\lambda\)) &.52 &.53 & **.01** &.20 &.18 & n/a &.15 &.14 &.08 &.21 &.10 &.08 &.16 &.04 & n/a \\ \hline \multirow{4}{*}{Mistral} & **A** &.43 & **1.0** &.34 &.32 & **1.0** &.58 &.73 & **1.0** &.27 &.39 & **.99** &.49 &.14 & **.99** &.36 \\  & **R** &.74 &.81 &.39 &.21 &.35 &.33 &.01 &.00 &.03 &.02 &.01 &.34 &.00 &.00 &.01 \\ \cline{1-1}  & **AR** &.39 & **.81** &.31 &.07 &.35 &.29 &.01 &.00 &.00 &.01 &.01 &.29 &.00 &.00 &.01 \\ \cline{1-1}  & **H** (\(\lambda\)) &.57 & **.00** &.66 &.68 & **.00** &.42 &.27 & **.00** &.73 &.59 & **.00** &.51 &.84 & **.01** &.64 \\ \hline \hline \end{tabular}
+\end{table}
+Table 23: LLM performances in few-shot setting on the 5 datasets. The questions and the LLMs used for the evaluation are identical to those in Table 2. The size of the 5 datasets was reduced for Mistral’s evaluation due to its extensive inference time. “n/a” means the LLM knows too few entities (less than 20) for the result to be meaningful; see Sec. B.3 for the number of entities known by each LLM. Lower **H** values are better, whereas higher **A**, **R**, and **AR** values are better.
+
+evidence when assessing the factuality of a given LLM response. However, these additional evidence retrieval steps can be erroneous [72] and may not be sufficient for the assessment. ERBench on the other hand takes a different approach where it builds upon an existing relational database where we already have knowledge on how to evaluate the responses. Finally, there are methods [73; 74] that use LLMs to self-check themselves, for example by prompting them to evaluate their previous responses. However, the detection performance of these methods can be highly dependent on the given LLM's performance. In comparison, ERBench's evaluation depends less on the LLM's performance.
+
+LLM Benchmarks from Knowledge GraphsNumerous LLM benchmarks use knowledge graphs (KGs) [75; 11; 76] for generating evaluation samples, but ERBench use relational databases (RDBs), which have fundamental differences with KGs. While both RDBs and KGs can store large amounts of data and enable scalable benchmarks by converting data into factual questions, they rely on different data models. RDBs are based on the relational data model and assume a fixed schema, which enables strong data integrity based on database design theory; KGs are based on the graph data model and have a schema-less design, which means the format is more flexible, but it may be more challenging to maintain the data integrity.
+
+The key idea of ERBench is to utilize data integrity constraints in RDBs for more effective LLM hallucination evaluation. In particular, ERBench uses (1) functional dependencies (FDs) to automatically pinpoint critical keywords and assess LLM reasoning, and (2) foreign key constraints (FKCs) to systematically construct complex multi-hop questions. These benefits are not easily supported by KGs, as integrity constraints are unique to RDBs. For example, without strong signals like FDs, it can be nontrivial to determine which keywords to focus on in the rationale, leading to most KG-based methods to verify only final answers [77; 11; 78]. Moreover, without FKCs, constructing arbitrarily long multi-hop questions involving multiple connected entities becomes challenging, and existing KG-based methods [41; 79] often require manual curation of bridge entities [41] or logical rules [79] to make the connections. ERBench thus complements KG-based methods, offering unique benefits and enabling new types of analysis through RDBs.
+
+### Multimodal Prompts
+
+Continuing from Sec. 4.4, we provide the multimodal questions used in our experiments. Table 25 and Table 26 show the FDs and the questions of two datasets for the binary and multiple-choice questions, respectively. Due to the restriction policies of vision models, particularly those prohibiting the use of facial images, we make slight modifications to the question templates for the _Movie_ dataset. Similar to Sec. 4.1, we also negate the binary questions to evaluate both _Yes_ and _No_ answers of the LLMs.
+
+\begin{table}
+\begin{tabular}{c c c c c c c c c c c c c c} \hline \hline  & & \multicolumn{6}{c}{**Movie**} & \multicolumn{6}{c}{**Soccer**} \\  & & \multicolumn{3}{c}{w/o KA} & \multicolumn{3}{c}{w/ KA} & \multicolumn{3}{c}{w/o KA} & \multicolumn{3}{c}{w/ KA} \\
+**Model** & **Metric** & BN\({}_{\text{N/O}}\) & BN\({}_{\text{N/O}}\) & MC & BN\({}_{\text{N/O}}\) & BN\({}_{\text{N/O}}\) & MC & BN\({}_{\text{N/O}}\) & BN\({}_{\text{N/O}}\) & MC & BN\({}_{\text{N/O}}\) & BN\({}_{\text{N/O}}\) & MC \\ \hline \hline \multirow{4}{*}{GPT-3.5} & **A** & **.85** &.06 &.97 &.57 &.34 & **.99** &.35 &.00 &.83 &.17 &.00 &.89 \\  & **R** & **.81** &.11 &.96 &.51 &.35 &.63 &.28 &.02 &.60 &.04 &.00 &.37 \\  & **AR** & **.80** &.05 &.96 &.50 &.22 &.62 &.24 &.00 &.55 &.04 &.00 &.35 \\  & **H** (\(\downarrow\)) & **.15** &.94 &.03 &.37 &.44 & **.01** & **.64** & 1.0 &.17 &.10 &.52 &.11 \\ \hline \multirow{4}{*}{GPT-4} & **A** &.65 &.51 &.97 &.57 & **.56** & **.99** & **.47** & **.19** &.91 &.01 &.03 & **.96** \\  & **R** & **.81** & **.76** &.97 &.68 &.64 & **.98** & **.70** & **.49** & **.69** &.02 &.02 &.57 \\  & **AR** &.64 &.50 & **.97** &.56 & **.54** & **.97** & **.41** & **.17** & **.69** &.01 &.02 &.57 \\  & **H** (\(\downarrow\)) &.35 &.47 &.03 &.39 & **.34** & **.01** &.38 &.04 & **.02** & **.02** & **.00** &.04 \\ \hline \hline \end{tabular}
+\end{table}
+Table 24: GPT-3.5 and GPT-4 performances using the binary basic (BN\({}_{\text{N/O}}\)), binary negated (BN\({}_{\text{N/O}}\)), and multiple-choice (MC) questions with knowledge augmentation (KA) on 2 datasets. See Sec. B.3 for the number of entities known by each LLM. Lower **H** values are better, whereas higher **A**, **R**, and **AR** values are better. For each question type, we mark the best performance in bold among all models w/wo KA.
+
+### Demonstration Prompts
+
+Continuing from Sec. 4.5, we provide all demonstration prompts used in the few-shot and Chain-of-Thought [13] (CoT) analyses. Tables 27-36 show the demonstration prompts in the few-shot setting, and Tables 37-38 show the demonstration prompts with CoT. We manually design all demonstration prompts to have balanced distributions w.r.t. the answer type (e.g., _Yes/No_ and _Option_ numbers) to reduce any potential bias in the resulting LLM performances to certain answers.
+
+\begin{table}
+\begin{tabular}{c c c} \hline \hline
+**Dataset** & **FD** & **Question** \\ \hline \hline _Movie_ & _director_, _star_, _released year_ & _Is the movie, released in \(\langle year\rangle\), starring \(\langle star\rangle\)_ \\ \(\rightarrow\) _movie title_, _movie poster (image)_ & _where \(\langle dir\rangle\) is the director the same movie as the movie with the movie poster as the given image?_ \\ \hline _Soccer_ & _nationality_, _jersey number_, _club logo_ (image)_ & _Is there a soccer player from \(\langle country\rangle\) who played_ _for the club in the image with uniform number \(\langle no\rangle\)_ \\ \(\rightarrow\) _player name (2019 year only)_ & _in the club in the image in 2019?_ \\ \hline \hline \end{tabular}
+\end{table}
+Table 26: FDs and multiple-choice questions for multimodal tasks.
+
+\begin{table}
+\begin{tabular}{c c c} \hline \hline
+**Dataset** & **FD** & **Question** \\ \hline \hline _Movie_ & _Movie poster (image)_ & _Q: What’s the inaccurate option about the movie with the movie poster as the given image?_ _Provide an explanation._ \\ _movie poster (image)_ & _Option 1: Directed by \(\langle dir\rangle\)_ \\ _motion \(\rightarrow\) director_, _country of origin_, _genre (amounting, non-uniformity)_ & _Option 2: Produced in the country \(\langle country\rangle\)_ \\ _motion \(\rightarrow\)_ & _Option 3: Has the genre of \(\langle genre\rangle\) movie._ \\ \hline _Soccer_ & _Q: What’s the inaccurate option about soccer player?_ _Provide an explanation._ \\ _motion \(\rightarrow\)_ & _Option 1: Played for the club in the image in 2019._ \\ _motion \(\rightarrow\)_ & _Option 2: Wore jersey number \(\langle no\rangle\) in 2019._ \\ _motion \(\rightarrow\)_ & _Option 3: Born in \(\langle country\rangle\)._ \\ _motion \(\rightarrow\)_ & _Option 4: Participated in league named_ \\ \(\langle league\rangle\) _during the year 2019._ \\ \hline \hline \end{tabular}
+\end{table}
+Table 25: FDs and binary questions for multimodal tasks.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR MOVIE DATASET** \\ \hline
+**Q:** Is there a movie, released in 1975, starring Al Pacino where Sidney Lumet is the director? \\
+**A:** Yes, the movie, among various movies Al Pacino starred in 1975, Sideny Lumet directed the movie \\ “Dog Day Afternoon”. \\
+**Q:** Is it true that there are no movies, released in 2005, starring Ben Affleck where Kevin Smith is the director? \\
+**A:** Yes, it is true. However, there is a movie,“Chasing Amy” that Kevin Smith directed, where Ben Affleck starred in, which was released in 1997. \\
+**Q:** Is it true that there are no movies, released in 2019, starring Kangho Song where Bong Joon-ho is the director? \\
+**A:** No, it is not true. The movie “Parasite”, which was released in 2019 was directed by Bong Joon-ho, where Kangho Song starred in the movie. \\
+**Q:** Is there a movie, released in 1997, starring Jason Biggs where Paul Weitz is the director? \\
+**A:** No, however there is a movie, “American Pie” that Paul Weitz directed, where Jason Biggs starred in, which was released in 1999. \\
+**Q:** Is there a movie, released in 1979, starring George Lazenby where Peter R. Hunt is the director? \\
+**A:** No, however there is movie, “On Her Majesty’s Secret Service” that George Lazenby starred in, where Peter R. Hunt is the director, which was released in 1969. \\
+**Q:** Is it true that there are no movies, released in 2005, starring Leonardo DiCaprio where Martin Scorsese is the director? \\
+**A:** Yes, it is true. However, there is a movie, “Gangs of New York” that Martin Scorsese directed and Leonardo DiCaprio starred in, which was released in 2002. \\
+**Q:** Is it true that there are no movies, released in 1952, starring Robert Taylor where Richard Thorpe is the director? \\
+**A:** No, it is not true. The movie, “Ivanhoe” that Richard Thorpe directed, where Robert Taylor appeared in the movie was released in 1952. \\
+**Q:** Is there a movie, released in 1982, starring Dustin Hoffman where Sydney Pollack is the director? \\
+**A:** Yes, the movie, among various movies that Sydney Pollack directed in 1982, Dustin Hoffman starred in the movie, “Tootsie”. \\ \hline \hline \end{tabular}
+\end{table}
+Table 27: Demonstration prompts for the _Movie_ dataset used in few-shot prompting before asking each binary question. To generate questions that lead to a negative/positive response for the existence/negation prompt respectively, the _released year_ of the movie is modified.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR SOCCER DATASET** \\ \hline
+**Q:** Is there a soccer player from Republic of Korea who played for Valencia CF with uniform number 16 in Valencia CF in 2019? \\
+**A:** Yes, Kangin Lee, a South Korean footballer, was a member of Valencia CF and wore the uniform number 16 while playing for Valencia CF in 2019. \\
+**Q:** Is it true that there are no soccer players from Italy who played for Everton with uniform number 27 in Everton in 2019? \\
+**A:** No, it is not true. There is an Italian soccer player, M. Kean, who was a member of Everton and wore the uniform number 27 while playing for Everton in 2019. \\
+**Q:** Is there a soccer player from Brazil who played for Vissel Kobe with uniform number 10 in Vissel Kobe in 2019? \\
+**A:** No. Lukasz Jozef Podolski (L. Podolski), who was a member of Vissel Kobe and wore the uniform number 10 while playing for Vissel Kobe in 2019 is from Germany, not Brazil. \\
+**Q:** Is it true that there are no soccer players from Italy who played for Crystal Palace with uniform number 13 in Crystal Palace in 2019? \\
+**A:** Yes, it is true. The soccer player, who was a member of Crystal Palace wearing the uniform number 13 while playing for Everton in 2019 was W. Hennessey. He is from Wales, not Italy. \\
+**Q:** Is there a soccer player from Portugal who played for Paris Saint-Germain with uniform number 26 in Paris Saint-Germain in 2019? \\
+**A:** No. Jesé Rodr guez Ruiz (Jesé), a Spanish soccer player, was a member of Paris Saint-Germain and wore the uniform number 26 while playing for Paris Saint-Germain in 2019. He is from Spain, not Portugal. \\
+**Q:** Is there a soccer player from Italy who played for Torino F.C. with uniform number 29 in Torino F.C. in 2019? \\
+**A:** Yes, Lorenzo De Silvestri (L. De Silvestri), an Italian footballer, was a member of Torino F.C. and wore the uniform number 29 while playing for Torino F.C. in 2019. \\
+**Q:** Is it true that there are no soccer players from England who played for Burnley with uniform number 28 in Burnley in 2019? \\
+**A:** No, it is not true. There is a English footballer, M. Lowton, who was a member of Burnley and wore the uniform number 2 while playing for Burnley in 2019. \\
+**Q:** Is it true that there are no soccer players from Japan who played for Philadelphia Union with uniform number 10 in Philadelphia Union in 2019? \\
+**A:** Yes it is true. The soccer player, who was a memebr of Philadelphia Union while wearing the uniform number 10 when playing for Philadelphia Union in 2019 was Marco Jhonfai Fabian De La Mora (M. Fabian). \\ \hline \hline \end{tabular}
+\end{table}
+Table 28: Demonstration prompts for the _Soccer_ dataset used in few-shot prompting before asking each binary question. To generate questions that lead to a negative/positive response for the existence/negation prompt respectively, the _nationality_ of the soccer player is modified.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR AIRPORT DATASET** \\ \hline
+**Q:** Is there an airport located at latitude 33.7756 and longitude -84.3963? \\
+**A:** No, there are no airports located at latitude 33.7756 and longitude -84.3963. This location corresponds to Georgia Institute of Technology, located in Atlanta, Georgia, United States of America. \\
+**Q:** Is it true that there are no airports located at latitude -33.4445 and longitude -70.6510? \\
+**A:** Yes, it is true. There are no airports located at latitude -33.4445 and longitude -70.6510. This location corresponds to University of Chile, located in Santiago, Region Metropolitan, Chile. \\
+**Q:** Is it true that there are no airports located at latitude 48.1180 and longitude 16.5663? \\
+**A:** No, it is not true. There is an airport located at latitude 48.1180 and longitude 16.5663. The airport is called Vienna International Airport and is located in Vienna, Austria. \\
+**Q:** Is there an airport located at latitude -32.2189 and longitude 148.5697? \\
+**A:** Yes, there is an airport located at latitude -32.2189 and longitude 148.5697. The airport is called Dubbo Regional Airport, located in Dubbo, New South Wales, Australia. \\
+**Q:** Is there an airport located at latitude 25.420738 and longitude 51.490154? \\
+**A:** No, there are no airports located at latitude 25.420738 and longitude 51.490154. This location corresponds to Lusail Stadium, located in Lusail, Qatar. \\
+**Q:** Is it true that there are no airports located at latitude -32.9277 and longitude 18.4237? \\
+**A:** Yes, it is true. There are no airports located at latitude -32.9277 and longitude 18.4237. This location corresponds to District Six Museum, located in District Six, Cape Town, South Africa. \\
+**Q:** Is there an airport located at latitude 37.469101 and longitude 126.450996? \\
+**A:** Yes, there is an airport located at latitude 37.469101 and longitude 126.450996. The airport is called Incheon International Airport and is located in Incheon, Republic of Korea. \\
+**Q:** Is it true that there are no airports located at latitude 49.1951 and longitude -123.1788? \\
+**A:** No, it is not true. There is an airport located at latitude 49.1951 and longitude -123.1788. The airport is called Vancouver International Airport, located in Richmond, British Columbia, Canada. \\ \hline \hline \end{tabular}
+\end{table}
+Table 29: Demonstration prompts for the _Airport_ dataset used in few-shot prompting before asking each binary question. To generate questions that lead to a negative/positive response for the existence/negation prompt respectively, _latitude_ and _longitude_ corresponding to places other than airports are added.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR MUSIC DATASET** \\ \hline
+**Q:** Is there an artist or group who sang a song titled solitude standing in 1985? \\
+**A:** No, there is no such artist or group. However, there is an artist who sang a song titled “Solitude Standing” in 1987. The song is by the artist Suzanne Vega. \\
+**Q:** Is it true that no artists nor groups sang a song titled i’m sitting on top of the world in 1953? \\
+**A:** No, it is not true. Les Paul sang a song titled “I’m Sitting On Top Of The World” in 1953. \\
+**Q:** Is it true that no artists nor groups sang a song titled you can’t hurry love in 1976? \\
+**A:** Yes, it is true. However, there is an artist who sang a song titled “You Can’t Hurry Love” in 1966. The song is by the group The Supremes. \\
+**Q:** Is there an artist or group who sang a song titled rebel girl in 1992? \\
+**A:** Yes, there is an artist who sang a song titled “Rebel Girl” in 1992. The song is by the group Bikini Kill. \\
+**Q:** Is it true that no artists nor groups sang a song titled dissident aggressor in 1972? \\
+**A:** Yes, it is true. However, there is an artist who sang a song titled “Dissident Aggressor” in 1977. The song is by the artist Judas Priest. \\
+**Q:** Is there an artist or group who sang a song titled young black male in 1988? \\
+**A:** No, there is no such artist or group. However, there is an artist who sang a song titled “Young Black Male” in 1991. The song is by the artist 2Pac. \\
+**Q:** Is it true that no artists nor groups sang a song titled because you live in 2004? \\
+**A:** No, it is not true. Jesse Mccartney sang a song titled “Because You Live” in 2004. \\
+**Q:** Is there an artist or group who sang a song titled the age of worry in 2012? \\
+**A:** Yes, there is an artist who sang a song titled “The Age Of Worry” in 2012. The song is by the artist \\ John Mayor. \\ \hline \hline \end{tabular}
+\end{table}
+Table 30: Demonstration prompts for the _Music_ dataset used in few-shot prompting before asking each binary question. To generate questions that lead to a negative/positive response for the existence/negation prompt respectively, the _released year_ of the music is modified.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR BOOK DATASET** \\ \hline
+**Q:** Is there a book written by Hodge, Paul that was published in October, 1984? \\
+**A:** Yes, there is a book written by Paul Hodge that was published in October, 1984. The book is titled “The Universe of Galaxies”. \\
+**Q:** Is it true that there are no books written by Mosel, Ted that were published in January, 1978? \\
+**A:** No, it is not true. There is a book written by Ted Mosel that was published in January, 1978. The book is titled “Leading Lady: The World and Theatre of Katharine Cornell”. \\
+**Q:** Is it true that there are no books written by Blanchard, Kenneth H. that were published in June, 1998? \\
+**A:** Yes, it is true. There are no books written by Kenneth H. Blanchard that were published in June, 1998. There is a book, written by Kenneth H. Blanchard that was published in a similar date, June, 1999. The book is titled “The Heart of a Leader”. \\
+**Q:** Is there a book written by Terzian, James P. that was published in February, 1959? \\
+**A:** No, there are no books written by James P. Terzian that was published in February, 1959. There is a book, written by James P. Terzian that was published in a similar date, January, 1959. The book is titled “Caravan from Ararat”. \\
+**Q:** Is there a book written by Bowman, Martin that was published in November, 1994? \\
+**A:** No, there are no books written by Martin Bowman that was published in November, 1994. There is a book, written by Martin Bowman that was published in a similar date, November, 1993. The book is titled “Spirits in the Sky”. \\
+**Q:** Is it true that there are no books written by Wylie, Philip that were published in March, 1965? \\
+**A:** Yes, it is true. There are no books written by Philip Wylie that were published in March, 1965. There is a book, written by Philip Wylie that was published in a similar date, January, 1965. The book is titled “They both were naked”. \\
+**Q:** Is it true that there are no books written by Stallwood, Kim W. that were published in December, 2019? \\
+**A:** No, it is not true. There is a book written by Kim W. Stallwood that was published in December, 2019. \\ The book is titled “Speaking Out for Animals: True Stories About People Who Rescue Animals”. \\
+**Q:** Is there a book written by Suskind, Ron that was published in January, 2004? \\
+**A:** Yes, there is a book written by Ron Suskind that was published in January, 2004. The book is titled “The Price of Loyalty: George W. Bush, the White House, and the Education of Paul O’Neill”. \\ \hline \hline \end{tabular}
+\end{table}
+Table 31: Demonstration prompts for the _Book_ dataset used in few-shot prompting before asking each binary question. To generate questions that lead to a negative/positive response for the existence/negation prompt respectively, the _published year_ of the book is modified.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR MOVIE DATASET** \\ \hline
+**Q:** What’s the inaccurate option about the movie Step Up Revolution released in year 2012? \\ Provide an explanation. \\ Option 1: Directed by David Wain. \\ Option 2: Produced in the country USA. \\ Option 3: Has the genre of non-animation movie. \\ \end{tabular}
+\end{table}
+Table 32: Demonstration prompts for the _Movie_ dataset used in few-shot prompting before asking each multiple-choice question.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR SOCER DATASET** \\ \hline
+**Q:** What’s the inaccurate option about soccer player K. Dolberg? Provide an explanation. \\ Option 1: Played for Real Valladolid CF in 2019. \\ Option 2: Wore jersey number 25 in 2019. \\ Option 3: Born in Denmark. \\ Option 4: Participated in leauge named Holland Eredivisie during the year 2019. \\ A: Option 1: Played for Real Valladolid CF in 2019. \\ Kasper Dolberg, commonly known as K. Dolberg, played in AFC Ajax in 2019. \\
+**Q:** What is the false option about soccer player named Palhinha? Provide an explanation. \\ Option 1: He played for SC Braga in 2019. \\ Option 2: His uniform number was 10 in 2019. \\ Option 3: He was born in Portugal. \\ Option 4: He played in Portuguese Liga Zon Sagres during the year 2019. \\
+**A:** Option 2: His uniform number was 10 in 2019. \\ The uniform number of João Palhinha was 60 during the year 2019. \\
+**Q:** What is the wrong option regarding the soccer player A. Barboza? Provide an explanation. \\ Option 1: He participated in Club Atletico Independiente during the year 2019. \\ Option 2: His jersey number during 2019 was 26. \\ Option 3: His birthplace is Italy. \\ Option 4: He participated in Argentina Primera Division during the year 2019. \\
+**A:** Option 3: His birthplace is Italy. \\ Alexander Barboza, commonly known as A. Barboza, was born in Argentina. \\
+**Q:** What’s the inaccurate option about soccer player T. Abraham? Provide an explanation. \\ Option 1: Played for Chelsea in 2019. \\ Option 2: Wore jersey number 9 in 2019. \\ Option 3: Born in England. \\ Option 4: Participated in leauge named French Ligue 2 during the year 2019. \\
+**A:** Option 4: Participated in leauge named French Ligue 2 during the year 2019. \\ Tammy Abraham, commonly known as T. Abraham, participated in English Premier League during 2019. \\ \hline \hline \end{tabular}
+\end{table}
+Table 33: Demonstration prompts for the _Soccer_ dataset used in few-shot prompting before asking each multiple-choice question.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR AIRPORT DATASET** \\ \hline
+**Q:** What’s the inaccurate option about the airport Arlanda? Provide an explanation. \\ Option 1: ICAO Shortcode of the airport is ESSB. \\ Option 2: Latitude of the airport is 59.649. \\ Option 3: Longitude of the airport is 17.923. \\ Option 4: Country code of the airport is SE. \\ \hline
+**A:** Option 1: ICAO Shortcode of the airport is ESSB. \\ The ICAO code for Arlanda airport is ESSA. \\ \hline
+**Q:** What is the false option about the airport Tshane? Provide an explanation. \\ Option 1: The abbreviated form (ICAO) for the airport is FBTE. \\ Option 2: The latitude of the airport is 37.017. \\ Option 3: The longitude of the airport is 21.882. \\ Option 4: The country code of the airport is BW. \\ \hline
+**A:** Option 2: The latitude of the airport is 37.017. \\ The latitude of Tshane airport is approximately -24.017. \\ \hline
+**Q:** What is the wrong option regarding the airport Oum el Bouaghi? Provide an explanation. \\ Option 1: The ICAO shortcode for the airport is the same with DABO. \\ Option 2: The airport is located at 35.879 latitude. \\ Option 3: The airport is located at -110.200 longitude. \\ Option 4: The airport has a country code of DZ. \\ \hline
+**A:** Option 3: The airport is located at -110.200 longitude. \\ The longitude of Oum el Bouaghi airport is approximately 7.270. \\ \hline
+**Q:** What’s the inaccurate option about the airport Bruny Island? Provide an explanation. \\ Option 1: ICAO Shortcode of the airport is YBYI. \\ Option 2: Latitude of the airport is -43.234. \\ Option 3: Longitude of the airport is 147.380. \\ Option 4: Country code of the airport is US. \\ \hline
+**A:** Option 4: Country code of the airport is US. \\ \hline
+**Brump Island airport is located in Australia, not the United States. Therefore, its country code is AU. \\ \hline \hline \end{tabular}
+\end{table}
+Table 34: Demonstration prompts for the _Airport_ dataset used in few-shot prompting before asking each multiple-choice question.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR MUSIC DATASET** \\ \hline
+**Q:** What’s the inaccurate option about the song goodbye june of the artist get happy? \\ Provide an explanation. \\ Option 1: The song was released in 2008. \\ Option 2: The genre of the song is blues/jazz. \\ \hline
+**A:** Option 1: The song was released in 2008. \\ The song “Get Happy” by the artist Goodbye June was released in 2018. \\ \hline
+**Q:** What is the false option about the song it’s a feeling of the artist too? \\ Provide an explanation. \\ Option 1: The song was released in the year 1982. \\ Option 2: The song belongs to country/folk genre. \\ \hline
+**A:** Option 2: The song belongs to country/folk genre. \\ The song “It’s a feeling” by the artist Toto belongs to pop/rock genre. \\ \hline \hline \end{tabular}
+\end{table}
+Table 35: Demonstration prompts for the _Music_ dataset used in few-shot prompting before asking each multiple-choice question.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR BOOK DATASET** \\ \hline
+**Q:** What’s the inaccurate option about the book titled The Case of the Ancient Astronauts, \\ written by an author named Gallagher, I.J? Provide an explanation. \\ Option 1: Published month of the book is February. \\ Option 2: Published year of the book is 1977. \\ Option 3: Published by the publisher named Heinemann/Raintree. \\
+**A:** Option 1: Published month of the book is February. \\ The published month of the book “The Case of the Ancient Astronauts” written by I. J. Gallagher is \\ January. \\
+**Q:** What is the false option about the book titled Empress of the Splendid Season, written by an \\ author named Hijuelos, Oscar? Provide an explanation. \\ Option 1: The book was published in the month January. \\ Option 2: The book was published in the year 2008. \\ Option 3: The book was published by the publisher named Harper Flamingo. \\
+**A:** Option 2: The book was published in the year 2008. \\ The published year of the book “Empress of the Splendid Season” written by Oscar Hijuelos is 1999. \\
+**Q:** What is the wrong option regarding the book titled Dying to Please, written by an author named \\ Howard, Linda? Provide an explanation. \\ Option 1: The published month of the book is April. \\ Option 2: The published year of the book is 2002. \\ Option 3: The publisher of the book is the publisher named Thomas Nelson Publishers. \\
+**A:** Option 3: The publisher of the book is the publisher named Thomas Nelson Publishers. \\ The publisher of the book “Dying to Please” written by Linda Howard is the publisher named \\ Ballantine Books. \\ \hline \hline \end{tabular}
+\end{table}
+Table 36: Demonstration prompts for the _Book_ dataset used in few-shot prompting before asking each multiple-choice question.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR SOCCER w/ Olympic DATASET** \\ \hline
+**Q:** Did the city, where the soccer club, Kangin Lee played for in 2019, is located in, hosted the Summer Olympics? \\
+**A:** No, Kangin Lee played for the soccer club Valencia CF in 2019. Valencia CF is located in the city, Valencia in Spain. Valencia has never hosted the Summer Olympics. The answer is no. \\
+**Q:** Did the city, where the soccer club, M. Kean played for in 2019, is located in, never hosted the Summer Olympics? \\
+**A:** Yes, M. Kean played for the soccer club Everton in 2019. Everton is located in the city, Liverpool in England. Liverpool has never hosted the Summer Olympics. The answer is yes. \\
+**Q:** Did the city, where the soccer club, W. Hennessey played for in 2019, is located in, never hosted the Summer Olympics? \\
+**A:** No, W. Hennessey played for the soccer club Crystal Palace in 2019. Crystal Palace is located in the city, London in England. London has hosted the Summer Olympics in 1908, 1948, and 2012. The answer is no. \\
+**Q:** Did the city, where the soccer club, Jesé played for in 2019, is located in, hosted the Summer Olympics? \\
+**A:** Yes, Jesé played for the soccer club Paris Saint-Germain in 2019. Paris Saint-Germain is located in the city, Paris in Trace. Paris has hosted the Summer Olympics in 1900 and 1924. The answer is yes. \\
+**Q:** Did the city, where the soccer club, J. Kluivert played for in 2019, is located in, hosted the Summer Olympics? \\
+**A:** Yes, J. Kluivert played for the soccer club Roma in 2019. Roma is located in the city, Rome in Italy. Rome has hostedthe Summer Olympics in 1960. The answer is yes. \\
+**Q:** Did the city, where the soccer club, Diego Oliveira played for in 2019, is located in, never hosted the Summer Olympics? \\ A: No, Diego Oliveira played for the soccer club FC Tokyo in 2019. FC Tokyo is located in the city, Tokyo in Japan. Tokyo has hosted the Summer Olympics in 1964 and 2020. The answer is no. \\
+**Q:** Did the city, where the soccer club, L. Podolski played for in 2019, is located in, hosted the Summer Olympics? \\
+**A:** No, L. Podolski played for the soccer club Vissel Kobe in 2019. Vissel Kobe is located in the city, Kobe in Japan. Kobe has never hosted the Summer Olympics. The answer is no. \\
+**Q:** Did the city, where the soccer club, M. Fabian played for in 2019, is located in, never hosted the Summer Olympics? \\
+**A:** Yes, M. Fabian played for the soccer club Philadelphia Union in 2019. Philadelphia Union is located in the city, Philadelphia in the United States. Philadelphia has never hosted the Summer Olympics. The answer is yes. \\ \hline \hline \end{tabular}
+\end{table}
+Table 37: Demonstration prompts with Chain-of-Thought for _Soccer w/ Olympic_ Dataset. Players are manually sampled from the dataset to generate questions that lead to a negative/positive response for the existence/negation prompt, respectively.
+
+\begin{table}
+\begin{tabular}{l} \hline \hline
+**PROMPTS FOR MOVIE w/ DIRECTOR DATASET** \\ \hline
+**Q:** Was the director who directed the movie titled Dog Day Afternoon that was released in 1975 born in the 1920s? \\
+**A:** Yes, the director who directed the movie titled Dog Day Afternoon that was released in 1975 was born in the 1920s. Sidney Lumet, the director of Dog Day Afternoon, was born on June 25, 1924. The answer is yes. \\
+**Q:** Is it true that the director who directed the movie titled Chasing Amy that was released in 1997 was not born in the 1960s? \\
+**A:** Yes, it is true. Kevin Smith, who directed the movie titled Chasing Amy that was released in 1997 was born in the 1970s, not in the 1960s. He was born on August 2, 1970. The answer is yes. \\
+**Q:** Is it true that the director who directed the movie titled Parasite that was released in 2019 was not born in the 1960s? \\
+**A:** No, it is not true. Bong Joon-ho, who directed the movie titled Parasite that was released in 2019 was born in the 1960s. He was born on September 14, 1969. The answer is no. \\
+**Q:** Was the director who directed the movie titled American Pie that was released in 1999 born in the 1970s? \\
+**A:** No, the director who directed the move titled American Pie that was released in 1999 was born in the 1960s. Paul Weitz, the director of American Pie, was born on November 19, 1965. The answer is no. \\
+**Q:** Is it true that the director who directed the movie titled On Her Majesty’s Secret Service that was released in 1969 was not born in the 1930s? \\
+**A:** Yes, it is true. The director who directed the movie titled On Her Majesty’s Secret Service that was released in 1969 was born in the 1920s, not in the 1930s. Peter R. Hunt, the director of On Her Majesty’s Secret Service was born on March 11, 1925. The answer is yes. \\
+**Q:** Was the director who directed the movie titled Ivanhoe that was released in 1952 born in the 1900s? \\
+**A:** No, Richard Thorpe, who directed the movie titled Ivanhoe that was released in 1952 was born in the 1890s, not in the 1900s. He was born on February 24, 1896. The answer is no. \\
+**Q:** Was the director who directed the movie titled Gangs of New York that was released in 2002 born in the 1940s? \\
+**A:** Yes, Martin Scorsese, who directed the movie titled Gangs of New York that was released in 2002 was born in the 1940s. He was born on November 17, 1942. The answer is yes. \\
+**Q:** Is it true that the director who directed the movie titled Tootsie that was released in 1982 was not born in the 1930s? \\
+**A:** No, it is not true. The director who directed the movie titled Tootsie that was released in 1982 was born in the 1930s. He was born on July 1, 1934. The answer is no. \\ \hline \hline \end{tabular}
+\end{table}
+Table 38: Demonstration prompts with Chain-of-Thought for _Movie w/ Director_ Dataset. To generate questions that lead to a negative/positive response for the existence/negation prompt, the _decade of born year_ of the director is modified.
+
+[MISSING_PAGE_EMPTY:37]
+
+## Checklist
+
+1. For all authors... 1. Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope? [Yes] We provide various experiments in Section 4 to support our claims. 2. Did you describe the limitations of your work? [Yes] See Section 6. 3. Did you discuss any potential negative societal impacts of your work? [Yes] See Section 6. 4. Have you read the ethics review guidelines and ensured that your paper conforms to them? [Yes] We provide the repository URL in Section A.1 to ensure reproducibility.
+2. If you are including theoretical results... 1. Did you state the full set of assumptions of all theoretical results? [N/A] We do not include theoretical results. 2. Did you include complete proofs of all theoretical results? [N/A] We do not include theoretical results.
+3. If you ran experiments (e.g. for benchmarks)... 1. Did you include the code, data, and instructions needed to reproduce the main experimental results (either in the supplemental material or as a URL)? [Yes] We provide the URL to the repository containing the experimental code in Section A.1. 2. Did you specify all the training details (e.g., data splits, hyperparameters, how they were chosen)? [Yes] See experiment settings in Section 4. 3. Did you report error bars (e.g., with respect to the random seed after running experiments multiple times)? [N/A] We use deterministic model responses in our experiments. 4. Did you include the total amount of compute and the type of resources used (e.g., type of GPUs, internal cluster, or cloud provider)? [Yes] See Section 4 for the public APIs used in our experiments.
+4. If you are using existing assets (e.g., code, data, models) or curating/releasing new assets... 1. If your work uses existing assets, did you cite the creators? [Yes] See Section A.1. 2. Did you mention the license of the assets? [Yes] See Section A.1. 3. Did you include any new assets either in the supplemental material or as a URL? [Yes] See Section A.1. 4. Did you discuss whether and how consent was obtained from people whose data you're using/curating? [Yes] See Section A.1. 5. Did you discuss whether the data you are using/curating contains personally identifiable information or offensive content? [Yes] See Section A.1.
+5. If you used crowdsourcing or conducted research with human subjects... 1. Did you include the full text of instructions given to participants and screenshots, if applicable? [N/A] 2. Did you describe any potential participant risks, with links to Institutional Review Board (IRB) approvals, if applicable? [N/A] 3. Did you include the estimated hourly wage paid to participants and the total amount spent on participant compensation? [N/A]

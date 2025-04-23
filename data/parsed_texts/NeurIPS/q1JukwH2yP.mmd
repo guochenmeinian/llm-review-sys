@@ -1,0 +1,402 @@
+# Learning to Search Feasible and Infeasible Regions of Routing Problems with Flexible Neural k-Opt
+
+Yining Ma
+
+National University of Singapore
+
+yiningma@u.nus.edu
+
+&Zhiguang Cao
+
+Singapore Management University
+
+zgcao@smu.edu.sg
+
+&Yeow Meng Chee
+
+National University of Singapore
+
+ymchee@nus.edu.sg
+
+ Zhiguang Cao
+
+Zhiguang Cao is the corresponding author.
+
+37th Conference on Neural Information Processing Systems (NeurIPS 2023).
+
+###### Abstract
+
+In this paper, we present Neural k-Opt (NeuOpt), a novel learning-to-search (L2S) solver for routing problems. It learns to perform flexible k-opt exchanges based on a tailored action factorization method and a customized recurrent dual-stream decoder. As a pioneering work to circumvent the pure feasibility masking scheme and enable the autonomous exploration of both feasible and infeasible regions, we then propose the Guided Infeasible Region Exploration (GIRE) scheme, which supplements the NeuOpt policy network with feasibility-related features and leverages reward shaping to steer reinforcement learning more effectively. Additionally, we equip NeuOpt with Dynamic Data Augmentation (D2A) for more diverse searches during inference. Extensive experiments on the Traveling Salesman Problem (TSP) and Capacitated Vehicle Routing Problem (CVRP) demonstrate that our NeuOpt not only significantly outstrips existing (masking-based) L2S solvers, but also showcases superiority over the learning-to-construct (L2C) and learning-to-predict (L2P) solvers. Notably, we offer fresh perspectives on how neural solvers can handle VRP constraints. Our code is available: https://github.com/yining043/NeuOpt.
+
+## 1 Introduction
+
+Vehicle Routing Problems (VRPs), prevalent in various real-world applications, present NP-hard combinatorial challenges that necessitate efficient search algorithms [1; 2]. In recent years, significant progress has been made in developing deep (reinforcement) learning-based solvers (e.g., [3; 4; 5; 6; 7; 8; 9; 10; 11]), which automates the tedious algorithm design with minimal human intervention in a data-driven fashion. Impressively, these neural solvers developed over the past five years have closed the gap to or even surpassed some traditional hand-crafted solvers that have evolved for several decades [5; 12].
+
+In general, neural methods for VRPs can be categorized into learning-to-construct (L2C), learning-to-search (L2S), and learning-to-predict (L2P) solvers, each offering unique advantages while suffering respective drawbacks. L2C solvers (e.g., [4; 13]) are recognised for their fast solution construction but may struggle to escape local optima. L2P solvers excel at predicting crucial information (e.g., edge heatmaps [14; 15]), thereby simplifying the search especially for large-scale instances, but may lack the generality to efficiently handle VRP constraints beyond the Traveling Salesman Problem (TSP). L2S solvers (e.g., [8; 9]) are designed to learn exploration in the search space directly; however, their search efficiency is still limited and lags behind the state-of-the-art L2C and L2P solvers. In this paper, we delve into the limitations of existing L2S solvers, and aim to unleash their full potential.
+
+One potential issue of L2S solvers lies in their simplistic action space designs. Current L2S solvers that learn to control k-opt exchanges mostly leverage smaller \(k\) values (2-opt [9; 16] or 3-opt [17]), partly because their models struggle to efficiently deal with larger \(k\). To address this issue, we introduce Neural k-Opt (NeuOpt), a flexible L2S solver capable of handling k-opt for any \(k\geq 2\). Specifically, it employs a tailored action factorization method that simplifies and decomposes a complex k-opt exchange into a sequence of basis moves (S-move, I-move, and E-move) with the number of I-moves determining the \(k\) of a specifically executed k-opt action1. Such design allows k-opt exchanges to be easily constructed step-by-step, which more importantly, provides the deep model with the flexibility to explicitly and automatically determine an appropriate \(k\). This further enables varying \(k\) values to be combined across different search steps, striking a balance between coarse-grained (larger \(k\)) and fine-grained (smaller \(k\)) searches. Correspondingly, we design a Recurrent Dual-Stream (RDS) decoder to decode such action factorization, which consists of recurrent networks and two complementary decoding streams for contextual modeling and attention computation, thereby capturing the strong correlations and dependencies between removed and added edges.
+
+Footnote 1: Broadly, in k-opt, added edges may coincide with removed ones. Thus, 2-opt may be viewed as degenerated 8-opt. To avoid ambiguity, unless specified, we refer to k-opt as an exchange introducing \(k\) entirely new edges.
+
+Besides, existing L2S solvers confine the search space to feasible regions based on feasibility masking. By contrast, we introduce a novel Guided Infeasible Region Exploration (GIRE) scheme that promotes the exploration of both feasible and infeasible regions. GIRE enriches the policy network with additional features that indicate constraint violations in the current solution and the exploration behaviour statistics in the search space. It also includes reward shaping to regulate extreme exploration behaviours and incentivize exploration at the boundaries of feasible and infeasible regions. Our GIRE offers four advantages: 1) it circumvents the non-trivial calculation of ground-truth action masks, particularly beneficial for constrained VRPs or broader action space as in NeuOpt, 2) it fosters searches at the more promising feasibility boundaries, similar to traditional solvers [18; 19; 20; 21], 3) it bridges (possibly isolated) feasible regions, helping escape local optima and discover shortcuts to better solutions (See Figure 2), and 4) it forces explicit awareness of the VRP constraints, facilitating the deep model to understand the problem landscapes. In this paper, we apply GIRE to the Capacitated Vehicle Routing Problem (CVRP), though we note that it is generic to most VRP constraints.
+
+Moreover, our NeuOpt leverages a Dynamic Data Augmentation (D2A) method during inference to enhance the search diversity and escape local optima. Our NeuOpt is trained via the reinforcement learning (RL) algorithm tailored in our previous work [12]. Extensive experiments on classic VRP variants (TSP and CVRP) validate our designs and demonstrate the superiority of NeuOpt and GIRE over existing approaches. Our contributions are four-fold: 1) we present NeuOpt, the first L2S solver that is flexible to handle k-opt with any \(k\geq 2\) based on a tailored formulation and a customized RDS decoder, 2) we introduce GIRE, the first scheme that extends beyond feasibility masking, enabling exploration of both feasible and infeasible regions in the search space, thereby bringing multiple benefits and offering fresh perspectives on handling VRP constraints, 3) we propose a simple yet effective D2A inference method for L2S solvers, and 4) we unleash the potential of L2S solvers and allow it to surpass L2C, L2P solvers, as well as the strong LKH-3 solver [20] on CVRP.
+
+## 2 Literature review
+
+We categorize recently developed neural methods for solving vehicle routing problems (VRPs) into _learning-to-construct_ (L2C), _learning-to-search_ (L2S), and _learning-to-predict_ (L2P) solvers.
+
+**L2C solvers.** They learn to construct solutions by iteratively adding nodes to the partial solution. The first modern L2C solver is Ptr-Net [22] based on a Recurrent Neural Network (RNN) and supervised learning (extended to RL in [23] and CVRP in [24]). The Graph Neural Networks (GNN) were then leveraged for graph embedding [25] and faster encoding [26]. Later, the Attention Model (AM) was proposed by Kool et al. [3], inspiring many subsequent works (e.g., [27; 28; 29; 30; 31]), where we highlight Policy Optimization with Multiple Optima (POMO) [4] which significantly improved AM with diverse rollouts and data augmentations. The L2C solvers can produce high-quality solutions within seconds using greedy rollouts; however, they are prone to get trapped in local optima, even when equipped with post-hoc methods (e.g., sampling [3], beam search [28], etc), or, advanced strategies (e.g., invariant representation [32; 13], learning collaborative policies [33], etc). Recently, the Efficient Active Search (EAS) [5] addressed such issues by updating a small subset of pre-trainedmodel parameters on each test instance, which could be further boosted if coupled with Simulation Guided Beam Search (SGBS) [34], achieving the current state-of-the-art performance for L2C solvers.
+
+**L2S solvers.** They learn to iteratively refine a solution to a new one, featuring a search process. Early attempts, e.g., NeuRewriter [35] and L2I [36], relied heavily on traditional local search algorithms and long run time. The NLNS solver [8] improved upon them by controlling a ruin-and-repair process that destroys parts of the solution using handcrafted operators and then fixes them using a learned deep model. Besides, the crossover exchanges between solutions were also learned in [37]. Recently, several L2S solvers focused on controlling the k-opt heuristic that is more suitable for VRPs [20; 38]. Wu et al. [39] made an early attempt to guide 2-opt, showing superior performance than the L2C solver AM [3]. Ma et al. [9] improved Wu et al. [39] by replacing vanilla attention with Dual-Aspect Collaborative Attention (DAC-Att) and a cyclic positional encoding method. The DAC-Att was then upgraded to Synthesis Attention (Synth-Att) [12] to reduce computational costs. Besides, Costa et al. [16] proposed an RNN-based policy to govern 2-opt, which was extended to 3-opt in [17] with higher efficiency. However, these neural k-opt solvers are limited by a small and fixed \(k\). Besides, although L2S solvers strive to surpass L2C solvers by directly learning to search, they are still inferior to those state-of-the-art L2C solvers (e.g., POMO [4] and EAS [5]) even when given prolonged run time.
+
+**L2P solvers.** They learn to guide the search by predicting critical information. Joshi et al. [14] proposed using GNN models to predict heatmaps that indicate probabilities of the presence of an edge in the optimal solution, which then uses beam search to solve TSP. It was leveraged for larger-scale TSP instances in [6] based on divide-and-conque, heatmap merging, and Monte Carlo Tree Search. In the GLS solver [40], a similar GNN was used to guide the traditional local search heuristics. More recently, the DIFUSCO solver [15] proposed to replace those GNN models with diffusion models [41]. Compared to L2C or L2S solvers, L2P solvers exhibit better scalability for large instances; however, they are mostly limited to supervised learning and TSP only, due to challenges in preparing training data and the ineffectiveness of heatmaps in handling VRP constraints. Though L2P solver DPDP [42] managed to solve CVRP with dynamic programming, it was outstripped by L2C solver EAS[5]. Recently, L2P solvers also explored predicting a latent continuous space for the underlying discrete solution space, where the latent space is then searched using differential evolution in [43] or gradient optimizer in [7]. Still, they can be either time-consuming or ineffective in tackling VRP constraints.
+
+**Feasibility satisfaction.** Most neural solvers handle VRP constraints using the masking scheme that filters out invalid actions (e.g., [12; 44]). However, few works considered better ways of constraint handling. Although the works [45; 46] attempted to use mask prediction loss to enhance constraint awareness, they overlooked the benefits of the temporary constraint violation applied in many traditional solvers [18; 19; 20; 21]. Lastly, we note that constraint handling in VRPs largely differs from safe RL tasks that focus on fully avoiding risky actions in uncertain environments [47; 48].
+
+## 3 Preliminaries and notations
+
+**VRP notations.** VRP aims to minimize the total travel cost (tour length) while serving a group of customers subject to certain constraints. It is defined on a complete directed graph \(\mathcal{G}\!=\!\{\mathcal{V},\mathcal{E}\}\) where \(x_{i}\!\in\!\mathcal{V}\) are nodes (customers) and \(e(x_{i}\!\to\!x_{j})\!\in\!\mathcal{E}\) are possible edges (route) weighted by the Euclidean distance between \(x_{i}\) and \(x_{j}\). In the Traveling Salesman Problem (TSP), the solution is a Hamiltonian cycle that visits each node exactly once and returns to the starting one. In the Capacitated Vehicle Routing Problem (CVRP), a depot \(x_{0}\) is added to \(\mathcal{V}\), and each customer node \(x_{i}(i\geq 1)\) is assigned a demand \(\delta_{i}\). A CVRP solution consists of multiple sub-tours, each representing a vehicle departing from the depot, serving a subset of customers, and returning to the depot, where each \(x_{i}(i\geq 1)\) is visited exactly once and the total demand of a sub-tour must not exceed the vehicle capacity \(\Delta\). For instance, \(\tau=\{x_{0}\!\to\!x_{2}\!\to\!x_{1}\!\to\!x_{0}\!\to\!x_{3}\!\to\!x_{0}\}\) is a CVRP-3 solution with \(\delta\!=\![5,5,9]\) and \(\Delta\!=\!10\).
+
+**Traditional k-opt heuristic.** The k-opt heuristic iteratively refines a given solution by exchanging \(k\) existing edges with \(k\) (entirely) new ones. The Lin-Kernighan (LK) algorithm [49] narrowed the search with several criteria, where we underscore the _sequential exchange criterion_. It requires: for each \(i=1,\ldots,k\), the removed edge \(e_{i}^{\text{out}}\) and added edge \(e_{i}^{\text{in}}\) must share an endpoint, and so must \(e_{i}^{\text{in}}\) and \(e_{i+1}^{\text{out}}\). This allows a simplified sequential search process, alternating between removing and adding edges. Moreover, the LK algorithm considers scheduling varying \(k\) values in a repeated ascending order, so as to escape local optima by varying search neighbourhoods. Inspired by them, our paper proposes a powerful L2S solver that performs flexible k-opt exchanges with automatically chosen based on our action factorization method and the customized decoder. Recently, the LK algorithm has been implemented by Helsgaun [50] in the open-source LKH solver, with additional non-sequential exchanges and an edge candidate set. It was then upgraded to LKH-2 [51], leveraging more general k-opt exchanges, divide-and-conquer strategies, etc. The latest release, LKH-3 [20], further tackled constrained VRPs by penalizing constraint violations, making it a generic and powerful solver that serves as a benchmark for neural methods. Finally, we note that k-opt has been a foundation for various solvers, including the state-of-the-art Hybrid Genetic Search (HGS) solver [21] for CVRP.
+
+## 4 Neural k-opt (NeuOpt)
+
+Designing an effective neural k-opt solver necessitates addressing challenges potentially overlooked in prior works. Firstly, the solver should be generic for any given \(k\!\geq\!2\), using a unified formulation and architecture. Secondly, it should coherently parameterize the complex action space while accounting for the strong correlations and dependencies between removed and added edges. Finally, it should dynamically adjust \(k\) to balance coarse-grained (larger \(k\)) and fine-grained (smaller \(k\)) search steps.
+
+In light of them, we introduce Neural k-Opt (NeuOpt) in this section. We first present our action factorization method for flexible k-opt exchanges, and then demonstrate our decoder to parameterize such actions, followed by the dynamic data augmentation method for inference. Note that this section focuses on TSP only, and we extend our NeuOpt to handle other VRP constraints in Section 5.
+
+### Formulations
+
+We introduce a new factorization method that constructs a k-opt exchange using a combination of three _basis moves_, namely the _starting move_, the _intermediate move_, and the _ending move_. Concretely, the sequential k-opt can be simplified as performing one S-move, several (possibly none) I-moves, and finally one E-move, where the choice of the \(k\) corresponds to determining the number of I-moves.
+
+**S-move.** The starting move removes an edge \(e^{\text{out}}(x_{a}\!\rightarrow\!x_{b})\), converting a TSP solution \(\tau\) (a Hamiltonian cycle) into an open Hamiltonian path with two endpoints \(x_{a}\) and \(x_{b}\). It is executed only at the beginning of action construction. We denote S-move as \(S(x_{a})\) since \(x_{b}\) can be uniquely determined if \(x_{a}\) is specified. We term the source node \(x_{a}\) as _anchor node_ to compute the _node rank_.
+
+**Definition 1** (Node rank w.r.t. anchor node): _Given an instance \(\mathcal{G}\!=\!(\mathcal{V},\mathcal{E})\) and a solution \(\tau\), let \(x_{a}\) be the anchor node, as specified in an S-move. The node rank of \(x_{a}\) (\(x_{u}\in\mathcal{V}\)) w.r.t. \(x_{a}\), denoted by \(\Gamma[x_{a},x_{u}]\) or \(\Gamma[a,u]\), is defined as the minimal number of edges in \(\tau\) needed to reach \(x_{u}\) from \(x_{a}\)._
+
+**I-move.** The intermediate move adds a new edge, removes an existing edge, and fixes edge directions, transforming the open Hamiltonian path into a new one. Let \(x_{i}\), \(x_{j}\) be the endpoints of the Hamiltonian
+
+Figure 1: Illustration of using our RDS decoder to determine a 3-opt exchange on TSP-9 given \(K=4\) steps (with the E-move chosen at the final decoding step). The upper portion depicts a visual representation of how the dual-stream attentions (move stream \(\mu\) and edge stream \(\lambda\)) are computed. The lower portion demonstrates how the inferred basis moves lead to the modification of the current solution. At step \(\kappa\), RDS computes dual-stream attention from representations of historical decisions \(q_{\mu}^{\kappa}\), \(q_{\Lambda}^{\kappa}\) to node embeddings \(h_{i}\), thereby deciding a basis move \(\Phi_{\kappa}(x_{\kappa})\) by selecting \(x_{\kappa}\). Ghost marks indicate the same location of a cyclic solution when viewed in a flat perspective as in this figure.
+
+path before the I-move (with \(\Gamma[a,i]\!<\!\Gamma[a,j]\)), and let \(e^{\text{in}}(x_{u}\!\rightarrow\!x_{v})\) be the introduced new edge. To avoid conflicts between consecutive I-moves, we impose sequential conditions on \(e^{\text{in}}\): (1) its source node \(x_{u}\) must be the endpoint of the current Hamiltonian path with a lower node rank, i.e., \(x_{u}\!=\!x_{i}\), and (2) the node rank of its target node \(x_{v}\), i.e., \(\Gamma[a,v]\), must be higher than the node ranks of the two current endpoints \(x_{i},x_{j}\), i.e., \(\Gamma[a,i]\!<\!\Gamma[a,j]\!<\!\Gamma[a,v]\). The removal of edge \(e^{out}(x_{v}\!\rightarrow\!x_{w})\) followed when \(x_{v}\) is chosen, and directions of the edges between \(x_{j}\) and \(x_{v}\) are reversed to yield a valid Hamiltonian path. Since an I-move can be uniquely determined by \(x_{v}\), we denote it as \(I(x_{v})\).
+
+**E-move.** The ending move adds a new edge connecting the two endpoints of the current Hamiltonian path, converting it into a Hamiltonian cycle, i.e., a new TSP solution \(\tau^{\prime}\). It is executed only at the end of action construction. Since it is uniquely determined without specifying any node, we denote it as \(E(x_{\text{null}})\). Note that if we relax the condition (2) of I-move to \(\Gamma[a,j]\!\leq\!\Gamma[a,v]\), an E-move can be treated as a _general I-move_ that selects \(x_{v}\!=\!x_{j}\), denoted as \(I^{\prime}(x_{j})\) or \(E(x_{j})\).
+
+**MDP formulations.** The examples of using the above _basis moves_ to factorize 1-opt (void action), 2-opt, 3-opt, and 4-opt are depicted in Appendix A. Next, we present the Markov Decision Process (MDP) formulation \(\mathcal{M}=(\mathcal{S},\mathcal{A},\mathcal{T},\mathcal{R},\gamma<1)\) for our NeuOpt. At step \(t\), the **state**\(s_{t}=\big{\{}\mathcal{G},\tau_{t},\tau_{t}^{\text{bsf}}\big{\}}\) describes the current instance \(\mathcal{G}\), the current solution \(\tau_{t}\), and the best-so-far solution \(\tau_{t}^{\text{bsf}}\) found before step \(t\). Given a maximum number of allowed _basis moves_\(K(K\geq 2)\), an **action** consists of \(K\)_basis moves_\(\Phi_{\kappa}(x_{\kappa})\), i.e., \(a_{t}\!=\!\{\Phi_{\kappa}(x_{\kappa}),\kappa\!=\!1,\ldots,K\}\), where the first move \(\Phi_{1}(x_{1})=S(x_{1})\) is an S-move, and the rest is either an I-move or an E-move (in the form of general I-move). Note that 1) we permit the I-move as the last move, adding an E-move during state transition if so, and 2) to ensure the action length is always \(K\), we include null actions if E-move early terminates the action. Our **state transition** rule \(\mathcal{T}\) is deterministic and it updates \(s_{t}\) to \(s_{t+1}\) based on the above action factorization method. We use **reward**\(r_{t}=f(\tau_{t}^{\text{bsf}})-min\left[f(\tau_{t+1}),f(\tau_{t}^{\text{bsf}})\right]\) following [9; 12].
+
+### Recurrent Dual-Stream (RDS) decoder
+
+Our NeuOpt adopts an encoder-decoder-styled policy network. We use the encoder from our previous work [12] but upgrade the linear projection to an MLP for embedding generation (details are presented in Appendix B). Here, we introduce the proposed recurrent dual-stream (RDS) decoder to effectively parameterize the aforementioned k-opt action factorization (see Figure 1 for a concrete example).
+
+**GRUs for action factorization.** An action \(a\!=\!\{\Phi_{\kappa}(x_{\kappa}),\kappa\!=\!1,\ldots,K\}\) is constructed sequentially by \(K\) steps, where each decoding step \(\kappa\) specifies a basis move type \(\Phi_{\kappa}\) and a node \(x_{\kappa}\) to instantiate the move. Such decoding can be further simplified to a _node selection process_, with move types inferred based on: (1) for \(\kappa\!=\!1\), it is an S-move; (2) for \(\kappa\!>\!1\), it is an I-move if \(\Gamma[a,j_{\kappa}]\!<\!\Gamma[a,\kappa]\) (assuming \(x_{i_{\kappa}},x_{j_{\kappa}}\) are the Hamiltonian path endpoints before the \(\kappa\)-th move with \(\Gamma[a,i_{\kappa}]\!<\!\Gamma[a,j_{\kappa}]\)), otherwise, if \(x_{\kappa}\!=\!x_{j_{\kappa}}\), it is an E-move that early stops the decoding. Formally, we use factorization:
+
+\[\pi_{\theta}(a|s)=P_{\theta}(\Phi_{1}(x_{1}),\Phi_{2}(x_{2}),\ldots,\Phi_{K}(x_ {K})|s)=\prod_{\kappa=1}^{K}P_{\theta}^{\kappa}(\Phi_{\kappa}|\Phi_{1},\ldots, \Phi_{\kappa-1},s)\] (1)
+
+where \(P_{\theta}^{\kappa}\) is a categorical distribution over \(N\) nodes for node selection. Our decoder leverages the Gated Recurrent Units (GRUs) [52] to help parameterize the conditional probabilities \(P_{\theta}^{\kappa}\). Given node embeddings \(h\!\in\!\mathbb{R}^{N\times d}\) from the encoders (\(h_{i}\) is a \(d\)-dimensional vector), the decoder first computes hidden representations \(q^{\kappa}\) to model the historical move decisions \(\{\Phi_{1},\ldots,\Phi_{k-1}\}\) (the conditions of \(P_{\theta}^{\kappa}\)) using Eq. (2), where \(q^{\kappa}\) (hidden state of GRU) is derived from \(q^{\kappa-1}\), based on an input \(o^{\kappa}\). For better contextual modeling, we consider two streams, \(\mu\) and \(\lambda\), which differ from each other by learning independent parameters and taking different inputs \(o^{\kappa}\) at each \(\kappa\). The \(q_{\mu}^{0}=q_{\lambda}^{0}=\frac{1}{N}\sum_{i=1}^{N}h_{i}\) are initialized by the mean pooling of node embeddings (i.e., a graph embedding).
+
+\[q_{\mu}^{\kappa}=\text{GRU}\left(o_{\mu}^{\kappa},\ q_{\mu}^{\kappa-1}\right), \ q_{\lambda}^{\kappa}=\text{GRU}\left(o_{\lambda}^{\kappa},\ q_{\lambda}^{ \kappa-1}\right)\] (2)
+
+**Dual-stream contextual modeling.** We employ a _move stream_\(\mu\) and an _edge stream_\(\lambda\) during contextual modeling and subsequent attention computation. On the one hand, to provide a relatively overall view, the _move stream_\(\mu\) considers modeling historical move decisions by taking the node embedding of the last selected node \(x_{\kappa-1}\), which is a representation of the past selected move \(\Phi_{\kappa-1}(x_{\kappa-1})\), as its GRU input, i.e., \(o_{\mu}^{\kappa}\!=\!h_{\kappa-1}\). On the other hand, to offer a relatively detailed view, the _edge stream_\(\lambda\) focuses on edge proposals in each step \(\kappa\) by taking the node embedding of \(x_{i_{\kappa}}\), which is stipulated to be the source node of the edge to be introduced in step \(\kappa\), as its GRU input,
+
+[MISSING_PAGE_FAIL:6]
+
+**Reward shaping.** Moreover, GIRE employs reward shaping:
+
+\[r_{t}^{\text{GIRE}}=r_{t}+\alpha\cdot r_{t}^{\text{reg}}+\beta\cdot r_{t}^{\text {bonus}}\] (4)
+
+to guide the reinforcement learning, where \(r_{t}\) is the original reward, \(r_{t}^{\text{reg}}\) regulates extreme exploration behaviours; \(r_{t}^{\text{bonus}}\) encourages exploration in the \(\epsilon\)-feasible regions; and \(\alpha\) and \(\beta\) are reward shaping weights (we use 0.05 for both). Here, the regulation \(r_{t}^{\text{reg}}\) is determined by an entropy measure \(\mathbb{H}[P]\) of the estimated conditional transforming probabilities \(P_{t}(\mathcal{U}|\mathcal{U})\!=\!P(\tau^{\prime}\!\in\!\mathcal{U}|\tau\!\in \!\mathcal{U})\) and \(P_{t}(\mathcal{F}|\mathcal{F})\!=\!P(\tau^{\prime}\!\in\!\mathcal{F}|\tau\! \in\!\mathcal{F})\):
+
+\[r_{t}^{\text{reg}}=-\mathbb{E}[r_{t}]\times\left[\mathbb{H}[P_{t }(\mathcal{U}|\mathcal{U})+\mathbb{H}[P_{t}(\mathcal{F}|\mathcal{F})]]\right],\] (5) \[\mathbb{H}[P]=\text{Clip}\left\{1-c_{1}\log_{2}\left[c_{2}\pi eP(1 -P)\right],0,1\right\},c_{1}=0.5,c_{2}=2.5,\]
+
+where expectation \(\mathbb{E}[r_{t}]\), that suggests the magnitude of \(r_{t}^{\text{reg}}\), is estimated during training; the entropy measure \(\mathbb{H}[P]\), as shown in Figure 3, imposes larger penalties when \(P\) is either too high or too low (indicating extreme exploration behaviour). The bonus \(r_{t}^{\text{bonus}}\) utilizes a similar reward function as the regular reward \(r_{t}\); however, it only considers an infeasible but \(\epsilon\)-feasible solution as a potential new best-so-far solution. More illustrations and discussions on GIRE designs are detailed in Appendix D.
+
+## 6 Experiments
+
+We conduct experiments on TSP and CVRP, with sizes \(N\!=\!20\), 50, 100 following the conventions [9; 13; 37]. Training and test instances are uniformly generated following [3]. For NeuOpt, we use \(K\!=\!4\); the initial solutions are sequentially constructed in a _random_ fashion for both training and inference. Results were collected using a machine equipped with NVIDIA 2080TI GPU cards and an Intel E5-2680 CPU at 2.40GHz. More hyper-parameter details, discussions, and additional results are available in Appendix E. Our PyTorch code and pre-trained models are publicly available2.
+
+Footnote 2: https://github.com/yining043/NeuOpt
+
+### Comparison studies
+
+**Setup.** In Table 1, we benchmark our NeuOpt (TSP) and NeuOpt-GIRE (CVRP) against a variety of neural solvers, namely, **1) L2P solvers**: _GCN+BS_[14] (TSP only), _Att-GCN+MCTS_[6] (TSP only), _GNN+GLS_[40] (TSP only), _CVAE-Opt-DE_[43], _DPDP_[42] (state-of-the-art), _DIMES_[7] (TSP only), _DIFUSCO_[15] (TSP only, state-of-the-art); **2) L2C solvers**: _AM+LCP_[33], _POMO_[4], _Pointformer_[32] (TSP only), _Sym-NCO_[13], _POMO+EAS+SGBS_[34] (state-of-the-art); and **3) L2S solvers**: _Costa et al._[16] (TSP only), _Sui et al._[17] (TSP only), _Wu et al._[39], _NLNS_[8] (CVRP only), _NCE_[37] (CVRP only), _DACCT_[9] (state-of-the-art). To ensure fairness, we test their publicly available pre-trained models on our hardware and test datasets. Those marked with \(\ddagger\) are sourced from their original papers due to difficulties in reproducing, among which we find potential issues marked with \(\#\). More implementation details are listed in Appendix E. Following the conventions [5; 9; 34], we report the metrics of objective values and optimality gaps averaged on a test dataset with 10k instances, where the total run time is measured under the premise of using one GPU for neural methods and one CPU for traditional ones. The gaps are computed w.r.t. the exact solver _Concorde_[54] for TSP and the state-of-the-art traditional solver _HGS_[21] for CVRP. We also include the _LKH_[20; 51] as baselines. However, we note that it is hard to be absolutely fair when comparing the run time between those CPU-based traditional solvers and GPU-based neural solvers. The baselines are grouped, where the last group comprises variations of our NeuOpt, differentiated by the number of augments (marked as 'D2A=') and the number of inference steps (marked as 'T=').
+
+**TSP results.** Compared to **L2P solvers**, NeuOpt (D2A=1, T=1k) surpasses GCN+BS, CVAE-Opt-DE, and GNN+GLS in all problem sizes with shorter run time. With increased T, NeuOpt continues reducing the gaps, and outshines the state-of-the-art DIFUSCO solver with less time at T=10k steps. The NeuOpt (D2A=5, T=1k), with more augmentations, shows lower gaps than NeuOpt (D2A=1, T=5k) in the same solution search count, where it achieves the lowest gap of 0.00% at (D2A=5, T=5k) on all sizes. Despite the longer run time compared to DPDP and Att-GCN+MCTS, their high efficiency is limited to TSP, and our NeuOpt could be potentially boosted by leveraging heatmaps
+
+[MISSING_PAGE_FAIL:8]
+
+[MISSING_PAGE_FAIL:9]
+
+presents the pointplots with confidence intervals that show the performance of our NeuOpt on TSP-100 with and without E-move during decoding across varying preset \(K\). When E-move is absent (dotted blue line), the model, downgraded to performing fixed \(K\)-opt only, exhibits diminished performance on larger \(K\). Conversely, our NeuOpt (solid orange line) could further benefit from a larger \(K\), due to its flexibility in determining and combining different \(k\) across search steps.
+
+### Generalization and scalability studies
+
+In Table 5 and Table 6, we further evaluate the generalization capability of our NeuOpt models on more complex instances from TSPLIB [55] and CVRPLIB [56], respectively. Our NeuOpt achieves lower gaps than DACT [9] and L2C solvers (AM [3] and POMO [4]), and even shows superiority over the AMDKD method [11] that is explicitly designed to boost the generalization of POMO through knowledge distillation. Beyond generalization, our NeuOpt also exhibits notable scalability. As shown in Table 7, when trained directly for size 200, NeuOpt finds close-to-optimal solutions and still surpasses the strong LKH-3 solver [20] on CVRP-200. Note that existing L2S solvers, e.g., DACT [9] may struggle with training on such scales. More details and discussions are available in Appendix E.
+
+### Hyper-parameter studies
+
+**Influence of preset \(K\).** In Table 8, we display the performance of NeuOpt on TSP-100, as well as the corresponding inference time (T=1k) and the training time (per epoch) for varying \(K\) values. The results highlight trade-offs between better performance and increased computational costs.
+
+**Influence of GIRE hyper-parameters.** Figure 6 depicts the influence of \(\alpha\) and \(\beta\) in Eq. (4) on CVRP-20, where we fix one while varying the other, investigating both extremely smaller (0.01) and larger (0.1) values. The results suggest that more effective reward shaping occurs when the weights are moderate. Please refer to Appendix D for discussions on more GIRE hyper-parameters.
+
+## 7 Conclusions and limitations
+
+In this paper, we introduce NeuOpt, a novel L2S solver for VRPs, that performs flexible k-opt exchanges with a tailored formulation and a designed RDS decoder. We also present GIRE, the first scheme to transcend masking for constraint handling based on feature supplement and reward shaping, enabling autonomous exploration in both feasible and infeasible regions. Moreover, we devise a D2A augmentation method to boost inference diversity. Despite delivering state-of-the-art results, our work still has **limitations**. While NeuOpt exhibits better scalability than existing L2S solvers, it falls short against some L2P solvers (e.g., [6; 7]) for larger-scale TSPs. Possible solutions in future works include: 1) integrating divide-and-conquer strategies as per [6; 57; 58; 59; 60], 2) reducing search space via heatmaps as predicted in [6; 15], 3) adopting more scalable encoders [61; 62], and 4) refactoring our code with highly-optimized CUDA libraries as did in [7; 15]. Besides enhancing scalability, future works can also focus on: 1) applying our GIRE to more VRP constraints and even beyond L2S solvers, 2) integrating our method with post-hoc per-instance processing boosters (e.g., EAS [5]) for better performance, and 3) enhancing the generalization capability of our NeuOpt on instances with different sizes/distributions (e.g., by leveraging the frameworks in [11; 63]).
+
+\begin{table}
+\begin{tabular}{l c c c c c c c c} \hline \hline AM & POMO & AMDKD & DACT (sol.10k) & Ours (sol.10k) \\ -mix & -mix & (POMO) & Avg.\(\downarrow\) & Best\(\downarrow\) & Avg.\(\downarrow\) & Best\(\downarrow\) \\ \hline
+15.87\% & 8.05\% & 5.77\% & 5.21\% & 3.68\% & 4.80\% & 3.27\% \\ \hline \hline \end{tabular}
+\end{table}
+Table 6: Generalization (10 runs) on CVRPLIB.
+
+\begin{table}
+\begin{tabular}{l|c c c c c} \hline \hline \multirow{2}{*}{Methods} & \multicolumn{2}{c|}{TSP-200} & \multicolumn{2}{c}{CVRP-200} \\  & \multicolumn{2}{c|}{Gip.\(\downarrow\)} & Time.\(\downarrow\) & Gap.\(\downarrow\) & Time.\(\downarrow\) \\ \hline LKH [20; 51] & 0.00\% & 2.3h & 1.17\% & 21.6h \\ \hline Ours (D2A2+S,T=10k) & 0.04\% & 4.7h & 0.68\% & 9.6h \\ Ours (D2A2+S,T=20k) & 0.02\% & 9.4h & 0.48\% & 19.2h \\ Ours (D2A2+S,T=30k) & 0.01\% & 14.1h & 0.39\% & 1.2d \\ \hline \hline \end{tabular}
+\end{table}
+Table 7: Results on \(N=200\).
+
+## Acknowledgments and Disclosure of Funding
+
+This research was supported by the Singapore Ministry of Education (MOE) Academic Research Fund (AcRF) Tier 1 grant.
+
+## References
+
+* [1] Paolo Toth and Daniele Vigo. _Vehicle routing: problems, methods, and applications_. SIAM press, 2014.
+* [2] Cong Zhang, Yaoxin Wu, Yining Ma, Wen Song, Zhang Le, Zhiguang Cao, and Jie Zhang. A review on learning to solve combinatorial optimisation problems in manufacturing. _IET Collaborative Intelligent Manufacturing_, 5(1):e12072, 2023.
+* [3] Wouter Kool, Herke van Hoof, and Max Welling. Attention, learn to solve routing problems! In _International Conference on Learning Representations_, 2018.
+* [4] Yeong-Dae Kwon, Jinho Choo, Byoungjip Kim, Iljoo Yoon, Youngjune Gwon, and Seungjai Min. POMO: Policy optimization with multiple optima for reinforcement learning. In _Advances in Neural Information Processing Systems_, volume 33, pages 21188-21198, 2020.
+* [5] Andre Hottung, Yeong-Dae Kwon, and Kevin Tierney. Efficient active search for combinatorial optimization problems. In _International Conference on Learning Representations_, 2022.
+* [6] Zhang-Hua Fu, Kai-Bin Qiu, and Hongyuan Zha. Generalize a small pre-trained model to arbitrarily large TSP instances. In _AAAI Conference on Artificial Intelligence_, 2021.
+* [7] Ruizhong Qiu, Zhiqing Sun, and Yiming Yang. DIMES: A differentiable meta solver for combinatorial optimization problems. In _Advances in Neural Information Processing Systems_, volume 35, pages 25531-25546, 2022.
+* [8] Andre Hottung and Kevin Tierney. Neural large neighborhood search for routing problems. _Artificial Intelligence_, page 103786, 2022.
+* [9] Yining Ma, Jingwen Li, Zhiguang Cao, Wen Song, Le Zhang, Zhenghua Chen, and Jing Tang. Learning to iteratively solve routing problems with dual-aspect collaborative transformer. In _Advances in Neural Information Processing Systems_, volume 34, pages 11096-11107, 2021.
+* [10] Qingfu Zhang Xi Lin, Zhiyuan Yang. Pareto set learning for neural multi-objective combinatorial optimization. In _International Conference on Learning Representations_, 2022.
+* [11] Jieyi Bi, Yining Ma, Jiahai Wang, Zhiguang Cao, Jinbiao Chen, Yuan Sun, and Yeow Meng Chee. Learning generalizable models for vehicle routing problems via knowledge distillation. In _Advances in Neural Information Processing Systems_, pages 31226-31238, 2022.
+* [12] Yining Ma, Jingwen Li, Zhiguang Cao, Wen Song, Hongliang Guo, Yuejiao Gong, and Yeow Meng Chee. Efficient neural neighborhood search for pickup and delivery problems. In _International Joint Conference on Artificial Intelligence_, pages 4776-4784, 2022.
+* [13] Minsu Kim, Junyoung Park, and Jinkyoo Park. Sym-nco: Leveraging symmetricity for neural combinatorial optimization. In _Advances in Neural Information Processing Systems_, volume 35, pages 1936-1949, 2022.
+* [14] Chaitanya K Joshi, Thomas Laurent, and Xavier Bresson. An efficient graph convolutional network technique for the travelling salesman problem. arxiv preprint arxiv:1906.01227, ArXiV, 2019.
+* [15] Zhiqing Sun and Yiming Yang. Difusco: Graph-based diffusion solvers for combinatorial optimization. arxiv preprint arxiv:2302.08224, ArXiV, 2023.
+* [16] Paulo da Costa, Jason Rhuggenaath, Yingqian Zhang, and Alp Eren Akcay. Learning 2-opt heuristics for the traveling salesman problem via deep reinforcement learning. In _Asian Conference on Machine Learning_, pages 465-480, 2020.
+* [17] Jingyan Sui, Shizhe Ding, Ruizhi Liu, Liming Xu, and Dongbo Bu. Learning 3-opt heuristics for traveling salesman problem via deep reinforcement learning. In _Asian Conference on Machine Learning_, volume 157, pages 1301-1316, 2021.
+* [18] Zbigniew Michalewicz et al. Do not kill unfeasible individuals. In _Proceedings of the Fourth Intelligent Information Systems Workshop_, pages 110-123, 1995.
+
+* Glover and Hao [2011] Fred Glover and Jin-Kao Hao. The case for strategic oscillation. _Annals of Operations Research_, 183:163-173, 2011.
+* Helsgaun [2017] Keld Helsgaun. LKH-3 (3.0.7), 2017. URL http://webhotel4.ruc.dk/~keld/research/LKH-3/.
+* Vidal [2022] Thibaut Vidal. Hybrid genetic search for the cvrp: Open-source implementation and swap* neighborhood. _Computers & Operations Research_, 140:105643, 2022.
+* Vinyals et al. [2015] Oriol Vinyals, Meire Fortunato, and Navdeep Jaitly. Pointer networks. In _Advances in Neural Information Processing Systems_, volume 28, pages 2692-2700, 2015.
+* Bello et al. [2017] Irwan Bello, Hieu Pham, Quoc V Le, Mohammad Norouzi, and Samy Bengio. Neural combinatorial optimization with reinforcement learning. In _International Conference on Machine Learning (Workshop)_, 2017.
+* Nazari et al. [2018] Mohammadreza Nazari, Afshin Oroojlooy, Martin Takac, and Lawrence V Snyder. Reinforcement learning for solving the vehicle routing problem. In _Advances in Neural Information Processing Systems_, pages 9861-9871, 2018.
+* Dai et al. [2017] Hanjun Dai, Elias B Khalil, Yuyu Zhang, Bistra Dilkina, and Le Song. Learning combinatorial optimization algorithms over graphs. In _Advances in Neural Information Processing Systems_, pages 6351-6361, 2017.
+* Drori et al. [2020] Iddo Drori, Anant Kharkar, William R Sickinger, Brandon Kates, Qiang Ma, Suwen Ge, Eden Dolev, Brenda Dietrich, David P Williamson, and Madeleine Udell. Learning to solve combinatorial optimization problems on real-world graphs in linear time. In _International Conference on Machine Learning and Applications (ICMLA)_, pages 19-24, 2020.
+* Xin et al. [2020] Liang Xin, Wen Song, Zhiguang Cao, and Jie Zhang. Step-wise deep learning models for solving routing problems. _IEEE Transactions on Industrial Informatics_, 17(7):4861-4871, 2020.
+* Xin et al. [2021] Liang Xin, Wen Song, Zhiguang Cao, and Jie Zhang. Multi-decoder attention model with embedding glimpse for solving vehicle routing problems. In _AAAI Conference on Artificial Intelligence_, pages 12042-12049, 2021.
+* 11120, 2022.
+* Li et al. [2022] Jingwen Li, Liang Xin, Zhiguang Cao, Andrew Lim, Wen Song, and Jie Zhang. Heterogeneous attentions for solving pickup and delivery problem via deep reinforcement learning. _IEEE Transactions on Intelligent Transportation Systems_, 23(3):2306-2315, 2022.
+* Li et al. [2022] Jingwen Li, Yining Ma, Ruize Gao, Zhiguang Cao, Andrew Lim, Wen Song, and Jie Zhang. Deep reinforcement learning for solving the heterogeneous capacitated vehicle routing problem. _IEEE Transactions on Cybernetics_, 52(12):13572-13585, 2022.
+* Jin et al. [2023] Yan Jin, Yuandong Ding, Xuanhao Pan, Kun He, Li Zhao, Tao Qin, Lei Song, and Jiang Bian. Pointerformer: Deep reinforced multi-pointer transformer for the traveling salesman problem. In _AAAI Conference on Artificial Intelligence_, 2023.
+* Kim et al. [2021] Minsu Kim, Jinkyoo Park, and Joungho kim. Learning collaborative policies to solve np-hard routing problems. In _Advances in Neural Information Processing Systems_, volume 34, pages 10418-10430, 2021.
+* Choo et al. [2022] Jinho Choo, Yeong-Dae Kwon, Jihoon Kim, Jeongwoo Jae, Andre Hottung, Kevin Tierney, and Youngjune Gwon. Simulation-guided beam search for neural combinatorial optimization. In _Advances in Neural Information Processing Systems_, volume 35, pages 8760-8772, 2022.
+* Chen and Tian [2019] Xinyun Chen and Yuandong Tian. Learning to perform local rewriting for combinatorial optimization. In _Advances in Neural Information Processing Systems_, volume 32, pages 6281-6292, 2019.
+* Lu et al. [2019] Hao Lu, Xingwen Zhang, and Shuang Yang. A learning-based iterative method for solving vehicle routing problems. In _International Conference on Learning Representations_, 2019.
+* Kim et al. [2023] Minjun Kim, Junyoung Park, and Jinkyoo Park. Learning to CROSS exchange to solve min-max vehicle routing problems. In _International Conference on Learning Representations_, 2023.
+* Konstantakopoulos et al. [2020] Grigorios D Konstantakopoulos, Sotiris P Gayialis, and Evipidis P Kechagias. Vehicle routing problem and related algorithms for logistics distribution: A literature review and classification. _Operational Research_, pages 2033-2062, 2020.
+
+* Wu et al. [2021] Yaoxin Wu, Wen Song, Zhiguang Cao, Jie Zhang, and Andrew Lim. Learning improvement heuristics for solving routing problems. _IEEE Transactions on Neural Networks and Learning Systems_, 33(9):5057-5069, 2021.
+* Hudson et al. [2022] Benjamin Hudson, Qingbiao Li, Matthew Malencia, and Amanda Prorok. Graph neural network guided local search for the traveling salesperson problem. In _International Conference on Learning Representations_, volume 35, 2022.
+* Sohl-Dickstein et al. [2015] Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised learning using nonequilibrium thermodynamics. In _International Conference on Machine Learning_, pages 2256-2265, 2015.
+* Kool et al. [2022] Wouter Kool, Herke van Hoof, Joaquim Gromicho, and Max Welling. Deep policy dynamic programming for vehicle routing problems. In _International Conference on Integration of Constraint Programming, Artificial Intelligence, and Operations Research_, pages 190-213, 2022.
+* Hottung et al. [2021] Andre Hottung, Bhanu Bhandari, and Kevin Tierney. Learning a latent search space for routing problems using variational autoencoders. In _International Conference on Learning Representations_, 2021.
+* Zhao et al. [2021] Jiuxia Zhao, Minjia Mao, Xi Zhao, and Jianhua Zou. A hybrid of deep reinforcement learning and local search for the vehicle routing problems. _IEEE Transactions on Intelligent Transportation Systems_, 22(11):7208-7218, 2021.
+* Zhang et al. [2022] Renchi Zhang, Runsheng Yu, and Wei Xia. Constraint-aware policy optimization to solve the vehicle routing problem with time windows. _Information Technology and Control_, 51(1):126-138, 2022.
+* Zhao et al. [2021] Hang Zhao, Qijin She, Chenyang Zhu, Yin Yang, and Kai Xu. Online 3d bin packing with constrained deep reinforcement learning. In _AAAI Conference on Artificial Intelligence_, pages 741-749, 2021.
+* Jayant and Bhatnagar [2022] Ashish K Jayant and Shalabh Bhatnagar. Model-based safe deep reinforcement learning via a constrained proximal policy optimization algorithm. _Advances in Neural Information Processing Systems_, 35:24432-24445, 2022.
+* Zhang et al. [2022] Linrui Zhang, Li Shen, Long Yang, Shixiang Chen, Xueqian Wang, Bo Yuan, and Dacheng Tao. Penalized proximal policy optimization for safe reinforcement learning. In _International Joint Conference on Artificial Intelligence_, pages 3744-3750, 2022.
+* Lin and Kernighan [1973] Shen Lin and Brian W Kernighan. An effective heuristic algorithm for the traveling-salesman problem. _Operations research_, 21(2):498-516, 1973.
+* Helsgaun [2000] Keld Helsgaun. An effective implementation of the lin-kernighan traveling salesman heuristic. _European journal of operational research_, 126(1):106-130, 2000.
+* Helsgaun [2018] Keld Helsgaun. LKH-2 (2.0.9), 2018. URL http://webhotel4.ruc.dk/~keld/research/LKH/.
+* Cho et al. [2014] Kyunghyun Cho, Bart van Merrienboer, Caglar Gulcehre, Dzmitry Bahdanau, Fethi Bougares, Holger Schwenk, and Yoshua Bengio. Learning phrase representations using RNN encoder-decoder for statistical machine translation. In _Conference on Empirical Methods in Natural Language Processing (EMNLP)_, pages 1724-1734, 2014.
+* Ha et al. [2017] David Ha, Andrew M. Dai, and Quoc V. Le. Hypernetworks. In _International Conference on Learning Representations_, 2017.
+* Applegate et al. [2020] David L Applegate, Robert E Bixby, Vasek Chvatal, and William J Cook. Concorde TSP Solver, 2020. URL http://www.math.uwaterloo.ca/tsp/concorde/.
+* Reinelt [1991] Gerhard Reinelt. TSPLIB-A traveling salesman problem library. _ORSA journal on computing_, 3(4):376-384, 1991.
+* Uchoa et al. [2017] Eduardo Uchoa, Diego Pecin, Artur Pessoa, Marcus Poggi, Thibaut Vidal, and Anand Subramanian. New benchmark instances for the capacitated vehicle routing problem. _European Journal of Operational Research_, 257(3):845-858, 2017.
+* Hou et al. [2023] Qingchun Hou, Jingwei Yang, Yiqiang Su, Xiaoqing Wang, and Yuming Deng. Generalize learned heuristics to solve large-scale vehicle routing problems in real-time. In _International Conference on Learning Representations_, 2023.
+* Cheng et al. [2023] Hanni Cheng, Haosi Zheng, Ya Cong, Weihao Jiang, and Shiliang Pu. Select and optimize: Learning to solve large-scale tsp instances. In _International Conference on Artificial Intelligence and Statistics_, pages 1219-1231, 2023.
+
+* [59] Xuanhao Pan, Yan Jin, Yuandong Ding, Mingxiao Feng, Li Zhao, Lei Song, and Jiang Bian. H-TSP: Hierarchically solving the large-scale travelling salesman problem. In _AAAI Conference on Artificial Intelligence_, 2023.
+* [60] Sirui Li, Zhongxia Yan, and Cathy Wu. Learning to delegate for large-scale vehicle routing. _Advances in Neural Information Processing Systems_, 34:26198-26211, 2021.
+* [61] Ladislav Rampasek, Michael Galkin, Vijay Prakash Dwivedi, Anh Tuan Luu, Guy Wolf, and Dominique Beaini. Recipe for a general, powerful, scalable graph transformer. In _Advances in Neural Information Processing Systems_, volume 35, pages 14501-14515, 2022.
+* [62] Sebastian Jaszczur, Aakanksha Chowdhery, Afroz Mohiuddin, LUKASZ KAISER, Wojciech Gajewski, Henryk Michalewski, and Jonni Kanerva. Sparse is enough in scaling transformers. In _Advances in Neural Information Processing Systems_, volume 34, pages 9895-9907, 2021.
+* [63] Jianan Zhou, Yaoxin Wu, Wen Song, Zhiguang Cao, and Jie Zhang. Towards omni-generalizable neural methods for vehicle routing problems. In _International Conference on Machine Learning_, 2023.
+
+## Appendix A Action factorization examples
+
+Figure 7 depicts examples of our factorization method using combinations of basis moves (S-move, I-move, and E-move) to represent different k-opt exchanges. Initiated from a TSP-9 instance (leftmost), we list examples from 1-opt to 4-opt, where the number of I-move corresponds to varying \(k\) values, leading to distinct new solutions (rightmost). This demonstrates the flexibility of our factorization.
+
+## Appendix B NeuOpt encoder
+
+Given a state \(s_{t}=\{\mathcal{G},\tau_{t},\tau_{t}^{\text{bsf}}\}\), where \(\mathcal{G}\) is the current instance, \(\tau_{t}\) is the current solution, and \(\tau_{t}^{\text{bsf}}\) is the best-so-far solution before step \(t\), the encoding process first translates the raw features of state into node embeddings. These embeddings are subsequently refined through \(L=3\) stacked encoders.
+
+**Feature Embedding.** Building upon the dual-aspect representation design from [12], we embed state features3, denoted as \(\psi[\mathcal{G},\tau_{t}]\!=\!\{\{\{\varphi_{i}^{t}\}_{x_{i}\in\mathcal{V}}, \{p_{i}^{t}\}_{x_{i}\in\mathcal{V}}\}\) into two separate sets of node embeddings: _Node Feature Embeddings_ (NFEs) to encode \(\psi(\mathcal{G})\!=\!\{\varphi_{i}^{t}\}\) and _Positional Feature Embeddings_ (PFEs) to encode \(\psi(\tau_{t})\!=\!\{p_{i}^{t}\}\). The **NFEs**, denoted as \(\{h_{i}^{\text{init}}\}_{x_{i}\in\mathcal{V}}\), are a set of \(d\)-dimensional vectors, each of which embeds \(d_{h}\)-dimensional problem-specific raw features \(\varphi_{i}^{t}\) of node \(x_{i}\) at step \(t\). To obtain \(h_{i}^{\text{init}}\), we upgrade linear projection used in [12] into the MLP with structure of (\(d_{h}\times\frac{d}{2}\times d\)) for enhanced representation. The **PFEs**, denoted as \(\{\bm{g}_{i}^{\text{init}}\}_{x_{i}\in\mathcal{V}}\), are a set of \(d\)-dimensional vectors, each of which embeds positional features \(p_{i}^{t}\) of \(x_{i}\) at step \(t\), derived from the position of \(x_{i}\) in the current solution \(\tau_{t}\). Following [9], we employ the Cyclic Positional Encoding (CPE) to generate a series of cyclic embeddings in a \(d\)-dimensional space. These CPE embeddings are then used to initialize \(g_{i}^{\text{init}}\) correspondingly, so as to capture the topological structure of the nodes in the current solution \(\tau_{t}\).
+
+Footnote 3: Note that the \(\tau_{t}^{\text{bsf}}\) is leveraged in the reward function and the critic network, but not the policy network.
+
+**Problem-specific raw node features \(\varphi_{i}^{t}\).** For **TSP**, node features \(\varphi_{i}^{t}\) of \(x_{i}\) contains its two-dimensional coordinates (i.e., \(d_{h}\!=\!2\)); For **CVRP**, \(\varphi_{i}^{t}\) contains six features (i.e., \(d_{h}\!=\!6\)) including 1-2) its two-dimensional coordinates, 3) the demand of node \(x_{i}\), 4) the sum of demand of the corresponding sub-tour before node \(x_{i}\) (inclusive), 5) the sum of demand of the corresponding sub-tour after \(x_{i}\) (exclusive), and 6) an indicator function to signify whether node \(x_{i}\) is a customer node. When GIRE is applied, we enrich \(\varphi_{i}^{t}\) with two Violation Indicator (VI) features, i.e., \(d_{h}\!=\!8\).
+
+Figure 7: Examples of using the basis moves to factorize 1-opt (void action), 2-opt, 3-opt, and 4-opt.
+
+**Stacked encoders.** Following the encoders in [9; 12], we use Transformer-styled encoders with Synthesis Attention (Synth-Att) to refine the embeddings \(\{h_{i}^{\text{init}}\}x_{i}\in\mathcal{V}\) and \(\{g_{i}^{\text{init}}\}x_{i}\in\mathcal{V}\), where PFEs serve as auxiliary embeddings that bolster the representation learning of NFEs. After the encoding, a unified set of embeddings \(\{h_{i}\}_{x_{i}\in\mathcal{V}}\) is obtained, which is then inputted in our recurrent dual-stream (RDS) decoder for k-opt action decoding (see Section 4).
+
+## Appendix C Training and inference algorithms
+
+### Training algorithm
+
+**Input**: policy network \(\pi_{\theta}\), critic network \(v_{\phi}\), PPO objective clipping threshold \(\vartheta\), learning rate \(\eta_{\theta}\), \(\eta_{\phi}\), learning rate decay rate \(\varsigma\), number of PPO inner loops \(\Omega\), training steps \(T_{\text{train}}\), number of epochs \(E\), number of batches per epoch \(B\), curriculum learning (CL) scalar \(\xi\)
+
+```
+1:for\(epoch=1\) to \(E\)do
+2:for\(batch=1\) to \(B\)do
+3: Randomly generate a batch of training instances \(\mathcal{D}=\{\mathcal{G}_{i}\}\) and their initial solutions \(\{\tau_{i}\}\);
+4:CL: Improve \(\{\tau_{i}\}\) to \(\{\tau_{i}^{\prime}\}\) by tuning the current policy \(\pi_{\theta}\) for \(T=epoch/\xi\) steps;
+5: Get initial state \(s_{0}\) based on \(\{\tau_{i}^{\prime}\}\) for each instance in the current batch;
+6:\(t\gets 0\);
+7:while\(t<T_{\text{train}}\)do
+8: Run policy \(\pi_{\theta}\) on each instance and get \(\{(s_{t^{\prime}},a_{t^{\prime}},r_{t^{\prime}})\}_{t^{\prime}=\,t}^{t+n-1}\) where \(a_{t^{\prime}}\!\sim\!\pi_{\theta}(a_{t^{\prime}}|s_{t^{\prime}})\);
+9:\(t\gets t+n\), \(\pi_{old}\leftarrow\pi_{\theta}\), \(v_{old}\gets v_{\phi}\);
+10:for\(j=1\) to \(\Omega\)do
+11:\(\hat{R}_{t}=v_{\phi}(s_{t})\);
+12:for\(t^{\prime}\in\{t-1,...,t-n\}\)do
+13:\(\hat{R}_{t^{\prime}}\gets r_{t^{\prime}}+\gamma\hat{R}_{t^{\prime}+1}\);
+14:\(\hat{A}_{t^{\prime}}\leftarrow\hat{R}_{t^{\prime}}-v_{\phi}(s_{t^{\prime}})\);
+15:endfor
+16: Compute RL loss \(\mathcal{L}_{\theta}^{\text{PPO}}\) using Eq. (6) and critic loss \(\mathcal{L}_{\phi}^{\text{Critic}}\) using Eq. (7);
+17:\(\theta\leftarrow\theta+\eta_{\theta}\nabla\mathcal{L}_{\theta}^{\text{PPO}}\); \(\phi\leftarrow\phi-\eta_{\phi}\nabla\mathcal{L}_{\phi}^{\text{Critic}}\);
+18:endfor
+19:endwhile
+20:endfor
+21:\(\eta_{\theta}\leftarrow\varsigma\eta_{\theta}\), \(\eta_{\phi}\leftarrow\varsigma\eta_{\phi}\);
+22:endfor ```
+
+**Algorithm 1** Reinforcement learning algorithms for NeuOpt
+
+As detailed in Algorithm 1, we adapt the \(n\)-step proximal policy optimization (PPO) with curriculum learning (CL) strategy used in [9; 12] to train our NeuOpt. For our GIRE scheme, we consider learning separate critics \(v_{\phi}^{\text{origin}}\), \(v_{\phi}^{\text{reg}}\), and \(v_{\phi}^{\text{bonus}}\) to fit the respective reward shaping terms in Eq.(4), so as to better estimate the state values. In light of this, when GIRE is applied, we update Algorithm 1 by: 1) duplicating lines 11, 13-14 to compute \(\hat{R}_{t^{\prime}}^{\text{origin}}\), \(\hat{R}_{t^{\prime}}^{\text{reg}}\), and \(\hat{R}_{t^{\prime}}^{\text{bonus}}\) as well as \(\hat{A}_{t^{\prime}}^{\text{origin}}\), \(\hat{A}_{t^{\prime}}^{\text{reg}}\), and \(\hat{A}_{t^{\prime}}^{\text{bonus}}\) at the same time; 2) updating the line 16 to replace Eq. (6) and Eq. (7) into Eq. (8) and Eq. (9), respectively; and update line 17 accordingly where all the critics share the same learning rate \(\eta_{\phi}\).
+
+\[\mathcal{L}_{\theta}^{\text{PPO}}=\frac{1}{n|\mathcal{D}|}\sum_{\mathcal{D}} \sum_{t^{\prime}=t-n}^{t-1}\min\!\left(\frac{\pi_{\theta}(a_{t^{\prime}}|s_{t^ {\prime}})}{\pi_{old}(a_{t^{\prime}}|s_{t^{\prime}})}\hat{A}_{t^{\prime}},\; \text{Clip}\!\left[\frac{\pi_{\theta}(a_{t^{\prime}}|s_{t^{\prime}})}{\pi_{ old}(a_{t^{\prime}}|s_{t^{\prime}})},1\!-\!\vartheta,1\!+\!\vartheta \right]\hat{A}_{t^{\prime}}\right),\] (6)
+
+\[\mathcal{L}_{\phi}^{\text{Critic}}=\frac{1}{n|\mathcal{D}|}\sum_{\mathcal{D}} \sum_{t^{\prime}=t-n}^{t-1}\max\left(\left|v_{\phi}(s_{t^{\prime}})\[\mathcal{L}_{\phi}^{\text{GRE}} =\frac{1}{n|\mathcal{D}|}\sum_{\mathcal{D}}\sum_{t^{\prime}=t-n}^{t- 1}\max\Big{(}\] (9) \[\left|v_{\phi}^{\text{origin}}(s_{t^{\prime}})-\hat{R}_{t^{\prime }}^{\text{origin}}\right|^{2}+\left|v_{\phi}^{\text{reg}}(s_{t^{\prime}})-\hat{ R}_{t^{\prime}}^{\text{reg}}\right|^{2}+\left|v_{\phi}^{\text{bonus}}(s_{t^{\prime}})- \hat{R}_{t^{\prime}}^{\text{bonus}}\right|^{2},\] \[\left|v_{\phi}^{\text{origin,clip}}(s_{t^{\prime}})-\hat{R}_{t^{ \prime}}^{\text{origin}}\right|^{2}+\left|v_{\phi}^{\text{reg,clip}}(s_{t^{ \prime}})-\hat{R}_{t^{\prime}}^{\text{reg}}\right|^{2}+\left|v_{\phi}^{\text{ bonus,clip}}(s_{t^{\prime}})-\hat{R}_{t^{\prime}}^{\text{bonus}}\right|^{2} \Big{)}\,.\]
+
+### Inference algorithm
+
+In our previous work [12], the data augmentation was incorporated during inference to boost the search diversity. The rationale is that a specific instance, \(\mathcal{G}\), can be transformed to different ones, yet still retain the identical optimal solution. These augmented instances can be solved differently by the trained model in parallel, thereby enhancing the diversity of the search for better performance. Specifically, each augmented instance is generated by consecutively executing four predetermined invariant augmentation transformations as listed in Table 9, where the execution order and configurations used for each transformation are randomly determined on the fly following Algorithm 2.
+
+```
+1:Instance \(\mathcal{G}\)
+2:Augmented instance \(\mathcal{G}^{\prime}\)
+3:\(\mathcal{G}^{\prime}\leftarrow\mathcal{G}\);
+4:\(\mathcal{A}\leftarrow\text{\bf RandomShuffle}([\text{flip-x-y, 1-x, 1-y, rotate}])\);
+5:for each augment method \(j\in\mathcal{A}\)do
+6:\(\Im(j)\leftarrow\text{\bf RandomConfig}(j)\);
+7:\(\mathcal{G}^{\prime}\leftarrow\text{perform augment }j\) on \(\mathcal{G}^{\prime}\) with config \(\Im(j)\);
+8:endfor ```
+
+**Algorithm 2** Augmentation (retrieved from [12])
+
+However, such augmentation is performed only once at the start of the inference, making the augmentation fixed across the search process. We thus propose Dynamic Data Augmentation (D2A). It suggests generating new augmented instances with different augmentation configurations each time when the solver fails to find a better solution within a consecutive maximum of \(T_{\text{D2A}}\) steps (i.e., we consider the search to be trapped in local optima). This allows the model to explicitly solve instances differently once it gets trapped in the local optima, thus promoting an even more diverse search process. Note that the proposed D2A is generic to boost most L2S solvers, and even has the potential to boost L2C solvers when equipped with post-hoc per-instance processing boosters such as EAS [5]. In Algorithm 3, we summarize the D2A procedures where we note that the loops in line 1 and line 7 can be run in parallel during practical implementations. For example, when we use "D2A=5" as per in Table 1, it means that for each instance \(\mathcal{G}\), there are 5 augmented instances \(\{\mathcal{G}_{1},\mathcal{G}_{2},\mathcal{G}_{3},\mathcal{G}_{4},\mathcal{G}_ {5}\}\) being solved simultaneously. Each of these instances has its own counter \(T_{i}^{\text{stall}}\) and the best-so-far solution \(\tau_{i}^{\text{bsf}}\) to track whether the search (for the particular instance \(\mathcal{G}_{i}\)) has fallen into local optima.
+
+## Appendix D Additional discussions on GIRE scheme
+
+**Separate critic networks.** As per Appendix C, we use separate critics in GIRE. We now introduce their detailed architectures. During the critic value estimation, we first upgrade embeddings \(\{h_{i}\}\)
+
+\begin{table}
+\begin{tabular}{c c c} \hline \hline Transformations & Formulations & Configurations \\ \hline flip-x-y & \((x^{\prime},y^{\prime})=(y,x)\) & perform or skip \\
+1-x & \((x^{\prime},y^{\prime})=(1-x,y)\) & perform or skip \\
+1-y & \((x^{\prime},y^{\prime})=(x,1-y)\) & perform or skip \\ rotate & \(\begin{pmatrix}x^{\prime}\\ y^{\prime}\end{pmatrix}=\begin{pmatrix}x\cos\boldsymbol{\theta}-y\sin \boldsymbol{\theta}\\ x\sin\boldsymbol{\theta}+y\cos\boldsymbol{\theta}\end{pmatrix}\) & \(\boldsymbol{\theta}\in\{0,\pi/2,\pi,3\pi/2\}\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 9: Descriptions of the four invariant augmentation transformations (retrieved from [12]).
+
+(from the encoders of \(\pi_{\theta}\)) to \(\{\hat{h}_{i}\}_{x_{i}\in\mathcal{V}}\) using a vanilla multi-head attention layer. The \(\{\hat{h}_{i}\}\) are then fed into a mean-pooling layer [39], yielding compressed representations as follows,
+
+\[\hat{y}_{i}=\hat{h}_{i}W^{\text{{Local}}}+\text{mean}\left[\{\hat{h}_{i}\}_{x_{i }\in\mathcal{V}}\right]W^{\text{{Global}}},\] (10)
+
+where \(W\in\mathbb{R}^{d\times\frac{d}{2}}\) are trainable matrices, and the mean and max are element-wise operators. All critics \(v_{\phi}^{\text{origin}}\), \(v_{\phi}^{\text{reg}}\), and \(v_{\phi}^{\text{bonus}}\) then share these representations \(\{\hat{y}_{i}\}\) as parts of their inputs. Specifically, \(v_{\phi}^{\text{origin}}\) is computed via a four-layer MLP in Eq. (11) with structure (\(d+1\), \(d\), \(\frac{d}{2}\), 1) which leverages \(f(\tau_{t}^{\text{bsf}})\) as additional features; \(v_{\phi}^{\text{reg}}\) is computed via a four-layer MLP in Eq. (12) with structure (\(d+10\), \(d\), \(\frac{d}{2}\), 1) which leverages \(f(\tau_{t}^{\text{bsf}})\) and ES features \(\mathcal{J}_{t}\) as additional features; and \(v_{\phi}^{\text{bonus}}\) is computed via a four-layer MLP in Eq. (13) with structure (\(d+1\), \(d\), \(\frac{d}{2}\), 1) which leverages the best-so-far cost w.r.t. \(\epsilon\)-\(\mathcal{F}\) regions \(f(\tau_{t}^{\text{bsf-wrt.}\epsilon})\) as additional features4. All MLPs use the ReLU activation function.
+
+Footnote 4: Given that GIRE uses additional features, the MDP states should be augmented accordingly.
+
+\[v_{\phi}^{\text{origin}}=\text{MLP}_{\phi_{1}}\left(\text{max}[\{\hat{y}_{i} \}_{x_{i}\in\mathcal{V}}]\,,\text{mean}[\{\hat{y}_{i}\}_{x_{i}\in\mathcal{V} }]\,,f(\tau_{t}^{\text{bsf}})\right)\] (11)
+
+\[v_{\phi}^{\text{reg}}=\text{MLP}_{\phi_{2}}\left(\text{max}[\{\hat{y}_{i}\}_{ x_{i}\in\mathcal{V}}]\,,\text{mean}[\{\hat{y}_{i}\}_{x_{i}\in\mathcal{V}}]\,,f(\tau_{t}^{ \text{bsf}}),\mathcal{J}_{t}\right)\] (12)
+
+\[v_{\phi}^{\text{bonus}}=\text{MLP}_{\phi_{3}}\left(\text{max}[\{\hat{y}_{i} \}_{x_{i}\in\mathcal{V}}]\,,\text{mean}[\{\hat{y}_{i}\}_{x_{i}\in\mathcal{V} }]\,,f(\tau_{t}^{\text{bsf-wrt.}\epsilon})\right)\] (13)
+
+**Illustrations of extreme search behaviour and our GIRE efficacy.** Recall that our GIRE considers reward-shaping terms to encourage search within more promising feasibility boundaries and regulate extreme search behaviours using an entropy measure of the estimated conditional transforming probabilities \(P_{t}(\mathcal{U}|\mathcal{U})=P(\tau^{\prime}\in\mathcal{U}|\tau\in\mathcal{U})\) and \(P_{t}(\mathcal{F}|\mathcal{F})=P(\tau^{\prime}\in\mathcal{F}|\tau\in\mathcal{F})\). Figure 8 depicts the persistence of extreme search behaviour when RS is absent while validating the efficacy of our reward shaping (RS) in GIRE. We conduct training with and without RS, recording the convergence curves of the objective values (with mean and confidence intervals) in Figure 8(a), the detailed objective values per run in Figure 8(b), the estimated probability \(P_{t}(\mathcal{F}|\mathcal{F})\) in Figure 8(c), and the estimated probability \(P_{t}(\mathcal{U}|\mathcal{U})\) in Figure 8(d). As revealed in Figure 8(a), without RS, the runs show unstable convergence and poorer final objective values. This can be attributed to higher \(P_{t}(\mathcal{F}|\mathcal{F})\) and lower \(P_{t}(\mathcal{U}|\mathcal{U})\) as shown in Figure 8(c) and Figure 8(d), indicating biased search preference towards feasible regionsand inefficient exploration in infeasible regions. In the worst case, training may fail to converge to lower objective values due to extremely low \(P_{t}(\mathcal{U}|\mathcal{U})\) (below 0.1 as shown in Figure 8(d)), indicating extreme search behaviour and entrapment in local optima. Conversely, GIRE fosters moderate search behaviours and promotes exploration in infeasible regions (especially for the boundaries), leading to significantly improved training curves with reduced variance and lower objective values.
+
+**Influence of \(\boldsymbol{c}\).** We employ a deterministic rule to decide \(\epsilon\), i.e., \(\epsilon=\zeta\times N_{\text{ customer}}\times(\bar{\delta}/\Delta)\), where \(\zeta\) is a coefficient within \([0,1]\), \(\Delta\) is the vehicle capacity, and \(\bar{\delta}\) represents the average customer demands. This formula implies that the total violation corresponds to scenarios where \(\zeta\)-ratio of customers, each with the average demand, breaches the constraint. Empirically, we set \(\zeta\!=\!0.1\). Figure 9 illustrates the impact of varying \(\zeta\).
+
+**Influence of \(c_{1}\) and \(c_{2}\).** Recall that in the entropy measure defined by Eq. (5), we introduce two hyper-parameters \(c_{1}\) and \(c_{2}\) to shape the entropy measure pattern \(\mathbb{H}[P]\), where the measure \(\mathbb{H}[P]\) is used to penalize extreme search behaviours, particularly when values of \(P\) approach 0 or 1. Figure 10 illustrates how hyper-parameters \(c_{1}\) and \(c_{2}\) influence the shape of \(\mathbb{H}[P]\). When \(c_{2}\) is fixed, a smaller \(c_{1}\) expands the penalty range, while a larger \(c_{1}\) constricts the penalty range. Similarly, when \(c_{1}\) is fixed, a smaller or a larger \(c_{2}\) will also control the shape of the patterns. Empirically, we set the values of \(c_{1}=0.5,c_{2}=2.5\) so as to only penalize extreme search behaviour if the feasibility transition probability is outside the \([0.25,0.75]\) range. In Figure 11, we investigate the influence of \(c_{1},c_{2}\) on the training stability of our NeuOpt-GIRE approach on CVRP-20. Results show that they may not affect training stability (thus no need for extensive tuning in practical usage).
+
+Figure 8: Training curves of our GIRE with and without RS on CVRP-20 (8 runs).
+
+Figure 10: Effects of \(c_{1}\) and \(c_{2}\) on \(\mathbb{H}[P]\) pattern: (a)-(c) fix \(c_{2}\!=\!2.5\) and vary \(c_{1}\); (d)-(f) fix \(c_{1}\!=\!0.5\) and vary \(c_{2}\). Compared to the pattern (b) and (e) used in this paper, varying \(c_{1}\) and \(c_{2}\) either **constricts** the penalty range, shown in (c) and (f), or **expands** the penalty range, shown in (a) and (d).
+
+Figure 9: Impact of varying \(\zeta\).
+
+**Applying GIRE to other constraints.** Our GIRE can be viewed as an important early attempt that moves beyond the pure feasibility masking to autonomously explore both feasible and infeasible regions during the search. To adapt GIRE for a particular constraint, we suggest the following:
+
+* For **Feature Supplement**, simply binary indicator functions can be employed to discern specific constraint violations of each node in the solution, thereby forming the Violation Indicator (VI) features. For example, VI can indicate nodes (customers) in the solution that breach their time window or the pickup/delivery precedence constraints. For the Exploration Statistics (ES) features, they can be retained as originally conceptualized since they are based on historical exploration records, rather than specific constraints.
+* For **Reward Shaping**, it can be retained as originally conceptualized. We suggest characterizing the \(\epsilon\)-feasible regions by a fraction of nodes that do not adhere to the constraints, i.e., \(\zeta\!=\!0.1\).
+
+## Appendix E Additional experimental results
+
+### Details of implementation
+
+**Hyper-parameter details.** We use \(d\!=\!128\), \(T_{\text{D2A}}\!=\!10\), \(T_{\text{his}}\!=\!25\) for NeuOpt, and employ 4 attention heads in both the encoders and critics. The ReLU activation function is utilized for MLPs within the network. In line with the training algorithms in [9; 12], we retain their hyper-parameters to ensure an equivalent training amount. Training involves \(E\!=\!200\) epochs and \(B\!=\!20\) batches per epoch, with batch sizes of 512 (TSP) and 600 (CVRP). For TSP, we use \(n\!=\!4\), \(T_{\text{train}}\!=\!200\); and for CVRP, we use \(n\!=\!5\), \(T_{\text{train}}\!=\!250\). The PPO inner loops is \(\Omega\!=\!3\) and the clip threshold is \(\vartheta\!=\!0.1\). The Adam optimizer is employed with learning rates \(\eta_{\theta}\!=\!8\!\times\!10^{-5}\) for \(\pi_{\theta}\), \(\eta_{\phi}\!=\!2\!\times\!10^{-5}\) for \(v_{\phi}\), as well as a decay rate \(\varsigma\!=\!0.985\). The reward discount factor \(\gamma\) is set to 0.999 for both problems. Besides, we empirically set approach-specific parameters: the gradient norm of NeuOpt is clipped at 0.05 in all cases, and the curriculum learning scalar \(\xi\) is set as 1, 0.5, and 0.25 for sizes 20, 50, and 100, respectively. The training time varies depending on the specific problem and size, e.g., CVRP requires about 4 days for size 20 (1 GPU), 5 days for size 50 (2 GPUs), and 8 days for size 100 (4 GPUs), which are around half the time taken as reported in DACT [9] and POMO [4] on CVRP100.
+
+**Setup details.** We follow Kool et al. [3] to sample all training and test instance coordinates within the unit square \([0,1]\times[0,1]\) uniformly. For CVRP, the demands of customers are uniformly sampled from the set {1, 2,..., 9} and the vehicle capacity is set to 30, 40, and 50 for sizes 20, 50, and 100 respectively (we thus estimate \(\bar{\delta}\) as 5/30, 5/40, 5/50 in our GIRE, respectively). To facilitate GPU parallelization given the varying lengths of CVRP solutions, we employ the _dummy depots_ design in [9; 39] for length padding, where depots are duplicated during both training and inference. Same as DACT [9], we include 10, 20, and 20 dummy depots for CVRP sizes of 20, 50, and 100 respectively.
+
+**Baseline details.** We provide details on the compared neural baselines. For the ones with \(\#\), we found certain **issues** in their code, which may lead to the underestimation of reported gaps by around 0.02% (TSP-50) and 0.04% (TSP-100). We observed that they used 'GEO' (Geographical distance) instead of 'EUC' (Euclidean distance) as the type of edge weights while running the Concorde to determine the optimal solutions. This results in the optimal solutions (optimal in the 'GEO' setting) no longer being optimal in the 'EUC' settings, while the objectives derived by neural solvers are based on Euclidean distances. This **discrepancy** might be the reason for the reported **negative** optimality gaps on TSP, which seems anomalous as Concorde is guaranteed to produce optimal solutions.
+
+* **GCN+BS**[14]\({}^{\#}\): a classic L2P solver that predicts heatmaps for TSP based on GCN. We run its star version that considers both beam search (1,280 beams) and shortest tour heuristics.
+
+Figure 11: Influence of **constricted** and **expanded** patterns of \(\mathbb{H}[P]\) on the training stability.
+
+* **Att-GCN+MCTS**[6]\({}^{\#}\): an efficient L2P solver that generalizes heatmap-based L2P solvers to larger-scale TSP instances through divide-and-conquer. However, we encountered issues running their GPU-version code, and the CPU-version code appeared to be time-consuming, taking around 28h (10s/instance) for 10k TSP100. We thus opt to use their reported results directly.
+* **GNN+GLS**[40]: an insightful L2P solver that uses GNN to predict regrets, thereby directing the traditional local search (relocate and 2-opt) heuristics for TSP. Regrettably, the code is not optimized for batch inference and we encountered some issues loading our datasets when following their instructions. As such, we opt to use their reported results directly.
+* **CVAE-Opt-DE**[43]: a generic L2P solver that learns to predict a latent search space for TSP and CVRP. We use their reported DE version results due to the long runtime to reproduce results.
+* **DPDP**[42]: a state-of-the-art L2P solver that combines heatmaps with dynamic programming to efficiently solve TSP and CVRP. We run it for 100k iterations (TSP) and 1,000k iterations (CVRP).
+* **DIMES**[7]\({}^{\#}\): a novel L2P solver that learns to predict a latent search space and exploits differentiable optimizers to find TSP solutions. Due to incompatible issues when installing the required Pytorch extension library packages, we opt to directly use their reported results obtained by the settings of using REINFORCE, active search, Monte Carlo tree search, and meta-learning.
+* **DIFUSCO**[15]\({}^{\#}\): a state-of-the-art L2P solver, that learns a diffusion model to predict heatmaps for TSP. We run their used setting: T=50 diffusion steps, S=16 samplings, and 2-opt post-processing.
+* one revises a length of 10 nodes for 25 iterations, and the other revises a length of 20 nodes for 20 iterations. However, their code for CVRP is not publicly available. Hence for CVRP, we opt to directly use their reported results.
+* **Pointformer**[32]: a latest L2C solver that enhances POMO with a multi-pointer Transformer and feature augmentation for TSP instances. We run it with 200 samplings and \(\times 8\) augmentations.
+* **Sym-NCO**[13]: an effective L2C solver that enhances POMO with auxiliary losses for TSP and CVRP, aiming at better symmetry handling. We run it with 200 samplings and \(\times 8\) augmentations.
+* **POMO**[4]: a renowned L2C solver that enhances the AM [3] with diverse rollouts and data augmentations for TSP and CVRP. We run it with 200 samplings and \(\times 8\) augmentations.
+* **POMO+EAS**[5]: a leading L2C solver that adjusts a small subset of the pre-trained POMO model parameters on test instances for efficient active search. We run the EAS-lay version with \(\times 8\) augmentations for T=200 iterations (both TSP and CVRP) which is the best setting for CVRP.
+* **POMO+EAS+SGBS**[34]: a state-of-the-art L2C solver that bolsters EAS by incorporating simulation-guided beam search, executing beam search and efficient active search phases alternately. We run 5 rounds (TSP) and 50 rounds (CVRP) for the short version, and 20 rounds (TSP) and 200 rounds (CVRP) for the long version. The beam search width is set as per their suggested values.
+* **Costa et al.**[16]: a compelling L2S solver that employs RNN-based policy to control the 2-opt for solving TSP. We run it for T=2k iterations.
+* **Sui et al.**[17]: a recent L2S solver improves upon [16] by performing 3-opt, where the policy first removes three edges and then chooses a re-connection type from all candidate options. Given that their code is not available, we opt to directly use their reported results.
+* **Wu et al.**[39]: a classic L2S solver that employs Transformer-based policy to control the 2-opt for solving TSP. We run it for T=5k iterations (both TSP and CVRP).
+* **DACT**[9]: a state-of-the-art L2S solver that enhances Wu et al. [39] via the cyclic positional encoding and dual-aspect representations. Consistent with their original best settings, we run it for 10k iterations with \(\times 4\) augmentations for TSP and \(\times 6\) augmentations for CVRP.
+* **NLNS**[8]: a strong L2S solver that learns to control ruin-and-repair operators. Following their default settings, we run their code on 10 CPUs in parallel, executing T=5k iterations.
+* **NCE**[37]: a distinctive L2S solver that is designed to execute CROSSOVER exchanges between two CVRP solutions. As their code is not available, we opt to use their reported results directly.
+
+### Generalization on real-world datasets
+
+We further evaluate the generalization performance of our NeuOpt models, which were trained on TSP100 and CVRP100, by testing them on real-world TSPLIB and CVRPLIB instances containing up to 200 nodes (customers). These real-world instances differ significantly from our training ones
+
+[MISSING_PAGE_FAIL:22]
+
+[MISSING_PAGE_FAIL:23]
+
+efficiently. Moreover, there is a trend of alternating searches between feasible and infeasible regions. This behaviour aligns with our motivation in Section 5, suggesting that exploring infeasible regions could foster shortcut discovery, promising boundary searches, and identification of possibly isolated feasible regions. This showcases the significance and effectiveness of our GIRE method.
+
+In Figure 13, we further visualize the estimated distribution of the number of infeasible solutions within the last 5 visited solutions before finding a new best-so-far feasible solution. Results suggest that the probability of encountering at least one infeasible solution before finding a better best-so-far solution is around 80%, showcasing the importance of exploring both feasible and infeasible regions by GIRE (compared to purely visiting feasible solutions in the masking scheme).
+
+### Used assets and licenses
+
+We list the used assets in Table 14. All of them are open-source for academic research use. Our code and pre-trained models have been made available on GitHub (https://github.com/yining043/NeuOpt) using the MIT License.
+
+Figure 12: Search trajectories (50 steps) on 5 random CVRP-20 instances. The blue line shows the objective values of each visited solution (green dot - feasible one; red cross - infeasible one). The red and green dotted lines represent the best-so-far infeasible and feasible objective values, respectively.
+
+\begin{table}
+\begin{tabular}{l l l} \hline \hline Type & License & Asset \\ \hline \multirow{6}{*}{Code} & \multirow{6}{*}{MIT license} & HGS [21], GCN+BS [14], DPDP [42], AM+LCP\({}^{*}\)[33], \\  & & Pointerformer [32], Sym-NCO [13], POMO [4], POMO+EAS [5], \\  & & POMO+EAS+SGBS [34], DACT [9], DIFUSCO [15] \\ \cline{1-1}  & \multirow{2}{*}{\begin{tabular}{l} BSD-3-Clause license \\ GPL-3.0 license \\ Available for academic use \\ No license \\ \end{tabular} } & 
+\begin{tabular}{l} COCO [54] \\ NLNS [8] \\ LKH-3 [20] \\ Costa et al. [16], Wu et al. [39] \\ \end{tabular} \\ \hline \multirow{2}{*}{Dataset} & \multirow{2}{*}{Available for academic use} & TSPLIB (http://comop.ifi.uni-heidelberg.de/software/TSPLIB95/), \\  & & CVRPLIB (http://vrp.galgos.inf.puc-rio.br/index.php/en/) \\ \hline \hline \end{tabular}
+\end{table}
+Table 14: List of used assets (pre-trained models, codes, and datasets).
+
+Figure 13: Estimated distribution of the number of infeasible solutions explored in 5 visited solutions before finding a new best-so-far feasible solution (as step size T increases).

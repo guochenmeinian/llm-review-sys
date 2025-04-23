@@ -1,0 +1,274 @@
+# Accelerating Diffusion Models with Parallel Sampling: Inference at Sub-Linear Time Complexity
+
+Haoxuan Chen
+
+ICME
+
+Stanford University
+
+haoxuanc@stanford.edu
+
+&Yinuo Ren
+
+ICME
+
+Stanford University
+
+yinuoren@stanford.edu
+
+&Lexing Ying
+
+Department of Mathematics and ICME
+
+Stanford University
+
+lexing@stanford.edu
+
+&Grant M. Rotskoff
+
+Department of Chemistry and ICME
+
+Stanford University
+
+rotskoff@stanford.edu
+
+Equal contribution, alphabetical order.Corresponding author.
+
+###### Abstract
+
+Diffusion models have become a leading method for generative modeling of both image and scientific data. As these models are costly to train and _evaluate_, reducing the inference cost for diffusion models remains a major goal. Inspired by the recent empirical success in accelerating diffusion models via the parallel sampling technique , we propose to divide the sampling process into \((1)\) blocks with parallelizable Picard iterations within each block. Rigorous theoretical analysis reveals that our algorithm achieves \(}( d)\) overall time complexity, marking _the first implementation with provable sub-linear complexity w.r.t. the data dimension \(d\)_. Our analysis is based on a generalized version of Girsanov's theorem and is compatible with both the SDE and probability flow ODE implementations. Our results shed light on the potential of fast and efficient sampling of high-dimensional data on fast-evolving modern large-memory GPU clusters.
+
+## 1 Introduction
+
+Diffusion and probability flow based models  are now state-of-the-art in many fields, such as computer vision and image generation , natural language processing , audio and video generation , optimization , sampling and learning of fixed classes of distributions , solving high-dimensional partial differential equations , and more recently several applications in physical, chemical and biological fields . For a more comprehensive list of related work, one may refer to the following review papers . While there are already many variants, such as denoising diffusion probabilistic models (DDPMs) , score-based generative models (SGMs) , diffusion schrodinger bridges , stochastic interpolants and flow matching , _etc._, the recurring idea is to design a stochastic process that interpolates between the data distribution and some simple distribution, along which _score functions_ or alike are learned by neural network-based estimators, and then perform inference guided by the learned score functions.
+
+Due to the sequential nature of the sampling process, the inference of high-quality samples from diffusion models often requires a large number of iterations and, thus, evaluations of the neural network-based score function, which can be computationally expensive . Efforts have beenmade to accelerate this process by resorting to higher-order or randomized numerical schemes [69; 70; 71; 72; 73; 74; 75; 76; 77; 78; 79], augmented dynamics , adaptive step sizes , operator learning , restart sampling , self-consistency [84; 85; 86; 87] and knowledge distillation [88; 89; 90]. Recently, several empirical works [1; 91; 92; 93; 94] leverage the Picard iteration and triangular Anderson acceleration to parallelize the sampling procedure of diffusion models and achieve empirical success in large-scale image generation tasks. Some other recent work [95; 96] also combine the parallel sampling technique with the randomized midpoint method  to accelerate the inference of diffusion models.
+
+This efficiency issue is closely related to the problem of bounding the required number of steps and evaluations of score functions to approximate an arbitrary data distribution on \(^{d}\) to \(\)-accuracy, which has been analyzed extensively in the literature [98; 99; 100; 101; 102; 103; 104; 105]. In terms of the dependency on the dimension \(d\), the current state-of-the-art result for the SDE implementation of diffusion models is \(}(d)\), improved from the previous \(}(d^{2})\) bound .  gives a \(}()\) bound for the probability flow ODE implementation by considering a predictor-corrector scheme with the underdamped Langevin Monte Carlo (UMLC) algorithm.
+
+In this work, we aim to provide parallelization strategies, rigorous analysis, and theoretical guarantees for accelerating the inference process of diffusion models. The time complexity of previous implementations of diffusion models has been largely hindered by the discretization error, which requires the step size to scale with \(}(1/d)\) for the SDE implementation and \(}(1/)\) for the probability flow ODE implementation. We show that the inference process can be first divided into \((1)\) blocks with parallelizable evaluations of the score function within each, and thus reduce the overall time complexity to \(}( d)\). We provide **the first implementation of diffusion models with poly-logarithmic complexity**, a significant improvement over the current state-of-the-art polynomial results that sheds light on the potential fast and efficient sampling of high-dimensional distributions with diffusion models on fast-developing memory-efficient modern GPU clusters.
+
+### Contributions
+
+* We propose parallelized inference algorithms for diffusion models in both the SDE and probability flow ODE implementations (PIADM-SDE/ODE) with exponential integrators, a shrinking step size scheme towards the data end, and the early stopping technique;
+* We provide a rigorous convergence analysis of PIADM-SDE, showing that our parallelization strategy yields a diffusion model with \(}( d)\) approximate time complexity;
+* We show that our strategy is also compatible with the probability flow ODE implementation, and PIADM-ODE could improve the space complexity from \(}(d^{2})\) to \(}(d^{3/2})\) while maintaining the poly-logarithmic time complexity.
+
+## 2 Preliminaries
+
+In this section, we briefly recapitulate the framework of score-based diffusion models, define notations, and discuss related work.
+
+  
+**Work** & **Implementation** & **Measure** & **Approx. Time Complexity** \\ 
+[100, Theorem 2] & SDE & \((p_{0},_{T})^{2}\) & \(}(d^{-1})\) \\
+[104, Theorem 2] & SDE & \(D_{}(p_{}\|_{T-})\) & \(}(d^{2}^{-2})\) \\
+[107, Corollary 1] & SDE & \(D_{}(p_{}\|_{T-})\) & \(}(d^{-2})\) \\
+[111, Theorem 3] & ODE w/UMLC correction & \((p_{},_{T-})^{2}\) & \(}(^{-1})\) \\
+**Theorem 3.3** & **SDE w/parallel sampling** & \(}(p_{}\|_{T-})}\) & \(}((d^{-2}))\) \\
+**Theorem 3.5** & **ODE w/parallel sampling** & \((p_{},_{T-})^{2}\) & \(}((d^{-2}))\) \\   
+
+Table 1: Comparison of the approximate time complexity (_cf._ Definition 2.1) of different implementations of diffusion models. \(\) is a small parameter that controls the smooth approximation of the data distribution (_cf._ Section 3.1.1).
+
+### Diffusion Models
+
+In score-based diffusion models, one considers a diffusion process \((_{s})_{s 0}\) in \(^{d}\) governed by the following stochastic differential equation (SDE):
+
+\[_{s}=_{s}(_{s})s+_{s} _{s},_{0} p_{0},\] (2.1)
+
+where \((_{s})_{s 0}\) is a standard Brownian motion, and \(p_{0}\) is the target distribution that we would like to sample from. The distribution of \(_{s}\) is denoted by \(p_{s}\). Once the drift \(_{s}()\), the diffusion coefficient \(_{s}\), and a sufficiently large time horizon \(T\) are specified, (2.1) also corresponds to a backward process \((}_{t})_{0 t T}\) for another arbitrary diffusion coefficient \((_{s})_{s 0}\):
+
+\[}_{t}=[-}_{t}(}_{t})+ }_{t}}_{t}^{}+}_{t }}_{t}^{}}{2}_{t}(}_{t})] t+}_{t}_{t},\] (2.2)
+
+where \(}_{t}\) denotes \({}_{T-t}\), with \(_{0}=p_{T}\) and \(_{T}=p_{0}\).
+
+For notational simplicity, we adopt a simple choice of the drift and the diffusion coefficients in what follows: \(_{t}()=-\), \(_{t}=_{d}\), and \(=_{d}\), under which (2.1) is an Ornstein-Uhlenbeck (OU) process converging exponentially to its stationary distribution, _i.e._\(p_{T}_{T}:=(0,_{d})\), and (2.1) and (2.2) reduce to the following form:
+
+\[_{s}=-_{s}s+_{s}, }_{t}=[}_ {t}+}{2}_{t}(}_{t})] t+_{t}.\] (2.3)
+
+In practice, the score function \(_{t}(}_{t})\) is often estimated by a neural network (NN) \(_{t}^{}(_{t})\), where \(\) represents its parameters, by minimizing the denoising score-matching loss [117; 118]:
+
+\[() :=_{_{t} p_{t}}[\| p_{t}( _{t})-_{t}^{}(_{t})\|^{2}]\] (2.4) \[=_{_{0} p_{0}}[_{_{t}  p_{t|0}(_{t}|_{0})}[\|_{t}-_{0}e ^{-t/2}}{1-e^{-t}}-_{t}^{}(_{t})\|^{2}]],\]
+
+and the backward process in (2.3) is approximated by the following SDE thereafter:
+
+\[_{t}=[_{t}+}{2} {s}_{t}^{}(_{t})]t+_{t}, _{0}(0,_{d}).\] (2.5)
+
+Implementations.Diffusion models admit multiple _implementations_ depending on the choice of the parameter \(\) in the backward process (2.2). The SDE implementation with \(=1\) is widely used in the literature for its simplicity and efficiency , while recent studies  claim that the probability flow ODE implementation with \(=0\) may exhibit better time complexity. We refer to [111; 119] for theoretical and [120; 121] for empirical comparisons of different implementations.
+
+### Parallel Sampling
+
+Parallel sampling algorithms have been actively explored in the literature, including the parallel tempering method [122; 123; 124] and several recent studies [125; 126; 127]. For diffusion models, the idea of parallel sampling is based on the _Picard iteration_[128; 129] for solving nonlinear ODEs. Suppose we have an ODE \(_{t}=_{t}(_{t})t\) and we would like to solve it for \(t[0,T]\), then the Picard iteration is defined as follows:
+
+\[_{t}^{(0)}_{0},_{t}^{(k+1)}:=_{0}+_{0}^{t}_{s}(_{s}^{(k)})s,\ k[0:K-1].\] (2.6)
+
+Under assumptions on the Lipschitz continuity of \(_{t}\), the Picard iteration converges to the true solution exponentially fast, in the sense that \(\|\|_{t}^{(k)}-_{t}\|\|_{L^{}([0,T])}\) with \(K=(^{-1})\) iterations. Unlike high-order ODE solvers, the Picard iteration is intrinsically parallelizable: for any \(t[0,T]\), the computation of \(_{t}^{(k+1)}\) relies merely on the values of the most recent iteration \(_{t}^{(k)}\). With sufficient computational sources parallelizing the evaluations of \(\), the computational cost of solving the ODE no longer scales with \(T\) but with the number of iterations \(K\).
+
+Recently, this idea has been applied to both the Langevin Monte Carlo (LMC) and the underdamped Langevin Monte Carlo (UMLC) contexts . Roughly speaking, it is proposed to simulate the Langevin diffusion process \(_{t}=- V(_{t})t+_{t}\) with the following iteration resembling (2.6):
+
+\[_{t}^{(0)}_{0},_{t}^{(k+1)}:=_{0}-_{0}^{t} V(_{t}^{(k)})s+_{t},k[0:K-1],\] (2.7)
+
+where all iterations share a common Wiener process \((_{t})_{t 0}\).
+
+It is shown that for well-conditioned log-concave distributions, parallelized LMC would achieve an iteration depth of \(K=}( d)\) that matches the indispensable time horizon \(T=}( d)\) to achieve exponential ergodicity (_cf._[130, Theorem 13]). This promises a significant speedup in sampling high-dimensional distributions from the standard LMC of \(T=}(d)\) iterations, hindered by the \(o(1/d)\) step size as imposed by the discretization error and now evaded by the parallelization.
+
+### Approximate Time Complexity
+
+A similar situation is expected in diffusion models, where the application bottleneck is largely the inference process with sequential iterations and expensive evaluations of the learned score function \(_{t}^{}()\), which is often parametrized by large-scale NNs. Despite several unavoidable costs involving pre- and post-processing, data storage and retrieval, and arithmetic operations, we define the following notion of the _approximate time complexity_ of the inference process of diffusion models:
+
+**Definition 2.1** (Approximate time complexity).: _For a specific implementation of diffusion models (2.5), we define the approximate time complexity of the sampling process as the number of unparallelizable evaluations of the learned NN-based score function \(_{t}^{}()\)._
+
+This definition coincides with the notion of _the number of steps required to reach a certain accuracy_ in [104; 100], _iteration complexity_ in [107; 111], _etc._ in the previous theoretical studies of diffusion models. We have adopted this notion in Table 1 for a comparison of the current state-of-the-art results and our bounds in this work. We will use the notion of _space complexity_ likewise to denote the approximate required storage during the inference. Trivially, the space complexity of the sequential implementation is \((d)\). Should no confusion occur, we omit the dependency of the complexities above on the accuracy threshold \(\), _etc._, during our discussion, as we focus on applications of diffusion models to high-dimensional data distributions, following the standard practice in the literature.
+
+## 3 Main Results
+
+Inspired by the acceleration achieved by the parallel sampling technique in LMC and ULMC, we aim to accommodate parallel sampling into the theoretical analysis framework of diffusion models. The benefit of the parallel sampling technique in this scenario has been recently confirmed by up to 14\(\) acceleration achieved by the ParaDiGMS algorithm  and ParaTAA , where several practical compromises are made to mitigate GPU memory constraints and theoretical guarantees are still lacking.
+
+In this section, we will propose **P**arallelized **I**nference **A**lgorithms for **D**iffusion **M**odels with both the **SDE** and probability flow **ODE** implementations, namely the **PIADM-SDE** (Algorithm 1) and **PIADM-ODE** (Algorithm 2), and present theoretical guarantees of our algorithms, including the approximate time complexity and space complexity, for both implementations in Section 3.1 and Section 3.2, respectively. Due to the large number of notations used in the presentation, we give an overview of notations in Appendix A.1 for readers' convenience.
+
+### SDE Implementation
+
+We first focus on the approximation, parallelization strategies, and error analysis of diffusion models with the SDE implementation, _i.e._ the forward and backward process (2.3) and its approximation (2.5) with \(=1\). We will show that PIADM-SDE _achieves an \(}( d)\) approximate time complexity with \(}(d^{2})\) space complexity_.
+
+#### 3.1.1 Algorithm
+
+PIADM-SDE is summarized in Algorithm 1 and illustrated in Figure 1. The main idea behind our algorithm is the fact that (2.5) can be efficiently solved by the Picard iteration within a period of \((1)\) length, transferring \(}(d)\) sequential computations to a parallelizable iteration of depth \(}( d)\). In the following, we introduce the numerical discretization scheme of our algorithm and the implementation of the Picard iteration in detail.
+
+Step Size Scheme.In our algorithm, the time horizon \(T\) is first segmented into \(N\) blocks of length \((h_{n})_{n=0}^{N-1}\), with each \(h_{n} h:=T/N=(1)\), forming a grid \((t_{n})_{n=0}^{N}\) with \(t_{n}=_{j=1}^{n}h_{j}\). For any \(n[0:N-1]\), the \(n\)-th block is further discretized into a grid \((_{n,m})_{m=0}^{M_{n}}\) with \(_{n,0}=0\) and \(_{n,M_{n}}=h_{n}\). We denote the step size of the \(m\)-th step in the \(n\)-th block as \(_{n,m}=_{n,m+1}-_{n,m}\), and the total number of steps in the \(n\)-th block as \(M_{n}\).
+
+For the first \(N-1\) blocks, we simply use the unique discretization, _i.e._\(h_{n}=h\), \(_{n,m}=\), and \(M_{n}=M:=h/\), for \(n[0:N-2]\) and \(m[0:M-1]\). Following , to curb the potential blow-up of the score function as \(t T\), which is shown by  for \(0 s<t<T\) to be of the order
+
+\[[_{s}^{t}\|_{}(}_{})-_{s}(}_{s})\|^{2} ] d()^{2},\]
+
+we apply early stopping at time \(t_{N}=T-\), where \(\) is chosen in a way such that the \(()\) 2-Wasserstein distance between \(_{T}\) and its smoothed version \(_{T-}\) that we aim to sample from alternatively, is tolerable for the downstream tasks. We also impose the exponential decay of the step size towards the data end in the last block. To be specific, we let \(h_{N-1}=h-\), and discretize the interval \([t_{N-1},t_{N}]=[(N-1)h,T-]\) into a grid \((_{N-1,m})_{m=0}^{M_{N-1}}\) with step sizes \((_{N-1,m})_{m=0}^{M_{N}-1}\) satisfying
+
+\[_{N-1,m}(h-_{N-1,m+1}).\] (3.1)
+
+As shown in Lemma B.7, this exponential decaying step size scheme towards the data end is crucial to bound the discretization error in the last block.
+
+For the simplicity of notations, we introduce the following indexing function: for \([t_{n},t_{n+1}]\), we define \(I_{n}()\) to be the unique integer such that \(_{j=1}^{I_{n}()}_{n,j}<_{j=1}^{I_{n}()+1} _{n,j}\). We also define
+
+Figure 1: Illustration of PIADM-SDE/ODE. The outer iterations are divided into \(( d)\) blocks of \((1)\) length. Within each block, the inner iterations are parallelized with \(}(d)\) steps for SDE (_cf. Theorem 3.3_), or \(}()\) for probability flow ODE implementation (_cf. Theorem 3.5_). The overall approximate time complexity is \(KN=}( d)\). brown, green, blue, and red curves represent the computation graph at \(t=t_{n}+_{n,m}\) for \(m=1,2,M_{n}-1,M_{n}\).
+
+a piecewise function \(g\) such that \(g_{n}()=_{j=1}^{I_{n}()}_{n,j}\). It is easy to check that under the uniform discretization for \(n[1:N-1]\), we have \(I_{n}()=/\) and \(g_{n}()=/\).
+
+Exponential IntegratorFor each step \([t_{n}+_{n,m},t_{n}+_{n,m+1}]\), we use the following exponential integrator scheme , as the numerical discretization of the SDE (2.5):
+
+\[}_{t_{n},_{n,m+1}}=e^{_{n,m}/2}}_{t_{n},_{n,m}}+2(e^{_{n,m}/2}-1) _{t_{n}+_{n,m}}^{}(}_{t_{n}+ _{n,m}})+}-1},\]
+
+where \((0,_{d})\). Lemma B.3 shows its equivalence to approximating (2.5) as
+
+\[}_{t_{n},}=[}_{t_{n},}+_{t_{n}+_{n,m}}^{}( }_{t_{n},_{n,m}})]+ _{t_{n}+},[_{n,m},_{n,m+1}].\] (3.2)
+
+**Remark 3.1**.: _One could also implement a straightforward Euler-Maruyama scheme instead of the exponential integrator (3.4), where an additional high-order discretization error term would emerge [104, Theorem 1], which we believe would not affect the overall \(}( d)\) time complexity with parallel sampling._
+
+Picard Iteration.Within each block, we apply Picard iteration of depth \(K\). As shown by Lemma B.3, the discretized scheme (3.4) implements the following iteration for \(k[0:K-1]\):
+
+\[}_{t_{n},}^{(k+1)}=[ }_{t_{n},}^{(k+1)}+_{t_{n}+g_{n}( )}^{}}_{t_{n},g_{n}()}^{(k)} ]+_{t_{n}+}, [0,h_{n}].\] (3.3)
+
+We denote the distribution of \(}_{t_{n},}^{(K)}\) by \(}_{t_{n}+}\). As proved in Lemma B.6, the iteration above would converge to (3.2) in each block exponentially fast, which given a sufficiently accurate learned score estimation \(_{t}^{}\) should be close to the true backward SDE (2.3). One should also notice that the Gaussians \(_{m}\) are only sampled once and used for all iterations.
+
+The parallelization for (3.4) in Algorithm 1 should be understood as that for any \(k[0:K-1]\), each \(_{t_{n}+_{n,j}}^{}(}_{t_{n}, _{n,j}}^{(k)})\) for \(j[0:M_{n}]\) is evaluated in parallel, with subsequent floating-point operations comparably negligible, resulting in the overall \((NK)\) approximate time complexity.
+
+#### 3.1.2 Assumptions
+
+Our theoretical analysis will be built on the following mild assumptions on the regularity of the data distribution and the numerical properties of the neural networks:
+
+**Assumption 3.1** (\(L^{2}([0,t_{N}])\)\(\)-accurate learned score).: _The learned NN-based score \(_{t}^{}\) is \(_{2}\)-accurate in the sense of_
+
+\[_{}[_{n=0}^{N-1}_{m=0}^{M_{n}-1}_{n, m}\|_{t_{n}+_{n,m}}^{}}_{t_{n}+_{n,m}} -_{t_{n}+_{n,m}}}_{t_{n}+ _{n,m}}\|^{2}]_{2}^{2}.\] (3.5)
+
+**Assumption 3.2** (Regular and normalized data distribution).: _The data distribution \(p_{0}\) has finite second moments and is normalized such that \(_{p_{0}}(_{0})=_{d}\)._
+
+**Assumption 3.3** (Bounded and Lipschitz learned NN-based score).: _The learned NN-based score function \(_{t}^{}\) has bounded \(C^{1}\) norm, i.e. \(\||_{t}^{}()\||_{L^{}([0,T])} M_{}\) with Lipschitz constant \(L_{}\)._
+
+**Remark 3.2**.: _Assumption 3.1 and the finite moment assumption in Assumption 3.2 are standard assumptions across previous theoretical works on diffusion models , while we adopt the normalization Assumption 3.2 from  to simplify true score function-related computations (cf. Lemma A.8). Assumption 3.3 can be easily satisfied by truncation, ensuring computational stability. Notice that the exponential integrator, one actually applies Picard iteration to \(e^{-t/2}_{t}^{}\), a relaxation of Assumption 3.1 might be possible, which is left for future work._
+
+#### 3.1.3 Theoretical Guarantees
+
+The following theorem summarizes our theoretical analysis for PIADM-SDE (Algorithm 1):
+
+**Theorem 3.3** (Theoretical Guarantees for PIADM-SDE).: _Under Assumptions 3.1, 3.2, and 3.3, given the following choices of the order of the parameters_
+
+\[T=((d^{-2})), h=(1), N= ((d^{-2})),\] \[=(d^{-1}^{2}^{-1}(d^{-2}) ), M=(d^{-2}(d^{-2})), K =}((d^{-2})),\]
+
+_and let \(L_{}^{2}h_{n}e^{h_{n}} 1\), \(_{2}\), \(T^{-1}\), the distribution \(_{t_{N}}\) that PIADM-SDE (Algorithm 1) generates samples from satisfies the following error bound:_
+
+\[D_{}(p_{}\|_{t_{N}}) de^{-T}+d T+ _{2}^{2}+dTe^{-K}^{2},\]
+
+_with a total of \(KN=}(^{2}(d^{-2}))\) approximate time complexity and \(dM=}(d^{2}^{-2})\) space complexity for parallailzable \(\)-accurate score function computations._
+
+**Remark 3.4**.: _We would like to make the following remarks on the result above:_
+
+* _The acceleration from_ \(}(d)\) _to_ \(}( d)\) _is at the cost of a trade-off with extra memory cost of_ \(M=}(d)\) _for computing and updating_ \(\{_{t_{n}+_{n,j}}^{}(}_{t_{n},_{n,m}}^{(k)} )\}_{m[0:M_{n}]}\) _simultaneously during each Picard iteration;_
+* _Compared with log-concave sampling_ _[_130_]__,_ \(M\) _being of order_ \(}(d)\) _instead of_ \(}()\) _therein is partly due to the time independence of the score function_ \( p()\) _in general sampling tasks. Besides, the scaling_ \(M=}(d)\) _agrees with the current state-of-the-art dependency_ _[_107_]_ _for the SDE implementation of diffusion models;_
+* _As mentioned above, the scale of the step size_ \(\) _within one block is still confined to_ \((1/M)=(1/d)\)_. The block length_ \(h\)_, despite being required to be small compared to_ \(1/L_{}\)_, is of order_ \((1)\)_, resulting in only_ \(( d)\) _blocks and thus_ \(}( d)\) _total iterations._
+
+#### 3.1.4 Proof Sketch
+
+The detailed proof of Theorem 3.3 is deferred to Section B. The pipeline of the proof is to (a) first decompose the error \(D_{}(_{t_{N}}\|_{t_{N}})\) into blockwise errors using the chain rule of KL divergence; (b) bound the error in each block by invoking Girsanov's theorem; (c) sum up the errors in all blocks.
+
+The key technical challenge lies in Step (b). Different from all previous theoretical works , the Picard iteration in our algorithm generates \(K\) paths recursively in each block using the learned score \(_{t}^{}\). And therefore the final path \((}_{t_{n},}^{(K)})_{[0,h_{n}]}\) depends on all previous paths \((}_{t_{n},}^{(k)})_{[0,h_{n}]}\) for \(k[0:K-1]\), ruling out a direct change of measure argument from thenaive application of Girsanov's theorem. To this end, we need a more sophisticated mathematical framework of stochastic processes, as given in Appendix A.2. We define the measurable space \((,)\) with filtrations \((_{t})_{t 0}\) to specify the probability measures on \((,)\) of each Wiener process, and resort to one of the most general forms of Girsanov's theorem ([131, Theorem 8.6.6]). For example, in the \(n\)-th block, we apply the following change of measure procedure:
+
+1. Let \(q|_{_{t_{n}}}\) be the measure where \(_{t}()\) is the shared Wiener process in the Picard iteration (3.3) for any \(k[0:K-1]\);
+2. Define another process \(}_{t_{n}+}()=_{t_{n}+ }()+_{t_{n}}(,)d\), where \[_{t_{n}}(,):=^{}_{t_{n}+g_{n}()}( {}^{(K-1)}_{t_{n},g_{n}()}())-_{t_{n}+ }(}^{(K)}_{t_{n}+}());\]
+3. Invoke Girsanov's theorem, which yields that the Radon-Nikodym derivative of the measure \(|_{_{t_{n}}}\) with respect to \(q|_{_{t_{n}}}\) satisfies \[|_{_{t_{n}}}}{q|_{ _{t_{n}}}}()=-_{0}^{h_{n}}_{t_{n}}(, )^{}_{t_{n}+}()-_{0}^{h_{n} }\|_{t_{n}}(,)\|^{2};\]
+4. Conclude that \((}_{t_{n}+})_{ 0}\) is a Wiener process under the measure \(|_{_{t_{n}}}\) and thus (3.3) at iteration \(K\) satisfies the following SDE: \[}^{(K)}_{t_{n},}()=[ }^{(K)}_{t_{n},}()+_{t_{n}+ }}^{(K)}_{t_{n},}()] +}_{t_{n}+}(),\] _i.e._ the true backward SDE (2.3) with the true score function for \([t_{n},t_{n+1}]\).
+
+One should notice that this change of measure argument will cause an additional term in the bound of the discrepancy between the first iteration \(}^{(1)}_{t_{n},}\) and the initial condition \(}^{(0)}_{t_{n},}\) in Lemma B.5. However, due to the exponential convergence of the Picard iteration, this term does not affect the overall error bound.
+
+### Probability Flow ODE Implementation
+
+In this section, we will show that our parallelization strategy is also compatible with the probability ODE implementation of diffusion models, _i.e._ the forward and backward process (2.3) and its approximatation (2.5) with \(v=0\). We will demonstrate that PIADM-ODE (Algorithm 2) further _improves the space complexity from \(}(d^{2})\) to \(}(d^{3/2})\) while maintaining the same \(}( d)\) approximate time complexity_.
+
+#### 3.2.1 Algorithm
+
+Due to the space limit, we refer the readers to Section C.1 and Algorithm 2 for the details of our parallelization of the probability flow ODE formulation of diffusion models. PIADM-ODE keeps the discretization scheme detailed in Section 3.1.1 that divides the time horizon \(T\) into \(N\) blocks and uses exponential integrators for all updating rules. Notably, PIADM-ODE has the following distinctions compared with PIADM-SDE (Algorithm 1):
+
+* Instead of applying Picard iteration to the backward SDE as in (3.2), we apply Picard iteration to the probability flow ODE as in (C.3) within each block, which does not require sampling i.i.d. Gaussians to simulate a Wiener process;
+* The most significant difference is the adoption of an additional _corrector step_ after running the probability flow ODE with Picard iteration within one block. During the corrector step, one augments the state space with a Gaussian that represents the initial momentum and then simulates an underdamped Langevin dynamics for \((1)\) time with the learned NN-based score function at the time of the block end;
+* We then further parallelize the underdamped Langevin dynamics in the corrector step so that it can also be accomplished with \(( d)\) approximate time complexity, as a naive implementation would result in \(}()\), which is incompatible with our desired poly-logarithmic guarantee.
+
+#### 3.2.2 Assumptions
+
+Due to technicalities specific to this implementation, we need first to modify Assumption 3.1 and add assumption on the Lipschitzness of the true score functions \( p_{t}\), which is a common practice in related literature . Recent work on the probability flow ODE implementation  also adopts stronger assumptions compared to the SDE implementation.
+
+**Assumption 3.1'** (\(L^{}([0,t_{N}])\)\(\)-accurate learned score).: _For any \(n[0:N-1]\) and \(m[0:M_{n}-1]\), the learned NN-based score \(^{}_{t_{n},_{n,m}}\) is \(_{}\)-accurate in the sense of_
+
+\[_{_{t_{n}+_{n,m}}}[\|^{}_{t_{n}+ _{n,m}}}_{t_{n}+_{n,m}}- _{t_{n}+_{n,m}}}_{t_{n}+_{n,m}}\|^{2} ]_{}^{2}.\]
+
+**Assumption 3.4** (Bounded and Lipschitz true score).: _The true score function \( p_{t}\) has bounded \(C^{1}\) norm, i.e. \(\|| p_{t}()\||_{L^{}([0,T])} M_{p}\) with Lipschitz constant \(L_{p}\)._
+
+Further relaxations on Assumption 3.4 to time-dependent assumptions accommodating the blow-up to the data end (_e.g._[103, Assumption 1.5]) are left for further work.
+
+#### 3.2.3 Theoretical Guarantees
+
+Our results for PIADM-ODE are summarized in the following theorem:
+
+**Theorem 3.5** (Theoretical Guarantees for PIADM-ODE).: _Under Assumptions 3.1', 3.2, 3.3, and 3.4, given the following choices of the order of the parameters_
+
+\[T=((d^{-2})), h=(1), N= ((d^{-2})),\] \[=(d^{-1/2}^{-1}(d^{-1/2}^{-1}) ), M=(d^{1/2}^{-1}(d^{1/2}^{-1})), K =}((d^{-2})),\]
+
+_for the outer iteration and_
+
+\[T^{}=(1) L_{p}^{-1/2} L_{ }^{-1/2}, h^{}=(1), N^{}=(1),\] \[^{}=(d^{-1/2}), M^{}= (d^{1/2}^{-1}), K^{}=((d^{- 2})),\]
+
+_for the inner iteration during the corrector step, and let \(L_{}^{2}h^{2}e^{h} L_{}^{2}{h^{}}^{2}e^{h^{}}/ 1\), \(_{}^{-1}(d^{-2})\), and \( L_{p}^{1/2}\), then the distribution \(_{t_{N}}\) that PIADM-ODE (Algorithm 2) generates samples from satisfies the following error bound:_
+
+\[(p_{},_{t_{N}})^{2} de^{-T}+d ^{2}T^{2}+(T^{2}+N^{2})_{}^{2}+dN^{2}e^{-K}^ {2},\]
+
+_with a total of \((K+K^{}N^{})N=}(^{2}(d^{-2 }))\) approximate time complexity and \(d(M M^{})=(d^{3/2}^{-1})\) space complexity for parallalizable \(\)-accurate score function computations._
+
+The reduction of space complexity by the probability flow ODE implementation is intuitively owing to the fact that the probability flow ODE process is a deterministic process in time rather than a stochastic process as in the SDE implementation, getting rid of the \(()\) term derived by Ito's symmetry. This allows the discretization error to be bounded with \((^{2})\) instead (_cf._ Lemma B.7 and C.5).
+
+#### 3.2.4 Proof Sketch
+
+The details of the proof of Theorem 3.5 are provided in Section C. Along with the complexity benefits the deterministic nature of the probability flow ODE may bring, the analysis is technically more involved than that of Theorem 3.3 and requires an intricate interplay between statistical distances. Several major challenges and our corresponding solutions are summarized below:
+
+* The error of the parallelized algorithm within each block may now only be bounded by 2-Wasserstein distance (_cf._ Theorem C.7) instead of any \(f\)-divergence that admits data processing inequality as in the SDE case by Girsanov's theorem. The additional corrector step exactly handles this issue and would intuitively translate 2-Wasserstein proximity to TV distance proximity (_cf._ Lemma C.18), allowing the decomposition of the overall error into each block;* For the corrector step, the underdamped Langevin dynamics as a second-order dynamics requires only \(()\) steps to converge, instead of \((d)\) steps in its overdamped counterpart. We then adapt the parallelization technique mentioned in Section 2.2 to conclude that it can be accomplished with \(( d)\) approximate time complexity (_cf._ Theorem C.17). The error caused by the approximation to the true score and numerical discretization within this step is bounded in KL divergence by invoking Girsanov's theorem(Theorem A.4) as in the proof of Theorem 3.3;
+* Different from the SDE case, where the chain rule of KL divergence can easily decouple the initial distribution and the subsequent dynamics, we need several interpolating processes between the implementation and the true backward process in this case. The final guarantee is in TV distance as it connects with the KL divergence via Pinsker's inequality and admits data processing inequality. We refer the readers to Figure 2 for an overview of the proof pipeline, as well as the notations and intuitions of the auxiliary and interpolating processes appearing in the proof.
+
+## 4 Discussion and Conclusion
+
+In this work, we have proposed novel parallelization strategies for the inference of diffusion models in both the SDE and probability flow ODE implementations. Our algorithms, namely PIADM-SDE and PIADM-ODE, are meticulously designed and rigorously proved to achieve \(}( d)\) approximate time complexity and \(}(d^{2})\) and \(}(d^{3/2})\) space complexity, respectively, marking the first inference algorithm of diffusion and probability flow based models with sub-linear approximate time complexity. Our algorithm intuitively divides the time horizon into several \((1)\) blocks and applies Picard iteration within each block in parallel, transferring the time complexity into space complexity. Our analysis is built on a sophisticated mathematical framework of stochastic processes and provides deeper insights into the mathematical theory of diffusion models.
+
+Our findings echo and corroborate the recent empirical work  that parallel sampling techniques significantly accelerate the inference process of diffusion models. Theoretical exploration of the adaptive block window scheme therein presents an interesting future research potential. Possible future work also includes the investigation of how to apply our parallelization framework to other variants of diffusion models, such as the discrete  and multi-marginal  formulations. Although we anticipate implementing diffusion models in parallel may introduce engineering challenges, _e.g._ scalability, hardware compatibility, memory bandwidth, _etc._, we believe that our theoretical contributions lay a solid foundation that not only supports but also motivates the empirical development of parallel inference algorithms for diffusion models since advancements continue in GPU power and memory efficiency.

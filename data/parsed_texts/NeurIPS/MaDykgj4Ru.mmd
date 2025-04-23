@@ -1,0 +1,680 @@
+# BLoB: Bayesian Low-Rank Adaptation by
+
+Backpropagation for Large Language Models
+
+Yibin Wang \({}^{*}{}^{\dagger}{}^{1}\)   Haizhou Shi \({}^{*}{}^{\dagger}{}^{1}\)   Ligong Han \({}^{12}\)   Dimitris Metaxas \({}^{1}\)   Hao Wang \({}^{\dagger}{}^{1}\)
+
+Equal Contribution. \({}^{1}\)Rutgers University. \({}^{2}\)MIT-IBM Watson AI Lab. \({}^{\dagger}\)Correspondence to: Yibin Wang <yibin.wang@rutgers.edu>, Haizhou Shi <haizhou.shi@rutgers.edu>, Hao Wang <hw488@cs.rutgers.edu>.
+
+###### Abstract
+
+Large Language Models (LLMs) often suffer from overconfidence during inference, particularly when adapted to downstream domain-specific tasks with limited data. Previous work addresses this issue by employing approximate Bayesian estimation _after_ the LLMs are trained, enabling them to quantify uncertainty. However, such post-training approaches' performance is severely limited by the parameters learned _during_ training. In this paper, we go beyond post-training Bayesianization and propose **B**ayesian **L**ow-Rank Adaptation by **B**ackpropagation (**BLoB**), an algorithm that continuously and jointly adjusts both the mean and covariance of LLM parameters throughout the whole fine-tuning process. Our empirical results verify the effectiveness of BLoB in terms of generalization and uncertainty estimation, when evaluated on both in-distribution and out-of-distribution data. Code is available at https://github.com/Wang-ML-Lab/bayesian-pft.
+
+## 1 Introduction
+
+Despite the recent advancements in Large Language Models (LLMs) [9, 106, 105, 66, 15, 4, 91, 92, 77, 12, 1, 71], addressing the challenges of reliability and responsibility remains imperative [42, 100, 99]. LLMs often produce overconfident responses detached from factual grounding, posing potential harm to users [3, 107, 44, 43, 87, 50, 7, 118, 111, 120, 33, 68, 115, 45]. Therefore, accurately estimating response confidence (or uncertainty) is crucial to preemptively intervene before harm occurs. Current research predominantly focuses on eliciting the internal capability of uncertainty estimation of LLMs. For example, studies suggest that verbalized uncertainty yields better-calibrated results compared to conditional probability [87, 45].
+
+While effective, the aforementioned methods do not offer a universal solution for expressing LLM uncertainty across all scenarios, especially when adapted [113] to domain-specific corpora, human preferences, or downstream tasks [44]. Even a well-calibrated LLM may struggle to estimate uncertainty during fine-tuning due to catastrophic forgetting of general knowledge [84]. Moreover, when applied to limited-scale downstream tasks, excessively over-parameterized LLMs can rapidly overfit, leading to overconfidence. Thus, enabling accurate uncertainty estimation of LLMs is vital for their reliable and responsible deployment.
+
+Bayesian methods emerge as a natural solution for learning uncertainty estimation abilities among their counterparts [88, 11, 101, 98, 29, 46, 51, 61, 97, 58, 102, 20, 110]. These methods model predictive uncertainty \(P(\bm{y}|\bm{x},\mathcal{D})\) by marginalizing the posterior parameter distribution \(P(\bm{\theta}|\mathcal{D})\) after observing the dataset \(\mathcal{D}\):
+
+\[P(\bm{y}|\bm{x},\mathcal{D})=\int P(\bm{y}|\bm{x},\bm{\theta})P(\bm{\theta}| \mathcal{D})d\bm{\theta}.\] (1)
+
+However, adapting the Bayesian framework to LLMs poses significant challenges. LLM architectures typically incorporate complex components, including non-linear activation functions, rendering exactBayesian inference of parameter posteriors intractable, i.e., unable to compute the integral precisely. Consequently, finding an accurate approximation algorithm for the true posterior distribution becomes a primary challenge. Additionally, modeling parameter posterior distributions demands extra memory space, imposing a prohibitive burden on systems due to the massive scale of LLMs.
+
+Contemporary methods leverage Parameter-Efficient Fine-Tuning (PEFT) to reduce the number of tunable parameters, thus alleviating computational and storage resource burdens [23; 41; 26; 121; 56; 53]. Built on this, recent research explores Bayesianizing only the PEFT module during fine-tuning to calibrate LLMs [8; 103; 116; 69], somewhat relieving the burden of introducing more parameters for posterior approximation. However, initial investigations suggest that straightforward combinations of PEFT and basic Bayesian techniques like Monte-Carlo Dropout (MCD, [29]) or Deep Ensemble (ENS, [51; 8; 103]) yield only marginal improvements in generalization and uncertainty estimation. The most promising results to date involve Kronecker factorized Laplace approximation, applied after maximum a posteriori (MAP) estimation provided by any optimization algorithm [116]. Nevertheless, we argue that such post-training procedures bifurcate posterior approximation into two stages, inevitably leading to suboptimal estimation.
+
+To address this challenge, we propose **B**ayesian **L**ow-Rank Adaptation by **B**ackpropagation (**BLoB**), a Bayesian Deep Learning framework for fine-tuning LLMs with LoRA. BLoB jointly estimates the low-rank variational distributions' mean and covariance throughout the entire fine-tuning stage via backpropagation. Unlike methods relying on post-training approximation, BLoB enables simultaneous estimation of both the parameter mode (i.e., the mean if one assumes Gaussian distributions) and the parameter variance. Random sampling of model parameters based on variance estimation can enhance mode estimation. It thereby improves model performance in terms of accuracy and uncertainty estimation on both in-distribution and out-of-distribution datasets, as verified by our extensive experiments across multiple datasets. In summary, our contributions are:
+
+* We propose a principled Bayesianization framework for Low-Rank Adaptation (LoRA) in Large Language Models (LLMs) by assuming that full weights' approximate posterior distribution has a low-rank structure containing a linear combination of independent Gaussian distributions.
+* We show that, under mild conditions, optimization of the full-weight variational distribution can be done efficiently in the low-rank space of the weight update matrices.
+* We introduce BLoB, a variational Bayesian low-rank adaptation framework for LLMs that jointly learns the mean and covariance of the variational distribution during fine-tuning.
+* Extensive evaluations demonstrate the superiority of BLoB in terms of generalization and uncertainty estimation across different scenarios.
+
+## 2 Preliminaries
+
+In this section, we describe the notation as well as some preliminaries.
+
+Notation.In this paper, scalars are denoted by lowercase letters, vectors by lowercase boldface letters, and matrices by uppercase boldface letters. Probability, expectation, and the dataset are denoted by \(P\), \(\mathbb{E}\), and \(\mathcal{D}\), respectively. We use \([m]=\{1,2,\cdots,m\}\) to denote the set of consecutive integer numbers starting from \(1\) and ending at \(m\). For a matrix \(\bm{X}=[\bm{x}_{1},\cdots,\bm{x}_{n}]\in\mathbb{R}^{m\times n}\), we use \(\mathrm{vec}(\bm{X})=[\bm{x}_{1}^{\top},\bm{x}_{2}^{\top},\cdots,\bm{x}_{n}^{ \top}]^{\top}\in\mathbb{R}^{(mn)\times 1}\) to denote the vectorization operation; we use \(\|\bm{X}\|_{p}=\left[\sum_{ij}|X_{ij}|^{p}\right]^{\nicefrac{{1}}{{p}}}\) to define the \(p\)-norm of a matrix. We use \(\otimes\) and \(\circ\) to denote the Kronecker product and the element-wise product, respectively.
+
+### Low-Rank Adaptation (LoRA)
+
+Inspired by the pioneering work on identifying and leveraging the low intrinsic rank of over-parameterized models during fine-tuning [55; 2], Low-Rank Adaptation (LoRA) assumes a low rank for the network's weight updates [41]. Typically in a single linear layer, LoRA decomposes each update matrix \(\Delta\bm{W}=\bm{B}\bm{A}\) into the product of two low-rank matrices, where \(\bm{B}\in\mathbb{R}^{m\times r}\) and \(\bm{A}\in\mathbb{R}^{r\times n}\). Here, \(m\), \(n\), and \(r\) denote the number of input neurons, output neurons, and the rank of the decomposition, respectively [41]. The forward pass of the linear layer with LoRA is formulatedas:
+
+\[\bm{z}=\bm{W}_{0}\bm{h}+\Delta\bm{W}\bm{h}=\bm{W}_{0}\bm{h}+\bm{B}\bm{A}\bm{h},\] (2)
+
+where \(\bm{h}\) and \(\bm{z}\) denote the input and output of the layer. Since the rank \(r\ll\min\{m,n\}\) is significantly smaller than the numbers of input and output neurons (e.g., \(r=8\ll m=n=4096\) in the attention layer [41]), LoRA can drastically reduce the number of trainable parameters by approximately three orders of magnitude compared to full-parameter fine-tuning, while achieving comparable performance to the full-rank fine-tuning. This also leads to a similar reduction in memory consumption for storing optimizer states, thereby reducing the hardware requirements for fine-tuning LLMs to a great extent.
+
+### Variational Bayesian Networks (VBNs)
+
+Bayesian Neural Networks (BNNs) estimate the posterior distributions of network parameters rather than relying on single-point estimates [10; 102]. Due to the intractability of exact inference of the true posterior, Variational Bayesian Networks (VBNs) approximate the true posterior using a variational distribution; this is done by minimizing its KL divergence from the true posterior distribution [39; 30; 11]. Specifically, if the weights \(\bm{W}\)'s variational distribution \(q(\bm{W}|\bm{\theta})\) is parameterized by \(\bm{\theta}\), minimizing the divergence \(\mathrm{KL}[q(\bm{W}|\bm{\theta})\|P(\bm{W}|\mathcal{D})]\) is equivalent to minimizing the following variational free energy with respect to \(\bm{\theta}\)[67; 117; 28]:
+
+\[\mathcal{F}(\mathcal{D},\bm{\theta})\triangleq-\mathbb{E}_{q(\bm{W}|\bm{ \theta})}[\log P(\mathcal{D}|\bm{W})]+\mathrm{KL}[q(\bm{W}|\bm{\theta})\parallel P (\bm{W})].\] (3)
+
+The final formulation of the objective function in Eqn. 3 offers another interpretation beyond minimizing the KL divergence between the variational and true posterior distributions [11]. Specifically, the first term maximizes the likelihood of the data, while the second term regularizes the variational distribution \(q(\bm{W}|\bm{\theta})\). We refer to the first term as the likelihood cost and the second term as the complexity cost. Optimizing these two terms involves balancing the expressiveness of the approximate posterior distribution and its simplicity.
+
+Optimizing the first term of Eqn. 3 requires integrating out the parameterized variational distribution, necessitating Monte Carlo gradient estimation [52; 81]. Using this approach, we can incorporate the re-parameterization trick to enable backpropagation of the gradient to the underlying parameter \(\bm{\theta}\)[72; 47; 78]. In Bayes By Backprop (BBB) [11], the variational distribution is further simplified as a diagonal Gaussian \(\mathcal{N}(\bm{\mu},\bm{\sigma}^{2})\), where \(\bm{\sigma}=\log(1+\exp(\bm{\rho}))\) ensures the standard deviation is positive. Then we have the Monte-Carlo estimation of Eqn. 3 that can pass the gradient to \(\bm{\theta}\):
+
+\[\mathcal{F}(\mathcal{D},\bm{\theta})\approx-\tfrac{1}{K}\sum_{k=1}^{K}\log P( \mathcal{D}|\bm{W}_{k})+\tfrac{1}{K}\sum_{k=1}^{K}[\log q(\bm{W}_{k}|\bm{ \theta})-\log P(\bm{W}_{k})],\] (4)
+
+where \(\bm{W}_{k}=\bm{\mu}+\log(1+\exp(\bm{\rho}))\odot\bm{\epsilon}_{k}\) is the \(k\)-th sample of the weights yielded by parameterization and \(\bm{\epsilon}_{k}\sim\mathcal{N}(\bm{0},\bm{I})\). In BBB, the authors assume the prior distribution \(P(\bm{W})=\pi\mathcal{N}(\bm{0},\bm{\sigma}_{1}^{2})+(1-\pi)\mathcal{N}(\bm{0},\bm{\sigma}_{2}^{2})\) to be a mixture of Gaussians. Consequently, they optimize the second term based on weight sampling. In different scenarios, a simpler form of the prior, which allows for a closed-form solution, can also be considered. Although our proposed method is largely based on the existing framework of BBB, trivially combining BBB with LoRA does not yield satisfactory results. It is important to note that our specific designs are necessary to encourage the fast convergence of the variational distribution, which will be introduced later in Sec. 3.
+
+## 3 Methodology
+
+In this section, we formally introduce our proposed method, **B**ayesian **L**ow-**R**ank Adaptation by **B**ackpropagation (BLoB). We begin by discussing the design choices for Bayesianizing LoRA parameters in Sec. 3.1, highlighting the assumptions BLoB makes about the approximate posterior in the full-weight space. Next, in Sec. 3.2, we explore the low-rank structure of the prior distribution in the full-weight space, which in turn motivates our choice of prior distributions in the low-rank parameter space. In Sec. 3.3, we introduce our parameterization method for the variational distributions. In Sec. 3.4, we integrate Flipout [108] into LoRA for improved sampling efficiency and faster convergence. Finally, we present the complete algorithmic description of BLoB in Sec. 3.5. Proof of the theorems and claims in this section can be found in Appendix A.
+
+### Low-Rank Variational Approximate Posterior Distribution: LoRA Bayesianization
+
+**Asymmetric LoRA Bayesianization.** In LoRA [41], the weights are treated asymmetrically. \(\bm{A}\) is randomly initialized, usually from the standard normal distribution or using Kaiming initialization, while \(\bm{B}=\bm{0}\) is initialized as a zero matrix to ensure that the model fully retains the capabilities of the pre-trained weights at the start of fine-tuning. The trivial solution of estimating the variational approximate posterior for the entire set of LoRA parameters can significantly hinder training convergence. For example, consider the Gaussian posteriors \(q(\bm{A}|\bm{\theta})=\mathcal{N}(\bm{A}|\bm{M}_{A},\bm{\Omega}_{A}^{2})\) and \(q(\bm{B}|\bm{\theta})=\mathcal{N}(\bm{B}|\bm{0},\bm{\Omega}_{B}^{2})\), where \(\bm{\Omega}_{A}\) and \(\bm{\Omega}_{B}\) are variance estimates added to \(\bm{A}\) and \(\bm{B}\), respectively. Although the expectation \(\mathbb{E}_{\bm{A},\bm{B}}[(\bm{W}_{0}+\bm{B}\bm{A})\bm{x}]=\bm{W}_{0}\bm{x}+ \mathbb{E}_{\bm{A},\bm{B}}[\bm{B}\bm{A}\bm{x}]=\bm{W}_{0}\bm{x}\) preserves the functionality of the pre-trained model, accurate estimation requires an impractically large number of weight samples. Such variational distributions lead to significant fluctuations during the early stages of fine-tuning, unless the initial variance of \(\bm{B}\), \(\bm{\Omega}_{B}\to\bm{0}^{+}\), is intentionally minimized towards zero. Therefore, we take an _asymmetric_ approach to initialize \(\bm{\Omega}_{B}=\bm{0}\) and keep it fixed throughout the fine-tuning process. This, in effect, gives up Bayesian modeling of the \(\bm{B}\) component and focuses only on the posterior of \(\bm{A}\) in LoRA, as shown in Fig. 1.
+
+**Additional Advantages.** In addition to reducing sampling noise and improving convergence speed, our Bayesianization design has two further advantages. First, compared to modeling the variational distributions of both \(\bm{A}\) and \(\bm{B}\), our approach significantly reduces additional memory cost by approximately 50% per layer. Second, our design is equivalent to finding a posterior estimate for the full-weight matrix with a low-rank structure. For instance, by assuming a deterministic \(\bm{B}\) and Bayesianizing \(P(\bm{A}|\bm{\theta})=\mathcal{N}(\bm{A}|\bm{M},\bm{\Omega}^{2})\), each element of the full weight matrix \(W_{ij}\) is calculated as
+
+\[W_{ij}=W_{0,ij}+\sum_{k=1}^{r}B_{ik}A_{kj},\] (5)
+
+where \(A_{kj}\sim\mathcal{N}(M_{kj},\Omega_{kj}^{2})\) is drawn independently \(\forall k\in[r]\). It is noteworthy that due to the low-rank structure defined in Eqn. 5, the full-weight parameters of \(\bm{W}\) are no longer independent from each other. The correlation among them can be reflected by the following theorem:
+
+**Theorem 3.1** (**Variational Distribution of the Full-Weight Matrix in BLoB)**.: _With the pre-trained weight matrix \(\bm{W}_{0}\in\mathbb{R}^{m\times n}\) and the low-rank weight update matrix \(\bm{B}\in\mathbb{R}^{m\times r}\), suppose that the variational distribution of the other low-rank update matrix \(\bm{A}\in\mathbb{R}^{r\times n}\) is Gaussian with \(q(\bm{A}|\bm{\theta}=\{\bm{M},\bm{\Omega}\})=\prod_{ij}\mathcal{N}(A_{ij}|M_ {ij},\Omega_{ij}^{2})\), where \(\bm{M}=[M_{ij}]\in\mathbb{R}^{r\times n}\) and \(\bm{\Omega}=[\Omega_{ij}]\in\mathbb{R}^{r\times n}\) are its mean and standard deviation, respectively. The equivalent variational distribution defined on the full weight matrix \(\bm{W}\) as in Eqn. 3 is given by_
+
+\[q(\mathrm{vec}(\bm{W})|\bm{B},\bm{\theta}) =\mathcal{N}(\mathrm{vec}(\bm{W})|\bm{\mu}_{q},\bm{\Sigma}_{q}),\] (6) \[\text{where}\quad\bm{\mu}_{q} =\mathrm{vec}(\bm{W}_{0}+\bm{B}\bm{M}),\] (7) \[\bm{\Sigma}_{q} =[\bm{I}_{n}\otimes\bm{B}]\cdot[\mathrm{diag}(\mathrm{vec}(\bm{ \Omega})^{2})]\cdot[\bm{I}_{n}\otimes\bm{B}^{\top}].\] (8)
+
+Theorem 3.1 shows that our asymmetric LoRA Bayesianization is equivalent to using a Gaussian variational distribution for the full weight \(\bm{W}\) (i.e., Eqn. 6), with a flexible covariance matrix (i.e., Eqn. 8), to approximate the postetior distribution of the full weight \(\bm{W}\).
+
+Figure 1: Overview of our Bayesian Low-Rank Adaptation by Backpropagation, i.e., BLoB (**right**) as well as comparison with existing methods such as LoRA (**left**) and Laplace LoRA (**middle**).
+
+**Remark**.: _The covariance matrix \(\bm{\Sigma}_{q}\) is strictly singular, which consequently inspires us to design a prior \(P(\bm{W})\) with such low-rank structure in Sec. 3.2. Previous work on low-rank Gaussians typically considers covariance with a similar structure \(\bm{D}^{2}+\bm{\Sigma}_{q}\), where \(\bm{D}\) is diagonal [89; 70; 86; 90; 73]. However, sampling from a Gaussian with this structure requires sampling noise of the same shape as the full-weight matrix, which is not parameter-efficient; we therefore do not adopt this in our work._
+
+### Low-Rank Prior Distribution
+
+In Eqn. 3, optimizing the KL divergence between the variational and prior distributions in the space of full weights can be burdensome. Therefore, we assume the prior distribution of the full weights to be a low-rank Gaussian, with its mean centered at the pre-trained weights \(\mathrm{vec}(\bm{W}_{0})\) and its covariance matrix parameterized by a rank-\(r^{\prime}\) matrix \(\widetilde{\bm{R}}\in\mathbb{R}^{(mn)\times r^{\prime}}\):
+
+\[P(\mathrm{vec}(\bm{W})) =\mathcal{N}(\mathrm{vec}(\bm{W})|\bm{\mu}_{p},\bm{\Sigma}_{p}),\] (9) \[\text{where}\quad\bm{\mu}_{p} =\mathrm{vec}(\bm{W}_{0}),\] \[\bm{\Sigma}_{p} =\widetilde{\bm{R}}\widetilde{\bm{R}}^{\top}.\]
+
+Assuming a low-rank prior distribution and designing an appropriate \(\widetilde{\bm{R}}\) allows us to optimize the KL divergence in the decomposed low-rank weight space, as suggested by the following theorem.
+
+**Theorem 3.2** (**Efficient Computation of Full-Weight KL Divergence)**.: _Suppose the pre-trained weights \(\bm{W}_{0}\), update matrix \(\bm{B}\), and the variational distribution \(q(\bm{A}|\bm{\theta})\) are defined as in Theorem 3.1, and the prior distribution of the full-weight matrix \(P(\mathrm{vec}(\bm{W}))\) is defined as Eqn. 9. Consider the Gaussian prior distribution \(P(\bm{A})=\prod_{ij}\mathcal{N}(A_{ij}|0,\sigma_{p}^{2})\); we then have:_
+
+\[\mathrm{KL}[q(\mathrm{vec}(\bm{W})|\bm{B},\bm{\theta})\|P(\mathrm{vec}(\bm{W} ))]=\mathrm{KL}[q(\bm{A}|\bm{\theta})\|P(\bm{A})],\] (10)
+
+_if \(\widetilde{\bm{R}}=[\sigma_{p}\bm{I}_{n}\otimes\bm{R}]\), where \(\bm{R}\) satisfies \(\bm{R}\bm{R}^{\top}=\bm{B}\bm{B}^{\top}\)._
+
+Theorem 3.2 shows that with a proper \(\widetilde{\bm{R}}\), one can compute the KL divergence for the high-dimensional full weight \(\mathrm{vec}(\bm{W})\) simply by computing the KL divergence for \(\bm{A}\), which is much lower-dimension, more parameter-efficient, more memory-efficient, and faster. Note that the Gaussian distributions we define for both the prior and the posterior are degenerate. However, they are valid for probabilistic inference [83], as (i) their probability density is well-defined, and (ii) their KL divergence is computable under the assumptions of Theorem 3.2. See Appendix A.1 for a detailed discussion.
+
+Concretely, we assume that the prior distribution in BLoB follows the low-rank structure described in Theorem 3.2 and minimize the KL divergence term for the low-rank component \(\bm{A}\) using its analytical solution in Eqn. 3:
+
+\[\mathrm{KL}[q(\bm{A}|\bm{\theta}=\{\bm{M},\bm{\Omega}\})\|P(\bm{A})]=\tfrac{1} {2\sigma_{p}^{2}}(\|\bm{M}\|_{2}^{2}+\|\bm{\Omega}\|_{2}^{2})-\sum_{ij}\log \Omega_{ij}.\] (11)
+
+### Parameterization of the Low-Rank Variational Distribution
+
+The parameterization of the Gaussian variational distribution \(q(\bm{A}|\bm{\theta})\) significantly affects the convergence speed of the KL term in Eqn. 11. The mean matrix \(\bm{M}\) of \(q(\bm{A}|\bm{\theta})\) has no additional constraints, we therefore parameterize it directly as the output of a neural network. Each entry of \(q(\bm{A}|\bm{\theta})\)'s diagonal covariance matrix \(\bm{\Omega}\) (i.e., standard deviation) is non-negative; we therefore use element-wise parameterization \(\Omega_{ij}=G_{ij}^{2}\), where \(\bm{G}=[G_{ij}]\in\mathbb{R}^{r\times n}\) is the real parameter matrix that determines the standard deviation \(\bm{\Omega}\). Since \(\bm{\Omega}\) is usually initialized with small positive values close to zero, our parameterization method provides large gradients initially, contributing to the rapid decrease of the KL term. We further show, both theoretically and empirically, that our parameterization method, unlike BBB's softplus function \(\log(1+\exp(\cdot))\), is crucial for the fast convergence of \(\bm{\Omega}\) when \(q(\bm{A}|\bm{\theta})\) is close to the prior distribution \(P(\bm{A})\) (see more analysis in Appendix A.2).
+
+### On Improving the Sample Efficiency of BLoB
+
+**Improving Sample Efficiency with Flipout.** One main challenge in estimating the variational distribution (i.e., the approximate posterior) during fine-tuning lies in the sample efficiency of theweights [109; 25; 58]. During mini-batch stochastic gradient descent, a batch of examples typically share the same weights drawn from the variational distribution. This can lead to slow convergence of the likelihood cost in Eqn. 3. Drawing inspiration from [108], we introduce the technique of flipout to speed up the sampling procedure of our low-rank variational distributions \(q(\bm{A}|\bm{\theta})\).
+
+**LoRA Flipout.** Unlike the original approach, which applies rank-1 random flipping to the full weights, we apply flipout exclusively to the low-rank component \(\bm{A}\). Specifically, suppose we have a mini-batch of input vectors \(\bm{H}\in\mathbb{R}^{n\times b}\), where \(b\) represents the batch size. We randomly sample two low-rank flipping matrices \(\bm{S}\in\{-1,+1\}^{n\times b}\) and \(\bm{T}\in\{-1,+1\}^{b\times r}\). Denoting as \(\bm{E}\in\mathbb{R}^{r\times n}\) the weight noise sampled for this mini-batch, the batched output \(\bm{Z}\) after applying flipout is then
+
+\[\bm{Z}=\bm{W}_{0}\bm{H}+\bm{B}(\bm{M}\bm{H}+[(\bm{E}\circ\bm{\Omega})(\bm{H} \circ\bm{S})]\circ\bm{T}),\] (12)
+
+It is crucial that the independent noises added to the low-rank weight noise \(\Delta\bm{A}\triangleq\bm{E}\circ\bm{\Omega}\) ensure _sampling independence across examples_ within a mini-batch, thereby enhancing the sampling efficiency of the algorithm. This is done without violating the assumptions outlined in Theorem 3.1 and 3.2. As illustrated in algorithm 1, we use \(\widetilde{\bm{E}}_{kj}\) to represent the equivalent noise applied to parameter \(\bm{A}\) for the \(j\)-th example in the \(k\)-th batch after BLoBFlipout. Due to the low-rank structure of our Bayesianization method, the computational overhead of employing flipout in BLoB is also minimal.
+
+```
+0: dataset \(\mathcal{D}\), pre-trained weight \(\bm{W}_{0}\), low-rank component \(\bm{B}\), \(\bm{\theta}=\{\bm{M},\bm{G}\}\) for parameterizing the mean and variance of \(\bm{A}\);
+0: prior standard deviation \(\sigma_{p}\), initialization hyperparameter \(\epsilon\), number of input features \(n\);
+0: number of samples during training \(K\), number of iterations \(T\), learning rate \(\eta\);
+1:\(\bm{G}\sim\mathcal{U}(\frac{\epsilon}{\sqrt{2}},\epsilon)\), \(\bm{M}\sim\mathcal{U}\left(-\sqrt{\frac{6}{n}},\sqrt{\frac{6}{n}}\right)\)\(\triangleright\) Initialization of \(\bm{A}\)'s parameters.
+2:\(\bm{B}\leftarrow\bm{0}\)\(\triangleright\) Initialization of \(\bm{B}\).
+3:for\(t=1,\cdots,T\)do
+4: Sample a mini-batch of data \(\mathcal{D}_{t}\sim\mathcal{D}\) containing \(b\) samples.
+5:for\(k=1,\cdots,K\)do
+6: Sample batched noise \(\bm{E}_{k}\sim\mathcal{N}\left(\bm{0},\bm{I}\right)\).\(\triangleright\) Sample the noise.
+7: Let \(\{\widetilde{\bm{E}}_{kj}\}_{j=1}^{b}\leftarrow\text{BLoBFlipout}(\bm{E}_{k})\).\(\triangleright\) Eqn. 12
+8: Let \(\{\bm{A}_{kj}=\bm{M}+\bm{G}^{2}\circ\widetilde{\bm{E}}_{kj}\}_{j=1}^{b}\).
+9:endfor
+10: Let \(\widetilde{\mathcal{F}}_{t}=-\frac{1}{Kb}\sum_{k=1}^{K}\sum_{j=1}^{b}\log P( \mathcal{D}_{t}|\bm{A}_{kj},\bm{B})+\frac{1}{2\sigma_{p}^{2}}(\|\bm{M}\|_{2}^ {2}+\|\bm{G}\|_{2}^{4})-2\sum_{ij}\log G_{ij}\).
+11:\(\triangleright\) Eqn. 13 and 11.
+12: Calculate the gradient w.r.t. the parameters: \(\Delta_{\bm{M}}=\nicefrac{{\partial\widetilde{\mathcal{F}}_{t}}}{{\partial \bm{M}}}\), \(\Delta_{\bm{G}}=\nicefrac{{\partial\widetilde{\mathcal{F}}_{t}}}{{\partial \bm{G}}}\), \(\Delta_{\bm{B}}=\nicefrac{{\partial\widetilde{\mathcal{F}}_{t}}}{{\partial \bm{B}}}\).
+13: Update the parameters: \(\bm{M}\leftarrow\bm{M}-\eta\Delta_{\bm{M}}\); \(\bm{G}\leftarrow\bm{G}-\eta\Delta_{\bm{G}}\); \(\bm{B}\leftarrow\bm{B}-\eta\Delta_{\bm{B}}\).
+14:endfor ```
+
+**Algorithm 1** Bayesian Low-Rank Adaptation by Backpropagation (**BLoB**)
+
+### BLoB: Final Algorithm
+
+We are now ready to present our full BLoB algorithm.
+
+**During training**, under the assumptions outlined in Theorem 3.1 and 3.2, optimizing the evidence lower bound on the full weight \(\bm{W}\) can be efficiently done in the low-rank space, using the following final objective function:
+
+\[\mathcal{F}(\mathcal{D},\bm{B},\bm{\theta}) =-\mathbb{E}_{q(\bm{W}|\bm{B},\bm{\theta})}[\log P(\mathcal{D}| \bm{W})]+\mathrm{KL}[q(\bm{W}|\bm{B},\bm{\theta})\parallel P(\bm{W})]\] \[=-\mathbb{E}_{q(\bm{A}|\bm{\theta})}[\log P(\mathcal{D}|\bm{A}, \bm{B})]+\mathrm{KL}[q(\bm{A}|\bm{\theta})\parallel P(\bm{A})],\] (13)
+
+where \(\bm{\theta}=\{\bm{M},\bm{\Omega}\}\) denotes the set of the parameters underlying the variational distribution of the low-rank matrix \(\bm{A}\). Additionally, to trade off between data fitting and posterior approximation,we employ a KL re-weighting scheme, which is detailed in Appendix B.1. The full algorithmic description of BLoB training is shown in Algorithm 1.
+
+**During inference,** for an input \(\bm{x}\), we approximate the expected output distribution \(P(\bm{y}|\bm{x})\) of BLoB by drawing \(N\) samples from the variational distribution \(q(\bm{W}|\bm{\theta})\). Empirically, \(N=10\) provides a good balance between estimation quality and computational efficiency:
+
+\[\mathbb{E}_{q(\bm{W}|\bm{\theta})}[P(\bm{y}|\bm{x},\bm{W})]\approx\tfrac{1}{N} \sum_{n=1}^{N}P(\bm{y}|\bm{x},\bm{W}_{n}),\quad\bm{W}_{n}\sim q(\bm{W}|\bm{ \theta}).\] (14)
+
+## 4 Experiments
+
+In this section, we compare our BLoB with existing methods on real-world datasets. Sec. 4.1 introduces the experimental settings, including baselines, fine-tuning, and evaluation protocols. We then evaluate BLoB's generalization and uncertainty estimation abilities in both in-distribution (Sec. 4.2) and out-of-distribution scenarios (Sec. 4.3).
+
+### Settings
+
+**Fine-tuning and Evaluation.** We implement BLoB in the PEFT library [63] and fine-tune the LlaMA2-7B [92] model on common-sense reasoning tasks. Following Laplace-LoRA [116], we apply LoRA to the output layer as well as the queries and values of all the attention layers. For hyperparameters, we strictly adhere to the default settings in the PEFT library and the original LoRA paper [63; 41] to ensure maximal reproducibility. This includes the number of training steps, learning rate, and LoRA rank \(r\) (see Appendix B.1 for details). For common-sense reasoning tasks, we select
+
+\begin{table}
+\begin{tabular}{c l l l l l l l} \hline \hline \multirow{2}{*}{**Metric**} & \multirow{2}{*}{**Method**} & \multicolumn{6}{c}{**Datasets**} \\ \cline{3-8}  & & WG-S [32] & ARC-C [18] & ARC-E [18] & WG-M [82] & OBQA [65] & BoolQ [17] \\ \hline \multirow{8}{*}{ACC (\(\uparrow\))} & MLE & 68.99\(\pm\)0.58 & 69.10\(\pm\)2.84 & 85.65\(\pm\)0.92 & 74.53\(\pm\)0.66 & 81.52\(\pm\)0.25 & 86.53\(\pm\)0.28 \\  & MAP & 68.62\(\pm\)0.71 & 67.59\(\pm\)0.40 & 86.55\(\pm\)0.55 & 75.61\(\pm\)0.71 & 81.38\(\pm\)0.65 & 86.50\(\pm\)0.41 \\  & MCD [29] & 69.46\(\pm\)0.62 & 68.69\(\pm\)1.30 & 86.21\(\pm\)0.46 & **76.45\(\pm\)0.60** & 81.72\(\pm\)0.10 & 87.29\(\pm\)0.13 \\  & ENS [51; 8; 103] & 69.57\(\pm\)0.66 & 66.20\(\pm\)0.21 & 84.40\(\pm\)0.81 & 75.32\(\pm\)0.21 & 81.38\(\pm\)0.91 & 87.09\(\pm\)0.11 \\  & BBB [11] & 56.54\(\pm\)37.80 & 68.13\(\pm\)1.27 & 85.86\(\pm\)0.74 & 73.63\(\pm\)2.44 & 82.06\(\pm\)0.99 & **87.11\(\pm\)0.22** \\  & LAP [116] & 69.20\(\pm\)1.50 & 66.78\(\pm\)0.69 & 80.05\(\pm\)0.22 & 75.55\(\pm\)0.36 & 82.12\(\pm\)0.65 & 86.95\(\pm\)0.09 \\ \cline{2-8}  & BLoB (N=0) & **70.89\(\pm\)0.82** & **70.83\(\pm\)1.57** & **86.68\(\pm\)0.66** & 74.55\(\pm\)1.94 & **82.73\(\pm\)0.64** & 86.80\(\pm\)0.23 \\  & BLoB (N=5) & 66.30\(\pm\)0.62 & 67.34\(\pm\)1.55 & 84.74\(\pm\)0.33 & 72.89\(\pm\)1.25 & 81.79\(\pm\)0.84 & 86.47\(\pm\)0.15 \\  & BLoB (N=10) & 69.07\(\pm\)0.34 & 68.81\(\pm\)1.49 & 85.56\(\pm\)0.35 & 73.69\(\pm\)0.17 & 81.52\(\pm\)0.74 & 86.99\(\pm\)0.24 \\ \hline \multirow{8}{*}{ECE (\(\downarrow\))} & MLE & 29.83\(\pm\)0.38 & 29.00\(\pm\)1.97 & 13.12\(\pm\)1.39 & 20.62\(\pm\)0.74 & 12.55\(\pm\)0.46 & 3.18\(\pm\)0.09 \\  & MAP & 29.76\(\pm\)0.87 & 29.42\(\pm\)0.68 & 12.07\(\pm\)0.55 & 23.07\(\pm\)0.14 & 13.26\(\pm\)0.82 & 3.16\(\pm\)0.23 \\  & MCD [29] & 27.98\(\pm\)0.44 & 27.53\(\pm\)0.00 & 12.02\(\pm\)0.36 & 19.55\(\pm\)0.47 & 13.10\(\pm\)0.11 & 3.46\(\pm\)0.16 \\  & ENS [51; 8; 103] & 25.52\(\pm\)0.55 & 29.16\(\pm\)2.37 & 12.57\(\pm\)0.58 & 20.86\(\pm\)0.40 & 15.34\(\pm\)0.27 & 9.61\(\pm\)0.24 \\  & BBB [11] & 21.81\(\pm\)12.95 & 26.23\(\pm\)1.47 & 12.28\(\pm\)0.58 & 15.76\(\pm\)0.71 & 11.38\(\pm\)1.07 & 3.74\(\pm\)0.10 \\  & LAP [116] & **4.15\(\pm\)1.12** & 16.25\(\pm\)2.61\({}^{\circ}\) & 33.29\(\pm\)0.57 & 7.40\(\pm\)0.27 & 8.70\(\pm\)1.77 & **1.30\(\pm\)0.33** \\ \cline{2-8}  & BLoB (N=0) & 20.62\(\pm\)0.83 & 20.61\(\pm\)1.16 & 9.43\(\pm\)0.38 & 11.23\(\pm\)0.69 & 8.36\(\pm\)0.38 & 2.46\(\pm\)0.07 \\  & BLoB (N=5) & 10.89\(\pm\)0.63 & 11.22\(\pm\)0.35 & 6.10\(\pm\)0.22 & 4.51\(\pm\)0.35 & **3.40\(\pm\)0.57** & 1.63\(\pm\)0.35 \\  & BLoB (N=10) & 0.35\(\pm\)1.37 & **9.59\(\pm\)1.88** & **3.64\(\pm\)0.53** & **3.01\(\pm\)0.12** & **3.71\(\pm\)0.47** & 1.41\(\pm\)0.19 \\ \hline \multirow{8}{*}{NLL (\(\downarrow\))} & MLE & 3.17\(\pm\)0.37 & 2.85\(\pm\)0.27 & 1.17\(\pm\)0.13 & 0.95\(\pm\)0.07 & 0.73\(\pm\)0.03 & 0.32\(\pm\)0.00 \\  & MAP & 2.46\(\pm\)0.34 & 2.66\(\pm\)0.11 & 0.90\(\pm\)0.05 & 1.62\(\pm\)0.29 & 0.75\(\pm\)0.01 & 0.33\(\pm\)0.00 \\  & MCD [29] & 2.79\(\pm\)0.53 & 2.67\(\pm\)0.15 & 1.00\(\pm\)0.14 & 1.02\(\pm\)0.03 & 0.77\(\pm\)0.03 & 0.31\(\pm\)0.00 \\  & ENS [51; 8; 103] & 27.14\(\pm\)0.08 & 2.46\(\pm\)0.22 & 0.82\(\pm\)0.03 & 1.25\(\pm\)0.03 & 1.06\(\pm\)0.04 & 0.57\(\pm\)0.02 \\  & BBB [11] & 1.40\(\pm\)0.55 & 2.23\(\pm\)0.04 & 0.91\(\pm\)0.06 & 0.84\(\pm\)0.15 & 0.66\(\pm\)0.05 & **0.31\(\pm\)0.00** \\  & LAP [116] & **0.60\(\pm\)0.00** & 1.03\(\pm\)0.00 & 0.88\(\pm\)0.00 & 0.57\(\pm\)the next token logits corresponding to possible answers from each dataset and fine-tune the LLM to maximize the likelihood of the correct token. For evaluation, in addition to Accuracy (**ACC**), we use Expected Calibration Error (**ECE**[31]) and Negative Log-Likelihood (**NLL**) to assess the models' uncertainty estimation ability (see Appendix B.2 for details).
+
+**Baselines and Implementation Details.** We compare **BLoB** with state-of-the-art uncertainty estimation methods applied to the LoRA adapters of LLMs, including Monte-Carlo Dropout (**MCD**) [29], Bayes By Backprop (**BBB**) [11], Deep Ensemble (**ENS**) [51; 8; 103], and the latest Laplace-LoRA (**LAP**) [116]. We also report the performance of two standard PEFT baseline methods for reference: Maximum Likelihood Estimation (**MLE**) [41] and Maximum A Posteriori (**MAP**).
+
+For MLE, we use the LoRA implementation. For MAP, we use a weight decay rate of \(1e-5\). For MCD, we use an ensemble of 10 LoRAs with a dropout rate of \(p=0.1\). For ENS, we independently fine-tune 3 LoRAs and average their logits during evaluation. For BBB, we adopt the default settings from the Bayesian-Torch library [48] and only Bayesianize the **_A_** matrix, similar to BLoB. We sample \(N=10\) times for BBB during test. We re-implement LAP and apply it to the MAP checkpoints. We keep all BLoB-specific hyperparameters consistent across all datasets. Typically, we set the number of samples \(K=1\) during training for all our BLoB experiments, which highlights BLoB's sampling efficiency. As shown in Table 1, we also report BLoB's performance with different numbers of samples during Bayesian inference, where \(N=0\) indicates directly using the mean of the weight distribution for prediction.
+
+### Results on In-distribution Datasets
+
+We fine-tune LLama2-7B on six common-sense reasoning tasks: Winogrande-small (WG-S), Winogrande-medium (WG-M) [82], ARC-Challenge (ARC-C) [18], ARC-Easy (ARC-E) [18], OpenBokQA (OBQA) [65], and BoolQ [17]. For all baseline methods, using the same pre-trained LLM backbone, we maintain consistent hyperparameters across all datasets and do not use additional validation sets to achieve higher performance (See Appendix B.3 for detailed settings).
+
+Table 1 shows the performance of BLoB compared to the baselines, including ACC, ECE, and NLL, on the in-distribution test set with the pre-trained LLama2-7B model. The high ECE and NLL for MLE indicate overconfidence in LLMs during conventional fine-tuning, except for BoolQ due to its large dataset size. Simple but popular baselines like MAP, MCD, and ENS show mixed results in terms of NLL and/or ECE, highlighting the challenge of uncertainty estimation during LLM fine-tuning. LAP, the most competitive post-training baseline for uncertainty estimation, significantly reduces NLL and ECE on some datasets but lacks consistent performance, as indicated by its failures on ARC-C and ARC-E. BBB mitigates the overconfidence issue in LLMs across almost all datasets, showcasing the advantage of jointly optimizing the mean and covariance of the variational weight distributions during fine-tuning. However, there remains considerable room for improvement.
+
+BLoB consistently achieves better or comparable performance across all datasets. With the number of samples during inference set to \(N=10\), the same as MCD, BLoB provides the best uncertainty estimation performance, significantly reducing NLL and ECE, and greatly mitigating overconfidence while maintaining comparable or better ACC than MLE. Even with half the number of samples, \(N=5\), BLoB still delivers performance comparable to that of \(N=10\) and outperforms other baselines on most datasets. By abandoning the modeling of the posterior distribution, prediction using the mean of the weight distribution, i.e., BLoB (N=0) sacrifices some degree of calibration in exchange for improved accuracy. Appendix C.5 presents the trade-off between accuracy and calibration, which is controlled by the standard deviation of the prior Gaussian distribution).
+
+Besides LLama2-7B, we also include additional results for RoBERTa-base [60] on text classification tasks in Appendix C.1. Our method consistently achieved either the best or runner-up performance across nearly all datasets, demonstrating its versatility across different architectures.
+
+[MISSING_PAGE_FAIL:9]
+
+Bayesianizing LoRA due to its widespread application in existing works. We also note that BLoB can be naturally adapted to handle different LoRA variants.
+
+**Uncertainty Estimation in Large Language Models.** Large-scale pre-trained models are well-calibrated during pre-training [44], but fail to accurately express predictive uncertainty during inference [3; 107; 44; 43; 87], especially after fine-tuning [8; 103; 69; 116]. This indicates that measures effective during pre-training [93; 114; 16; 122; 14] may lose their power of uncertainty estimation after fine-tuning for domain-specific knowledge. To address this issue, [27; 123] define priors and approximate posteriors on the full attention weights during fine-tuning, achieving better uncertainty estimation but at a significant cost in time and space. Consequently, recent work integrates Bayesian methods and PEFT for efficient uncertainty estimation. For instance, [8; 103] train and store multiple copies of different LoRAs, ensembling their outputs during inference to achieve somewhat better results. [116] applies Kronecker factorized Laplace approximation on fine-tuned LoRA. However, such post-training procedures bifurcate posterior approximation into two stages, leading to suboptimal estimation. In contrast, our BLoB enables simultaneous estimation of both the mean and covariance of LLM parameters in a single fine-tuning stage, substantially improving performance.
+
+## 6 Conclusion
+
+In this work, we propose a principled Bayesianization framework for parameter-efficiently fine-tuning LLMs. Our theoretical analysis shows that a full-weight variational distribution can be efficiently optimized by approximately using a low-rank space of the weight update matrices. Our empirical evaluations corroborate this theoretical insight, demonstrating superior generalization and uncertainty estimation capabilities across diverse scenarios compared to various baseline methods. Building on LoRA, our approach seamlessly integrates with existing LLM architectures while imposing minimal additional memory overhead and training time. Our method highlights that jointly learning the mean and covariance of the variational distribution during fine-tuning can mutually improve both, underscoring the powerful potential of Bayesian methods in enhancing the reliability and generalization of LLMs.
+
+## 7 Limitations
+
+The main limitations of our proposed BLoB method are: (i) BLoB is confined to fine-tuning scenarios and is not applicable to training-free tasks, such as direct uncertainty estimation during inference [64]. (ii) As a typical mean-field variational inference method, BLoB requires multiple sampling iterations during inference, which challenges stable and efficient deployment. (iii) While BLoB's effectiveness has been empirically demonstrated for downstream classification tasks, its application to generation tasks requires further investigation.
+
+## Acknowledgement
+
+The authors thank the reviewers/AC for the constructive comments to improve the paper. We thank Sanket Jantre for identifying improvements to our proof and for other valuable discussions. HS and HW are partially supported by Microsoft Research AI & Society Fellowship, NSF Grant IIS-2127918, NSF CAREER Award IIS-2340125, NIH Grant 1R01CA297832, and the Amazon Faculty Research Award. This research is also supported by NSF National Artificial Intelligence Research Resource (NAIRR) Pilot. The views and conclusions contained herein are those of the authors and should not be interpreted as necessarily representing the official policies, either expressed or implied, of the sponsors.
+
+## References
+
+* [1] J. Achiam, S. Adler, S. Agarwal, L. Ahmad, I. Akkaya, F. L. Aleman, D. Almeida, J. Altenschmidt, S. Altman, S. Anadkat, et al. Gpt-4 technical report. _arXiv preprint arXiv:2303.08774_, 2023.
+
+* [2] A. Aghajanyan, S. Gupta, and L. Zettlemoyer. Intrinsic dimensionality explains the effectiveness of language model fine-tuning. In _Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers)_, pages 7319-7328, 2021.
+* [3] D. Amodei, C. Olah, J. Steinhardt, P. Christiano, J. Schulman, and D. Mane. Concrete problems in ai safety, 2016.
+* [4] R. Anil, A. M. Dai, O. Firat, M. Johnson, D. Lepikhin, A. Passos, S. Shakeri, E. Taropa, P. Bailey, Z. Chen, et al. Palm 2 technical report. _arXiv preprint arXiv:2305.10403_, 2023.
+* [5] A. Ansell, E. M. Ponti, A. Korhonen, and I. Vulic. Composable sparse fine-tuning for cross-lingual transfer. _arXiv preprint arXiv:2110.07560_, 2021.
+* [6] A. Asai, M. Salehi, M. E. Peters, and H. Hajishirzi. Attempt: Parameter-efficient multi-task tuning via attentional mixtures of soft prompts. In _Proceedings of the 2022 Conference on Empirical Methods in Natural Language Processing_, pages 6655-6672, 2022.
+* [7] A. Azaria and T. Mitchell. The internal state of an llvm knows when its lying. _arXiv preprint arXiv:2304.13734_, 2023.
+* [8] O. Balabanov and H. Linander. Uncertainty quantification in fine-tuned llms using lora ensembles. _arXiv preprint arXiv:2402.12264_, 2024.
+* [9] S. Biderman, H. Schoelkopf, Q. G. Anthony, H. Bradley, K. O'Brien, E. Hallahan, M. A. Khan, S. Purohit, U. S. Prashanth, E. Raff, et al. Pythia: A suite for analyzing large language models across training and scaling. In _International Conference on Machine Learning_, pages 2397-2430. PMLR, 2023.
+* [10] C. M. Bishop. Pattern recognition and machine learning. _Springer google schola_, 2:1122-1128, 2006.
+* [11] C. Blundell, J. Cornebise, K. Kavukcuoglu, and D. Wierstra. Weight uncertainty in neural network. In _International conference on machine learning_, pages 1613-1622. PMLR, 2015.
+* [12] T. Brown, B. Mann, N. Ryder, M. Subbiah, J. D. Kaplan, P. Dhariwal, A. Neelakantan, P. Shyam, G. Sastry, A. Askell, et al. Language models are few-shot learners. _Advances in neural information processing systems_, 33:1877-1901, 2020.
+* [13] T. H. Chan, K. W. Lau, J. Shen, G. Yin, and L. Yu. Adaptive uncertainty estimation via high-dimensional testing on latent representations. In A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine, editors, _Advances in Neural Information Processing Systems_, volume 36, pages 39975-39993. Curran Associates, Inc., 2023.
+* [14] W. Chen and Y. Li. Calibrating transformers via sparse gaussian processes. _arXiv preprint arXiv:2303.02444_, 2023.
+* [15] A. Chowdhery, S. Narang, J. Devlin, M. Bosma, G. Mishra, A. Roberts, P. Barham, H. W. Chung, C. Sutton, S. Gehrmann, et al. Palm: Scaling language modeling with pathways. _Journal of Machine Learning Research_, 24(240):1-113, 2023.
+* [16] T. Cinquin, A. Immer, M. Horn, and V. Fortuin. Pathologies in priors and inference for bayesian transformers. _arXiv preprint arXiv:2110.04020_, 2021.
+* [17] C. Clark, K. Lee, M.-W. Chang, T. Kwiatkowski, M. Collins, and K. Toutanova. BoolQ: Exploring the surprising difficulty of natural yes/no questions. In J. Burstein, C. Doran, and T. Solorio, editors, _Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers)_, pages 2924-2936, Minneapolis, Minnesota, June 2019. Association for Computational Linguistics.
+* [18] P. Clark, I. Cowhey, O. Etzioni, T. Khot, A. Sabharwal, C. Schoenick, and O. Tafjord. Think you have solved question answering? try arc, the ai2 reasoning challenge, 2018.
+
+* [19] I. Dagan, O. Glickman, and B. Magnini. The pascal recognising textual entailment challenge. In J. Quinonero-Candela, I. Dagan, B. Magnini, and F. d'Alche Buc, editors, _Machine Learning Challenges. Evaluating Predictive Uncertainty, Visual Object Classification, and Recognising Tectual Entailment_, pages 177-190, Berlin, Heidelberg, 2006. Springer Berlin Heidelberg.
+* effortless bayesian deep learning. In M. Ranzato, A. Beygelzimer, Y. Dauphin, P. Liang, and J. W. Vaughan, editors, _Advances in Neural Information Processing Systems_, volume 34, pages 20089-20103. Curran Associates, Inc., 2021.
+* [21] T. Dettmers, A. Pagnoni, A. Holtzman, and L. Zettlemoyer. Qlora: Efficient finetuning of quantized llms. _Advances in Neural Information Processing Systems_, 36, 2024.
+* [22] N. Ding, X. Lv, Q. Wang, Y. Chen, B. Zhou, Z. Liu, and M. Sun. Sparse low-rank adaptation of pre-trained language models. _arXiv preprint arXiv:2311.11696_, 2023.
+* [23] N. Ding, Y. Qin, G. Yang, F. Wei, Z. Yang, Y. Su, S. Hu, Y. Chen, C.-M. Chan, W. Chen, et al. Parameter-efficient fine-tuning of large-scale pre-trained language models. _Nature Machine Intelligence_, 5(3):220-235, 2023.
+* [24] W. B. Dolan and C. Brockett. Automatically constructing a corpus of sentential paraphrases. In _Proceedings of the Third International Workshop on Paraphrasing (IWP2005)_, 2005.
+* [25] M. Dusenberry, G. Jerfel, Y. Wen, Y. Ma, J. Snoek, K. Heller, B. Lakshminarayanan, and D. Tran. Efficient and scalable Bayesian neural nets with rank-1 factors. In H. D. III and A. Singh, editors, _Proceedings of the 37th International Conference on Machine Learning_, volume 119 of _Proceedings of Machine Learning Research_, pages 2782-2792. PMLR, 13-18 Jul 2020.
+* [26] A. Edalati, M. Tahaei, I. Kobyzev, V. P. Nia, J. J. Clark, and M. Rezagholizadeh. Krona: Parameter efficient tuning with kronecker adapter. _arXiv preprint arXiv:2212.10650_, 2022.
+* [27] X. Fan, S. Zhang, B. Chen, and M. Zhou. Bayesian attention modules. _Advances in Neural Information Processing Systems_, 33:16362-16376, 2020.
+* [28] K. Friston, J. Mattout, N. Trujillo-Barreto, J. Ashburner, and W. Penny. Variational free energy and the laplace approximation. _Neuroimage_, 34(1):220-234, 2007.
+* [29] Y. Gal and Z. Ghahramani. Dropout as a bayesian approximation: Representing model uncertainty in deep learning. In _international conference on machine learning_, pages 1050-1059. PMLR, 2016.
+* [30] A. Graves. Practical variational inference for neural networks. _Advances in neural information processing systems_, 24, 2011.
+* [31] C. Guo, G. Pleiss, Y. Sun, and K. Q. Weinberger. On calibration of modern neural networks. In _International conference on machine learning_, pages 1321-1330. PMLR, 2017.
+* [32] D. Guo, A. M. Rush, and Y. Kim. Parameter-efficient transfer learning with diff pruning. In _Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers)_, pages 4884-4896, 2021.
+* [33] N. Gupta, H. Narasimhan, W. Jitkrittum, A. S. Rawat, A. K. Menon, and S. Kumar. Language model cascades: Token-level uncertainty and beyond. _arXiv preprint arXiv:2404.10136_, 2024.
+* [34] K. Hambardzumyan, H. Khachatrian, and J. May. Warp: Word-level adversarial reprogramming. In _Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers)_, pages 4921-4933, 2021.
+* [35] L. Han, Y. Li, H. Zhang, P. Milanfar, D. Metaxas, and F. Yang. Svdiff: Compact parameter space for diffusion fine-tuning. In _Proceedings of the IEEE/CVF International Conference on Computer Vision_, pages 7323-7334, 2023.
+
+* [36] J. He, C. Zhou, X. Ma, T. Berg-Kirkpatrick, and G. Neubig. Towards a unified view of parameter-efficient transfer learning. In _International Conference on Learning Representations_, 2021.
+* [37] D. Hendrycks, C. Burns, S. Basart, A. Critch, J. Li, D. Song, and J. Steinhardt. Aligning ai with shared human values. _Proceedings of the International Conference on Learning Representations (ICLR)_, 2021.
+* [38] D. Hendrycks, C. Burns, S. Basart, A. Zou, M. Mazeika, D. Song, and J. Steinhardt. Measuring massive multitask language understanding. _Proceedings of the International Conference on Learning Representations (ICLR)_, 2021.
+* [39] G. E. Hinton and D. Van Camp. Keeping the neural networks simple by minimizing the description length of the weights. In _Proceedings of the sixth annual conference on Computational learning theory_, pages 5-13, 1993.
+* [40] N. Houlsby, A. Giurgiu, S. Jastrzebski, B. Morrone, Q. De Laroussilhe, A. Gesmundo, M. Attariyan, and S. Gelly. Parameter-efficient transfer learning for nlp. In _International conference on machine learning_, pages 2790-2799. PMLR, 2019.
+* [41] E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang, and W. Chen. LoRA: Low-rank adaptation of large language models. In _International Conference on Learning Representations_, 2022.
+* [42] C. Huang, R. Wang, K. Xie, T. Yu, and L. Yao. Learn when (not) to trust language models: A privacy-centric adaptive model-aware approach, 2024.
+* [43] L. Huang, W. Yu, W. Ma, W. Zhong, Z. Feng, H. Wang, Q. Chen, W. Peng, X. Feng, B. Qin, and T. Liu. A survey on hallucination in large language models: Principles, taxonomy, challenges, and open questions, 2023.
+* [44] S. Kadavath, T. Conerly, A. Askell, T. Henighan, D. Drain, E. Perez, N. Schiefer, Z. Hatfield-Dodds, N. DasSarma, E. Tran-Johnson, S. Johnston, S. El-Showk, A. Jones, N. Elhage, T. Hume, A. Chen, Y. Bai, S. Bowman, S. Fort, D. Ganguli, D. Hernandez, J. Jacobson, J. Kermion, S. Kravec, L. Lovitt, K. Nodousse, C. Olsson, S. Ringer, D. Amodei, T. Brown, J. Clark, N. Joseph, B. Mann, S. McCandlish, C. Olah, and J. Kaplan. Language models (mostly) know what they know, 2022.
+* [45] S. Kapoor, N. Gruver, M. Roberts, K. Collins, A. Pal, U. Bhatt, A. Weller, S. Dooley, M. Goldblum, and A. G. Wilson. Large language models must be taught to know what they don't know. _arXiv preprint arXiv:2406.08391_, 2024.
+* [46] A. Kendall and Y. Gal. What uncertainties do we need in bayesian deep learning for computer vision? In I. Guyon, U. V. Luxburg, S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett, editors, _Advances in Neural Information Processing Systems_, volume 30. Curran Associates, Inc., 2017.
+* [47] D. P. Kingma and M. Welling. Auto-Encoding Variational Bayes. In _2nd International Conference on Learning Representations, ICLR 2014, Banff, AB, Canada, April 14-16, 2014, Conference Track Proceedings_, 2014.
+* [48] R. Krishnan, P. Esposito, and M. Subedar. Bayesian-torch: Bayesian neural network layers for uncertainty estimation. https://github.com/IntelLabs/bayesian-torch, Jan. 2022.
+* [49] R. Krishnan, M. Subedar, and O. Tickoo. Specifying weight priors in bayesian deep neural networks with empirical bayes. In _Proceedings of the AAAI Conference on Artificial Intelligence_, volume 34, pages 4477-4484, 2020.
+* [50] L. Kuhn, Y. Gal, and S. Farquhar. Semantic uncertainty: Linguistic invariances for uncertainty estimation in natural language generation. _arXiv preprint arXiv:2302.09664_, 2023.
+* [51] B. Lakshminarayanan, A. Pritzel, and C. Blundell. Simple and scalable predictive uncertainty estimation using deep ensembles. _Advances in neural information processing systems_, 30, 2017.
+
+* [52] Y. LeCun. Une procedure d'apprentissage ponr reseau a seuil asymetrique. _Proceedings of Cognitiva 85_, pages 599-604, 1985.
+* [53] B. Lester, R. Al-Rfou, and N. Constant. The power of scale for parameter-efficient prompt tuning. _arXiv preprint arXiv:2104.08691_, 2021.
+* [54] B. Lester, R. Al-Rfou, and N. Constant. The power of scale for parameter-efficient prompt tuning. In _Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing_, pages 3045-3059, 2021.
+* [55] C. Li, H. Farkhoor, R. Liu, and J. Yosinski. Measuring the intrinsic dimension of objective landscapes. _arXiv preprint arXiv:1804.08838_, 2018.
+* [56] X. L. Li and P. Liang. Prefix-tuning: Optimizing continuous prompts for generation. _arXiv preprint arXiv:2101.00190_, 2021.
+* [57] X. L. Li and P. Liang. Prefix-tuning: Optimizing continuous prompts for generation. In _Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers)_, pages 4582-4597, 2021.
+* [58] J. Liu, Z. Lin, S. Padhy, D. Tran, T. Bedrax Weiss, and B. Lakshminarayanan. Simple and principled uncertainty estimation with deterministic deep learning via distance awareness. _Advances in neural information processing systems_, 33:7498-7512, 2020.
+* [59] X. Liu, Y. Zheng, Z. Du, M. Ding, Y. Qian, Z. Yang, and J. Tang. Gpt understands, too. _AI Open_, 2023.
+* [60] Y. Liu, M. Ott, N. Goyal, J. Du, M. Joshi, D. Chen, O. Levy, M. Lewis, L. Zettlemoyer, and V. Stoyanov. Roberta: A robustly optimized bert pretraining approach. _arXiv preprint arXiv:1907.11692_, 2019.
+* [61] W. J. Maddox, P. Izmailov, T. Garipov, D. P. Vetrov, and A. G. Wilson. A simple baseline for bayesian uncertainty in deep learning. _Advances in neural information processing systems_, 32, 2019.
+* [62] R. K. Mahabadi, S. Ruder, M. Dehghani, and J. Henderson. Parameter-efficient multi-task fine-tuning for transformers via shared hypernetworks. In _Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers)_, pages 565-576, 2021.
+* [63] S. Mangrulkar, S. Gugger, L. Debut, Y. Belkada, S. Paul, and B. Bossan. Peft: State-of-the-art parameter-efficient fine-tuning methods. https://github.com/huggingface/peft, 2022.
+* [64] L. Mi, H. Wang, Y. Tian, and N. Shavit. Training-free uncertainty estimation for neural networks. In _AAAI_, 2022.
+* [65] T. Mihaylov, P. Clark, T. Khot, and A. Sabharwal. Can a suit of armor conduct electricity? a new dataset for open book question answering. In E. Riloff, D. Chiang, J. Hockenmaier, and J. Tsujii, editors, _Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing_, pages 2381-2391, Brussels, Belgium, Oct.-Nov. 2018. Association for Computational Linguistics.
+* [66] S. Min, X. Lyu, A. Holtzman, M. Artetxe, M. Lewis, H. Hajishirzi, and L. Zettlemoyer. Rethinking the role of demonstrations: What makes in-context learning work? _arXiv preprint arXiv:2202.12837_, 2022.
+* [67] R. M. Neal and G. E. Hinton. A view of the em algorithm that justifies incremental, sparse, and other variants. In _Learning in graphical models_, pages 355-368. Springer, 1998.
+* [68] A. Nikitin, J. Kossen, Y. Gal, and P. Marttinen. Kernel language entropy: Fine-grained uncertainty quantification for llms from semantic similarities. _arXiv preprint arXiv:2405.20003_, 2024.
+
+* [69] E. Onal, K. Floge, E. Caldwell, A. Sheverdin, and V. Fortuin. Gaussian stochastic weight averaging for bayesian low-rank adaptation of large language models, 2024.
+* [70] V. M.-H. Ong, D. J. Nott, and M. S. Smith. Gaussian variational approximation with a factor covariance structure. _Journal of Computational and Graphical Statistics_, 27(3):465-478, 2018.
+* [71] OpenAI. Introducing chatgpt. [online]. available: https://openai.com/blog/chatgpt. 2022.
+* [72] M. Opper and C. Archambeau. The variational gaussian approximation revisited. _Neural computation_, 21(3):786-792, 2009.
+* [73] Y. Park and D. Blei. Density uncertainty layers for reliable uncertainty estimation. In _International Conference on Artificial Intelligence and Statistics_, pages 163-171. PMLR, 2024.
+* 1076, 1962.
+* [75] J. Pfeiffer, A. Kamath, A. Ruckle, K. Cho, and I. Gurevych. Adapterfusion: Non-destructive task composition for transfer learning. In _Proceedings of the 16th Conference of the European Chapter of the Association for Computational Linguistics: Main Volume_, pages 487-503, 2021.
+* [76] M. T. Pilehvar and J. Camacho-Collados. WiC: the word-in-context dataset for evaluating context-sensitive meaning representations. In J. Burstein, C. Doran, and T. Solorio, editors, _Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers)_, pages 1267-1273, Minneapolis, Minnesota, June 2019. Association for Computational Linguistics.
+* [77] A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, I. Sutskever, et al. Language models are unsupervised multitask learners. _OpenAI blog_, 1(8):9, 2019.
+* [78] D. J. Rezende, S. Mohamed, and D. Wierstra. Stochastic backpropagation and approximate inference in deep generative models. In _International conference on machine learning_, pages 1278-1286. PMLR, 2014.
+* 837, 1956.
+* [80] A. Ruckle, G. Geigle, M. Glockner, T. Beck, J. Pfeiffer, N. Reimers, and I. Gurevych. Adapterdrop: On the efficiency of adapters in transformers. In _Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing_, pages 7930-7946, 2021.
+* [81] D. E. Rumelhart, G. E. Hinton, and R. J. Williams. Learning representations by back-propagating errors. _nature_, 323(6088):533-536, 1986.
+* [82] K. Sakaguchi, R. L. Bras, C. Bhagavatula, and Y. Choi. Winogrande: an adversarial winograd schema challenge at scale. _Commun. ACM_, 64(9):99-106, aug 2021.
+* [83] J. C. Schoenan, C. E. van Daalen, and J. A. du Preez. Degenerate gaussian factors for probabilistic inference. _International Journal of Approximate Reasoning_, 143:159-191, 2022.
+* [84] H. Shi, Z. Xu, H. Wang, W. Qin, W. Wang, Y. Wang, Z. Wang, S. Ebrahimi, and H. Wang. Continual learning of large language models: A comprehensive survey. _arXiv preprint arXiv:2404.16789_, 2024.
+* [85] E. Stengel-Eskin and B. Van Durme. Calibrated interpretation: Confidence estimation in semantic parsing. _Transactions of the Association for Computational Linguistics_, 11:1213-1231, 2023.
+* [86] L. S. Tan and D. J. Nott. Gaussian variational approximation with sparse precision matrices. _Statistics and Computing_, 28:259-275, 2018.
+
+* [87] K. Tian, E. Mitchell, A. Zhou, A. Sharma, R. Rafailov, H. Yao, C. Finn, and C. Manning. Just ask for calibration: Strategies for eliciting calibrated confidence scores from language models fine-tuned with human feedback. In H. Bouamor, J. Pino, and K. Bali, editors, _Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing_, pages 5433-5442, Singapore, Dec. 2023. Association for Computational Linguistics.
+* [88] L. Tierney and J. B. Kadane. Accurate approximations for posterior moments and marginal densities. _Journal of the american statistical association_, 81(393):82-86, 1986.
+* [89] M. Titsias and M. Lazaro-Gredilla. Doubly stochastic variational bayes for non-conjugate inference. In E. P. Xing and T. Jebara, editors, _Proceedings of the 31st International Conference on Machine Learning_, volume 32 of _Proceedings of Machine Learning Research_, pages 1971-1979, Bejing, China, 22-24 Jun 2014. PMLR.
+* [90] M. Tomczak, S. Swaroop, and R. Turner. Efficient low rank gaussian variational inference for neural networks. _Advances in Neural Information Processing Systems_, 33:4610-4622, 2020.
+* [91] H. Touvron, T. Lavril, G. Izacard, X. Martinet, M.-A. Lachaux, T. Lacroix, B. Roziere, N. Goyal, E. Hambro, F. Azhar, et al. Llama: Open and efficient foundation language models. _arXiv preprint arXiv:2302.13971_, 2023.
+* [92] H. Touvron, L. Martin, K. Stone, P. Albert, A. Almahairi, Y. Babaei, N. Bashlykov, S. Batra, P. Bhargava, S. Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models. _arXiv preprint arXiv:2307.09288_, 2023.
+* [93] D. Tran, M. Dusenberry, M. Van Der Wilk, and D. Hafner. Bayesian layers: A module for neural network uncertainty. _Advances in neural information processing systems_, 32, 2019.
+* [94] T. Vu, B. Lester, N. Constant, R. Al-Rfou, and D. Cer. Spot: Better frozen model adaptation through soft prompt transfer. In _Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)_, pages 5039-5059, 2022.
+* [95] A. Wang, Y. Pruksachatkun, N. Nangia, A. Singh, J. Michael, F. Hill, O. Levy, and S. R. Bowman. _SuperGLUE: a stickier benchmark for general-purpose language understanding systems_. Curran Associates Inc., Red Hook, NY, USA, 2019.
+* [96] A. Wang, A. Singh, J. Michael, F. Hill, O. Levy, and S. Bowman. GLUE: A multi-task benchmark and analysis platform for natural language understanding. In T. Linzen, G. Chrupala, and A. Alishahi, editors, _Proceedings of the 2018 EMNLP Workshop BlackboxNLP: Analyzing and Interpreting Neural Networks for NLP_, pages 353-355, Brussels, Belgium, Nov. 2018. Association for Computational Linguistics.
+* [97] H. Wang, C. Mao, H. He, M. Zhao, T. S. Jaakkola, and D. Katabi. Bidirectional inference networks: A class of deep bayesian networks for health profiling. In _AAAI_, volume 33, pages 766-773, 2019.
+* [98] H. Wang, X. Shi, and D.-Y. Yeung. Natural-parameter networks: A class of probabilistic neural networks. _Advances in neural information processing systems_, 29, 2016.
+* [99] H. Wang, S. Tan, Z. Hong, D. Zhang, and H. Wang. Variational language concepts for interpreting foundation language models. In _EMNLP_, 2024.
+* [100] H. Wang, S. Tan, and H. Wang. Probabilistic conceptual explainers: Towards trustworthy conceptual explanations for vision foundation models. In _ICML_, 2024.
+* [101] H. Wang and D.-Y. Yeung. Towards bayesian deep learning: A framework and some existing methods. _TDKE_, 28(12):3395-3408, 2016.
+* [102] H. Wang and D.-Y. Yeung. A survey on bayesian deep learning. _ACM computing surveys (csur)_, 53(5):1-37, 2020.
+* [103] X. Wang, L. Aitchison, and M. Rudolph. Lora ensembles for large language model fine-tuning, 2023.
+
+* [104] A. Warstadt, A. Singh, and S. R. Bowman. Neural network acceptability judgments. _Transactions of the Association for Computational Linguistics_, 7:625-641, 2019.
+* [105] J. Wei, M. Bosma, V. Y. Zhao, K. Guu, A. W. Yu, B. Lester, N. Du, A. M. Dai, and Q. V. Le. Finetuned language models are zero-shot learners. _arXiv preprint arXiv:2109.01652_, 2021.
+* [106] J. Wei, Y. Tay, R. Bommasani, C. Raffel, B. Zoph, S. Borgeaud, D. Yogatama, M. Bosma, D. Zhou, D. Metzler, et al. Emergent abilities of large language models. _arXiv preprint arXiv:2206.07682_, 2022.
+* [107] L. Weidinger, J. Mellor, M. Rauh, C. Griffin, J. Uesato, P.-S. Huang, M. Cheng, M. Glaese, B. Balle, A. Kasirzadeh, Z. Kenton, S. Brown, W. Hawkins, T. Stepleton, C. Biles, A. Birhane, J. Haas, L. Rimell, L. A. Hendricks, W. Isaac, S. Legassick, G. Irving, and I. Gabriel. Ethical and social risks of harm from language models, 2021.
+* [108] Y. Wen, P. Vicol, J. Ba, D. Tran, and R. Grosse. Flipout: Efficient pseudo-independent weight perturbations on mini-batches. In _International Conference on Learning Representations_, 2018.
+* [109] J. G. Wiese, L. Wimmer, T. Papamarkou, B. Bischl, S. Gunnemann, and D. Rugamer. Towards efficient mcmc sampling in bayesian neural networks by exploiting symmetry. In _Joint European Conference on Machine Learning and Knowledge Discovery in Databases_, pages 459-474. Springer, 2023.
+* [110] A. G. Wilson and P. Izmailov. Bayesian deep learning and a probabilistic perspective of generalization, 2022.
+* [111] M. Xiong, Z. Hu, X. Lu, Y. Li, J. Fu, J. He, and B. Hooi. Can llms express their uncertainty? an empirical evaluation of confidence elicitation in lms. _arXiv preprint arXiv:2306.13063_, 2023.
+* [112] R. Xu, F. Luo, Z. Zhang, C. Tan, B. Chang, S. Huang, and F. Huang. Raise a child in large language model: Towards effective and generalizable fine-tuning. In _Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing_, pages 9514-9528, 2021.
+* [113] Z. Xu, G.-H. Lee, Y. Wang, H. Wang, et al. Graph-relational domain adaptation. In _ICLR_, 2022.
+* [114] B. Xue, J. Yu, J. Xu, S. Liu, S. Hu, Z. Ye, M. Geng, X. Liu, and H. Meng. Bayesian transformer language models for speech recognition. In _ICASSP 2021-2021 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)_, pages 7378-7382. IEEE, 2021.
+* [115] Y. A. Yadkori, I. Kuzborskij, A. Gyorgy, and C. Szepesvari. To believe or not to believe your llm. _arXiv preprint arXiv:2406.02543_, 2024.
+* [116] A. X. Yang, M. Robeyns, X. Wang, and L. Aitchison. Bayesian low-rank adaptation for large language models. _arXiv preprint arXiv:2308.13111_, 2023.
+* [117] J. S. Yedidia, W. Freeman, and Y. Weiss. Generalized belief propagation. _Advances in neural information processing systems_, 13, 2000.
+* [118] Z. Yin, Q. Sun, Q. Guo, J. Wu, X. Qiu, and X. Huang. Do large language models know what they don't know? _arXiv preprint arXiv:2305.18153_, 2023.
+* [119] E. B. Zaken, Y. Goldberg, and S. Ravfogel. Bitfit: Simple parameter-efficient fine-tuning for transformer-based masked language-models. In _Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 2: Short Papers)_, pages 1-9, 2022.
+* [120] H. Zhang, S. Diao, Y. Lin, Y. R. Fung, Q. Lian, X. Wang, Y. Chen, H. Ji, and T. Zhang. R-tuning: Teaching large language models to refuse unknown questions. _arXiv preprint arXiv:2311.09677_, 2023.
+
+* [121] J. O. Zhang, A. Sax, A. Zamir, L. Guibas, and J. Malik. Side-tuning: a baseline for network adaptation via additive side networks. In _Computer Vision-ECCV 2020: 16th European Conference, Glasgow, UK, August 23-28, 2020, Proceedings, Part III 16_, pages 698-714. Springer, 2020.
+* [122] R. Zhang, C. Li, J. Zhang, C. Chen, and A. G. Wilson. Cyclical stochastic gradient mcmc for bayesian deep learning. _arXiv preprint arXiv:1902.03932_, 2019.
+* [123] S. Zhang, X. Fan, B. Chen, and M. Zhou. Bayesian attention belief networks. In _International Conference on Machine Learning_, pages 12413-12426. PMLR, 2021.
+* [124] M. Zhao, T. Lin, F. Mi, M. Jaggi, and H. Schutze. Masking as an efficient alternative to finetuning for pretrained language models. In _Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP)_, pages 2226-2241, 2020.
+
+## Appendix
+
+In Appendix A, we present the proofs for the theorems in the main body of our paper. In Appendix B, we introduce the experimental settings, including evaluation metrics and training schemes. Finally, in Appendix C, we present supplementary empirical results including the experiments on another language model and analysis of the space and time cost of our algorithm.
+
+## Appendix A Proof of Theorems and Claims
+
+In this section, we first present the proof of the two main theorems (Theorem 3.1 and Theorem 3.2) in Appendix A.1. Next, we show how a analysis on our design of parameterization in Appendix A.2. Finally, we provide a detailed derivation of the LoRA Flipout in Appendix A.3.
+
+### Proof of Main Theorems
+
+**Theorem 3.1** (**Variational Distribution of the Full-Weight Matrix in BLoB**).: _With the pre-trained weight matrix \(\bm{W}_{0}\in\mathbb{R}^{m\times n}\) and the low-rank weight update matrix \(\bm{B}\in\mathbb{R}^{m\times r}\), suppose that the variational distribution of the other low-rank update matrix \(\bm{A}\in\mathbb{R}^{r\times n}\) is Gaussian with \(q(\bm{A}|\bm{\theta}=\{\bm{M},\bm{\Omega}\})=\prod_{ij}\mathcal{N}(A_{ij}|M_{ ij},\Omega_{ij}^{2})\), where \(\bm{M}=[M_{ij}]\in\mathbb{R}^{r\times n}\) and \(\bm{\Omega}=[\Omega_{ij}]\in\mathbb{R}^{r\times n}\) are its mean and standard deviation, respectively. The equivalent variational distribution defined on the full weight matrix \(\bm{W}\) as in Eqn. 3 is given by_
+
+\[q(\mathrm{vec}(\bm{W})|\bm{B},\bm{\theta}) =\mathcal{N}(\mathrm{vec}(\bm{W})|\bm{\mu}_{q},\bm{\Sigma}_{q}),\] \[\text{where}\quad\bm{\mu}_{q} =\mathrm{vec}(\bm{W}_{0}+\bm{B}\bm{M}),\] \[\bm{\Sigma}_{q} =[\bm{I}_{n}\otimes\bm{B}]\cdot[\mathrm{diag}(\mathrm{vec}( \bm{\Omega})^{2})]\cdot[\bm{I}_{n}\otimes\bm{B}^{\top}].\]
+
+Proof.: We begin by calculating the mean value of \(q\),
+
+\[\bm{\mu}_{q} =\mathrm{vec}(\mathbb{E}[\bm{W}_{0}+\bm{B}\bm{A}])\] (15) \[=\mathrm{vec}(\bm{W}_{0}+\bm{B}\mathbb{E}[\bm{A}])\] (16) \[=\mathrm{vec}(\bm{W}_{0}+\bm{B}\bm{M}).\] (17)
+
+Suppose the deterministic matrix \(\bm{B}=[\bm{b}_{1},\bm{b}_{2},\cdots,\bm{b}_{r}]\in\mathbb{R}^{m\times r}\), random matrix \(\bm{A}=[\bm{a}_{1},\bm{a}_{2},\cdot,\bm{a}_{r}]^{\top}\in\mathbb{R}^{r\times n}\), with its underlying parameters of mean and standard deviation defined likewise \(\bm{M}\in\mathbb{R}^{r\times n}\) and \(\bm{\Omega}\in\mathbb{R}^{r\times n}\). We have \(\bm{W}=\bm{B}\bm{A}=\sum_{i=1}^{r}\bm{b}_{i}\cdot\bm{a}_{i}^{\top}\). We then rewrite \(\mathrm{vec}(\bm{W})\) in the form of Kronecker product \(\otimes\):
+
+\[\mathrm{vec}(\bm{W})=\mathrm{vec}(\sum_{i=1}^{r}\bm{b}_{i}\cdot\bm{a}_{i}^{ \top})=\sum_{i=1}^{r}(\bm{a}_{i}\otimes\bm{b}_{i})\] (18)
+
+We then calculate the covariance matrix \(\bm{\Sigma}_{q}\) as
+
+\[\bm{\Sigma}_{q} =\mathrm{cov}[\mathrm{vec}(\bm{W}),\mathrm{vec}(\bm{W})]=\mathrm{ cov}[\sum_{i=1}^{r}(\bm{a}_{i}\otimes\bm{b}_{i}),\sum_{i=1}^{r}(\bm{a}_{i} \otimes\bm{b}_{i})]\] (19) \[=\sum_{i=1}^{r}\mathrm{cov}[\bm{a}_{i}\otimes\bm{b}_{i},\bm{a}_ {i}\otimes\bm{b}_{i}]+\sum_{i\neq j}\mathrm{cov}[\bm{a}_{i}\otimes\bm{b}_{i}, \bm{a}_{j}\otimes\bm{b}_{j}]\] (20) \[=\sum_{i=1}^{r}\left\{\mathbb{E}_{\bm{a}_{i}}[(\bm{a}_{i}\otimes \bm{b}_{i})(\bm{a}_{i}\otimes\bm{b}_{i})^{\top}]-\mathbb{E}_{\bm{a}_{i}}[(\bm {a}_{i}\otimes\bm{b}_{i})]\mathbb{E}_{\bm{a}_{i}}[(\bm{a}_{i}\otimes\bm{b}_{ i})^{\top}]\right\}\] (21) \[=\sum_{i=1}^{r}\left\{\mathbb{E}_{\bm{a}_{i}}[(\bm{a}_{i}\bm{a}_{ i}^{\top})]\otimes(\bm{b}_{i}\bm{b}_{i}^{\top})-(\mathbb{E}_{\bm{a}_{i}}[\bm {a}_{i}]\mathbb{E}_{\bm{a}_{i}}[\bm{a}_{i}]^{\top})\otimes(\bm{b}_{i}\bm{b}_{ i}^{\top})\right\}\] (22) \[=\sum_{i=1}^{r}\mathrm{diag}(\bm{\sigma}_{i}^{2})\otimes(\bm{b} _{i}\bm{b}_{i}^{\top})\] (23) \[=[\bm{I}_{n}\otimes\bm{B}]\cdot[\mathrm{diag}(\mathrm{vec}(\bm{ \Omega}^{2}))]\cdot[\bm{I}_{n}\otimes\bm{B}^{\top}],\] (24)
+
+completing the proof.
+
+It is crucial to note here, the final covariance matrix of \(q(\mathrm{vec}(\bm{W}))\) follows a block-diagonal structure, which will be further utilized for the proof of Theorem 3.2. Defining \(\bm{\Sigma}_{i}=\mathrm{diag}(\bm{\Omega}_{i}^{2})\), we have:
+
+\[\bm{\Sigma}_{q}=\begin{bmatrix}\bm{B}\bm{\Sigma}_{1}\bm{B}^{\top}&&\\ &\ddots&\\ &&\bm{B}\bm{\Sigma}_{n}\bm{B}^{\top}\end{bmatrix}.\] (25)
+
+Another important fact about \(\bm{\Sigma}_{q}\) is its singularity. It can be seen directly as we consider the rank of any one of the block matrix \(\bm{B}\bm{\Sigma}_{i}\bm{B}^{\top}\in\mathbb{R}^{m\times m},\forall i\in[n]\):
+
+\[\mathrm{r}(\bm{B}\bm{\Sigma}\bm{B}^{\top})\leq\min\{\mathrm{r}(\bm{B}), \mathrm{r}(\bm{\Sigma}_{i}),\mathrm{r}(\bm{B}^{\top})\}\leq r<m,\] (26)
+
+where \(r\) is the rank of LoRA, strictly smaller than the output dimension of \(m\).
+
+**Theorem 3.2** (**Efficient Computation of Full-Weight KL Divergence**).: _Suppose the pre-trained weights \(\bm{W}_{0}\), update matrix \(\bm{B}\), and the variational distribution \(q(\bm{A}|\bm{\theta})\) are defined as in Theorem 3.1, and the prior distribution of the full-weight matrix \(P(\mathrm{vec}(\bm{W}))\) is defined as Eqn. 9. Consider the Gaussian prior distribution \(P(\bm{A})=\prod_{ij}\mathcal{N}(A_{ij}|0,\sigma_{p}^{2})\); we then have:_
+
+\[\mathrm{KL}[q(\mathrm{vec}(\bm{W})|\bm{B},\bm{\theta})\|P(\mathrm{vec}(\bm{W} ))]=\mathrm{KL}[q(\bm{A}|\bm{\theta})\|P(\bm{A})],\]
+
+_if \(\widetilde{\bm{R}}=[\sigma_{p}\bm{I}_{n}\otimes\bm{R}]\), where \(\bm{R}\) satisfies \(\bm{R}\bm{R}^{\top}=\bm{B}\bm{B}^{\top}\)._
+
+Proof.: We start by assuming the low-rank structure of the prior \(P(\mathrm{vec}(\bm{W}))\), and then reveal the conditions reaching to our final conclusion step by step.
+
+Typically, for two Gaussian distributions \(q\) and \(p\) whose covariance matrices \(\bm{\Sigma}_{q}\in\mathbb{R}^{d\times d}\) and \(\bm{\Sigma}_{p}\in\mathbb{R}^{d\times d}\) are both full-rank, and their means as \(\bm{\mu}_{q}\in\mathbb{R}^{d}\) and \(\bm{\mu}_{p}\in\mathbb{R}^{d}\), we have their KL-divergence as
+
+\[\mathrm{KL}[q\|p]=\tfrac{1}{2}\left[\log\tfrac{|\bm{\Sigma}_{p}|}{|\bm{ \Sigma}_{q}|}-d+\mathrm{tr}(\bm{\Sigma}_{p}^{-1}\bm{\Sigma}_{q})+(\bm{\mu}_{q} -\bm{\mu}_{p})^{\top}\bm{\Sigma}_{p}^{-1}(\bm{\mu}_{q}-\bm{\mu}_{p})\right].\] (27)
+
+The singularity of the covariance matrices of \(P(\mathrm{vec}(\bm{W}))\) and \(q(\mathrm{vec}(\bm{W}))\), i.e., \(|\bm{\Sigma}_{q}|=|\bm{\Sigma}_{p}|=0\), can cause issues when computing the KL-divergence as it includes the log-determinant term. Therefore in this proof, we consider the alternative of the covariance matrices, where an extremely small diagonal elements are added.
+
+**For the prior distribution**, following the alternative form of a degenerate Gaussian [83], as suggested in Eqn. 9, we assume
+
+\[P(\mathrm{vec}(\bm{W})) =\mathcal{N}(\bm{W}_{0},\bm{\Sigma}_{p}),\] (28) \[\text{where}\qquad\bm{\Sigma}_{p} =\lambda\bm{I}+\widetilde{\bm{R}}\widetilde{\bm{R}}^{\top},\quad( \lambda\to 0^{+}).\]
+
+By default, we assume that the low-rank tall matrix \(\widetilde{\bm{R}}\in\mathbb{R}^{(mn)\times r^{\prime}}\) has the full column rank \(r^{\prime}\). Otherwise if \(\mathrm{r}(\widetilde{\bm{R}})=r^{\prime\prime}<r^{\prime}\), then we can in effect consider a new matrix component \(\widetilde{\bm{R}}^{\prime}\in\mathbb{R}^{(mn)\times r^{\prime\prime}}\) that has the same rank as \(r^{\prime\prime}\), which satisfies our assumption of full column rank. Therefore, we have the SVD decomposition of \(\widetilde{\bm{R}}\) is given by
+
+\[\widetilde{\bm{R}}=\bm{U}_{R}\bm{D}_{R}\bm{V}_{R}^{\top},\] (29)
+
+where \(\bm{U}_{R}\in\mathbb{R}^{(mn)\times(mn)}\) and \(\bm{V}_{R}\in\mathbb{R}^{r^{\prime}\times r^{\prime}}\) are orthonormal, i.e., \(\bm{U}_{R}\bm{U}_{R}^{\top}=\bm{U}_{R}^{\top}\bm{U}_{R}=\bm{I}_{(mn)}\) and \(\bm{V}_{R}\bm{V}_{R}^{\top}=\bm{V}_{R}^{\top}\bm{V}_{R}=\bm{I}_{r^{\prime}}\). \(\bm{D}_{R}\) is a tall matrix where its upper part is diagonal and the lower part is a zero matrix, denoted as \(\bm{D}_{R}=[\bm{D}_{R}^{*},\bm{O}]^{\top}=[\mathrm{diag}([d_{R_{1}}>0,d_{R_{2} }>0,\cdots,d_{R_{r^{\prime}}}>0]),\bm{O}]^{\top}\).
+
+**For the approximate posterior \(q(\mathrm{vec}(\bm{W})|\bm{B},\bm{\theta})\)**, we consider
+
+\[q(\mathrm{vec}(\bm{W})|\bm{B},\bm{\theta}) =\mathcal{N}(\bm{W}_{0}+\bm{B}\bm{M},\bm{\Sigma}_{q}),\] (30) \[\text{where}\qquad\bm{\Sigma}_{q} =\lambda\bm{I}+\widetilde{\bm{B}}\bm{\Sigma}\widetilde{\bm{B}}^{ \top},\quad(\lambda\to 0^{+}),\]
+
+where we simplify the notation for the covariance matrix \(\bm{\Sigma}_{q}\) by defining \(\widetilde{\bm{B}}=[\bm{I}_{n}\otimes\bm{B}]\in\mathbb{R}^{(mn)\times(mr)}\) and \(\bm{\Sigma}=\mathrm{diag}(\mathrm{vec}(\bm{\Omega})^{2})\). Likewise, we have the SVD-decomposed matrices for \(\widetilde{\bm{B}}\) where they are defined in the same way as Eqn. 29:
+
+\[\widetilde{\bm{B}}=\bm{U}_{B}\bm{D}_{B}\bm{V}_{B}^{\top},\] (31)where \(\bm{U}_{B}\) and \(\bm{V}_{B}\) are orthogonal matrices, and \(\bm{D}_{B}=[\bm{D}_{B}^{*},\bm{O}]^{\top}=[\mathrm{diag}([d_{B_{1}}>0,d_{B_{2}}>0, \cdots,d_{B_{mr}}>0]),\bm{O}]^{\top}\).
+
+First, we calculate the log-determinant part of the KL-divergence. For the log-determinant of the covariance matrix of the prior distribution \(\bm{\Sigma}_{p}\), by applying SVD decomposition in Eqn. 29, we have
+
+\[\log|\bm{\Sigma}_{p}| =\log|\lambda\bm{I}+\widetilde{\bm{R}}\widetilde{\bm{R}}^{\top}| =\log|\lambda\bm{I}+\bm{U}_{R}\bm{D}_{R}\bm{V}_{R}^{\top}\bm{V}_{R}\bm{D}_{R}^ {\top}\bm{U}_{R}^{\top}|\] (32) \[=\log|\bm{U}_{R}(\lambda\bm{I}+\bm{D}_{R}\bm{D}_{R}^{\top})\bm{U }_{R}^{\top}|\] (33) \[=\log\left|\bm{U}_{R}\begin{bmatrix}(\bm{D}_{R}^{*})^{2}+\lambda \bm{I}_{r^{\prime}}&\bm{O}\\ \bm{O}&\lambda\bm{I}_{mn-r^{\prime}}\end{bmatrix}\bm{U}_{R}^{\top}\right|\] (34) \[=\log|(\bm{D}_{R}^{*})^{2}+\lambda\bm{I}_{r^{\prime}}|+\log| \lambda\bm{I}_{mn-r^{\prime}}|\] (35) \[=(mn-r^{\prime})\log\lambda+\sum_{i=1}^{r^{\prime}}\log(d_{R_{i}} ^{2}+\lambda).\] (36)
+
+Following (almost) the same idea, we now have the log-determinant of the variational distribution's covariance \(\bm{\Sigma}_{q}\) as
+
+\[\log|\bm{\Sigma}_{q}| =\log|\lambda\bm{I}+\widetilde{\bm{B}}\widetilde{\bm{B}}^{\top}|= \log\left|\bm{D}_{B}^{*}\bm{V}_{B}^{\top}\bm{\Sigma}\bm{V}_{B}\bm{D}_{B}^{*}+ \lambda\bm{I}_{mr}\begin{array}{c}\bm{O}\\ \bm{O}\end{array}\right|\] (37) \[=(mn-mr)\log\lambda+2\log|\bm{D}_{B}^{*}|+\log|\bm{V}_{B}^{\top} \bm{\Sigma}\bm{V}_{B}+\lambda(\bm{D}_{B}^{*})^{-2}|\] (38) \[=(mn-mr)\log\lambda+2\sum_{i=1}^{mr}\log d_{B_{i}}+\log|\bm{ \Sigma}|+\log|\bm{I}+\lambda\bm{V}_{B}^{\top}\bm{\Sigma}^{-1}\bm{V}_{B}(\bm{D} _{B}^{*})^{-2}|.\] (39)
+
+We make two observations when \(\lambda\to 0^{+}\): (i) compare the terms that contain \(\log\lambda\) on both sides, to make sure the log-determinant in the divergence term _bounded_, we have to set \(r^{\prime}=mr\); (ii) the last term in Eqn. 39, \(\log|\bm{I}+\lambda\bm{V}_{B}^{\top}\bm{\Sigma}^{-1}\bm{V}_{B}(\bm{D}_{B}^{*} )^{-2}|=\log|\bm{I}|=0\). Therefore, we have
+
+\[\log\frac{|\bm{\Sigma}_{p}|}{|\bm{\Sigma}_{q}|}=\sum_{i=1}^{mr}\log\frac{d_{R _{i}}^{2}+\lambda}{d_{B_{i}}^{2}}-\log|\bm{\Sigma}|.\] (40)
+
+Next we calculate \(\mathrm{tr}(\bm{\Sigma}_{p}^{-1}\bm{\Sigma}_{q})\) in Eqn. 27. Following the same assumptions and notations above, we have the inverse of the covariance of the prior distribution as
+
+\[\bm{\Sigma}_{p}^{-1}=\bm{U}_{R}\begin{bmatrix}[(\bm{D}_{R}^{*})^{2}+\lambda \bm{I}]^{-1}&\bm{O}\\ \bm{O}&\lambda^{-1}\bm{I}\end{bmatrix}\bm{U}_{R}^{\top}.\] (41)
+
+Hence we have
+
+\[\mathrm{tr}(\bm{\Sigma}_{p}^{-1}\bm{\Sigma}_{q})=\mathrm{tr}(\bm{U}_{R} \begin{bmatrix}[(\bm{D}_{R}^{*})^{2}+\lambda\bm{I}]^{-1}&\bm{O}\\ \bm{O}&\lambda^{-1}\bm{I}\end{bmatrix}\bm{U}_{R}^{\top}\bm{U}_{B}\begin{bmatrix} \bm{D}_{B}^{*}\bm{V}_{B}^{\top}\bm{\Sigma}\bm{V}_{B}\bm{D}_{B}^{*}+\lambda\bm{ I}&\bm{O}\\ \bm{O}&\lambda\bm{I}\end{bmatrix}\bm{U}_{B}^{\top}).\] (42)
+
+By using the condition \(\bm{R}\bm{R}^{\top}=\bm{B}\bm{B}^{\top}\) and \(\widetilde{\bm{R}}=[\sigma_{p}\bm{I}_{n}\otimes\bm{R}]\) defined in Theorem 3.2, we have
+
+\[\widetilde{\bm{R}}\widetilde{\bm{R}}^{\top}=\sigma_{p}^{2}\widetilde{\bm{B}} \widetilde{\bm{B}}^{\top},\] (43)
+
+and there exists an orthogonal matrix \(\bm{P}\in\mathbb{R}^{(mr)\times(mr)}\), such that
+
+\[\widetilde{\bm{R}}=\sigma_{p}\widetilde{\bm{B}}\bm{P}.\] (44)
+
+The SVD decomposition on \(\widetilde{\bm{R}}\) can then be formulated as:
+
+\[\widetilde{\bm{R}} =\sigma_{p}\bm{U}_{B}\bm{D}_{B}\bm{V}_{B}^{\top}\bm{P}\] (45) \[=(\bm{U}_{R}=\bm{U}_{B})(\bm{D}_{R}=\sigma_{p}\bm{D}_{B})(\bm{V}_{ R}=\bm{V}_{B}^{\top}\bm{P}).\] (46)
+
+Substituting \(\bm{U}_{R},\bm{D}_{R},\bm{V}_{R}\) back to Eqn. 42 and applying \(\lambda\to 0^{+}\), we have
+
+\[\mathrm{tr}(\bm{\Sigma}_{p}^{-1}\bm{\Sigma}_{q}) =\mathrm{tr}(\bm{I}_{mn-nr})+\mathrm{tr}([(\sigma_{p}\bm{D}^{*}) ^{2}+\lambda\bm{I}]^{-1}[\bm{D}_{B}^{*}\bm{V}_{B}^{\top}\bm{\Sigma}\bm{V}_{B}\bm {D}_{B}^{*}])\] (47) \[=(mn-nr)+\sigma_{p}^{-2}\,\mathrm{tr}(\bm{V}_{B}^{\top}\bm{\Sigma} \bm{V}_{B})\] (48) \[=(mn-nr)+\sigma_{p}^{-2}\,\mathrm{tr}(\bm{\Sigma}).\] (49)For the quadratic term in Eqn. 27, the pre-trained weights \(\bm{W}_{0}\) cancel out, and we can calculate it as
+
+\[\operatorname{vec}(\bm{BM})^{\top}\bm{\Sigma}_{p}^{-1} \operatorname{vec}(\bm{BM})\] (50) \[= [\bm{M}_{:1}^{\top}\bm{B}^{\top},\cdots,\bm{M}_{:1}^{\top}\bm{B}^ {\top}]\begin{bmatrix}(\bm{B}\bm{\Sigma}_{1}\bm{B}^{\top})^{-1}&&\\ &\ddots&\\ &&(\bm{B}\bm{\Sigma}_{n}\bm{B}^{\top})^{-1}\end{bmatrix}\begin{bmatrix}\bm{BM}_ {:1}\\ \vdots\\ \bm{BM}_{:n}\end{bmatrix}\] (51) \[= \sum_{i=1}^{n}\bm{M}_{:i}^{\top}\bm{B}^{\top}(\bm{B}\bm{\Sigma}_{ i}\bm{B}^{\top})^{-1}\bm{BM}_{:i}\] (52) \[= \sum_{i=1}^{n}\bm{M}_{:i}^{\top}(\bm{V}_{B}\begin{bmatrix}\frac{ d_{B_{1}}^{2}}{\sigma_{p}^{2}(d_{B_{1}}^{2}+\lambda)}&&\\ &\ddots&\\ &&\frac{d_{B_{mr}}^{2}}{\sigma_{p}^{2}(d_{B_{mr}}^{2}+\lambda)}\end{bmatrix} \bm{V}_{B}^{\top})\bm{M}_{:i}\] (53) \[= \tfrac{1}{\sigma_{p}^{2}}\sum_{i=1}^{n}\bm{M}_{:i}^{\top}\bm{M}_{:i}\] (54) \[= \tfrac{1}{\sigma_{p}^{2}}\|\bm{M}\|_{2}^{2}.\] (55)
+
+Finally, proof is completed by combining Eqn. 40, Eqn. 49, and Eqn. 55. 
+
+### Analysis on BLoB Parameterization
+
+**General Analysis on Parameterization.** Consider a path of parameterization for a single variable:
+
+\[\rho\to\sigma=f(\rho)\to\mathcal{L}=l(\sigma),\] (56)
+
+where \(\rho\) is the real parameter we perform update on, \(f\) is our parameterization choice for the variable \(\sigma\), and \(l\) represents the loss function we aim to minimize. When comparing two different parameterization methods, we consider the same initial conditions of \(\sigma=\sigma_{0}\), and we assume the same step size \(\eta\) on the real parameter \(\rho\). To show the influence of the choice of parameterization, we calculate the decrease of the loss value by performing one step of gradient descent. First, by the chain rule, the gradient w.r.t. \(\rho_{0}\) is calculated as
+
+\[\tfrac{\mathrm{d}\mathcal{L}}{\mathrm{d}\rho}\big{|}_{\rho_{0}}= \tfrac{\mathrm{d}\mathcal{L}}{\mathrm{d}\sigma}\big{|}_{\sigma_{0}}\cdot\tfrac {\mathrm{d}\sigma}{\mathrm{d}\rho}\big{|}_{\rho_{0}}=l^{\prime}(\sigma_{0}) \cdot f^{\prime}(\rho_{0}).\] (57)
+
+After one step of the gradient descent, we have \(\rho_{1}\) as
+
+\[\rho_{1}=\rho_{0}-\eta\cdot l^{\prime}(\sigma_{0})\cdot f^{\prime}(\rho_{0}),\] (58)
+
+and the loss value decreased at \(\rho_{1}\) can be approximated by the first-order Taylor expansion,
+
+\[\Delta\mathcal{L} =l(f(\rho_{0}))-l(f(\rho_{1}))\] (59) \[=l(f(\rho_{0}))-[l(f(\rho_{0}-\eta\cdot l^{\prime}(\sigma_{0}) \cdot f^{\prime}(\rho_{0})))]\] (60) \[\approx l(f(\rho_{0}))-[l(f(\rho_{0})-\eta\cdot l^{\prime}(\sigma_{0}) \cdot(f^{\prime}(\rho_{0}))^{2})]\] (61) \[\approx\eta\cdot(l^{\prime}(\sigma_{0}))^{2}\cdot(f^{\prime}( \rho_{0}))^{2}.\] (62)
+
+Since the initialization of the different parameterization variable \(\rho_{0}\) is set to ensure the same initial condition of \(\sigma_{0}\) for different \(f\)s, we can see that the amount the loss decreases by after one step of update is proportional to the squared gradient \(\Delta\mathcal{L}\propto(l^{\prime}(\sigma_{0}))^{2}\cdot(f^{\prime}(\rho))^{ 2}=(\nicefrac{{\mathrm{d}\mathcal{L}}}{{\mathrm{d}\rho}})^{2}\).
+
+**Parameterization with \(\log(1+\exp(\cdot))\) or \((\cdot)^{2}\)?** Previous VBNs [11, 49] typically use a softplus function \(\sigma_{q}=\log(1+\exp(\rho))\) to parameterize the standard deviation. For a single element \(\rho\), the derivative of the closed-form solution of the KL divergence in Eqn. 11 is calculated as
+
+\[\tfrac{\mathrm{d}\operatorname{KL}}{\mathrm{d}\rho}=-\tfrac{e^{\rho}}{(1+e^{ \rho})\log(1+e^{\rho})}+\tfrac{e^{\rho}\log(1+e^{\rho})}{\sigma_{p}^{2}(1+e^{ \rho})}.\] (63)
+
+Due to the fact that \(\sigma_{q}\) is typically initialized to a small value close to 0 to ensure stable optimization of the likelihood cost term (e.g., \(1e-3\)), and in order to ensure that the model obtains good uncertainty,\(\sigma_{p}\) is usually set to a larger value close to 1 (e.g., \(1e-1\)). In this case, the derivative of \(\rho\) in Eqn. 63 is almost always a constant \(-1\), which, based on our previous analysis, leads to slow convergence for large \(\sigma_{p}\) values when \(\sigma_{q}\) is small.
+
+Therefore, we parameterize \(\sigma_{q}\) with quadratic function: \(\sigma_{q}=\rho^{2}\). In this case, the derivative of the KL divergence with respect to \(\rho\) in Eqn. 11 becomes:
+
+\[\tfrac{\mathrm{d}\,\mathrm{KL}}{\mathrm{d}\rho}=-\tfrac{2}{\rho}+\tfrac{2\rho^ {3}}{\sigma_{p}^{2}}.\] (64)
+
+Under the same initialization conditions, the derivative in Eqn. 64 is approximately of the order of \(\rho^{-1}\), leading to rapid convergence towards larger \(\sigma_{p}\) values when \(\sigma_{q}\) is small. Building on this, we use SGD without momentum to optimize the complexity loss term, thereby achieving the natural convergence of \(\sigma_{q}\).
+
+**Visualization.** To visually demonstrate the differences in the convergence of KL divergence during training with these two parameterizations, we set \(\sigma_{p}=1\) and employ gradient descent to optimize the KL divergence. As introduced in B.1, in practical mini-batch gradient descent, the KL divergence is weighted by \(\nicefrac{{1}}{{\theta}}_{\text{mini-batches}}\). Therefore, assuming there are 100 mini-batches, the learning rate is set to 0.01, which translates to an actual learning rate of \(1e-4\) for \(\rho\). We initialize \(\sigma_{q}=0.01\) for both parameterizations. The growth of \(\sigma_{q}\) during the KL training, for \(\sigma_{q}=\text{log}(1+e^{\rho})\) and \(\sigma_{q}=\rho^{2}\) is shown in Fig. 2. In the same setting, the softplus parameterization takes nearly 100,000 gradient steps to converge, while the square parameterization takes only about 5,000 gradient steps. This modification makes it suitable for our fine-tuning setup, where the number of gradient steps is relatively small.
+
+### Deriving Flipout for BLoB
+
+For the \(i\)-th input vector \(\bm{h}_{i}\) in a mini-batch, we randomly sample two flipping vector \(\bm{s}\in\{-1,+1\}^{n}\) and \(\bm{t}\in\{-1,+1\}^{r}\). Denoting \(\bm{A}\) as the weight matrix sampled from posterior distribution, and \(\Delta\bm{A}\) as the batched noise for sampling \(\bm{A}\), the output vector \(\bm{z}_{i}\) after applying flipout is:
+
+\[\bm{z}_{i} =\bm{W}\bm{h}_{i}\] (65) \[=\bm{W}_{0}\bm{h}_{i}+\bm{B}\bm{A}\bm{h}_{i}\] (66) \[=\bm{W}_{0}\bm{h}_{i}+\bm{B}(\bm{M}+\Delta\bm{A})\bm{h}_{i}\] (67) \[=\bm{W}_{0}\bm{h}_{i}+\bm{B}\bm{M}\bm{h}+\bm{B}(\widehat{\bm{A}} \circ\bm{t}_{i}\bm{s}_{i}^{\top})\bm{h}_{i}.\] (68)
+
+Similarly, for a mini-batch input matrix \(\bm{H}\in\mathbb{R}^{n\times b}\) with batch size \(b\), we randomly sample two low-rank flipping matrices \(\bm{S}\in\{-1,+1\}^{n\times b}\) and \(\bm{T}\in\{-1,+1\}^{b\times r}\). The batched output matrix \(\bm{Z}\) after applying flipout is then:
+
+\[\bm{Z} =\bm{W}_{0}\bm{H}+\bm{B}(\bm{M}\bm{H}+\left[\widehat{\bm{A}}(\bm{ H}\circ\bm{S})\right]\circ\bm{T})\] (69) \[=\bm{W}_{0}\bm{H}+\bm{B}(\bm{M}\bm{H}+\left[(\bm{E}\circ\bm{ \Omega})(\bm{H}\circ\bm{S})\right]\circ\bm{T}).\] (70)
+
+Figure 2: The growth curve of \(\sigma_{q}=\text{log}(1+e^{\rho})\) and \(\sigma_{q}=\rho^{2}\) during the optimization of KL divergence (without data likelihood). The number of gradient steps (5000) is marked with the red line.
+
+## Appendix B Implementation Details
+
+In this section, we first introduce the implementation details of BLoB in Appendix B.1, including the KL Re-weighting scheme, initialization of the parameters, and learning scheduling, etc. Next, we introduce the two evaluation metrics for uncertainty estimation in Appendix B.2. Finally, we present some statistics of the adopted datasets in Appendix B.3.
+
+### Implementation of BLoB
+
+**KL Re-weighting.** In mini-batch SGD, the training data \(\mathcal{D}\) is randomly divided into \(M\) equally sized subsets: \(\mathcal{D}_{1},\mathcal{D}_{2},\ldots,\mathcal{D}_{M}\). For mini-batch \(i=1,2,\ldots,M\), the cost function is:
+
+\[\mathcal{F}(\mathcal{D}_{i},\bm{\theta})=-\mathbb{E}_{q(\bm{W}|\bm{\theta})}[ \log P(\mathcal{D}_{i}|\bm{W})]+\lambda_{i}\operatorname{KL}[q(\bm{W}|\bm{ \theta})\parallel P(\bm{W})],\] (71)
+
+where \(\lambda_{i}\in[0,1]\) and \(\sum_{i=1}^{M}\lambda_{i}=1\). There are various approaches for controlling the weight of KL divergence. [30] utilizes \(\lambda_{i}=\nicefrac{{1}}{{M}}\), while [11] adopts \(\lambda_{i}=\nicefrac{{2^{M}-i}}{{2^{M}-1}}\). In fine-tuning tasks, we found that using a scheduler with \(\lambda_{i}=\nicefrac{{2^{i}}}{{2^{M}-1}}\) performs well. This allows the model to find good fits to the data points within the early stages and then optimize the complexity cost in later stages.
+
+In multiple epochs of mini-batch SGD, larger datasets require more iterations to complete one epoch, resulting in delayed convergence of the complexity cost. To enhance the stability of BLoB's performance across datasets with varying sizes, we pseudo-rescaled the size of the training dataset to make smaller datasets slightly larger and larger datasets slightly smaller. For the portions of the dataset that required expansion, we incorporated additional mini-batches from subsequent epochs. Conversely, for the datasets needing reduction, we deferred the excess mini-batches to subsequent epochs. We denote the size of original dataset as \(L_{0}\), The rescaled dataset size is:
+
+\[L^{*}=100\cdot L_{0}^{\frac{\pi}{\gamma}},\] (72)
+
+where \(\gamma\) is a coefficient used to control the scaling magnitude, and we set it to 8 in all experiments.
+
+The pseudo-rescaling does not affect the likelihood cost in practical mini-batch gradient descent. In fact, it only changes the warm-up period in KL reweighting from \(M\) to \(\nicefrac{{L^{*}}}{{\text{batch size}}}\), thereby facilitating more consistent optimization of the complexity cost across datasets of different sizes.
+
+**Additional Details.** We initialize standard deviation parameterization matrix \(\bm{G}\) by element-wise sampling from a uniform distribution with a range of \(\lfloor\frac{\epsilon}{\sqrt{2}},\epsilon\rfloor\), while keeping the remaining initialization settings consistent with LoRA. To maintain consistency, we use the same learning rate scheduler and warmup ratio for the optimizer of the KL term as we do for the likelihood term. We sample only once during the training process. During inference, we sample \(N\) times, then take the average of the logits obtained after passing through the softmax function. Detailed hyperparameter settings are provided in the Table 4. Table 3 provides the hyperparameters for fine-tuning with LoRA shared with other baselines. Our experiments on Llama2-7B were conducted using 2 NVIDIA RTX A5000 GPUs for parallel training, while experiments on RoBERTa-base were conducted using 4 NVIDIA RTX A5000 GPUs for parallel training.
+
+\begin{table}
+\begin{tabular}{c c c} \hline \hline \multirow{2}{*}{**Hyperparameter**} & \multicolumn{2}{c}{**Model**} \\ \cline{2-3}  & **Roberta-base** & **Llama2-7B** \\ \hline Optimizer & AdamW \\ \hline LR Scheduler & Linear \\ \hline Warmup Ratio & \multicolumn{2}{c}{0.06} \\ \hline Learning Rate & \(5e-4\) & \(1e-4\) \\ \hline Batch Size & 32 & 4 \\ \hline Max Seq. Len. & 512 & 300 \\ \hline LoRA \(\alpha\) & 8 & 16 \\ \hline LoRA \(r\) & 8 & \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: Hyperparameters of LoRA
+
+### Evaluation Metrics for Uncertainty Estimation
+
+Negative Log-Likelihood (**NLL**) and Expected Calibration Error (**ECE**[31]) are two prevalent metrics for assessing uncertainty estimation. NLL calculates the sum of the negative expected log probability of predicting the actual label. Suppose this predicted probability is given by the model \(P_{\bm{\theta}}\), and we have a test dataset \(\{\bm{x}_{n},y_{n}\}_{n=1}^{N}\) of size \(N\). Then the NLL measured on this dataset is
+
+\[\text{NLL}=\tfrac{1}{N}\sum_{n=1}^{N}-\log P_{\bm{\theta}}(y_{n}).\] (73)
+
+This metric prefers models that assign higher probabilities to correct labels. If the model exhibits overconfident in an incorrect prediction, the probability assigned to the correct label will be diminished, thereby increasing the NLL.
+
+On the other hand, ECE measures how well the model's confidence matches its accuracy. This is done by binning the predictions based on their confidence levels and then computing a weighted average of the absolute difference between accuracy and confidence within each bin:
+
+\[\text{ECE}=\sum_{m=1}^{M}\tfrac{|B_{m}|}{n}\left|\text{acc}(B_{m})-\text{conf} (B_{m})\right|,\] (74)
+
+where \(\text{acc}(B_{m})\) and \(\text{conf}(B_{m})\) denote the average accuracy and confidence within bin \(B_{m}\), respectively. These are given by:
+
+\[\text{acc}(B_{m})=\tfrac{1}{|B_{m}|}\sum_{i\in B_{m}}\mathbf{1}(\widehat{y}_{ i}=y_{i}),\quad\text{conf}(B_{m})=\tfrac{1}{|B_{m}|}\sum_{i\in B_{m}}P( \widehat{y}_{i}),\] (75)
+
+where \(|B_{m}|\) is the number of samples in bin \(m\). We set \(|B_{m}|=15\) across all experiments.
+
+### Dataset Details
+
+Table 5 summarizes the size of the training set and the number of labels for each dataset. Table 6 summarizes the prompt templates used for common sense reasoning tasks.
+
+## Appendix C Additional Experimental Results
+
+This section provides additional experimental results omitted from the main body of the paper due to space limitations. First, we present the results of BLoB when applied to RoBERTa, another pre-trained language model, in Appendix C.1. Next, in Appendix C.2, we conduct the ablation
+
+\begin{table}
+\begin{tabular}{c|c} \hline
+**Task** & **Prompt** \\ \hline Winogrande (WG-S/WG-M) & Select one of the choices that answers the following question: \\  & \begin{tabular}{c} [question] Choices: A. (option1). B. (option2). Answer: \\ \end{tabular} \\ \hline ARC (ARC-C/ARC-E), & Select one of the choices that answers the following question: \\ Openbook QA (OBQA), & \begin{tabular}{c} [question] Choices: A. (choice1). B. (choice2). C. (choice3). \\ \end{tabular} \\  & \begin{tabular}{c} [question] \\ [choice4]. Answer: \\ \end{tabular} \\ \hline \begin{tabular}{c} [question] \\ \end{tabular} & 
+\begin{tabular}{c} Answer the question with only True or False: \\ [question] Context: \{passage\}. \\ \end{tabular} \\ \hline \end{tabular}
+\end{table}
+Table 6: Prompt templates for common sense reasoning tasks.
+
+\begin{table}
+\begin{tabular}{c c c c c c c c c c c} \hline \hline  & WG-S [52] & ARC-C [18] & ARC-E [18] & WG-M [52] & OBQA [65] & BoolQ [17] & RTE [19] & MRPC [24] & WiC [76] & CoLA [104] \\ \hline Size of Train. Set & 640 & 1.12k & 2.25k & 2.56k & 4.96k & 2.49k & 3.67k & 5.43k & 8.55k & 9.43k \\ \hline Num. of Labels & 2 & 5 & 5 & 2 & 4 & 2 & 2 & 2 & 2 \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: Size of the training set and number of labels for each dataset.
+
+study on our proposed refinement in BLoB. Then we analyze the memory and training time costs in Appendix C.3. Finally, we provide visualization illustrating our BLoB's advantage on embedding uncertainty in Appendix C.6.
+
+### Performance of RoBERTa on In-distribution Datasets
+
+We also evaluate different methods on RoBERTa-base, which has approximately \(\nicefrac{{1}}{{50}}\) the parameter count of Llama2-7B. Table 7 shows the results. Compared to MLE, MAP shows minor improvements in NLL and ECE, while MCD, ENS, and LAP enjoy significant improvements. The convergence difficulty observed with the BBB algorithm is further exacerbated on the smaller model, resulting in significant decreases in ACC across all datasets, and even training failures on RTE and WiC. In contrast, our method demonstrates the best or runner-up performance in uncertainty estimation on almost all datasets. Only a slight decrease in ACC is observed on BoolQ and CoLA. We suspect that such decrease is caused by RoBERTa-base's small model size compared to the large size of these datasets BoolQ and CoLA (i.e., underfitting). Using a larger pretrained model, e.g., Llama2-7B, would potentially address this issue.
+
+### Ablation Study
+
+We perform an ablation study on the Llama2-7B model to showcase the effects of a range of techniques we designed: KL Re-Weighting (RW, Appendix B.1), Re-Parameterization (RP, Sec. 3.3), and Asymmetric Bayesianization (AB, Sec. 3.1). In the scenarios w/o AB, we Bayesianize both matrices, \(\bm{A}\) and \(\bm{B}\). In practice, using identical initialization and prior for the standard deviation
+
+\begin{table}
+\begin{tabular}{l l l l l l l} \hline \hline \multirow{3}{*}{**Metric**} & \multirow{3}{*}{**Method**} & \multicolumn{5}{c}{**Datasets**} \\ \cline{3-8}  & & RTE [(19)] & MRPC [(24)] & WC [(7)] & CoLA [(10)] & BoolQ [(17)] \\ \hline \multirow{6}{*}{ACC (\(\uparrow\))} & MLE & 75.81\(\pm\)0.78 & 86.27\(\pm\)0.69 & 64.52\(\pm\)0.91 & 83.29\(\pm\)0.16 & 77.67\(\pm\)0.51 \\  & MAP & 75.81\(\pm\)2.26 & 86.36\(\pm\)0.51 & 65.46\(\pm\)1.04 & 83.00\(\pm\)0.15 & 77.69\(\pm\)0.65 \\  & MCD [(29)] & 76.65\(\pm\)0.85 & 87.75\(\pm\)0.53 & 68.55\(\pm\)0.32 & 84.76\(\pm\)0.62 & 78.41\(\pm\)0.25 \\  & ENS [(10; 8; 13)] & 77.74\(\pm\)1.10 & 88.64\(\pm\)0.37 & 65.83\(\pm\)0.41 & 84.08\(\pm\)0.44 & 78.57\(\pm\)0.36 \\  & BBB [(11)] & 49.46\(\pm\)2.53 & 68.38\(\pm\)0.00 & 50.57\(\pm\)1.34 & 69.13\(\pm\)0.00 & 62.16\(\pm\)0.04 \\  & LAP [(116)] & 76.05\(\pm\)0.95 & 86.52\(\pm\)0.72 & 64.52\(\pm\)0.91 & 83.29\(\pm\)0.16 & 77.67\(\pm\)0.52 \\ \cline{2-8}  & BLoB (N=0) & 76.05\(\pm\)0.17 & 88.24\(\pm\)0.00 & 63.17\(\pm\)0.22 & 80.92\(\pm\)0.70 & 74.80\(\pm\)2.10 \\  & BLoB (N=5) & 74.61\(\pm\)0.61 & 88.48\(\pm\)0.60 & 64.00\(\pm\)0.53 & 80.54\(\pm\)0.16 & 74.77\(\pm\)1.77 \\  & BLoB (N=10) & 75.45\(\pm\)0.51 & 88.73\(\pm\)0.35 & 64.26\(\pm\)1.00 & 80.89\(\pm\)0.24 & 75.49\(\pm\)1.60 \\ \hline \multirow{6}{*}{ECE (\(\downarrow\))} & MLE & 20.59\(\pm\)1.25 & 11.13\(\pm\)1.05 & 25.72\(\pm\)0.83 & 10.70\(\pm\)0.49 & 10.02\(\pm\)0.71 \\  & MAP & 21.67\(\pm\)3.25 & 11.12\(\pm\)0.45 & 24.26\(\pm\)1.17 & 10.61\(\pm\)0.49 & 10.11\(\pm\)0.62 \\  & MCD [(29)] & 13.06\(\pm\)0.59 & 7.36\(\pm\)0.85 & 16.94\(\pm\)0.75 & 4.58\(\pm\)0.27 & 6.21\(\pm\)0.33 \\  & ENS [(10; 8; 13)] & 19.47\(\pm\)0.37 & 10.13\(\pm\)0.56 & 28.26\(\pm\)0.63 & 12.44\(\pm\)0.42 & 5.98\(\pm\)0.26 \\  & BBB [(11)] & 2.66\({}^{+}\)2.24 & 6.46\(\pm\)0.43 & 2.53\({}^{+}\)0.39 & 3.90\(\pm\)0.41 & 5.02\({}^{+}\)0.29 \\  & LAP [(116)] & **5.33\(\pm\)0.60** & 6.29\(\pm\)0.99 & **11.48\(\pm\)0.67** & **3.13\(\pm\)0.28** & 4.84\(\pm\)0.15 \\ \cline{2-8}  & BLoB (N=0) & 14.64\(\pm\)0.55 & 5.61\(\pm\)0.06 & 18.93\(\pm\)1.39 & 10.90\(\pm\)0.24 & 5.80\(\pm\)0.41 \\  & BLoB (N=5) & 10.46\(\pm\)0.61 & 4.49\(\pm\)0.32 & 13.62\(\pm\)1.18 & 7.76\(\pm\)0.21 & 3.21\(\pm\)0.13 \\  & BLoB (N=10) & 8.97\(\pm\)0.98 & **3.30\(\pm\)0.19** & 13.03\(\pm\)0.85 & 7.83\(\pm\)0.27 & **2.90\(\pm\)0.2** \\ \hline \multirow{6}{*}{NLL (\(\downarrow\))} & MLE & 1.11\(\pm\)0.02 & 0.62\(\pm\)0.02 & 1.19\(\pm\)0.03 & 0.53\(\pm\)0.02 & 0.56\(\pm\)0.01 \\  & MAP & 1.23\(\pm\)1.00 & 0.58\(\pm\)0.04 & 1.14\(\pm\)0.06 & 0.53\(\pm\)0.00 & 0.55\(\pm\)0.02 \\  & MCD [(29)] & 0.65\(\pm\)0.03 & 0.39\(\pm\)0.04 & 0.88\(\pm\)0.02 & **0.39\(\pm\)0.01** & 0.50\(\pm\)0.01 \\  & ENS [(10; 8; 13)] & 1.04\(\pm\)0.05 & 0.63\(\pm\)0.02 & 1.70\(\pm\)0.07 & 0.62\(\pm\)0.00 & **0.48\(\pm\)0.00** \\  & BBB [(11)] & 0.69\(\pm\)0.00 & 0.63\(\pm\)0.00 & 0.69\({}^{+}\)0.00 & 0.62\(\pm\)0.00 & 0.67\(\pm\)0.00 \\  & LAP [(116)] & 0.55\(\pm\)0.00 & 0.47\(\pm\)0.01 & **0.63\(\pm\)0.00** & 0.48\(\pm\)0.00 & 0.53\(\pm\)0.00 \\ \cline{2-8}  & BLoB (N=0) & 0.56\(\pm\)0.01 & 0.29\(\pm\)0.00 & 0.76\(\pm\)0.02 & 0.52\(\pm\)0.01 & 0.52\(\pm\)0.02 \\  & BLoB (N=5) & 0.50\(\pm\)0.01 & 0.27\(\pm\)0.00 & 0.68\(\pm\)0.01 & 0.45\(\pm\)0.01 & 0.51\(\pm\)0.02 \\  & BLoB (N=10) & **0.48\(\pm\)0.01** & **0.26\(\pm\)0.00** & 0.67\(\pm\)0.01 & 0.46\(\pm\)0.01 & 0.51\(\pm\)0.01 \\ \hline \hline \end{tabular}
+\end{table}
+Table 7: **Performance of different methods applied to LoRA on RoBERTa-base pre-trained weights.** The evaluation is undertaken on five GLUE [(96)] and SuperGLUE [(95)] tasks, with a shared hyper-parameter setting without using individual validation dataset. “\(\uparrow\)” and “\(\downarrow\)” represent that higher and lower values are preferred, respectively. The **boldface** and underline are used to denote the best and runner-up performance, respectively. The asterisk “\(\dashdot\)” denotes training failure.
+
+matrix \(\bm{G}\) of the variational distribution on both \(\bm{A}\) and \(\bm{B}\) leads to training failures caused by "NaN" loss across all datasets; this is consistent with the findings in Sec. 3.1. As a solution, we introduce a scaled standard deviation matrix \(\bm{G}/_{100}\) on \(\bm{B}\) to alleviate early-stage fluctuations. Nevertheless, it is important to note that not using AB incurs double the additional memory cost and training time, as described in Appendix C.3.
+
+As demonstrated in Table 8, BBB w/o AB fails to converge due to the unbounded NaN loss, which cannot be solved by using scaled standard deviation. By introducing KL Re-Weighting, Re-Parameterization, and scaled standard deviation, BLoB w/o AB achieves the runner-up performance and improves accuracy on small datasets. However, BLoB with all techniques achieves the best ECE and NLL with minimal additional computational cost.
+
+### Additional Results on Memory and Time Efficiency
+
+By introducing an additional standard deviation matrix \(\bm{\Omega}\) of the same size as the LoRA \(\bm{A}\) matrix, the number of trainable parameters in BLoB increases by half compared to LoRA. In the case of BLoB w/o Asymmetric Bayesianization (AB), the number of trainable parameters are twice as many as those in LoRA. The calculation of KL divergence and the inclusion of the additional standard deviation matrix in the likelihood loss computation result in additional forward and backward propagation time. We conduct parallel training using two NVIDIA RTX A5000 GPUs to observe the differences in GPU memory cost and training time between BLoB and standard LoRA fine-tuning on the Llama2-7B
+
+\begin{table}
+\begin{tabular}{l l c c c c c c c c c} \hline \hline \multirow{3}{*}{**Metric**} & \multirow{3}{*}{**Method**} & \multicolumn{3}{c}{**Techniques**} & \multicolumn{6}{c}{**Datasets**} \\ \cline{3-11}  & & RW & RP & AB & WG-S [82] & ARC-C [18] & ARC-E [18] & WG-M [82] & OBQA [65] & BoolQ [17] \\ \hline \multirow{6}{*}{ACC (\(\uparrow\))} & MLE & - & - & - & 68.99\(\pm\)0.58 & 69.10\(\pm\)2.84 & 85.65\(\pm\)0.92 & 74.53\(\pm\)0.66 & 81.52\(\pm\)0.25 & 86.53\(\pm\)0.28 \\ \cline{2-11}  & BBB- & \multicolumn{6}{c}{} & - & - & - & - & - & - & - \\  & BBB- & \multicolumn{6}{c}{} & - & - & - & - & - & - & - \\  & BBB [1] & \multicolumn{6}{c}{} & ✓ & 56.54\(\pm\)7.87 & 68.13\(\pm\)1.27 & 85.86\(\pm\)0.74 & 73.63\(\pm\)2.44 & **82.06\(\pm\)0.39** & 87.21\(\pm\)0.22 \\ \cline{2-11}  & BLLoB- & ✓ & \multicolumn{6}{c}{} & \(\bm{69.75\pm_{0.60}}\) & 67.91\(\pm\)1.43 & 86.03\(\pm\)0.74 & **76.24\(\pm\)0.58** & 81.65\(\pm\)0.66 & **87.23\(\pm\)0.42** \\ \cline{2-11}  & BLLoB- & ✓ & ✓ & \multicolumn{6}{c}{} & - & - & - & - & - & - \\  & BLLoB- & ✓ & ✓ & \multicolumn{6}{c}{} & - & - & - & - & - & - \\  & BLLoB- & ✓ & ✓ & \multicolumn{6}{c}{} & \(\bm{69.75\pm_{0.60}}\) & \(\bm{70.27\pm_{0.60}}\) & **86.33\(\pm\)0.44** & 74.92\(\pm\)0.419 & 81.32\(\pm\)0.41 & 86.47\(\pm\)0.46 \\ \cline{2-11}  & BLLoB (Ours) & ✓ & ✓ & \multicolumn{6}{c}{} & \(\bm{69.07\pm_{0.60}}\) & \(\bm{66.81\pm_{0.60}}\) & 85.56\(\pm\)0.35 & 73.69\(\pm\)0.17 & 81.52\(\pm\)0.74 & 86.99\(\pm\)0.24 \\ \hline \multirow{6}{*}{ECE (\(\downarrow\))} & MLE & - & - & - & 29.83\(\pm\)0.58 & 29.00\(\pm\)1.97 & 13.12\(\pm\)1.39 & 20.62\(\pm\)0.74 & 12.55\(\pm\)0.46 & 3.18\(\pm\)0.09 \\  & BBB- & \multicolumn{6}{c}{} & - & - & - & - & - & - & - \\  & BBB [1] & \multicolumn{6}{c}{} & ✓ & 21.81\(\pm\)12.95 & 26.23\(\pm\)1.47 & 12.28\(\pm\)0.58 & 15.76\(\pm\)4.71 & 11.38\(\pm\)1.07 & 3.74\(\pm\)0.10 \\ \cline{2-11}  & BLLoB- & ✓ & ✓ & \multicolumn{6}{c}{} & \(\bm{26.60\pm_{0.78}}\) & 26.24\(\pm\)0.94 & 11.53\(\pm\)0.57 & 18.05\(\pm\)0.76 & 12.36\(\pm\)0.42 & 3.05\(\pm\)0.09 \\ \cline{2-11}  & BLLoB- & ✓ & ✓ & - & - & - & - & - & - & - \\  & BLLoB- & ✓ & ✓ & - & - & - & - & - & - & - \\  & BLLoB- & ✓ & ✓ & - & - & - & - & - & - & - \\  & BLLoB- & ✓ & ✓ & \multicolumn{6}{c}{} & 16.59\(\pm\)17.38 & 13.85\(\pm\)1.166 & 5.93\(\pm\)0.68 & 8.33\(\pm\)0.76 & 4.77\(\pm\)0.25 & **1.18\(\pm\)0.2** \\ \cline{2-11}  & BLLoB (Ours) & ✓ & ✓ & \multicolumn{6}{c}{} & \(\bm{9.35\pm_{1.37}}\) & \(\bm{9.59\pm_{1.38}}\) & **3.64\(\pm\)0.53** & **3.01\(\pm\)0.42** & **3.77\(\pm\)1.47** & 1.41\(\pm\)1.19 \\ \hline \multirow{6}{*}{NLL (\(\downarrow\))} & MLE & - & - & - & 3.17\(\pm\)0.37 & 2.85\(\pm\)0.27 & 1.17\(\pm\)0.13 & 0.95\(\pm\)0.07 & 0.73\(\pm\)0.03 & 0.32\(\pm\)0.00 \\ \cline{2-11}  & BBB- & \multicolumn{6}{c}{} & - & - & - & - & - & - & - \\  & BBB [1] & \multicolumn{6}{c}{} & - & - & - & - & - & - & - \\  & BBB [1] & \multicolumn{6}{c}{} & ✓ & 1.40\(\pm\)0.58 & 2.23\(\pm\)0.04 & 0.91\(\pm\)0.66 & 0.84\(\pm\)0.15 & 0.66\(\pm\)0.05 & **0.31\(\pm\)0.00** \\ \cline{2-11}  & BLLoB- & ✓ & ✓ & \multicolumn{6}{c}{} & 1.96\(\pm\)0.20 & 2.31\(\pm\)0.13 & 0.84\(\pm\)0.63 & 0.87\(\pm\)0.01 & 0.68\(\pm\)0.00 & **0.31\(\pm\)0.00** \\ \cline{2-11}  & BLLoB- & ✓ & ✓ & \multicolumn{6}{c}{} & - & - & - & - & - & - \\  & BLLoB- & ✓ & ✓ & \multicolumn{6}{c}{} & - & - & - & - & - & - \\  & BLLoB- & ✓ & ✓ & \multicolumn{6}{c}{} & 0.80\(\pm\)0.42 & 0.91\(\pm\)0.04 & 0.46\(\pm\)0.01 & 0.55\(\pm\)0.01 & 0.51\(\pm\)0.00 & 0.32\(\pm\)0.00 \\ \cline{2-11}  & BLLoB (Ours) & ✓ & ✓ & \multicolumn{6}{c}{} & \(\bm{0.63\pm_{0.60}}\) & \(\bm{0.78\pm_{0.60}}\) & \(\bm{0.40\pm_{0.61}}\) & \(\bm{0.54\pm_{0.60}}\) & \(\bm{0.50\pm_{0.61}}\) & **0.31\(\pm\)0.00** \\ \hline \hline \end{tabular}
+\end{table}
+Table 8: **Ablation study of BLoB, applied to LoRA on Llama2-7B pre-trained weights, where RW, RP, and AB represent our designed techniques of KL Re-Weighting (Appendix B.1), Re-Parameterization (Sec. 3.3), and Asymmetricmodel. The results are shown in Table 9. BLoB increases memory cost by only about 3% to 13% compared to LoRA, with training time increased by about 15%.
+
+We further evaluate the inference time and maximum memory usage for standard LoRA, Laplace-LoRA (LAP), and our BLoB, as shown in Table 10. The experiments are conducted on two NVIDIA A100 GPUs. These results show that compared to LAP, our BLoB can achieve comparable or better ECE and NLL with less inference time and less memory usage. Notably, our BLoB's memory overhead compared to standard LoRA is minimal, while LAP introduces significant memory overhead.
+
+### Impact of Sample Size on Inference Performance
+
+Here we provide a more detailed empirical study on the sample size of BLoB during inference. Specifically, we report the results for different number of samples from \(N=1\) to \(N=160\) on the WG-S dataset, demonstrating improved uncertainty estimation with increased number of samples, as shown in Fig. 3.
+
+### Trade-Off between Accuracy and Calibration Controlled by Gaussian Prior
+
+The empirical trade-off between accuracy and calibration caused by different model architectures is observed in [85]. By controlling the standard deviation of the prior Gaussian distribution, we
+
+\begin{table}
+\begin{tabular}{c l c c c c c c} \hline \hline \multirow{2}{*}{**Metric**} & \multirow{2}{*}{**Method**} & \multicolumn{6}{c}{**Datasets**} \\ \cline{3-8}  & & WG-S [82] & ARC-C [18] & ARC-E [18] & WG-M [82] & OBQA [65] & BoolQ [17] \\ \hline \multirow{3}{*}{Time (Seconds) (\(\downarrow\))} & Standard LoRA & 17 & 5 & 8 & 17 & 7 & 58 \\  & LAP & 311 & 445 & 814 & 554 & 1165 & 2508 \\  & BLoB (N=10) & 193 & 45 & 86 & 193 & 75 & 627 \\ \hline \multirow{3}{*}{Max Memory (MB) (\(\downarrow\))} & Standard LoRA & 14391 & 14157 & 13081 & 14391 & 14391 & 14391 & 14160 \\  & LAP & 43742 & 61881 & 64737 & 43678 & 55642 & 67364 \\ \cline{1-1}  & BLoB (N=10) & 14171 & 14411 & 13911 & 14407 & 14478 & 14177 \\ \hline \hline \end{tabular}
+\end{table}
+Table 10: **A comparison of time and max memory cost between Standard LoRA, LAP, and BLoB (N=10) during inference.**
+
+Figure 3: **Performance of BLoB with Varying Sample Sizes \(N\) during Inference.** We fine-tune the Llama2-7B model on the WG-S dataset for 5,000 steps, evaluating the model’s performance with different sample sizes, specifically when \(N\) is 1, 2, 3, 4, 5, 10, 20, 40, 80, and 160.
+
+\begin{table}
+\begin{tabular}{c l c c c c c c} \hline \hline \multirow{2}{*}{**Metric**} & \multirow{2}{*}{**Method**} & \multicolumn{6}{c}{**Datasets**} \\ \cline{3-8}  & & WG-S [82] & ARC-C [18] & ARC-E [18] & WG-M [82] & OBQA [65] & BoolQ [17] \\ \hline \multirow{2}{*}{Time (Seconds) (\(\downarrow\))} & Standard LoRA & 1399 & 1614 & 1586 & 1408 & 1822 & 3382 \\  & BLoB (N=10) & 1563 & 1790 & 1753 & 1556 & 2142 & 3733 \\ \hline \multirow{2}{*}{Max Memory (MB) (\(\downarrow\))} & Standard LoRA & 14688 & 16870 & 17044 & 14710 & 14984 & 20784 \\  & BLoB (N=10) & 15015 & 18863 & 19015 & 15015 & 15890 & 23552 \\ \hline \hline \end{tabular}
+\end{table}
+Table 9: **A comparison of time and maximum memory cost between standard LoRA and BLoB, during training.** The evaluation is based on fine-tuning for 5,000 steps on the Llama2-7B model.
+
+observed a similar trade-off between accuracy and calibration. Specifically, we report results for different prior Gaussian standard deviations, ranging from \(0.05\) to \(0.25\), while proportionally scaling the learning rate of KL divergence from its original value of \(0.01\) to values between \(0.0025\) and \(0.0125\). This highlights the trade-off between accuracy and calibration, as shown in Fig. 4.
+
+### Embedding Uncertainty of BLoB: A Preliminary Visual Study
+
+Estimating the uncertainty of LLMs in the embedding space has recently garnered significant attention in the community [13]. Expressing models' uncertainty via their generated embeddings can benefit both discriminative (the focus of this paper) and generative models. In this section, we present a preliminary study on uncertainty estimation in the embedding spaces of different models, as illustrated in Fig. 5. We compare BLoB with two baseline models, BBB and MCD, which can generate embedding samples and effectively estimate uncertainty. We exclude LAP from this section due to its excessive memory consumption, which consistently results in Out-Of-Memory (OOM) errors during inference. The experiment is conducted on the OBQA dataset [65], which consists of four categories.
+
+For each input sequence \(\bm{s}\), we use the last token's embedding generated by the final transformer block in Llama2-7B as the final embedding. Given the weights \(\bm{W}\), we denote the embedding as \(\bm{\phi}(\bm{s};\bm{W})\). Generally, three types of embeddings can be generated using the Bayesian approach:
+
+1. Embeddings generated by the mean of the weights (these embeddings are shown as "\(\bm{\star}\)" in Fig. 5): \[\bm{\phi}(\bm{s};\mathbb{E}_{\bm{W}\sim q(\cdot|\bm{\theta})}[\bm{W}])=\bm{ \phi}(\bm{s};\bm{W}_{0}+\bm{B}\bm{M}).\] (76)
+2. Embedding samples generated by sampling different weights from the approximate posterior, whose distribution is plotted by the solid line ().
+3. The expectation of the embedding, which is approximated by averaging the sampled embeddings: \[\mathbb{E}_{\bm{W}\sim q(\cdot|\bm{\theta})}[\bm{\phi}(\bm{s};\bm{W})]\approx \tfrac{1}{N}\sum_{n=1}^{N}\bm{\phi}(\bm{s};\bm{W}_{0}+\bm{B}(\bm{M}+\bm{E}_{n} \circ\bm{\Omega})),\] (77) where \(N\) denotes the number of samples during inference, and \(\bm{E}_{n}\) denotes the \(n\)-th sampled noise for the weight matrix. We show this expectation as "\(\bm{\bigtriangledown}\)" in Fig. 5.
+
+To visually demonstrate the confidence calibration effect of the Bayesian treatment, we adopt the following pipeline of visualization, which we believe can be further applied in visualizing other frameworks' embedding uncertainty quality.
+
+1. Acquire high-dimensional embeddings produced by the weight mean for the given test dataset, as decribed in (a) and Eqn. 76 above.
+
+Figure 4: **Performance of BLoB (N=10) with Varying Prior Gaussian Standard Deviations \(\sigma_{p}\).** We fine-tune the Llama2-7B model on the WG-S dataset for 5,000 gradient steps, evaluating the model’s performance with different prior Gaussian standard deviations and learning rates of KL divergence.
+
+2. Use Linear Discriminant Analysis (LDA) [10] to project these high-dimensional embeddings into a low-dimensional 2D space.
+3. In the 2D space, fit a logistic regression model to mimic the decision regions and color them based on the true labels.
+4. Sample weights 10 times from the approximate posterior, generate the embeddings, and project them into the same 2D space using the previously learned LDA. Use Kernel Density Estimation (KDE) [79, 74] to show their distributions, as described in (b) above.
+5. Average the sampled embeddings for each example and visualize them in the 2D space, as described in (c) and Eqn. 77 above.
+
+In Fig. 5, we show 4 correct and incorrect predictions made by each model. Ideally, a model with better uncertainty estimation should produce lower level of uncertainty (**smaller embedding variance**, i.e., smaller contours, and **further away from the decision boundary**) for correct predictions, and higher level of uncertainty (**larger embedding variance**, i.e., larger contours, and **closer to the decision boundary**). From the figure, we have the following observations:
+
+* All three Bayesian approaches produce higher embedding variance for incorrect predictions and lower embedding variance for correct predictions. However, BLoB achieves significantly larger embedding variance compared to the baselines, consistent with the quantitative evaluation shown in Table 1. BLoB's produced variance is higher for the incorrect predictions, demonstrating its accurate uncertainty estimation even in the embedding space.
+* In BLoB, the mean embedding produced by sampling weights from the approximate posterior is closer to the decision boundary than the embedding generated by the mean of weights (\(\bm{\star}\)\(\bm{\rightarrow}\)\(\bm{\bigtriangledown}\)). This effect is most apparent when the prediction is incorrect, consistent with the quantitative results yielded from the final softmax layer of the model. Again, this demonstrates BLoB's Bayesian inference can bring the final prediction closer to the ground truth.
+
+Figure 5: **Visualization of embedding uncertainty quality for different methods.** The model is fine-tuned for 5,000 steps on the Llama2-7B. We fine-tune the Llama2-7B model on the OBQA dataset for 5000 steps. The two contour lines represent the probability mass of 0.5 and 0.75, respectively.
+
+### NeurIPS Paper Checklist
+
+1. **Claims** Question: Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope? Answer: [Yes] Justification: The abstract and introduction contains summarized claims about this paper that accurately reflect our contributions. Guidelines: * The answer NA means that the abstract and introduction do not include the claims made in the paper. * The abstract and/or introduction should clearly state the claims made, including the contributions made in the paper and important assumptions and limitations. A No or NA answer to this question will not be perceived well by the reviewers. * The claims made should match theoretical and experimental results, and reflect how much the results can be expected to generalize to other settings. * It is fine to include aspirational goals as motivation as long as it is clear that these goals are not attained by the paper.
+2. **Limitations** Question: Does the paper discuss the limitations of the work performed by the authors? Answer: [Yes] Justification: Our main theorems (Theorem 3.1 and 3.2) state the hidden assumptions of the low-rank structure of the approximate posterior we propose for LLMs, and we have discussed the similar topics we do not consider in the Remark. Guidelines: * The answer NA means that the paper has no limitation while the answer No means that the paper has limitations, but those are not discussed in the paper. * The authors are encouraged to create a separate "Limitations" section in their paper. * The paper should point out any strong assumptions and how robust the results are to violations of these assumptions (e.g., independence assumptions, noiseless settings, model well-specification, asymptotic approximations only holding locally). The authors should reflect on how these assumptions might be violated in practice and what the implications would be. * The authors should reflect on the scope of the claims made, e.g., if the approach was only tested on a few datasets or with a few runs. In general, empirical results often depend on implicit assumptions, which should be articulated. * The authors should reflect on the factors that influence the performance of the approach. For example, a facial recognition algorithm may perform poorly when image resolution is low or images are taken in low lighting. Or a speech-to-text system might not be used reliably to provide closed captions for online lectures because it fails to handle technical jargon. * The authors should discuss the computational efficiency of the proposed algorithms and how they scale with dataset size. * If applicable, the authors should discuss possible limitations of their approach to address problems of privacy and fairness. * While the authors might fear that complete honesty about limitations might be used by reviewers as grounds for rejection, a worse outcome might be that reviewers discover limitations that aren't acknowledged in the paper. The authors should use their best judgment and recognize that individual actions in favor of transparency play an important role in developing norms that preserve the integrity of the community. Reviewers will be specifically instructed to not penalize honesty concerning limitations.
+3. **Theory Assumptions and Proofs** Question: For each theoretical result, does the paper provide the full set of assumptions and a complete (and correct) proof?Answer: [Yes] Justification: In the main statement of the theorems and their proof, we clearly include the assumptions we make underlying them. Guidelines: * The answer NA means that the paper does not include theoretical results. * All the theorems, formulas, and proofs in the paper should be numbered and cross-referenced. * All assumptions should be clearly stated or referenced in the statement of any theorems. * The proofs can either appear in the main paper or the supplemental material, but if they appear in the supplemental material, the authors are encouraged to provide a short proof sketch to provide intuition. * Inversely, any informal proof provided in the core of the paper should be complemented by formal proofs provided in appendix or supplemental material. * Theorems and Lemmas that the proof relies upon should be properly referenced.
+4. **Experimental Result Reproducibility** Question: Does the paper fully disclose all the information needed to reproduce the main experimental results of the paper to the extent that it affects the main claims and/or conclusions of the paper (regardless of whether the code and data are provided or not)? Answer: [Yes] Justification: We have provided the full settings of our experiments in Sec. 4 and Appendix B. Guidelines: * The answer NA means that the paper does not include experiments. * If the paper includes experiments, a No answer to this question will not be perceived well by the reviewers: Making the paper reproducible is important, regardless of whether the code and data are provided or not. * If the contribution is a dataset and/or model, the authors should describe the steps taken to make their results reproducible or verifiable. * Depending on the contribution, reproducibility can be accomplished in various ways. For example, if the contribution is a novel architecture, describing the architecture fully might suffice, or if the contribution is a specific model and empirical evaluation, it may be necessary to either make it possible for others to replicate the model with the same dataset, or provide access to the model. In general. releasing code and data is often one good way to accomplish this, but reproducibility can also be provided via detailed instructions for how to replicate the results, access to a hosted model (e.g., in the case of a large language model), releasing of a model checkpoint, or other means that are appropriate to the research performed. * While NeurIPS does not require releasing code, the conference does require all submissions to provide some reasonable avenue for reproducibility, which may depend on the nature of the contribution. For example 1. If the contribution is primarily a new algorithm, the paper should make it clear how to reproduce that algorithm. 2. If the contribution is primarily a new model architecture, the paper should describe the architecture clearly and fully. 3. If the contribution is a new model (e.g., a large language model), then there should either be a way to access this model for reproducing the results or a way to reproduce the model (e.g., with an open-source dataset or instructions for how to construct the dataset). 4. We recognize that reproducibility may be tricky in some cases, in which case authors are welcome to describe the particular way they provide for reproducibility. In the case of closed-source models, it may be that access to the model is limited in some way (e.g., to registered users), but it should be possible for other researchers to have some path to reproducing or verifying the results.
+5. **Open access to data and code**Question: Does the paper provide open access to the data and code, with sufficient instructions to faithfully reproduce the main experimental results, as described in supplemental material? Answer: [Yes] Justification: we have submitted the anonymized code to Openreview, with the dependency specification of the packages and instructions for running the code. Guidelines: * The answer NA means that paper does not include experiments requiring code. * Please see the NeurIPS code and data submission guidelines (https://nips.cc/public/guides/CodeSubmissionPolicy) for more details. * While we encourage the release of code and data, we understand that this might not be possible, so "No" is an acceptable answer. Papers cannot be rejected simply for not including code, unless this is central to the contribution (e.g., for a new open-source benchmark). * The instructions should contain the exact command and environment needed to run to reproduce the results. See the NeurIPS code and data submission guidelines (https://nips.cc/public/guides/CodeSubmissionPolicy) for more details. * The authors should provide instructions on data access and preparation, including how to access the raw data, preprocessed data, intermediate data, and generated data, etc. * The authors should provide scripts to reproduce all experimental results for the new proposed method and baselines. If only a subset of experiments are reproducible, they should state which ones are omitted from the script and why. * At submission time, to preserve anonymity, the authors should release anonymized versions (if applicable). * Providing as much information as possible in supplemental material (appended to the paper) is recommended, but including URLs to data and code is permitted.
+6. **Experimental Setting/Details** Question: Does the paper specify all the training and test details (e.g., data splits, hyperparameters, how they were chosen, type of optimizer, etc.) necessary to understand the results? Answer: [Yes] Justification: We have provided the full settings of our experiments in Sec. 4 and Appendix B. Guidelines: * The answer NA means that the paper does not include experiments. * The experimental setting should be presented in the core of the paper to a level of detail that is necessary to appreciate the results and make sense of them. * The full details can be provided either with the code, in appendix, or as supplemental material.
+7. **Experiment Statistical Significance** Question: Does the paper report error bars suitably and correctly defined or other appropriate information about the statistical significance of the experiments? Answer: [Yes] Justification: Our experiments are repeated for 3 runs with different random seeds, and we have reported the standard deviation of all the methods in all the tables. Guidelines: * The answer NA means that the paper does not include experiments. * The authors should answer "Yes" if the results are accompanied by error bars, confidence intervals, or statistical significance tests, at least for the experiments that support the main claims of the paper. * The factors of variability that the error bars are capturing should be clearly stated (for example, train/test split, initialization, random drawing of some parameter, or overall run with given experimental conditions).
+
+* The method for calculating the error bars should be explained (closed form formula, call to a library function, bootstrap, etc.)
+* The assumptions made should be given (e.g., Normally distributed errors).
+* It should be clear whether the error bar is the standard deviation or the standard error of the mean.
+* It is OK to report 1-sigma error bars, but one should state it. The authors should preferably report a 2-sigma error bar than state that they have a 96% CI, if the hypothesis of Normality of errors is not verified.
+* For asymmetric distributions, the authors should be careful not to show in tables or figures symmetric error bars that would yield results that are out of range (e.g. negative error rates).
+* If error bars are reported in tables or plots, The authors should explain in the text how they were calculated and reference the corresponding figures or tables in the text.
+8. **Experiments Compute Resources** Question: For each experiment, does the paper provide sufficient information on the computer resources (type of compute workers, memory, time of execution) needed to reproduce the experiments? Answer: [Yes] Justification: See Appendix C.3. Guidelines: * The answer NA means that the paper does not include experiments. * The paper should indicate the type of compute workers CPU or GPU, internal cluster, or cloud provider, including relevant memory and storage. * The paper should provide the amount of compute required for each of the individual experimental runs as well as estimate the total compute. * The paper should disclose whether the full research project required more compute than the experiments reported in the paper (e.g., preliminary or failed experiments that didn't make it into the paper).
+9. **Code Of Ethics** Question: Does the research conducted in the paper conform, in every respect, with the NeurIPS Code of Ethics https://neurips.cc/public/EthicsGuidelines? Answer: [Yes] Justification: We have read and fully considered the Code Of Ethics of NeurIPS, and we confirm we follow it strictly without any violation. Guidelines: * The answer NA means that the authors have not reviewed the NeurIPS Code of Ethics. * If the authors answer No, they should explain the special circumstances that require a deviation from the Code of Ethics. * The authors should make sure to preserve anonymity (e.g., if there is a special consideration due to laws or regulations in their jurisdiction).
+10. **Broader Impacts** Question: Does the paper discuss both potential positive societal impacts and negative societal impacts of the work performed? Answer: [Yes] Justification: We have some discussions on how our research can achieve a reliable LLM deployment with reduced harm to people by estimating the uncertainty of the prediction in Sec. 1. Guidelines: * The answer NA means that there is no societal impact of the work performed. * If the authors answer NA or No, they should explain why their work has no societal impact or why the paper does not address societal impact.
+
+* Examples of negative societal impacts include potential malicious or unintended uses (e.g., disinformation, generating fake profiles, surveillance), fairness considerations (e.g., deployment of technologies that could make decisions that unfairly impact specific groups), privacy considerations, and security considerations.
+* The conference expects that many papers will be foundational research and not tied to particular applications, let alone deployments. However, if there is a direct path to any negative applications, the authors should point it out. For example, it is legitimate to point out that an improvement in the quality of generative models could be used to generate deepfakes for disinformation. On the other hand, it is not needed to point out that a generic algorithm for optimizing neural networks could enable people to train models that generate Deepfakes faster.
+* The authors should consider possible harms that could arise when the technology is being used as intended and functioning correctly, harms that could arise when the technology is being used as intended but gives incorrect results, and harms following from (intentional or unintentional) misuse of the technology.
+* If there are negative societal impacts, the authors could also discuss possible mitigation strategies (e.g., gated release of models, providing defenses in addition to attacks, mechanisms for monitoring misuse, mechanisms to monitor how a system learns from feedback over time, improving the efficiency and accessibility of ML).
+11. **Safeguards** Question: Does the paper describe safeguards that have been put in place for responsible release of data or models that have a high risk for misuse (e.g., pretrained language models, image generators, or scraped datasets)? Answer: [NA] Justification: The paper does not pose any risks since there is no release of models. Guidelines: * The answer NA means that the paper poses no such risks. * Released models that have a high risk for misuse or dual-use should be released with necessary safeguards to allow for controlled use of the model, for example by requiring that users adhere to usage guidelines or restrictions to access the model or implementing safety filters. * Datasets that have been scraped from the Internet could pose safety risks. The authors should describe how they avoided releasing unsafe images. * We recognize that providing effective safeguards is challenging, and many papers do not require this, but we encourage authors to take this into account and make a best faith effort.
+12. **Licensees for existing assets** Question: Are the creators or original owners of assets (e.g., code, data, models), used in the paper, properly credited and are the license and terms of use explicitly mentioned and properly respected? Answer: [Yes] Justification: we perform all the experiments under the license, and have cited work properly in the paper. Guidelines: * The answer NA means that the paper does not use existing assets. * The authors should cite the original paper that produced the code package or dataset. * The authors should state which version of the asset is used and, if possible, include a URL. * The name of the license (e.g., CC-BY 4.0) should be included for each asset. * For scraped data from a particular source (e.g., website), the copyright and terms of service of that source should be provided.
+
+* If assets are released, the license, copyright information, and terms of use in the package should be provided. For popular datasets, paperswithcode.com/datasets has curated licenses for some datasets. Their licensing guide can help determine the license of a dataset.
+* For existing datasets that are re-packaged, both the original license and the license of the derived asset (if it has changed) should be provided.
+* If this information is not available online, the authors are encouraged to reach out to the asset's creators.
+* **New Assets*
+* Question: Are new assets introduced in the paper well documented and is the documentation provided alongside the assets? Answer: [NA] Justification: There is no new assets introduced in this paper. Guidelines:
+* The answer NA means that the paper does not release new assets.
+* Researchers should communicate the details of the dataset/code/model as part of their submissions via structured templates. This includes details about training, license, limitations, etc.
+* The paper should discuss whether and how consent was obtained from people whose asset is used.
+* At submission time, remember to anonymize your assets (if applicable). You can either create an anonymized URL or include an anonymized zip file.
+* **Crowdsourcing and Research with Human Subjects*
+* Question: For crowdsourcing experiments and research with human subjects, does the paper include the full text of instructions given to participants and screenshots, if applicable, as well as details about compensation (if any)? Answer: [NA] Justification: No crowdsourcing experiments are involved in this paper. Guidelines:
+* The answer NA means that the paper does not involve crowdsourcing nor research with human subjects.
+* Including this information in the supplemental material is fine, but if the main contribution of the paper involves human subjects, then as much detail as possible should be included in the main paper.
+* According to the NeurIPS Code of Ethics, workers involved in data collection, curation, or other labor should be paid at least the minimum wage in the country of the data collector.
+* **Institutional Review Board (IRB) Approvals or Equivalent for Research with Human Subjects*
+* Question: Does the paper describe potential risks incurred by study participants, whether such risks were disclosed to the subjects, and whether Institutional Review Board (IRB) approvals (or an equivalent approval/review based on the requirements of your country or institution) were obtained? Answer: [NA] Justification: No IRB is involved in this paper. Guidelines:
+* The answer NA means that the paper does not involve crowdsourcing nor research with human subjects.
+* Depending on the country in which research is conducted, IRB approval (or equivalent) may be required for any human subjects research. If you obtained IRB approval, you should clearly state this in the paper.
+* We recognize that the procedures for this may vary significantly between institutions and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the guidelines for their institution.
+* For initial submissions, do not include any information that would break anonymity (if applicable), such as the institution conducting the review.

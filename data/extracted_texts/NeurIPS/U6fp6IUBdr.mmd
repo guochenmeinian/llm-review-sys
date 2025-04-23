@@ -1,0 +1,287 @@
+# Understanding Neural Network Binarization with Forward and Backward Proximal Quantizers
+
+Yiwei Lu
+
+School of Computer Science
+
+University of Waterloo
+
+Vector Institute
+
+yiwei.lu@uwaterloo.ca
+
+&Yaoliang Yu
+
+School of Computer Science
+
+University of Waterloo
+
+Vector Institute
+
+yaoliang.yu@uwaterloo.ca
+
+&Xinlin Li
+
+Huawei Noah's Ark Lab
+
+xinlin.li1@huawei.com
+
+&Yaoliang Yu
+
+School of Computer Science
+
+University of Waterloo
+
+Vector Institute
+
+yaoliang.yu@uwaterloo.ca
+
+&Xinlin Li
+
+Huawei Noah's Ark Lab
+
+vahid.partovinia@huawei.com
+
+Work done during an internship at Huawei Noah's Ark Lab.
+
+###### Abstract
+
+In neural network binarization, BinaryConnect (BC) and its variants are considered the standard. These methods apply the \(\) function in their forward pass and their respective gradients are backpropagated to update the weights. However, the derivative of the sign function is zero whenever defined, which consequently freezes training. Therefore, implementations of BC (e.g., BNN) usually replace the derivative of \(\) in the backward computation with identity or other _approximate gradient_ alternatives. Although such practice works well empirically, it is largely a heuristic or "training trick." We aim at shedding some light on these training tricks from the optimization perspective. Building from existing theory on ProxConnect (PC, a generalization of BC), we (1) equip PC with _different_ forward-backward quantizers and obtain ProxConnect++ (PC++) that includes existing binarization techniques as special cases; (2) derive a principled way to synthesize forward-backward quantizers with automatic theoretical guarantees; (3) illustrate our theory by proposing an enhanced binarization algorithm BNN++; (4) conduct image classification experiments on CNNs and vision transformers, and empirically verify that BNN++ generally achieves competitive results on binarizing these models.
+
+## 1 Introduction
+
+The recent success of numerous applications in machine learning is largely fueled by training big models with billions of parameters, e.g., GPTs in large language models [7; 8], on extremely large datasets. However, as such models continue to scale up, end-to-end training or even fine-tuning becomes prohibitively expensive, due to the heavy amount of computation, memory and storage required. Moreover, even after successful training, deploying these models on resource-limited devices or environments that require real-time inference still poses significant challenges.
+
+A common way to tackle the above problems is through model compression, such as pruning [44; 47; 51], reusing attention , weight sharing , structured factorization , and network quantization [16; 30; 32; 38]. Among them, network quantization (i.e., replacing full-precision weights with lower-precision ones) is a popular approach. In this work we focus on an extreme case of network quantization: binarization, i.e., constraining a subset of the weights to be only binary (i.e., \( 1\)), withthe benefit of much reduced memory and storage cost, as well as inference time through simpler and faster matrix-vector multiplications, which is one of the main computationally expensive steps in transformers and the recently advanced vision transformers [14; 34; 52].
+
+For neural network binarization, BinaryConnect [BC, 11] is considered the de facto standard. BC applies the \(\) function to binarize the weights in the forward pass, and evaluates the gradient at the binarized weights using the Straight Through Estimator [STE, 4]2. This widely adopted training trick has been formally justified from an optimization perspective: Dockhorn et al. , among others, identify BC as a nonconvex counterpart of dual averaging, which itself is a special case of the generalized conditional gradient algorithm. Dockhorn et al.  further propose ProxConnect (PC) as an extension of BC, by allowing arbitrary proximal quantizers (with \(\) being a special case) in the forward pass.
+
+However, practical implementations [e.g., 2; 12; 22] usually apply an _approximate gradient_ of the sign function on top of STE. For example, Hubara et al.  employ the hard \(\) function as an approximator of \(\). Thus, in the backward pass, the derivative of \(\) is approximated by the indicator function \(_{[-1,1]}\), the derivative of hard \(\). Later, Darabi et al.  consider the \(\)-Swish function as a more accurate and flexible approximation in the backward pass (but still employs the \(\) in the forward pass).
+
+Despite their excellent performance in practice, _approximate gradient_ approaches cannot be readily understood in the PC framework of Dockhorn et al. , which does not equip any quantization in the backward pass. Thus, the main goal of this work is to further generalize PC and improve our understanding of approximate gradient approaches. Specifically, we introduce PC++ that comes with a _pair_ of forward-backward proximal quantizers, and we show that most of the existing approximate gradient approaches are special cases of our proximal quantizers, and hence offering a formal justification of their empirical success from an optimization perspective. Moreover, inspired by our theoretical findings, we propose a novel binarization algorithm BNN++ that improves BNN+  on both theoretical convergence properties and empirical performances. Notably, our work provides direct guidance on designing new forward-backward proximal quantizers in the PC++ family, with immediate theoretical guarantees while enabling streamlined implementation and comparison of a wide family of existing quantization algorithms.
+
+Empirically, we benchmark existing PC++ algorithms (including the new BNN++) on image classification tasks on CNNs and vision transformers. Specifically, we perform weight (and activation) binarization on various datasets and models. Moreover, we explore the fully binarized scenario, where the dot-product accumulators are also quantized to 8-bit integers. In general, we observe that BNN++ is very competitive against existing approaches on most tasks, and achieves 30x reduction in memory and storage with a modest 5-10% accuracy drop compared to full precision training.
+
+We summarize our main contributions in more detail:
+
+* We generalize ProxConnect with forward-backward quantizers and introduce ProxConnect++ (PC++) that includes existing binarization techniques as special cases.
+* We derive a principled way to synthesize forward-backward quantizers with theoretical guarantees. Moreover, we design a new BNN++ variant to illustrate our theoretical findings.
+* We empirically compare different choices of forward-backward quantizers on image classification benchmarks, and confirm that BNN++ is competitive against existing alternatives.
+
+## 2 Background
+
+In neural network quantization, we aim at minimizing the usual (nonconvex) objective function \(()\) with discrete weights \(\):
+
+\[_{ Q}\ (),\] (1)
+
+where \(Q^{d}\) is a discrete, nonconvex quantization set such as \(Q=\{ 1\}^{d}\). The acquired discrete weights \( Q\) are compared directly with continuous full precision weights, which we denote as \(^{*}\) for clarity. While our work easily extends to most discrete set \(Q\), we focus on \(Q=\{ 1\}^{d}\) since this binary setting remains most challenging and leads to the most significant savings. Existing binarization schemes can be largely divided into the following two categories.
+
+Post-Training Binarization (PTB):we can formulate post-training binarization schemes as the following standard forward and backward pass:
+
+\[_{t}=_{Q}(_{t}^{*}),_{t+1}^{*}= _{t}^{*}-_{t}(_{t}^{*}),\]
+
+where \(_{Q}\) is the projector that binarizes the continuous weights \(^{*}\) deterministically (e.g., the \(\) function) or stochastically3, and \((_{t}^{*})\) denotes a sample (sub)gradient of \(\) at \(_{t}^{*}\). We point out that PTB is merely a post-processing step, i.e., the binarized weights \(_{t}\) do not affect the update of the continuous weights \(_{t}^{*}\), which are obtained through normal training. As a result, there is no guarantee that the acquired discrete weights \(_{t}\) is a good solution (either global or local) to eq.1.
+
+Binarization-Aware Training (BAT):we then recall the more difficult binarization-aware training scheme BinaryConnect (BC), first initialized by Courbariaux et al. :
+
+\[_{t}=_{Q}(_{t}^{*}),_{t+1}^{*}= _{t}^{*}-_{t}(_{t}),\] (2)
+
+where we spot that the gradient is evaluated at the binarized weights \(_{t}\) but used to update the continuous weights \(_{t}^{*}\). This approach is also known as Straight Through Estimator [STE, 4]. Note that it is also possible to update the binarized weights instead, effectively performing the proximal gradient algorithm to solve (1), as shown by Bai et al. :
+
+\[_{t}=_{Q}(_{t}^{*}),_{t+1}^{*}= _{t}-_{t}(_{t}).\]
+
+This method is known as ProxQuant, and will serve as a baseline in our experiments.
+
+### ProxConnect
+
+Dockhorn et al.  proposed ProxConnect (PC) as a broad generalization of BinaryConnect in (2):
+
+\[_{t}=_{t}^{_{t}}(_{t}^{*}),_{ t+1}^{*}=_{t}^{*}-_{t}(_{t}),\] (3)
+
+where \(_{t}:=1+_{=1}^{t-1}_{}\), \(_{t}>0\) is the step size, and \(_{t}^{_{t}}\) is the proximal quantizer:
+
+\[_{t}^{}() :=*{argmin}_{}\ \|-\|_{2}^{2}+ (),\] \[_{t}^{}() :=_{}\ \|-\|_{2}^{2}+ ().\]
+
+In particular, when the regularizer \(=_{Q}\) (the indicator function of \(Q\)), \(_{t}^{_{t}}=_{Q}\) (for any \(_{t}\)) and we recover BC in (2). Dockhorn et al.  showed that the PC update (3) amounts to applying the generalized conditional gradient algorithm to a smoothened dual of the regularized problem:
+
+\[_{}\ [()+()]_{^ {*}}\ ^{*}(-^{*})+_{t^{*}}^{}(^{*}),\]
+
+where \(f^{*}(^{*}):=_{},^{*} -f()\) is the Fenchel conjugate of \(f\). The theory behind PC thus formally justifies STE from an optimization perspective. We provide a number of examples of the proximal quantizer \(_{t}^{_{t}}\) in AppendixA.
+
+Another natural cousin of PC is the reversed PC (rPC):
+
+\[_{t}=_{t}^{_{t}}(_{t}^{*}),_{ t+1}^{*}=_{t}-_{t}(_{t}^{*}),\]
+
+which is able to exploit the rich landscape of the loss by evaluating the gradient at the continuous weights \(_{t}^{*}\). Thus, we also include it as a baseline in our experiments.
+
+We further discuss other related works in AppendixB.
+
+## 3 Methodology
+
+One popular heuristic to explain BC is through the following reformulation of problem (1):
+
+\[_{^{*}}\;_{Q}(^{*}).\]
+
+Applying (stochastic) "gradient" to update the continuous weights we obtain:
+
+\[^{*}_{t+1}=^{*}_{t}-_{t}^{}_{Q}( ^{*}_{t})(_{Q}(^{*}_{ t})).\]
+
+Unfortunately, the derivative of the projector \(_{Q}\) is 0 everywhere except at the origin, where the derivative actually does not exist. BC , see (2), simply "pretended" that \(^{}_{Q}=I\). Later works propose to replace the troublesome \(^{}_{Q}\) by the derivative of functions that approximate \(_{Q}\), e.g., the hard tanh in BNN  and the \(\) in BNN+ . Despite their empirical success, it is not clear what is the underlying optimization problem or if it is possible to also replace the projector inside \(\), i.e., allowing the algorithm to evaluate gradients at continuous weights, a clear advantage demonstrated by Bai et al.  and Dockhorn et al. . Moreover, the theory established in PC, through a connection to the generalized conditional gradient algorithm, does not apply to these modifications yet, which is a gap that we aim to fill in this section.
+
+### ProxConnect++
+
+To address the above-mentioned issues, we propose to study the following regularized problem:
+
+\[_{^{*}}\;((^{*}))+( ^{*}),\] (4)
+
+as a relaxation of the (equivalent) reformulation of (1):
+
+\[_{^{*}}\;(_{Q}(^{*}))+_{Q}(^{*}).\]
+
+In other words, \(:^{d}^{d}\) is some transformation that approximates \(_{Q}\) and the regularizer \(:^{d}\) approximates the indicator function \(_{Q}\). Directly applying ProxConnect in (3) we obtain4:
+
+\[_{t}=^{_{t}}_{}(^{*}_{t}),\;\; ^{*}_{t+1}=^{*}_{t}-_{t}^{}(_{t})(_{t}).\] (5)
+
+Introducing the forward and backward proximal quantizers:
+
+\[^{}_{}:=^{}_{}, ^{}_{}:=^{}^{}_ {},\] (6)
+
+we can rewrite the update in (5) simply as:
+
+\[^{*}_{t+1}=^{*}_{t}-_{t}^{_{}}_{}(^{*}_{t}) ^{_{t}}_{}(^{*}_{t}).\] (7)
+
+It is clear that the original ProxConnect corresponds to the special choice
+
+\[^{}_{}=^{}_{},^{ }_{} I.\]
+
+Of course, one may now follow the recipe in (6) to design new forward-backward quantizers. We call this general formulation in (7) ProxConnect++ (PC++), which covers a broad family of algorithms.
+
+Conversely, the complete characterization of proximal quantizers in Dockhorn et al.  allows us also to reverse engineer \(\) and \(\) from manually designed forward and backward quantizers. As we will see, most existing forward-backward quantizers turn out to be special cases of our proximal quantizers, and thus their empirical success can be justified from an optimization perspective. Indeed, for simplicity, let us restrict all quantizers to univariate ones that apply component-wise. Then, the following result is proven in Appendix C.
+
+**Corollary 1**.: _A pair of forward-backward quantizers \((,)\) admits the decomposition in (6) (for some smoothing parameter \(\) and regularizer \(\)) iff both \(\) and \(\) are functions of \((w):=_{-}^{w}()}\, ()\), which is proximal (i.e., monotone, compact-valued and with a closed graph)._Importantly, with forward-backward proximal quantizers, the convergence results established by Dockhorn et al.  for PC directly carries over to PC++ (see Appendix C for details). Let us further illustrate the convenience of Corollary 1 by some examples.
+
+**Example 1** (Bnn).: _Hubara et al.  proposed BNN with the choice_
+
+\[==_{[-1,1 ]},\]
+
+_which satisfies the decomposition in (6). Indeed, let_
+
+\[(w) =\{1,\{-1,w\}\},\] (8) \[}_{r}^{}(w) =w+(w)(1-),&|w|>1\\ (w),&|w| 1.\] (9)
+
+_Since \(\) is constant over \([-1,1]\), applying Corollary 1 we deduce that the proximal quantizer \(}_{r}^{}\), if exists, must coincide with \(\) over the support of \(\). Applying monotonicity of \(}_{r}^{}\) we may complete the reverse engineering by making the choice over \(|w|>1\) as indicated above. We can easily verify the decomposition in (6):_
+
+\[==}_{r}^{ },\;\;=_{[-1,1]}=^{}}_{r}^{}.\]
+
+_Thus, BNN is exactly BinaryConnect applied to the transformed problem in (4), where the transformation \(\) is the so-called hard tanh in (8) while the regularizer \(\) is determined (implicitly) by the proximal quantizer \(}_{r}^{}\) in (9)._
+
+To our best knowledge, this is the first time the (regularized) objective function that BNN aims to optimize has been identified. The convergence properties of BNN hence follow from the general result of Dockhorn et al.  on ProxConnect, see Appendix C.
+
+Figure 1: Forward and backward pass for ProxConnect++ algorithms (red/blue arrows indicate the forward/backward pass), where fp denotes full precision, bn denotes binary and back-prop denotes backpropagation.
+
+**Example 2** (Bnn+).: _Darabi et al.  adopted the derivative of the sign-Swish (SS) function as a backward quantizer while retaining the sign function as the forward quantizer:_
+
+\[()=():=[1-}{2}(}{2})]^{}(}{2}), \ \ =,\]
+
+_where \(\) is a hyperparameter that controls how well SS approximates the sign. Applying Corollary 1 we find that the derivative of SS (as backward) coupled with the sign (as forward) do not admit the decomposition in (6), for any regularizer \(\). Thus, we are not able to find the (regularized) objective function (if it exists) underlying BNN+._
+
+We conclude that BNN+ cannot be justified under the framework of PC++. However, it is possible to design a variant of BNN+ that does belong to the PC++ family and hence enjoys the accompanying theoretical properties:
+
+**Example 3** (Bnn++).: _We propose that a simple fix of BNN+ would be to replace its \(\) forward quantizer with the sign-Swish (SS) function:_
+
+\[()=():=}{2} ^{}(}{2})+(}{2}),\]
+
+_which is simply the primitive of \(\). In this case, the algorithm simply reduces to PC++ applied on (4) with \(=0\) (and hence essentially stochastic gradient descent). Of course, we could also compose with a proximal quantizer to arrive at the pair \((_{}^{},_{ }^{})\), which effectively reduces to PC++ applied on the regularized objective in (4) with a nontrivial \(\). We call this variant BNN++._
+
+We will demonstrate in the next section that BNN++ is more desirable than BNN+ empirically.
+
+More generally, we have the following result on designing new forward-backward quantizers:
+
+**Corollary 2**.: _If the forward quantizer is continuously differentiable (with bounded support), then one can simply choose the backward quantizer as the derivative of the forward quantizer._
+
+This follows from Corollary 1 since \((w) w\) is clearly proximal. Note that the BNN example does not follow from Corollary 2. In Appendix F, we provide additional examples of forward-backward quantizers based on existing methods, and we show that Corollary 2 consistently improves previous practices.
+
+In summary: (1) ProxConnect++ enables us to design forward-backward quantizers with infinite many choices of \(\) and \(\), (2) it also allows us to reverse engineer \(\) and \(\) from existing forward-backward quantizers, which helps us to better understand existing practices, (3) with our theoretical tool, we design a new BNN++ algorithm, which enjoys immediate convergence properties. Figure 1 visualizes ProxConnect++ with a variety of forward-backward quantizers.
+
+## 4 Experiments
+
+In this section, we perform extensive experiments to benchmark PC++ on CNN backbone models and the recently advanced vision transformer architectures in three settings: (a) binarizing weights only (BW); (b) binarizing weights and activations (BWA), where we simply apply a similar forward-backward proximal quantizer to the activations; and (c) binarizing weights, activations, with 8-bit dot-product accumulators (BWAA) .
+
+  
+**Forward Quantizer** & **Backward Quantizer** & **Algorithm** \\  identity & identity & FP \\ \(_{Q}\) & identity & BC \\ \(_{}^{}\) & identity & PC \\ \(_{Q}\) & \(_{[-1,1]}\) & BNN \\ \(_{Q}\) & \(\) & BNN+ \\ SS & \(\) & BNN++ \\   
+
+Table 1: Variants of ProxConnect++.
+
+### Experimental settings
+
+**Datasets**: We perform image classification on CIFAR-10/100 datasets  and ImageNet-1K dataset . Additional details on our experimental setting can be found in Appendix D.
+
+**Backbone architectures:** (1) _CNNs_: we evaluate CIFAR-10 classification using ResNet20 , and ImageNet-1K with ResNet-50 . We consider both fine-tuning and end-to-end training; (2) _Vision transformers_: we further evaluate our algorithm on two popular vision transformer models: ViT  and DeiT . For ViT, we consider ViT-B model and fine-tuning task across all models5. For DeiT, we consider DeiT-B, DeiT-S, and DeiT-T, which consist of 12, 6, 3 building blocks and 768, 384 and 192 embedding dimensions, respectively; we consider fine-tuning task on ImageNet-1K pre-trained model for CIFAR datasets and end-to-end training on ImageNet-1K dataset.
+
+**Baselines**: For ProxConnect++, we consider the 6 variants in Table 1. With different choices of the forward quantizer \(^{}_{r}\) and the backward quantizer \(^{}_{r}\), we include the full precision (FP) baseline and 5 binarization methods: BinaryConnect (BC) , ProxConnect (PC) , Binary Neural Network (BNN) , the original BNN+ , and the modified BNN++ with \(^{}_{r}=\). Note that we linearly increase \(\) in BNN++ to achieve full binarization in the end. We also compare ProxConnect++ with the ProxQuant and reverseProxConnect baselines.
+
+**Hyperparameters**: We apply the same training hyperparameters and fine-tune/end-to-end training for 100/300 epochs across all models. For binarization methods: (1) PQ (ProxQuant): similar to Bai et al. , we apply the LinearQuantizer (LQ), see (10) in Appendix A, with initial \(_{0}=0.01\) and linearly increase to \(_{T}=10\); (2) rPC (reverseProxConnect): we use the same LQ for PC; (3) ProxConnect++: for PC, we apply the same LQ; for BNN+, we choose \(=5\) (no need to increase \(\) as the forward quantizer is \(\)); for BNN++, we choose \(_{0}=5\) and linearly increase to \(_{T}=30\) to achieve binarization at the final step.
+
+Across all the experiments with random initialization, we report the mean of three runs with different random seeds. Furthermore, we provide the complete results with error bars in Appendix G.
+
+### CNN as backbone
+
+We first compare PC++ against baseline methods on various tasks employing CNNs:
+
+1. Binarizing weights only (BW), where we simply binarize the weights and keep the other components (i.e., activations and accumulations) in full precision.
+
+    &  &  &  &  &  &  \\    & & & & & & BC & PC & BNN & BNN+ & BNN++ \\   &  & BW & 92.01\% & 89.94\% & 89.98\% & 90.31\% & 90.31\% & 90.35\% & 90.27\% & **90.40\%** \\  & & BWA & 92.01\% & 88.79\% & 83.55\% & 89.39\% & 89.95\% & 90.01\% & 89.99\% & **90.22\%** \\  & & BWA & 92.01\% & 85.39\% & 81.10\% & 89.11\% & 89.21\% & 89.32\% & 89.55\% & **90.01\%** \\    &  & BW & 92.01\% & 81.59\% & 81.82\% & 87.51\% & 88.05\% & 89.92\% & 89.39\% & **90.03\%** \\  & & BWA & 92.01\% & 81.51\% & 81.60\% & 86.99\% & 87.26\% & 89.15\% & 89.02\% & **89.91\%** \\   &  & BW & 78.87\% & 66.77\% & 69.22\% & 71.35\% & 71.29\% & 71.41\% & 70.22\% & **72.33\%** \\  & & BWA & 78.87\% & 56.21\% & 58.19\% & 65.99\% & 65.61\% & 66.02\% & 65.22\% & **68.03\%** \\   & & BWA & 78.87\% & 53.29\% & 55.28\% & 58.18\% & 59.21\% & 59.77\% & 59.10\% & **63.02\%** \\     &  & BW & 78.87\% & 63.23\% & 66.39\% & 67.45\% & 67.51\% & 67.49\% & 66.99\% & **68.11\%** \\   & & BWA & 78.87\% & 61.19\% & 64.17\% & 65.42\% & 65.31\% & 65.29\% & 65.98\% & **66.08\%** \\   
+
+Table 2: Binarizing weights (BW), binarizing weights and activation (BWA) and binarizing weights, activation, with 8-bit accumulators (BWAA) on CNN backbones. We consider the fine-tuning (FT) pipeline and the end-to-end (E2E) pipeline. We compare five variants of ProxConnect++ (BC, PC, BNN, BNN+, and BNN++) with FP, PQ, and rPC in terms of test accuracy. For the end-to-end pipeline, we omit the results for BWAA due to training divergence and report the mean of five runs with different random seeds.
+
+2. Binarizing weights and activations (BWA), while keeping accumulation in full precision. Similar to the weights, we apply the same forward-backward proximal quantizer to binarize activations.
+3. Binarizing weights, activations, with 8-bit accumulators (BWAA). BWAA is more desirable in certain cases where the network bandwidth is narrow, e.g., in homomorphic encryption. To achieve BWAA, in addition to quantizing the weights and activations, we follow the implementation of WrapNet  and quantize the accumulation of each layer with an additional cyclic function. In practice, we find that with 1-bit weights and activations, the lowest bits we can successfully employ to quantize accumulation is 8, while any smaller choice would raise a high overflow rate and cause the network to diverge. Moreover, BWAA highly relies on a good initialization and cannot be successfully trained end-to-end in our evaluation (and hence omitted).
+
+Note that for the fine-tuning pipeline, we initialize the model with their corresponding pre-trained full precision weights. For the end-to-end pipeline, we utilize random initialization. We report our results in Table 2 and observe: (1) the PC family outperforms baseline methods (i.e., PQ and rPC), and achieves competitive performance on both small and larger scale datasets; (2) BNN++ performs consistently better and is more desirable among the five variants of PC++, especially on BWA and BWAA tasks. Its advantage over BNN+ further validates our theoretical guidance.
+
+### Vision transformer as backbone
+
+Next, we perform similar experiments on the three tasks on vision transformers.
+
+    &  &  &  &  &  \\   & & & & & BC & PC & BNN & BNN++ & **86.41\%** \\  & BWAA & 94.85\% & 82.56\% & 82.02\% & 82.89\% & 85.01\% & 85.99\% & 85.66\% & **86.12\%** \\  & BWAA & 94.85\% & 81.34\% & 80.97\% & 82.08\% & 84.31\% & 84.87\% & 84.72\% & **85.31\%** \\  & BW & 72.37\% & 54.55\% & 55.66\% & 99.65\% & 60.15\% & 60.06\% & 59.77\% & **60.33\%** \\  & BWA & 72.37\% & 53.77\% & 54.98\% & 59.21\% & 59.71\% & 59.66\% & 59.12\% & **59.85\%** \\  & BWAA & 72.37\% & 52.15\% & 54.36\% & 58.15\% & 59.01\% & 58.72\% & 58.15\% & **59.06\%** \\   & BW & 72.20\% & 61.23\% & 60.35\% & 63.23\% & 66.15\% & 65.00\% & 66.67\% & **67.34\%** \\  & BWA & 72.20\% & 60.01\% & 58.77\% & 62.13\% & 65.29\% & 63.75\% & 65.29\% & **65.65\%** \\   
+
+Table 4: Results on binarizing vision transformers (BW, BWA, and BWAA) on DeiT-T. We compare 5 variants of ProxConnect++ (BC, PC, BNN, BNN+, and BNN++) with FP, PQ, and rPC. End-to-end training tasks are marked as **bold** (i.e., ImageNet-1K), where we omit the results for BWAA due to training divergence and the reported results are the mean of five runs with different random seeds.
+
+    &  &  &  &  &  \\   & & & & & BC & PC & BNN & BNN+ & BNN++ \\  & CIFAR-100 & 98.13\% & 85.06\% & 86.22\% & 87.97\% & 90.12\% & 89.08\% & 88.12\% & **90.24\%** \\  & CIFAR-100 & 87.14\% & 72.07\% & 73.52\% & 76.35\% & 78.13\% & 77.23\% & 77.10\% & **79.22\%** \\  & ImageNet-1K & 77.91\% & 57.65\% & 55.33\% & 63.24\% & **66.33\%** & 65.31\% & 63.55\% & **66.33\%** \\   & CIFAR-10 & 94.86\% & 82.76\% & 82.25\% & 83.10\% & 85.15\% & 86.12\% & 85.91\% & **86.41\%** \\  & CIFAR-100 & 72.37\% & 54.55\% & 55.66\% & 59.65\% & 60.10\% & 60.06\% & 59.77\% & **60.33\%** \\  & **ImageNet-1K** & 72.20\% & 61.23\% & 60.35\% & 63.22\% & 66.15\% & 55.00\% & 66.67\% & **67.34\%** \\   & CIFAR-10 & 95.10\% & 81.67\% & 80.23\% & 84.85\% & 85.13\% & 85.09\% & 85.16\% & **86.19\%** \\  & CIFAR-100 & 73.19\% & 45.55\% & 46.66\% & 60.12\% & 61.59\% & 60.55\% & 60.17\% & **62.98\%** \\  & **ImageNet-1K** & 79.91\% & 69.87\% & 68.74\% & 73.16\% & 73.51\% & 73.77\% & 73.23\% & **73.53\%** \\   & CIFAR-10 & 98.72\% & 85.22\% & 86.35\% & 88.95\% & 90.53\% & 90.21\% & 89.03\% & **90.67\%** \\  & CIFAR-100 & 86.65\% & 72.11\% & 73.40\% & 75.40\% & **78.55\%** & 76.22\% & 76.51\% & 78.30\% \\  & **ImageNet-1K** & 81.81\% & 72.54\% & 70.11\% & 76.55\% & 76.61\% & 75.60\% & 76.63\% & **76.74\%** \\   
+
+Table 3: Our results on binarizing vision transformers (binarizing weights only). We compare five variants of ProxConnect++ (BC, PC, BNN, BNN+, and BNN++) with FP, PQ, and rPC. End-to-end training tasks are marked as **bold** (i.e., ImageNet-1K for DeiT-T/S/B), where the results are the mean of five runs with different random seeds.
+
+**Implementation on vision transformers**: While network binarization is popular for CNNs, its application for vision transformers is still rare6. Here we apply four protocols for implementation:
+
+(1) We keep the mean \(s_{n}\) of full precision weights \(_{n}^{*}\) for each layer \(n\) as a scaling factor (can be thus absorbed into \(_{r}^{_{r}}\)) for the binary weights \(_{n}\). Such an approach keeps the range of \(_{n}^{*}\) during binarization and significantly reduces training difficulty without additional computation.
+
+(2) For binarized vision transformer models, LayerNorm is important to avoid gradient explosion. Thus, we add one more LayerNorm layer at the end of each attention block.
+
+(3) When fine-tuning a pre-trained model (full precision), the binarized vision transformer usually suffers from a bad initialization. Thus, a few epochs of pre-training on the binarized vision transformer is extremely helpful and can make fine-tuning much more efficient and effective.
+
+(4) We apply the knowledge distillation technique in BiBERT  to boost the performance. We use full precision pre-trained models as the teacher model.
+
+**Main Results**: We report the main results of binarizing vision transformers in Table 3 (BW) and Table 4 (BW, BWA, BWAA), where we compare ProNonect++ algorithms with the FP, PQ, and rPC baselines on fine-tuning and end-to-end training tasks. We observe that: (1) ProxConnect++ variants generally outperform PQ and rPC and are able to binarize vision transformers with less than \(10\%\) accuracy degradation on the BW task. In particular, for end-to-end training, the best performing ProxConnect++ algorithms achieve \( 5\%\) accuracy drop; (2) Among the five variants, we confirm BNN++ is also generally better overall for vision transformers. This provides evidence that our Corollary 1 allows practitioners to easily design many and choose the one that performs best empirically; (3) With a clear underlying optimization objective, BNN++ again outperforms BNN+ across all tasks, which empirically verifies our theoretical findings on vision transformers; (4) In general, we find that weight binarization achieves about 30x reduction in memory footprint, e.g., from 450 MB to 15 MB for ViT-B.
+
+**Ablation Studies**: We provide further ablation studies to gain more insights and verify our binarization protocols for vision transformers.
+
+_Post-training Binarization_: in Figure 2, we verify the difference between PTB (post-training binarization) and BAT (binarization-aware training) on the fine-tuning task on CIFAR-10 across different models. Note that we use BNN++ as a demonstration of BAT. We observe that without optimization during fine-tuning, the PTB approach fails in general, thus confirming the importance of considering BAT for vision transformers.
+
+_Effect of binarizing protocols_: here we show the effect of the four binarizing protocols mentioned at the beginning, including scaling the binarized weights using the mean of full precision weights
+
+   Method & Scaling & Normalization & Pre-train & KD & Accuracy \\   & ✗ & ✗ & ✗ & ✗ & 0.10\% \\  & ✓ & ✗ & ✗ & ✗ & 12.81\% \\  & ✓ & ✓ & ✗ & ✗ & 66.51\% \\  & ✓ & ✓ & ✓ & ✗ & 88.53\% \\  & ✓ & ✓ & ✓ & ✓ & 90.13\% \\   & ✗ & ✗ & ✗ & ✗ & 1.50\% \\  & ✓ & ✗ & ✗ & ✗ & 23.55\% \\   & ✓ & ✓ & ✗ & ✗ & 77.22\% \\   & ✓ & ✓ & ✓ & ✗ & 89.05\% \\   & ✓ & ✓ & ✓ & ✓ & 90.22\% \\   
+
+Table 5: Ablation study on the effect of the scaling factor, normalization, pre-training, and knowledge distillation. Experiments are performed on CIFAR-10 with ViT-B.
+
+Figure 2: Comparison between Full Precision (FP) model, BNN++, and Post-training Binarization (PTB) on the fine-tuning task on CIFAR-10.
+
+(scaling), adding additional LayerNorm layers (normalization), BAT on the full precision pre-trained models (pre-train) and knowledge distillation. We report the results in Table 5 and confirm that each protocol is essential to binarize vision transformers successfully.
+
+_Which block should one binarize_: lastly, we visualize the sensitivity of each building block to binarization in vision transformers (i.e., ViT-B) on CIFAR-10 in Figure 3. We observe that binarizing blocks near the head and the tail of the architecture causes a significant accuracy drop.
+
+## 5 Conclusion
+
+In this work we study the popular _approximate gradient_ approach in neural network binarization. By generalizing ProxConnect and proposing PC++, we provide a principled way to understand forward-backward quantizers and cover most existing binarization techniques as special cases. Furthermore, PC++ enables us to easily design the desired quantizers (e.g., the new BNN++) with automatic theoretical guarantees. We apply PC++ to CNNs and vision transformers and compare its variants in extensive experiments. We confirm empirically that PC++ overall achieves competitive results, whereas BNN++ is generally more desirable.
+
+## Broader impacts and limitations
+
+We anticipate our work to further enable training and deploying advanced machine learning models to resource limited devices and environments, and help reducing energy consumption and carbon footprint at large. We do not foresee any direct negative societal impact. One limitation we hope to address in the future is to build a theoretical framework that will allow practitioners to quickly evaluate different forward-backward quantizers for a variety of applications.

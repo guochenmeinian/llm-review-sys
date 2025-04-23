@@ -1,0 +1,183 @@
+# Accelerated Training via Incrementally
+
+Growing Neural Networks using
+
+Variance Transfer and Learning Rate Adaptation
+
+ Xin Yuan
+
+University of Chicago
+
+yuanx@uchicago.edu
+
+&Pedro Savarese
+
+TTI-Chicago
+
+savarese@ttic.edu
+
+&Michael Maire
+
+University of Chicago
+
+mmaire@uchicago.edu
+
+###### Abstract
+
+We develop an approach to efficiently grow neural networks, within which parameterization and optimization strategies are designed by considering their effects on the training dynamics. Unlike existing growing methods, which follow simple replication heuristics or utilize auxiliary gradient-based local optimization, we craft a parameterization scheme which dynamically stabilizes weight, activation, and gradient scaling as the architecture evolves, and maintains the inference functionality of the network. To address the optimization difficulty resulting from imbalanced training effort distributed to subnetworks fading in at different growth phases, we propose a learning rate adaption mechanism that rebalances the gradient contribution of these separate subcomponents. Experiments show that our method achieves comparable or better accuracy than training large fixed-size models, while saving a substantial portion of the original training computation budget. We demonstrate that these gains translate into real wall-clock training speedups.
+
+## 1 Introduction
+
+Modern neural network design typically follows a "larger is better" rule of thumb, with models consisting of millions of parameters achieving impressive generalization performance across many tasks, including image classification , object detection , semantic segmentation  and machine translation . Within a class of network architecture, deeper or wider variants of a base model typically yield further improvements to accuracy. Residual networks (ResNets)  and wide residual networks  illustrate this trend in convolutional neural network (CNN) architectures. Dramatically scaling up network size into the billions of parameter regime has recently revolutionized transformer-based language modeling .
+
+The size of these models imposes prohibitive training costs and motivates techniques that offer cheaper alternatives to select and deploy networks. For example, hyperparameter tuning is notoriously expensive as it commonly relies on training the network multiple times, and recent techniques aim to circumvent this by making hyperparameters transferable between models of different sizes, allowing them to be tuned on a small network prior to training an original large model once .
+
+Our approach incorporates these ideas, but extends the scope of transferability to include the parameters of the model itself. Rather than view training small and large models as separate events, we grow a small model into a large one through many intermediate steps, each of which introduces additional parameters to the network. Our contribution is to do so in a manner that preserves the function computed by the model at each growth step (functional continuity) and offers stable training dynamics, while also saving compute by leveraging intermediate solutions. More specifically, we use partially trained subnetworks as scaffolding that accelerates training of newly added parameters, yielding greater overall efficiency than training a large static model from scratch.
+
+Competing recent efforts to grow deep models from simple architectures [4; 23; 5; 25; 39; 37; 38; 44; 10] draw inspiration from other sources, such as the progressive development processes of biological brains. In particular, Net2Net  grows the network by randomly splitting learned neurons from previous phases. This replication scheme, shown in Figure 1(a) is a common paradigm for most existing methods. Gradient-based methods [38; 39] determine which neurons to split and how to split them by solving a combinatorial optimization problem with auxiliary variables.
+
+At each growth step, naive random initialization of new weights destroys network functionality and may overwhelm any training progress. Weight rescaling with a static constant from a previous step is not guaranteed to be maintained as the network architecture evolves. Gradient-based methods outperform these simple heuristics but require additional training effort in their parameterization schemes. Furthermore, all existing methods use a global LR scheduler to govern weight updates, ignoring the discrepancy among subnetworks introduced in different growth phases. The gradient itself and other parameterization choices may influence the correct design for scaling weight updates.
+
+We develop a growing framework around the principles of enforcing transferability of parameter settings from smaller to larger models (extending ), offering functional continuity, smoothing optimization dynamics, and rebalancing learning rates between older and newer subnetworks. Figure 1(b) illustrates key differences with prior work. Our core contributions are:
+
+* **Parameterization using Variance Transfer:** We propose a parameterization scheme accounting for the variance transition among networks of smaller and larger width in a single training process. Initialization of new weights is gradient-free and requires neither additional memory nor training.
+* **Improved Optimization with Learning Rate Adaptation:** Subnetworks trained for different lengths have distinct learning rate schedules, with dynamic relative scaling driven by weight norm statistics.
+* **Better Performance and Broad Applicability:** Our method not only trains networks fast, but also yields excellent generalization accuracy, even outperforming the original fixed-size models. Flexibility in designing a network growth curve allows choosing different trade-offs between training resources and accuracy. Furthermore, adopting an adaptive batch size schedule provides acceleration in terms of wall-clock training time. We demonstrate results on image classification and machine translation tasks, across various network architectures.
+
+## 2 Related Work
+
+**Network Growing.** A diverse range of techniques train models by progressively expanding the network architecture [36; 9; 5; 37; 44]. Within this space, the methods of [4; 25; 39; 38; 10] are most relevant to our focus - incrementally growing network width across multiple training stages. Net2Net  proposes a gradient-free neuron splitting scheme via replication, enabling knowledge transfer from previous training phases; initialization of new weights follows simple heuristics. Liu _et al._'s splitting approach  derives a gradient-based scheme for duplicating neurons by formulating a combinatorial optimization problem. FireFly  gains flexibility by also incorporating brand new neurons. Both methods improve Net2Net's initialization scheme by solving an optimization problem with auxiliary variables, at the cost of extra training effort. GradMax , in consideration of training dynamics, performs initialization via solving a singular value decomposition (SVD) problem.
+
+Figure 1: Dynamic network growth strategies. Different from (a) which rely on either splitting [4; 25; 39] or adding neurons with auxiliary local optimization [38; 10], our initialization (b) of new neurons is random but function-preserving. Additionally, our separate learning rate scheduler governs weight updating to address the discrepancy in total accumulated training between different growth stages.
+
+Neural Architecture Search (NAS) and Pruning.Another subset of methods mix growth with dynamic reconfiguration aimed at discovering or pruning task-optimized architectures. Network Morphism  searches for efficient networks by extending layers while preserving the parameters. AutoGrow  takes an AutoML approach governed by heuristic growing and stopping policies. Yuan _et al._ combine learned pruning with a sampling strategy that dynamically increases or decreases network size. Unlike these methods, we focus on the mechanics of growth when the target architecture is known, addressing the question of how to best transition weight and optimizer state to continue training an incrementally larger model. NAS and pruning are orthogonal to, though potentially compatible with, the technical approach we develop.
+
+Hyperparameter Transfer.Multiple works [42; 29; 16] explore transferable hyperparameter (HP) tuning. The recent Tensor Program (TP) work of  and  focuses on zero-shot HP transfer across model scale and establishes a principled network parameterization scheme to facilitate HP transfer. This serves as an anchor for our strategy, though, as Section 3 details, modifications are required to account for dynamic growth.
+
+Learning Rate Adaptation.Surprisingly, the existing spectrum of network growing techniques utilize relatively standard learning rate schedules and do not address potential discrepancy among subcomponents added at different phases. While general-purpose adaptive optimizers, _e.g._, AdaGrad , RMSProp , Adam , or AvaGrad , might ameliorate this issue, we choose to explicitly account for the discrepancy. As layer-adaptive learning rates (LARS) [12; 43] benefit in some contexts, we explore further learning rate adaption specific to both layer and growth stage.
+
+## 3 Method
+
+### Parameterization and Optimization with Growing Dynamics
+
+Functionality Preservation.We grow a network's capacity by expanding the width of computational units (_e.g.,_ hidden dimensions in linear layers, filters in convolutional layers). To illustrate our scheme, consider a 3-layer fully-connected network with ReLU activations \(\) at a growing stage \(t\):
+
+\[_{t}=(_{t}^{x})_{t}=(_{t}^{u}_{t})_{t}=_{t}^{h}_{t}\,,\] (1)
+
+where \(^{C^{x}}\) is the network input, \(_{t}^{C^{u}}\) is the output, and \(_{t}^{C^{u}},_{t}^{C^{h}_{t}}\) are the hidden activations. In this case, \(_{t}^{x}\) is a \(C_{t}^{u} C^{x}\) matrix, while \(_{t}^{u}\) is \(C_{t}^{h} C_{t}^{u}\) and \(_{t}^{h}\) is \(C^{y} C_{t}^{h}\). Our growing process operates by increasing the dimensionality of each hidden state, _i.e.,_ from \(C_{t}^{u}\) and \(C_{t}^{h}\) to \(C_{t+1}^{u}\) and \(C_{t+1}^{h}\), effectively expanding the size of the parameter tensors for the next growing stage \(t+1\). The layer parameter matrices \(_{t}\) have their shapes changed accordingly and become \(_{t+1}\). Figure 2 illustrates the process for initializing \(_{t+1}\) from \(_{t}\) at a growing step.1
+
+Following Figure 2(a), we first expand \(_{t}^{x}\) along the output dimension by adding two copies of new weights \(_{t}^{x}\) of shape \(^{u}-C_{t}^{u}}{2} C^{x}\), generating new features \((_{t}^{x})\). The first set of activations become
+
+\[_{t+1}=(_{t},(_{t}^{x}),(_{t}^{x}))\,,\] (2)
+
+where \(\) denotes the concatenation operation. Next, we expand \(_{t}^{u}\) across both input and output dimensions, as shown in Figure 2(b). We initialize new weights \(_{t}^{u}\) of shape \(C_{t}^{h}^{u}-C_{t}^{u}}{2}\) and add to \(_{t}^{u}\) two copies of it with different signs: \(+_{t}^{u}\) and \(-_{t}^{u}\). This preserves the output of the layer since \((_{t}^{u}_{t}+_{t}^{u}(_{t}^{x})+(- _{t}^{u})(_{t}^{x}))=(_{t}^{u}_{t})=_{t}\,.\) We then add two copies of new weights \(_{t}^{u}\), which has shape \(^{u}-C_{t}^{u}}{2} C_{t+1}^{u}\), yielding activations
+
+\[_{t+1}=(_{t},(_{t}^{u}_{t+1}),(_{t}^{u}_{t+1}))\,.\] (3)
+
+We similarity expand \(_{t}^{h}\) with new weights \(_{t}^{h}\) to match the dimension of \(_{t+1}\), as shown in Figure 2(c). The network's output after the growing step is:
+
+\[_{t+1} =_{t}^{h}_{t}+_{t}^{h}(_{t}^{u}_{ t+1})+(-_{t}^{h})(_{t}^{u}_{t+1})\] (4) \[=_{t}^{h}_{t}=_{t}\,,\]
+
+which preserves the original output features in Eq. 1. Appendix B provides illustrations for more layers.
+
+**Weights Initialization with Variance Transfer (VT).** Yang _et al._ investigate weight scaling with width at initialization, allowing hyperparameter transfer by calibrating variance across model size. They modify the variance of output layer weights from the commonly used \(_{in}}\) to \(_{in}^{2}}\). We adopt this same correction for the added weights with new width: \(^{h}\) and \(^{h}\) are initialized with variances of \(^{h^{2}}}\) and \(^{h^{2}}}\).
+
+However, this correction considers training differently-sized models separately, which fails to accommodate the training dynamics in which width grows incrementally. Assuming that the weights of the old subnetwork follow \(^{h}_{t}(0,^{h^{2}}})\) (which holds at initialization), we make them compatible with new weight tensor parameterization by rescaling it with the \(_{in}\) ratio as \(^{h^{}}_{t}=^{h}_{t}^{h}}{C_{t+1}^{h}}\). See Table 1 (top). Appendix A provides detailed analysis.
+
+This parameterization rule transfers to modern CNNs with batch normalization (BN). Given a weight scaling ratio of \(c\), the running mean \(\) and variance \(\) of BN layers are modified as \(c\) and \(c^{2}\), respectively.
+
+**Stage-wise Learning Rate Adaptation (LRA).** Following , we employ a learning rate scaling factor of \(_{in}}\) on the output layer when using SGD, compensating for the initialization scheme. However, subnetworks from different growth stages still share a global learning rate, though they have trained for different lengths. This may cause divergent behavior among the corresponding weights, making the training iterations after growing sensitive to the scale of the newly-initialized weights. Instead of adjusting newly added parameters via local optimization , we govern the update of each subnetwork in a stage-wise manner.
+
+Let \(_{t}\) denote the parameter variables of a layer at a growth stage \(t\), where we let \(_{t}\) and \(^{}_{t}\) correspond to the same set of variables such that \(_{t+1}_{t}\) denotes the new parameter variables whose values are initialized with \(_{t}\) and \(_{t}\). Moreover, let \(_{ k}\) and \(_{ k}\) denote the values and gradients of \(_{k}_{k-1}\). We adapt the learning rate used to update each sub-weight \(_{ k}\), for
+
+Figure 2: Initialization scheme. In practice, we also add noise to the expanded parameter sets for symmetry breaking.
+
+\(0 k t\), as follows:
+
+\[_{k}=_{0}_{ k})}{f(_{ 0})}_{  k}_{ k}-_{k}_{ k}\,,\] (5)
+
+where \(_{0}\) is the base learning rate, \(f\) is a function that maps subnetworks of different stages to corresponding train-time statistics, and \(_{ 0}\) are the layer's parameter variables at the first growth stage. Table 1 (bottom) summarizes our LR adaptation rule for SGD when \(f\) is instantiated as weight norm, providing an stage-wise extension to the layer-wise adaptation method LARS , _i.e.,_\(LR||||\). Alternative heuristics are possible; see Appendices C and D.
+
+### Flexible and Efficient Growth Scheduler
+
+We train the model for \(T_{total}\) epochs by expanding the channel number of each layer to \(C_{final}\) across \(N\) growth phases. Existing methods [25; 38] fail to derive a systemic way for distributing training resources across a growth trajectory. Toward maximizing efficiency, we experiment with a coupling between model size and training epoch allocation.
+
+**Architectural Scheduler.** We denote initial channel width as \(C_{0}\) and expand exponentially:
+
+\[C_{t}=C_{t-1}+ p_{c}C_{t-1}_{2}& t<N-1 \\ C_{final}& t=N-1\] (6)
+
+where \(_{2}\) rounds to the nearest even number and \(p_{c}\) is the growth rate between stages.
+
+**Epoch Scheduler.** We denote number of epochs assigned to \(t\)-th training stage as \(T_{t}\), with \(_{t=0}^{N-1}T_{t}=T_{total}\). We similarly adapt \(T_{t}\) via an exponential growing scheduler:
+
+\[T_{t}=T_{t-1}+ p_{t}T_{t-1} t<N-1 \\ T_{total}-_{i=0}^{N-2}T_{i} t=N-1\] (7)
+
+**Wall-clock Speedup via Batch Size Adaptation.** Though the smaller architectures in early growth stages require fewer FLOPs, hardware capabilities may still restrict practical gains. When growing width, in order to ensure that small models fully utilize the benefits of GPU parallelism, we adapt the batch size along with the exponentially-growing architecture in a reverse order:
+
+\[B_{t-1}=B_{base}& t=N\\ B_{t}+ p_{b}B_{t} t<N\] (8)
+
+where \(B_{base}\) is the batch size of the large baseline model. Algorithm 1 summarizes our full method.
+
+    & & Input Layer & Hidden Layer & Output Layer \\   & Old Re-scaling & 1 & \(^{u}/C_{t+1}^{u-}}\) & \(C_{t}^{h}/C_{t+1}^{h}\) \\  & New Init. & \(1/C_{t}^{x}\) & \(1/C_{t+1}^{h}\) & \(1/(C_{t+1}^{h})^{2}\) \\   & 0-th Stage & 1 & 1 & \(1/C_{0}\) \\  & \(t\)-th Stage & \(_{ k}^{}||}{||_{ 0}^{}||}\) & \(_{ k}^{}||}{||_{ 0}^{}||}\) & \(_{ k}^{}||}{||_{ 0}^{}||}\) \\   
+
+Table 1: Parameterization and optimization transition for different layers during growing. \(C_{t}\) and \(C_{t+1}\) denote the input dimension before and after a growth step.
+
+Experiments
+
+We evaluate on image classification and machine translation tasks. For image classification, we use CIFAR-10 , CIFAR-100  and ImageNet . For the neural machine translation, we use the IWSLT'14 dataset  and report the BLEU  score on German to English (De-En) translation.
+
+**Large Baselines via Fixed-size Training.** We use VGG-11  with BatchNorm , ResNet-20 , MobileNetV1  for CIFAR-10 and VGG-19 with BatchNorm, ResNet-18, MobileNetV1 for CIFAR-100. We follow  for data augmentation and processing, adopting random shifts/mirroring and channel-wise normalization. CIFAR-10 and CIFAR-100 models are trained for 160 and 200 epochs respectively, with a batch size of 128 and initial learning rate (LR) of 0.1 using SGD. We adopt a cosine LR schedule and set the weights decay and momentum as \(5\)e-\(4\) and \(0.9\). For ImageNet, we train the baseline ResNet-50 and MobileNetV1  using SGD with batch sizes of 256 and 512, respectively. We adopt the same data augmentation scheme as , the cosine LR scheduler with initial LR of 0.1, weight decay of \(1\)e-\(4\) and momentum of \(0.9\).
+
+For IWSLT'14, we train an Encoder-Decoder Transformer (6 attention blocks each) . We set width as \(d_{model}=1/4d_{ffn}=512\), the number of heads \(n_{head}=8\) and \(d_{k}=d_{q}=d_{v}=d_{model}/n_{head}=64\). We train the model using Adam for 20 epochs with learning rate \(1\)e-\(3\) and \((_{1},_{2})=(0.9,0.98)\). Batch size is 1500 and we use 4000 warm-up iterations.
+
+**Implementation Details.** We compare with the growing methods Net2Net , Splitting , FireFly-split, FireFly  and GradMax . In our method, noise for symmetry breaking is 0.001 to the norm of the initialization. We re-initialize the momentum buffer at each growing step when using SGD while preserving it for adaptive optimizers (_e.g.,_ Adam, AvaGrad).
+
+For image classification, we run the comparison methods except GradMax alongside our algorithm for all architectures under the same growing scheduler. For the architecture scheduler, we set \(p_{c}\) as 0.2 and \(C_{0}\) as 1/4 of large baselines in Eq. 6 for all layers and grow the seed architecture within \(N=9\) stages towards the large ones. For epoch scheduler, we set \(p_{t}\) as \(0.2\), \(T_{0}\) as \(8\), \(10\), and \(4\) in Eq. 7 on CIAFR-10, CIFAR-100, and ImageNet respectively. Total training epochs \(T_{total}\) are the same as the respective large fixed-size models. We train the models and report the results averaging over 3 random seeds.
+
+    &  &  &  \\   & Train & Test & Train & Test & Train & Test \\  & Cost(\(\%\)) \(\) Accuracy(\(\%\)) \(\) & Cost(\(\%\)) \(\) Accuracy(\(\%\)) \(\) & Cost(\(\%\)) \(\) Accuracy(\(\%\)) \(\) & Cost(\(\%\)) \(\) Accuracy(\(\%\)) \(\) \\  Large Baseline & \(100\) & \(92.62 0.15\) & \(100\) & \(92.14 0.22\) & \(100\) & \(92.27 0.11\) \\ Net2Net & \(\) & \(91.60 0.21\) & \(\) & \(91.78 0.27\) & \(\) & \(90.34 0.20\) \\ Splitting & \(70.69\) & \(91.80 0.10\) & \(63.76\) & \(91.88 0.15\) & \(65.92\) & \(91.50 0.06\) \\ FireFly-split & \(58.47\) & \(91.78 0.11\) & \(56.18\) & \(91.91 0.15\) & \(56.37\) & \(91.56 0.06\) \\ FireFly & \(68.96\) & \(92.10 0.13\) & \(60.24\) & \(92.08 0.16\) & \(62.12\) & \(91.69 0.07\) \\  Ours & \(\) & \(\) & \(\) & \(\) & \(\) & \(\) \\   
+
+Table 2: Growing ResNet-20, VGG-11, and MobileNetV1 on CIFAR-10.
+
+    &  &  &  \\   & Train & Test & Train & Test & Train & Test \\  & Cost(\(\%\)) \(\) Accuracy(\(\%\)) \(\) & Cost(\(\%\)) \(\) Accuracy(\(\%\)) \(\) & Cost(\(\%\)) \(\) Accuracy(\(\%\)) \(\) &  \\  Large Baseline & \(100\) & \(78.36 0.12\) & \(100\) & \(72.59 0.23\) & \(100\) & \(72.13 0.13\) \\ Net2Net & \(\) & \(76.48 0.20\) & \(\) & \(71.88 0.24\) & \(\) & \(70.01 0.20\) \\ Splitting & \(68.01\) & \(77.01 0.12\) & \(60.12\) & \(71.96 0.12\) & \(58.39\) & \(70.45 0.10\) \\ FireFly-split & \(56.11\) & \(77.22 0.11\) & \(54.64\) & \(72.19 0.14\) & \(54.36\) & \(70.69 0.11\) \\ FireFly & \(65.77\) & \(77.25 0.12\) & \(57.48\) & \(72.79 0.13\) & \(56.49\) & \(70.99 0.10\) \\ Ours & \(\) & \(\) & \(\) & \(\) & \(\) & \(\) \\   
+
+Table 3: Growing ResNet-18, VGG-19, and MobileNetV1 on CIFAR-100.
+
+[MISSING_PAGE_FAIL:7]
+
+### ImageNet Results
+
+We first grow ResNet-50 on ImageNet and compare the performance of our method to Net2Net and FireFly under the same epoch schedule: \(\{4,4,5,6,8,9,11,14,29\}\) (\(90\) total) with 9 growing phases. We also grow MobileNetV1 from a small seed architecture, which is more challenging than ResNet-50. We train Net2Net and our method uses the same scheduler as for ResNet-50. We also compare with Firefly-Opt (a variant of FireFly) and GradMax and report their best results from . Note that both methods not only adopt additional local optimization but also train with a less efficient growing scheduler: the final full-sized architecture needs to be trained for a \(75\%\) fraction while ours only requires \(32.2\%\). Table 4 shows that our method dominates all competing approaches.
+
+### IWSLT14 De-En Results
+
+We grow a Transformer from \(d_{model}=64\) to \(d_{model}=512\) within 4 stages, each trained with 5 epochs using Adam. Applying gradient-based growing methods to the Transformer architecture is nontrivial due to their domain specific design of local optimization. As such, we only compare with Net2Net. We also design variants of our method for self-comparison, based on the adaptation rules for Adam in Appendix C. As shown in Table 5, our method generalizes well to the Transformer architecture.
+
+### Analysis
+
+**Ablation Study.** We show the effects of turning on/off each of our modifications to the baseline optimization process of Net2Net (1) Growing: adding neurons with functionality preservation. (2) Growing+VT: only applies variance transfer. (3) Growing+RA: only applies LR rate adaptation. (4) Full method. We conduct experiments using both ResNet-20 on CIFAR-10 and ResNet-18 on CIFAR-100. As shown in Table 6, different variants of our growing method not only outperform Net2Net consistently but also reduce the randomness (std. over 3 runs) caused by random replication. We also see that, both RA and VT boost the baseline growing method. Both components are designed and woven to accomplish the empirical leap. Our full method bests the test accuracy.
+
+   Variant & Res-20 on C-10 (\(\%\)) & Res-18 on C-100 (\(\%\)) \\  Net2Net & \(91.60 0.21(+0.00)\) & \(76.48 0.20(+0.00)\) \\ Growing & \(91.62 0.12(+0.02)\) & \(76.82 0.17(+0.34)\) \\ Growing+VT & \(92.00 0.10(+0.40)\) & \(77.27 0.14(+0.79)\) \\ Growing+RA & \(92.24 0.11(+0.64)\) & \(77.74 0.16(+1.26)\) \\ Full & \(92.53 0.11(+0.93)\) & \(78.12 0.15(+1.64)\) \\   
+
+Table 6: Ablation study on VT and RA components.
+
+Figure 3: Baselines of 4-layer simple CNN.
+
+**Justification for Variance Transfer.** We train a simple neural network with 4 convolutional layers on CIFAR-10. The network consists of 4 resolution-preserving convolutional layers; each convolution has 64, 128, 256 and 512 channels, a \(3 3\) kernel, and is followed by BatchNorm and ReLU activations. Max-pooling is applied to each layer for a resolution-downsampling of 4, 2, 2, and 2. These CNN layers are then followed by a linear layer for classification. We first alternate this network into four variants, given by combinations of training epochs \(\{13(1),30(2.3)\}\) and initialization methods \(\) {standard, \(\)transfer }. We also grow from a thin architecture within 3 stages, where the channel number of each layer starts with only 1/4 of the original one, _i.e.,_\(\{16,32,64,128\}\{32,64,128,256\}\{64,128,256,512\}\), each stage is trained for 10 epochs.
+
+For network growing, we compare the baselines with standard initialization and variance transfer. We train all baselines using SGD, with weight decay set as 0 and learning rates sweeping over \(\{0.01,0.02,0.05,0.1,0.2,0.5,0.8,1.0,1.2,1.5,2.0\}\). In Figure 3(b), growing with Var. Transfer (blue) achieves overall better test accuracy than standard initialization (orange). Large baselines with merely \(\)transfer in initialization consistently underperform standard ones, which validate that the compensation from the LR rescaling is necessary in . We also observe, in both Figure 3(a) and 3(b), all growing baselines outperform fixed-size ones under the same training cost, demonstrating positive regularization effects. We also show the effect of our initialization scheme by comparing test performance on standard ResNet-20 on CIFAR-10. As shown in Figure 4(a), compared with standard initialization, our variance transfer not only achieves better final test accuracy but also appears more stable. See Appendix F for a fully-connected network example.
+
+**Justification for Learning Rate Adaptation.** We investigate the value of our proposed stage-wise learning rate adaptation as an optimizer for growing networks. As shown in the red curve in Figure 3, rate adaptation not only bests the train loss and test accuracy among all baselines, but also appears to be more robust over different learning rates. In Figure 4(a), rate adaptation further improves final test accuracy for ResNet-20 on CIFAR-10, under the same initialization scheme.
+
+Figure 4(b) and 4(c) visualize the gradients of different sub-components for the 17-th convolutional layer of ResNet-20 during last two growing phases of standard SGD and rate adaptation, respectively. Our rate adaptation mechanism rebalances subcomponents' gradient contributions to appear in lower divergence than global LR, when components are added at different stages and trained for different durations. In Figure 5, we observe that the LR for newly added Subnet-8 (red) in last stage starts around \(1.8\) the base LR, then quick adapts to a smoother level. This demonstrates that our method is able to automatically adapt the updates applied to new weights, without any additional local optimization costs . All above show our method has a positive effect in terms of stabilizing training dynamics, which is lost if one attempts to train different subcomponents using a global LR scheduler. Appendix D provides more analysis.
+
+**Flexible Growing Scheduler.** Our growing scheduler gains the flexibility to explore the best trade-offs between training budgets and test performance in a unified configuration scheme (Eq. 6 and Eq. 7). We compare the exponential epoch scheduler (\(p_{t}\{0.2,0.25,0.3,0.35\}\)) to a linear one (\(p_{t}=0\)) in ResNet-20 growing on CIFAR-10, denoted as 'Exp.' and 'Linear' baselines in Figure 6. Both baselines use the architectural schedulers with \(p_{c}\{0.2,0.25,0.3,0.35\}\), each generates trade-offs between train costs and test accuracy by alternating \(T_{0}\). The exponential scheduler yields better
+
+Figure 4: (a) Performance with Var. Transfer and Rate Adaptation growing ResNet-20. (b) and (c) visualize the gradients for different sub-components along training in the last two stages.
+
+overall trade-offs than the linear one with the same \(p_{c}\). In addition to different growing schedulers, we also plot a baseline for fixed-size training with different models. Growing methods with both schedulers consistently outperform the fixed-size baselines, demonstrating that the regularization effect of network growth benefits generalization performance.
+
+**Wall-clock Training Speedup.** We benchmark GPU memory consumption and wall-clock training time on CIFAR-100 for each stage during training on single NVIDIA 2080Ti GPU. The large baseline ResNet-18 trains for 140 minutes to achieve 78.36\(\%\) accuracy. As shown in the green bar of Figure 6(b), the growing method only achieves marginal wall-clock acceleration, under the same fixed batch size. As such, the growing ResNet-18 takes 120 minutes to achieve \(78.12\%\) accuracy. The low GPU utilization in the green bar in Figure 6(a) hinders FLOPs savings from translating into real-world training acceleration. In contrast, the red bar of Figure 6(b) shows our batch size adaptation results in a large proportion of wall clock acceleration by filling the GPU memory, and corresponding parallel execution resources, while maintaining test accuracy. ResNet-18 trains for \(84\) minutes (\(1.7\) speedup) and achieves \(78.01\%\) accuracy.
+
+## 5 Conclusion
+
+We tackle a set of optimization challenges in network growing and invent a corresponding set of techniques, including initialization with functionality preservation, variance transfer and learning rate adaptation to address these challenges. Each of these techniques can be viewed as 'upgrading' an original part for training static networks into a corresponding one that accounts for dynamic growing. There is a one-to-one mapping of these replacements and a guiding principle governing the formulation of each replacement. Together, they accelerate training without impairing model accuracy - a result that uniquely separates our approach from competitors. Applications to widely-used architectures on image classification and machine translation tasks demonstrate that our method bests the accuracy of competitors while saving considerable training cost.

@@ -1,0 +1,238 @@
+# The Mamba in the Llama:
+
+Distilling and Accelerating Hybrid Models
+
+Junxiong Wang\({}^{1}\)1 Daniele Paliotta\({}^{2,3}\)1 Avner May\({}^{3}\) Alexander M. Rush\({}^{1}\) Tri Dao\({}^{3,4}\)
+
+\({}^{1}\)Cornell University \({}^{2}\)University of Geneva \({}^{3}\)Together AI \({}^{4}\)Princeton University
+
+Equal Contribution. Order determined by coin flip. Correspondence to: junxiong@cs.cornell.edu and daniele.paliotta@unige.ch
+
+###### Abstract
+
+Linear RNN architectures, like Mamba, can be competitive with Transformer models in language modeling while having advantageous deployment characteristics. Given the focus on training large-scale Transformer models, we consider the challenge of converting these pretrained models for deployment. We demonstrate that it is feasible to distill large Transformers into linear RNNs by reusing the linear projection weights from attention layers with academic GPU resources. The resulting hybrid model, which incorporates a quarter of the attention layers, achieves performance comparable to the original Transformer in chat benchmarks and outperforms open-source hybrid Mamba models trained from scratch with trillions of tokens in both chat benchmarks and general benchmarks. Moreover, we introduce a hardware-aware speculative decoding algorithm that accelerates the inference speed of Mamba and hybrid models. Overall we show how, with limited computation resources, we can remove many of the original attention layers and generate from the resulting model more efficiently. Our top-performing model, distilled from Llama3-8B-Instruct, achieves a 29.61 length-controlled win rate on AlpacaEval 2 against GPT-4 and 7.35 on MT-Bench, surpassing the best 8B scale instruction-tuned linear RNN model. We also find that the distilled model has natural length extrapolation, showing almost perfect accuracy in the needle-in-a-haystack test at 20x the distillation length. Code and pre-trained checkpoints are open-sourced at https://github.com/jxiw/MambaInLlama and https://github.com/itsdaniele/speculative_mamba.
+
+## 1 Introduction
+
+While Transformers  have been an essential architecture in deep learning and have driven the success of large language models such as GPT , Llama , and Mistral , they are prohibitively slow for very long sequence generation due to their quadratic complexity with respect to sequence length and large key-value (KV) cache requirement. Recent linear RNN models (Mamba , Mamba2 , GLA , RWKV , RetNet , Griffin ) beat Transformers in controlled experiments at small to medium scale, although the best Transformers still significantly outperform these models on downstream tasks. We note that the training times of linear RNN models are similar to those of highly optimized Transformers , and therefore scaling up either of these models requires substantial computational resources.
+
+The primary benefit of linear RNN models (Mamba , Mamboa2 ) is that they have faster inference (5\(\) higher throughput) than Transformers. Efficient inference is emerging as a critical need for LLM systems such as new applications currently bottlenecked by the large KV cache of Transformers, e.g. reasoning over multiple long documents [30; 65; 56] and files in large codebases [61; 42]). Emerging workflows with agents [81; 77] also require large-batch inference to explore more trajectories and long-context to model complex environments.
+
+These properties motivate the goal of distilling a large pretrained Transformer model into a linear RNN in order to generate as efficiently as possible. The technical challenges are two-fold: how to map pretrained Transformer weights to linear RNN weights for distillation, and how to adapt best-practice Transformer inference techniques, such as speculative decoding, to the new architecture. We make the following contributions:
+
+* We show that by reusing weights from attention layers, it is possible to distill a large transformer into a large hybrid-linear RNN with minimal additional compute while preserving much of its generation quality. We propose a modified Mamboa architecture that can be directly initialized from the attention block of a pretrained model.
+* We propose a multistage distillation approach that mirrors the standard LLM pipeline combining progressive distillation, supervised fine-tuning , and directed preference optimization . This approach shows better perplexity and downstream evaluation compared with vanilla distillation.
+* We develop a hardware-aware speculative sampling algorithm and a fast kernel for speculative decoding on Mamboa and hybrid architectures. We achieve a throughput of over 300 tokens/second for a Mamboa 7B model. Additionally, we show that speculative decoding can be effectively applied to our hybrid architecture.
+
+Our experiments distill different large-scale open chat LLMs, Zephyr-7B , Llama-3 8B  to linear RNN models (hybrid Mamboa and Mamboa2), using only 20B tokens of training. Results show that the distilled approach matches the teacher model in standard Chat benchmarks [84; 43]. We also show that it performs on par or better with all similarly sized pretrained-from-scatch Mamboa models including Mamboa 7B models [52; 26] trained from scratch with 1.2T tokens or NVIDIA Hybrid Mamboa2 models  trained from scratch with 3.5T tokens in multiple tasks (e.g., MMLU , TruthfulQA ) in the LM evaluation . Concurrent with this work, MOHAWK  distills a Mamboa-2 variant based on the Phi-1.5 architecture with limited computation costs and performance loss.
+
+## 2 From Transformer to Mamboa
+
+### Relationship Between Attention and Linear RNNs
+
+We begin by reviewing multihead attention to clarify the shapes of intermediate objects. Notationally, we use explicit subscripts for the sequence position instead of matrix representation, to better highlight similarities between the two models.
+
+Attention is computed in parallel for multiple differently parameterized heads. Each head takes sequence \(\) with hidden size \(D\) as an argument and computes,
+
+\[_{t}=^{Q}_{t}, 14.226378pt_{t} =^{K}_{t}, 14.226378pt_{t}=^{V}_ {t} 14.226378ptt,\] \[_{1}_{T}=[m_{1,t} _{t}^{}_{1} m_{T,t}_{t}^{}_{T}]/ 14.226378pt_{t}=_{s=1}^{t}_{s} _{s}\] \[_{t}^{D 1}, 14.226378pt ^{N D} 14.226378pt_{t},_{t}, _{t}^{N 1} 14.226378ptm_{s,t}=(s  t)\]
+
+Recent work has argued that linear RNNs can be serious competitors to attention in large language models. Several different linear RNN formulations have been proposed with similar formulations. For now, we leave the shapes of the parameters \(_{t},_{t},_{t}\) abstract, and note that linear RNNs all take the following form that maps a 1-dimensional sequence to another through an implicit matrix-valued hidden state \(\).
+
+\[_{t}=_{t}_{t-1}+_{t}x_{t}, 14.226378pty_{t} =_{t}^{}_{t}\] (1)Linear RNNs have several computational advantages over attention. During training, all \(_{t}\) values can be computed more efficiently than attention since there is no softmax non-linearity. During inference, each next \(_{t}\) can be computed serially without requiring a cache.
+
+Despite the superficially different form, there is a natural relationship between linear RNNs and attention. _Linearizing_ the attention formula by removing the softmax yields:
+
+\[y_{t}=_{s=1}^{t}_{s}v_{s}=}_{s=1}^{t}m_{s,t} _{t}^{}_{s}v_{s}=}_{t}^{ }_{s=1}^{t}m_{s,t}_{s}v_{s}\]
+
+This implies that there exists a linear RNN form of linearized attention, specifically:
+
+\[_{t}=m_{t-1,t}_{t-1}+_{t}v_{t}  y_{t}=}_{t}^{}_{t}\] \[\] \[_{t}=_{t}_{t-1}+_{t}x_{t},  y_{t}=_{t}^{}_{t}\] \[_{t}=m_{t-1,t},\ _{t}=^{K}_{t}, \ _{t}=^{Q}_{t},\ _{t}=^{V}_{t}\]
+
+Note though that this version uses a hidden state of size \(^{N 1}\). Effectively tracking only one scalar over time per hidden dimension. Naively applying this transformation leads to poor results. The issue is that linearizing attention produces a degraded representation of the original model, as the softmax nonlinearity is critical to attention.
+
+The key to improving these models is to increase the capacity of the linear hidden state to better capture long-term structure. For example, previous work has shown the use of kernel methods to improve this approximation . These approaches expand the size of the hidden state representation to \(\) to \(^{N N^{}}\) to better match the modeling capacity of softmax.
+
+### Distilling to an Expanded Linear RNN
+
+To design a effective distilled linear RNN, we aim to stay as close as possible to the original Transformer parameterization, while also expanding the capacity of the linear RNN in an efficient manner. We will _not_ attempt to have the new model capture the exact original attention function, but instead use the linearized form as a starting point for distillation.
+
+Specifically, we adapt the parameterization from Mamba,  to increase the hidden state size, while initializing from the attention representation. Mamba uses a continuous time state-space model (SSM) to parameterize a linear RNN at run time, described by the differential equation,
+
+\[^{}(k)=(k)+(k)(k)( k)=(k)(k)\]
+
+Where \(\) is a diagonal matrix and other values are continuous signals. To apply this formulation to a discrete-time problem like language modeling, we use a neural network to produce a sequence of sampling intervals \(_{t}\) and samples of the signals at these time steps. Given these sampling intervals, and \(T\) samples of \(,\), Mambo approximates the continuous-time equation using a linear RNN as a discretization. We use an overbar to indicate the discrete-time form, which is reconstructed dynamically.
+
+\[}_{1 T},}_{1 T},}_{1 T}=(,_{1 T}, _{1 T},_{1 T})\]In this simplest case, with \(N^{}=1\) and an identity discretization, this approach recovers the linear attention to linear RNN conversion discussed in the previous section. The benefit of Mampa is that with \(N^{}>1\) the continuous-time parameterization allows the model to learn significantly richer functions, without many more parameters or decreased efficiency. Specifically the only additional learned parameters will be the sampling rate \(\) and the dynamic \(\). These new parameters will control the constructed linear RNN through the discretization function yielding the new matrix valued linear RNN. Specifically, we take in the same \(_{t},_{t}^{N 1}\) and \(_{t}^{N^{}}\), but output \(}_{t},}_{t}^{N^{}  N 1}\), effectively increasing the hidden size by a factor of \(N^{}\) over the naive linear attention.
+
+A core contribution of Mampa [26; 18] is to demonstrate a hardware-aware factorization of this algorithm. Implementing the algorithm naively would be prohibitively slow as the new expanded parameters are quite large. Their approach fuses discretization, state expansion, and applying the linear RNN into a single kernel, which circumvents fully materializing the discrete parameters. This allows for large \(N^{}\) with relatively small efficiency costs.
+
+### Attention-to-Mamba Initialization and Hybrid Stepwise Training
+
+Our full approach is shown in Algorithm 1. This algorithm feeds the standard \(,,\) heads from attention directly into the Mampa discretization, and then applies the resulting linear RNN. As noted above, this can seen as roughly initializing with linearized attention and allowing the model to learn richer interactions through the expanded hidden state.
+
+Figure 1 shows the resulting architecture. Our version directly replaces Transformer attention heads directly with fine-tune linear RNN layers. We keep the Transformer MLP layers as is and do not train them. This approach also requires processing additional components like grouped query attention that shares keys and values across heads. We note that this architecture differs from the architecture used in many Mampa systems, which combines MLP-SSM layers and uses a single head.
+
+This initialization allows us to replace any attention block with a linear RNN block. We experiment with _hybrid_ models where we keep every \(n\) attention layers. Empirically we found that replacing layers in a stepwise manner was the most effective strategy, i.e. we first keep every 2 layers, distill, and then every 4, and continue distillation.
+
+Figure 1: Transferring Transformer to Mampa. Weights, in orange, are initialized from the Transformer (Linear projections for \(\), \(\), and \(\) are initialized using linear projection for \(\), \(\), and \(\) respectively). We replace individual attention heads with Mampa heads, and then finetune Mampa blocks while freezing the MLP blocks. Shapes are kept mainly the same. Weights in green are added. New parameters are introduced for the learned \(\) and \(\) parameters.
+
+Knowledge Distillation for Aligned LMs
+
+Knowledge distillation (KD)  serves as a compression technique aimed at training a smaller network that mimics the behavior of a larger teacher network. After initializing the model from the Transformer parameters, we aim to distill it to perform on par with the original language model. We assume that most of the knowledge from the transformer is maintained in the MLP layers which were transferred from the original model, and focus on distilling the fine-tuning and alignment steps of the LLM. During this stage, the MLP layers are kept frozen and the Mamba layers are trained as in Figure 1.
+
+**Supervised Fine-Tuning** We first apply knowledge distillation to redo the supervised fine-tuning (SFT) stage of language model adaptation. During this stage, an LLM is trained to maximize the likelihood of a response \(y\) given an input prompt \(x\), i.e. \(p(y x)\). The task looks similar to conditional generation.
+
+There are two common approaches for distillation in this setting. One method is to use word-level KL-Divergence. In this setting, the full probability distribution of the student model \(p(;)\) is trained to match the full distribution of the teacher model \(p(;_{T})\) by minimizing the KL divergence over the entire set of next possible tokens at position \(t\). The second method is sequence-level knowledge distillation (SeqKD) . SeqKD suggests a simple method for distillation on this style of task, by replacing the ground truth text \(y_{1 t}\) with the teacher generation output \(_{1 t}\), also known as pseudo-labels.
+
+\[()=-_{t=1}^{T}\ \ p(_{t+1}_{1  t},x,)+\ [p(_{1 t},x,_{T}) p( _{1 t},x,)]\] (2)
+
+Here \(\) is trainable parameters of the student model and \(\) and \(\) control the weights of sequence and word loss term respectively.
+
+**Preference Optimization** The second stage of instruction-tuning for LLMs is to align them to a set of user preferences. During this stage, a set of desired preference pairs is used to improve the model's output. The objective is to produce outputs \(y\) to prompts \(x\) that maximize a reward model \(r\) while maintaining close to a reference model. Typically the reference model is chosen to be the model after supervised fine-tuning. For distillation, we can conveniently utilize the original teacher, i.e.
+
+\[_{}_{x,y p(y|x;)}r_{ }(x,y)-p(y x;)(y x ;_{T})\] (3)
+
+This preference model is defined by a reward function \(r_{}(x,y)\) dependent on the method used. Previous research utilizing AI feedback has primarily focused on employing reinforcement learning methods, such as proximal policy optimization (PPO) , to optimize \(\) concerning this reward. Recently, methods using direct preference optimization (DPO)  have been effective at optimizing this objective with direct gradient updates. Specifically, DPO shows that, if we have access to preferred \(y_{w}\) and dispreferred \(y_{l}\) outputs for a given prompt \(x\), we can reformulate this optimization problem as,
+
+\[_{}=_{}_{(x,y_{w},y_{l})} (|x;)}{p(y_{w}|x;_{T})}- |x;)}{p(y_{l}|x;_{T})}).\] (4)
+
+This optimization can be performed at the sequence level by scoring the preferred and dispreferred outputs of the model with the teacher and student and then backpropagating to the student. As far as we are aware this is the first use of DPO as a distillation objective.
+
+## 4 Speculative Decoding Algorithms For Linear RNNs
+
+The main goal of the linear RNN formulation is to improve decoding efficiency. For both attention and linear RNNs, the serial dependency of autoregressive generation inherently bottlenecks efficiency. Systems cannot utilize all available compute, as they need to wait for the generation of previous tokens to proceed [67; 41; 11; 76; 10]. _Speculative decoding_ has emerged as a method for breaking this bottleneck by spending extra compute to speculate 
+
+### Challenges in RNN Speculation
+
+Speculative decoding uses two models: a draft model, \(_{D}\), and a verification model, \(_{V}\). The fast draft model produces potential future completions, \(y^{*}=_{y_{1:T}}p(y_{1},,y_{T};_{D})\), and the larger verification model checks that these are top ranking at each time step, i.e. checking \(p(y^{*}_{t}|y^{*}_{1:t-1};_{V})\). The longer a chain before a verification failure the faster the output. If a partial chain matches, we can rewind to the last match.
+
+Attention-based models are particularly amenable to speculation, as they are slow at generation due to sequential nature, but fast at verification due to their ability to check multiple tokens in parallel. Linear RNN models like Mampa have significantly different performance characteristics that make them less amenable to speculative decoding. Sequential decoding using recurrent-style sampling is already significantly faster than attention. Like attention, there are parallel modes for models like Mampa which are used at training. These are efficient, but are tuned for extremely long sequences. In addition, they rely on hardware-aware optimizations, such as avoiding materializing intermediate states. These properties make it difficult to use for speculation for relatively short chains when it is unknown when a conflict will occur.
+
+An additional challenge arises from caching states in RNN models. The state of an attention model is represented by the key-value cache, \(_{1:t},_{1:t}\); whereas the state of an RNN model is simply \(_{t}\). To be competitive with attention this single RNN state needs to be very large. During speculation, we need to rewind to a previous state at time step \(t^{}\). For attention, this is simply \(_{1:t^{}},_{1:t^{}}\); however, for RNNs this would require caching all \(_{1:t}\) which would require a large memory overhead.
+
+### Multi-Step Linear RNN Speculation
+
+We propose a new algorithm for linear RNN speculative decoding using hardware-aware multi-step generation. The core to the approach generation kernel that computes,
+
+\[y_{j:k},_{j},_{k}(_{i}, y_{1:n},i,j,k;,,,)\]
+
+Where \(i\) is the starting hidden state, \(i j k\), and \(j k\) is the range of \(\) outputs needed. The kernel is hardware-aware because it avoids materializing key terms off of the fast GPU
+
+Figure 2: Multi-Step RNN Speculative Decoding. _Left (top)_: The draft model generates the set of blue draft tokens sequentially. The draft tokens are then verified. _Right (top)_: Verification uses the multistep kernel, without materializing the intermediate states. The last token is rejected and replaced with the true best token. Note, that even though more tokens are generated we cannot advance the hidden state cache. _Left (bottom)_ The draft model can now generate more blue draft tokens from the current tokens, resulting in six total. _Right (bottom)_ When the new draft is verified, the multi-step kernel returns both the hidden state after the yellow token and the final hidden state, since verification will fall between those positions. on future generations. In this section, we consider approaches for applying this technique to large Mampa models, which can then be applied to the distilled models.
+
+memory. Specifically, it avoids instantiating most \(_{1:n}\) as well as the discrete-time linear RNN parameters. This kernel is aimed to target the issues presented above. Specifically, it can save a snapshot of the state \(_{j}\) before evaluating the draft tokens. This allows recomputing the correct state on the fly after a token is rejected. The assumption is that decoding is bottlenecked by memory and not by compute, as we can compute multiple steps of decoding with very little overhead over single-step decoding.
+
+Algorithm 2 and Figure 2 show the full algorithm. The approach maintains only one RNN hidden state in cache for verification and advances it lazily based on the success of the multi-step kernel. Since the distilled models contain transformer layers, we also extend speculative decoding to Attention/RNN hybrid architectures. In this setting, the RNN layers perform verification according to Algorithm 2, while the transformer layers simply perform parallel verification.
+
+Note that if the draft model is a Mambo or hybrid model, the speculation part of the algorithm gets more complicated, as the draft model needs to recompute the state for the tokens accepted in the previous iteration. This is done similarly to the verifier model, by caching older entries and recomputing on the fly during the next round of speculation.
+
+### Speculation Analysis and Hardware Specific Optimization
+
+To verify the effectiveness of this approach we run the speculation using Mambo 7B and Mambo 2.8B as target models. Results are shown in Table 1. Figure 3 shows the performance characteristics of the Multi-Step kernel itself.
+
+Speedup on H100 GPUs.A naive implementation of our algorithm already shows strong performance on Ampere GPUs as shown in Table 1. However, achieving strong performance on H100 GPUs is much more challenging. This is mainly due to GEMM operations being much faster, which makes the overhead incurred from the caching and recomputation operations more visible. In practice, the naive implementation of our algorithm, with several different kernel
+
+  
+**Model Size** & **GPU** & **K** & **\# Gen. Tokens** & **Throughput (toks/s)** & **Speedup** \\ 
+2.8B & 3090 & 3 & 3.01 & 259 & 2.3x \\
+2.8B & 3090 & 4 & 3.28 & 289 & 2.6x \\ 
+2.8B & H100 & 3 & 4.04 & 389 & 1.71x \\
+2.8B & H100 & 4 & 3.9 & 421 & 1.85x \\  
+7B & 3090 & 3 & 3.19 & 109 & 2.1x \\
+7B & 3090 & 4 & 3.56 & 110 & 2.1x \\ 
+7B & H100 & 3 & 3.28 & 271 & 1.95x \\
+7B & H100 & 4 & 3.6 & 272 & 2x \\   
+
+Table 1: Speedup results for speculative decoding with pure Mambo models. The 2.8B verifier uses a 130M Mambo draft. The 7B verifier uses a Llama3 1B draft we trained. Data is from The Pile. \(K\) is number of draft tokens produced, # _Gen_ includes an additional token from the last verifier logits.
+
+Figure 3: Performance of the multi-step SSM kernel for generating 32 tokens.
+
+calls, achieves a decent speedup on 3090 GPUs (1.5x for Mamba 2.8B with \(60\%\) acceptance rate) but no speedup at all on H100s.
+
+We optimized our implementation by fusing kernels, and by adapting the implementation to easily allow caching and recomputing old steps. Specifically, the verifier model performs i) recomputation of previous steps from the cache, ii) multistep decoding for the new sequence of draft tokens and iii) caching within a single kernel 2. For the draft model, recomputation, decoding and caching are also fused in a single kernel. The resulting implementations archives speedups on H100s GPUs, as shown in Table 1.
+
+## 5 Results
+
+### Experimental Setup
+
+**Target models.** We perform experiments using two LLM chat models: Zephyr-7B , which is a chat fine-tuned Mistral 7B , Llama-3 Instruct 8B . For the linear RNN models, we use hybrid versions of Mamba and Mamba2 with 50%, 25%, 12.5%, and 0% attention layers. We refer to 0% as a pure Mamba model. Mamba2 is a variant architecture of Mamba that is designed to be more targeted to recent GPU architectures. Zephyr-Mamba refers to a distillation from Zephyr , while Llama3-Mamba / Llama3-Mamba2 indicates distillation from Llama-3 instruct 8B . Strictly speaking, our distilled Mamba-Zephyr is a subquartic model, since Zephyr/Mistral-8B uses sliding window attention architecture. Our distilled Mamba-Zephyr (50%) has the similar architecture as Samba .
+
+**Training.** Distillation does not require any language modeling pretraining data, but instead uses the post-training process to adapt the new model. We use a three-stage process. In the first stage, we use UltraChat  and UltraFeedback  as seed prompts and use the teacher model to generate pseudo-labels. The student model is trained in one epoch using the loss \(\) in Eq 2 with \(=1\) and \(=0.1\). Models are trained using AdamW optimizer with \(=(0.9,0.98)\) with a batch size \(64\). We use a linear learning rate warm-up (for the first \(500\) steps) followed by cosine annealing. In the second stage, we use supervised finetuning with our model on the GenQA , InfinityInstruct  and OpenHermes 2.5  datasets using SFT in one epoch, with the same hyperparameters as Zephyr . In the final stage, for models distilled from Zephyr, we do distilled alignment with our model using DPO on the UltraFeedback  dataset which is consistent with teacher model. While models distilled from Llama-3 instructed 8B, we use datasets from SimPO  and Zephyr . We only freeze Gated MLP (FFN) in the first stage, while in the second and final stage all parameters are trained 3. The total distillation process for each hybrid model (e.g., Mamba-Llama3 (50% attl)) takes less than five days in 8x80G A100.
+
+**Baselines.** In addition to the core Transformer architectures, the main baselines we compare against are other large-scale linear RNN models. We compare with both pure SSM architectures, such as TRI Mamba 7B  trained with 1.2T tokens and Falcon Mamba 7B4 trained with more than ST tokens, hybrid SSM architectures, such as Nvidia Hybrid Mamba 2  trained with 3.7T tokens, and other linear hybrid RNN models, such as Recurrent Gemma-9B Instruct .
+
+After the release of the new SoTA transformer models at the 8B and 3B scales, Llama-3.1 and Llama-3.2, we have streamlined the distillation process and are now distilling using the larger Llama-3.1 70B teacher model while initializing models with similarly sized 3B and 8B scales, respectively. We distill our model on the GenQA  and InfinityInstruct  datasets, resulting in Mamba-Llama3.2-3B, Mamba2-Llama3.2-3B, Mamba-Llama3.1-8B, and Mamba2-Llama3.1-8B. Additionally, we perform further DPO on top of these models using the same dataset as before, resulting in Mamba-Llama3.2-3B-dpo, Mamba2-Llama3.2-3B-dpo, Mamba-Llama3.1-8B-dpo, and Mamba2-Llama3.1-8B-dpo. The distillation phase takes eight days on 8xA100 and four days on 8xH100.
+
+### Evaluation on Chat Benchmarks
+
+We evaluate our models using both single-turn, AlpacaEval  and multi-turn chat benchmarks, MT-Bench . These benchmarks assess the model's ability to follow instructions and respond to challenging prompts across a wide variety of domains.
+
+Table 2 shows the performance of our models on chat benchmarks compared with large transformer models. The distilled hybrid Mamba model (50%) achieves a similar score in the MT-benchmark as the teacher model, and slightly better than the teacher model on the AlpacaEval benchmark in both LC win rate and overall win rate. The distilled hybrid Mamba (25% and 12.5%) performance is slightly worse than that of the teacher models in the MT benchmark but still surpasses some large transformers even with more parameters in AlpacaEval. The distilled pure (0%) model does degrade significantly in accuracy. Notably, the distilled hybrid model performs better than Falcon Mamba, which was trained from scratch with more than 5T tokens.
+
+### Evaluation on General Benchmarks
+
+**Zero Shot Evaluation.** We utilize the open-source LM Evaluation Harness library  (branch big-refactor) to assess 10 tasks, with the following evaluation metrics: WinoGrande (WG) accuracy , PIQA (PQ) accuracy , HellaSwag (HS) normalized accuracy , ARC-Easy and ARC-Challenge (AE and AC) accuracy and normalized accuracy, , MMLU (MM), accuracy , OpenBookQA (OB) normalized accuracy , TruthFuIQA (TQ) accuracy , PubMedQA (PM) accuracy , and RACE (RA), accuracy . Each task is evaluated by analyzing the probability assigned by the model to each potential answer choice.
+
+Table 3 shows zero shot evaluation in LM Eval benchmark for Mamba and Mamba2 distilled from different teacher models. Both hybrid Mamba-Llama3 and Mamba2-Llama3 models, distilled from the Llama-3 Instruct 8B, perform better compared to the open-source TRI Mamba and Nvidia Mamba models trained from scratch. Performance degrades with more linear RNN layers, but is still competitive at 25% to models trained from scratch.
+
+### Hybrid speculative decoding
+
+**Setup** We perform speculative decoding using the distilled hybrid models. We run experiments using both Hybrid Mamba \(50\%\) and Hybrid Mamba \(25\%\) as main models. For the draft models, we train 2 and 4-layer Transformer Draft models on the OpenHermes2.5
+
+  
+**Model (\% Att)** & Size & Align &  MT-Bench \\ (score) \\  &  MT-Bench \\ (Round 1) \\  &  MT-Bench \\ (Round 2) \\  &  AlpacaEval \\ (LC win \%) \\  &  AlpacaEval \\ (win \%) \\  \\  Zephyr & 7B & DPO & **7.34** & - & - &  13.20\({}_{0.96}\) \\  & 
+ 10.99\({}_{0.96}\) \\  \\
+** Mamba-Zephyr (50\%)** & 7B & DPO & 7.31 & - & - &  **20.66\({}_{0.74}\)** \\  & 
+ **16.69\({}_{1.10}\) \\  \\
+** Mamba-Zephyr (25\%)** & 7B & DPO & 6.40 & - & - &  17.16\({}_{0.69}\) \\  &  13.11\({}_{1.00}\) \\  \\   Llama-3.1-Instruct \\ **Mambo-Llama3.1 (50\%)** \\  & 8B & RLHF & **8.0** & - & - &  **20.9** \\  & 
+ **21.8** \\  \\
+** Mamba-Llama3.1 (50\%)** & 8B & & 7.7 & 8.0 & 7.3 &  18.97\({}_{1.23}\) \\  & 
+ 21.22\({}_{1.23}\) \\  \\
+** Mamba-Llama3.1 (50\%)** & 8B & & 7.6 & 8.1 &  7.0 \\  &  18.99\({}_{1.24}\) \\  & 
+ 21.55\({}_{1.24}\) \\  \\
+** Mamba-Llama3.2 (50\%)** & 3B & & 6.9 & 7.6 &  6.1 \\  &  13.57\({}_{1.05}\) \\  & 
+ 15.54\({}_{1.08}\) \\  \\
+** Mamba2-Llama3.2 (50\%)** & 3B & & 6.5 & 7.1 &  5.8 \\  &  12.61\({}_{1.05}\) \\  &  14.34\({}_{1.05}\) \\  \\   Llama-3-Instruct \\ **Mambo-Llama3 (50\%)** \\  & 8B & RLIHF & **8.00** & - & - &  22.90\({}_{1.26}\) \\  & 
+ 22.60\({}_{1.26}\) \\  \\
+** Mamba-Llama3 (50\%)** & 8B & DPO & 7.35 & 7.82 & 6.88 &  **29.61\({}_{1.31}\)** \\  & 
+ **26.69\({}_{1.31}\) \\  \\
+** Mamba-Llama3 (25\%)** & 8B & DPO & 6.86 & 7.56 &  6.15 \\  &  25.55\({}_{1.26}\) \\  & 
+ 22.50\({}_{2.26}\) \\  \\
+** Mamba-Llama3 (12.5\%)** & 8B & DPO & 6.46 & 6.91 &  6.01 \\  &  20.76\({}_{1.16}\) \\  &  17.93\({}_{1.16}\) \\  \\   **Mambo-2-Llama3 (50\%)** \\  & 8B & DPO & 7.32 & 7.93 & 6.70 &  26.78\({}_{1.26}\) \\  & 
+ 22.69\({}_{1.26}\) \\  \\
+** Mamba-Llama3 (25\%)** & 8B & DPO & 6.74 & 7.24 &  6.24 \\  &  22.75\({}_{1.18}\) \\  & 
+ 19.01\({}_{1.18}\) \\  \\
+** Mamba2-Llama3 (12.5\%)** & 8B & DPO & 6.48 & 6.83 &  6.13 \\  &  20.25\({}_{1.13}\) \\  & 
+ 16.88\({}_{1.13}\) \\  \\
+** Mamba2-Llama3 (0\%)** & 8B & DPO & 5.64 & 6.16 &  5.11 \\  &  14.49\({}_{0.93}\) \\  &  10.88\({}_{0.93}\) \\  \\   Falcon Mamba Instruct \\  & 7B & SFT & 6.40 & 7.25 & 5.55 &  4.04\({}_{0.45}\) \\  &  21.5\({}_{0.45}\) \\  \\   GPT-3.5-turbo \\  & - & RLHF & 7.94 & - & - &  22.70 \\  &  14.10 \\  \\   GPT-4.0 \\  & - & RLHF & - & - &  **57.46\({}_{1.47}\)** \\  & 
+ **51.33\({}_{1.47}\) \\  \\   
+
+Table 2: Chat benchmark results for open-access and proprietary models on MT-Bench and AlpacaEval. MT-Bench scores model responses using GPT-4. AlpacaEval version two measures the win-loss rate between baseline models and GPT-4 scored by GPT-4 Turbo.
+
+dataset , for approximately 3 full epochs, following the "shrink and fine-tune" approach from . Specifically, we initialize the draft layers using layers from the Zephyr-7B model (we take layers at indices \(\) for the 2-layer model and \(\) for the 4-layer model), and the embeddings and language model head also from the Zephyr-7B model . We perform loss masking on the prompt, thus only considering next token prediction loss (cross-entropy) on the chat continuations from the training set. Speculative decoding experiments are run on a single NVIDIA RTX 3090 on data from OpenHermes2.5.
+
+   Draft Model & K & Target Model (\% Att) & \# Gen. Tokens & Speedup \\   & 4 & Mamboa-Zephyr (\(50\%\)) & 2.48 & 1.8x \\  & 4 & Mamboa-Zephyr (\(25\%\)) & 2.64 & 1.88x \\   & 4 & Mamboa-Zephyr (\(50\%\)) & 3 & 1.81x \\  & 4 & Mamboa-Zephyr (\(25\%\)) & 3 & 1.8x \\   & 3 & Mamboa-Llama3 (\(50\%\)) & 2.7 & 1.6x \\  & 4 & Mamboa-Llama3 (\(50\%\)) & 3.6 & 1.58x \\   
+
+Table 4: Performance metrics for different draft and target model configurations for \(K=4\) on data from OpenHermes2.5. # _Gen_ is the average number of generated tokens per speculative decoding step and includes an additional token from the last verifier logits.
+
+**Results** Table 4 shows results for hybrid speculative decoding with, using both the Zephyr and Llama hybrid models with different configurations. For both the \(50\%\) and \(25\%\) distilled models, we achieve speedups of over \(1.8\)x on the Zephyr-Hybrid compared to the non-speculative baseline. We also show that the 4-layer draft model we trained achieves a higher acceptance rate, but it adds some additional overhead due to the increased draft model size. For the Llama-hybrid models, the speedups are more modest since the draft model is larger due to the large embedding table of Llama 3. In subsequent work, we will focus on making these draft models smaller.
+
+   Model (\% Att) & WG & PI & HS & AE & AC & MM & OB & PQ & PM & RA & AVG \\  TRI Mamboa-7B & 71.42 & 81.01 & 77.93 & 77.53 & 46.67 & 33.39 & **46.20** & 32.09 & 72.30 & 37.99 & 57.65 \\ Nvidia Hybrid Mamboa-8B & 71.72 & 79.65 & 77.68 & 77.23 & 47.70 & 51.46 & 42.80 & 38.72 & 69.80 & 39.71 & 59.60 \\  Llama-31-8Birstirst & 73.38 & 88.07 & **79.21** & 87.28 & 55.02 & **68.12** & 43.20 & 42.67 & **75.20** & 44.78 & 64.48 \\
+**Llama3.1-Mamboa (50\%)** & 72.77 & 79.33 & 75.91 & 82.24 & 53.84 & 62.13 & 42.80 & 40.02 & 72.00 & 42.11 & 62.32 \\
+**Llama3.1-Mamboa-DPO (50\%)** & 73.80 & 80.41 & 77.36 & 84.01 & 56.57 & 63.30 & **44.20** & 46.07 & 74.40 & 43.44 & 64.38 \\
+**Llama3.1-Mamboa-20 (50\%)** & 71.74 & 78.89 & 75.36 & 82.02 & 52.65 & 61.01 & 41.60 & 40.31 & 72.60 & 42.11 & 61.85 \\
+**Llama3.1-Mamboa-20PO (50\%)** & **74.11** & 80.03 & **79.69** & **84.11** & **59.73** & 59.74 & 44.00 & **50.22** & 74.60 & **46.12** & **65.31** \\  Llama-32-32-Instruct & **67.48** & 75.68 & 70.43 & 74.07 & 45.90 & **64.33** & 36.00 & 38.01 & 69.60 & 40.67 & 57.83 \\
+**Llama3.2-Mamboa (50\%)** & 67.32 & 77.31 & 70.37 & 77.65 & 48.38 & 54.48 & 39.40 & 42.02 & 66.40 & 42.98 & 53.66 \\
+**Llama3.2-Mamboa-DPO (50\%)** & 67.40 & 77.31 & 72.56 & 79.97 & 52.65 & 55.09 & 41.60 & 48.53 & **70.00** & **43.64** & **60.88** \\
+**Llama3.2-Mamboa-20 (50\%)** & 66.06 & 76.11 & 69.13 & 76.68 & 46.67 & 53.12 & 38.80 & 34.78 & 63.00 & 39.81 & 56.49 \\
+**Llama3.2-Mamboa-20 (50\%)** & 67.32 & 77.67 & **74.58** & **62.60** & 54.10 & 52.47 & **42.40** & **50.28** & 65.40 & 43.44 & 60.78 \\ 
+**Mamboa-Zephyr (50\%)** & 68.82 & 80.36 & 76.91 & 81.40 & 55.63 & 55.43 & 42.60 & 41.99 & 72.60 & 42.20 & 61.79 \\ 
+**Mamboa-Llama3 (50\%)** & 68.98 & 78.02 & 78.43 & 74.51 & 51.96 & **57.81** & 44.00 & 47.69 & 73.00 & 38.56 & 61.30 \\
+**Mamboa-Llama3 (25\%)** & 62.83 & 70.70 & 75.00 & 74.28 & 47.35 & 53.50 & 40.00 & 43.64 & 65.40 & 36.94 & 57.70 \\
+**Mamboa-Llama3 (12.5\%)** & 59.75 & 75.08 & 71.71 & 70.58 & 43.60 & 49.81 & 41.40 & 41.41 & 62.40 & 34.45 & 55.02 \\ 
+**Mamboa-Llama3 (50\%)** & 71.51 & **81.45** & **79.47** & **78.83** & **81.99** & 55.70 & 44.20 & **57.74** & **72.4** & **38.85** & **63.84** \\
+**Mamboa-Llama3 (25\%)** & 64.80 & 78.73 & 77.76 & 73.53 & **52.47** & 53.71 & 42.40 & 55.53 & 64.80 & 39.23 & 60.55 \\
+**Mamboa-Llama3 (12.5\%)** & 63.38 & 76.82 & 73.14 & 75.84 & 50.26 & 50.78 & 39.60 & 50.00 & 65.80 & 36.46 & 58.21 \\
+**Mamboa2-Llama3 (0\%)** & 58.56 & 76.82 & 70.75 & 74.12 & 47.95 & 45.19 & 39.00 & 40.20 & 62.20 & 32.63 & 54.74 \\   
+
+Table 3: Evaluation on LM Eval benchmark for Mamboa and Mamboa distilled from Llama-3 Instruct 8B.

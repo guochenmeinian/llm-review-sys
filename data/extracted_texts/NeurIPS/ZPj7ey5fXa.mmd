@@ -1,0 +1,169 @@
+# PyNeRF: Pyramidal Neural Radiance Fields
+
+Haithem Turki
+
+Carnegie Mellon University
+
+hturki@cs.cmu.edu &Michael Zollhofer
+
+Meta Reality Labs Research
+
+zollhoefer@meta.com &Christian Richardt
+
+Meta Reality Labs Research
+
+crichardt@meta.com &Deva Ramanan
+
+Carnegie Mellon University
+
+deva@cs.cmu.edu
+
+###### Abstract
+
+Neural Radiance Fields (NeRFs) can be dramatically accelerated by spatial grid representations . However, they do not explicitly reason about scale and so introduce aliasing artifacts when reconstructing scenes captured at different camera distances. Mip-NeRF and its extensions propose scale-aware renderers that project volumetric frustums rather than point samples but such approaches rely on positional encodings that are not readily compatible with grid methods. We propose a simple modification to grid-based models by training model heads at different spatial grid resolutions. At render time, we simply use coarser grids to render samples that cover larger volumes. Our method can be easily applied to existing accelerated NeRF methods and significantly improves rendering quality (reducing error rates by 20-90% across synthetic and unbounded real-world scenes) while incurring minimal performance overhead (as each model head is quick to evaluate). Compared to Mip-NeRF, we reduce error rates by 20% while training over 60x faster.
+
+## 1 Introduction
+
+Recent advances in neural volumetric rendering techniques, most notably around Neural Radiance Fields  (NeRFs), have lead to significant progress towards photo-realistic novel view synthesis. However, although NeRF provides state-of-the-art rendering quality, it is notoriously slow to train and render due in part to its internal MLP representation. It further assumes that scene content is equidistant from the camera and rendering quality degrades due to aliasing and excessive blurring when that assumption is violated.
+
+Recent methods  accelerate NeRF training and rendering significantly through the use of grid representations. Others, such as Mip-NeRF , address aliasing by projecting camera frustum volumes instead of point-sampling rays. However, these anti-aliasing methods rely on the base NeRF MLP representation (and are thus slow) and are incompatible with grid representations due to their reliance on non-grid-based inputs.
+
+Inspired by divide-and-conquer NeRF extensions  and classical approaches such as Gaussian pyramids  and mipmaps , we propose a simple approach that can easily be applied to any existing accelerated NeRF implementation. We train a pyramid of models at different scales, sample along camera rays (as in the original NeRF), and simply query coarser levels of the pyramid for samples that cover larger volumes (similar to voxel cone tracing ). Our method is simple to implement and significantly improves the rendering quality of fast rendering approaches with minimal performance overhead.
+
+**Contribution:** Our primary contribution is a partitioning method that can be easily adapted to any existing grid-rendering approach. We present state-of-the-art reconstruction results against a wide range of datasets, including on novel scenes we designed that explicitly target common aliasing patterns. We evaluate different posssible architectures and demonstrate that our design choices provide a high level of visual fidelity while maintaining the rendering speed of fast NeRF approaches.
+
+## 2 Related Work
+
+The now-seminal Neural Radiance Fields (NeRF) paper  inspired a vast corpus of follow-up work. We discuss a non-exhaustive list of such approaches along axes relevant to our work.
+
+**Grid-based methods.** The original NeRF took 1-2 days to train, with extensions for unbounded scenes [3; 40] taking longer. Once trained, rendering takes seconds per frame and is far below interactive thresholds. NSVF  combines NeRF's implicit representation with a voxel octree that allows for empty-space skipping and improves inference speeds by 10x. Follow-up works [10; 11; 39] further improve rendering to interactive speeds by storing precomputed model outputs into auxiliary grid structures that bypass the need to query the original model altogether at render time. Plenoxels  and DVGO  accelerate both training and rendering by directly optimizing a voxel grid instead of an MLP to train in minutes or even seconds. TensoRF  and K-Planes  instead use the product of low-rank tensors to approximate the voxel grid and reduce memory usage, while Instant-NGP  (iNGP) encodes features into a multi-resolution hash table. The main goal of our work is to combine the speed benefits of grid-based methods with an approach that maintains quality across different rendering scales.
+
+Figure 1: **Comparison of methods.****(a)** NeRF traces a ray from the camera’s center of projection through each pixel and samples points \(\) along each ray. Sample locations are then encoded with a positional encoding to produce a feature \(()\) that is fed into an MLP. **(b)** Mip-NeRF instead reasons about _volumes_ by defining a 3D conical frustum per camera pixel. It splits the frustum into sampled volumes, approximates them as multivariate Gaussians, and computes the integral of the positional encodings of the coordinates contained within the Gaussians. Similar to NeRF, these features are then fed into an MLP. **(c)** Accelerated grid methods, such as iNGP, sample points as in NeRF, but do not use positional encoding and instead featurize each point by interpolating between vertices in a feature grid. These features are then passed into a much smaller MLP, which greatly accelerates training and rendering. **(d)** PyNeRF also uses feature grids, but reasons about volumes by training separate models at different scales (similar to a mipmap). It calculates the area covered by each sample in world coordinates, queries the models at the closest corresponding resolutions, and interpolates their outputs.
+
+**Divide-and-conquer.** Several works note the diminishing returns in using large networks to represent scene content, and instead render the area of interest with multiple smaller models. DeRF  and KiloNeRF  focus on inference speed while Mega-NeRF , Block-NeRF , and SUDS  use scene decomposition to efficiently train city-scale neural representations. Our method is similar in philosophy, although we partition across different resolutions instead of geographical area.
+
+**Aliasing.** The original NeRF assumes that scene content is captured at roughly equidistant camera distances and emits blurry renderings when the assumption is violated. Mip-NeRF  reasons about the volume covered by each camera ray and proposes an integrated positional encoding that alleviates aliasing. Mip-NeRF 360  extends the base method to unbounded scenes. Exact-NeRF  derives a more precise integration formula that better reconstructs far-away scene content. Bungee-NeRF  leverages Mip-NeRF and further adopts a coarse-to-fine training approach with residual blocks to train on large-scale scenes with viewpoint variation. LIRF  proposes a multiscale image-based representation that can generalize across scenes. The methods all build upon the original NeRF MLP model and do not readily translate to accelerated grid-based methods.
+
+**Concurrent work.** Several contemporary efforts explore the intersection of anti-aliasing and fast rendering. Zip-NeRF  combines a hash table representation with a multi-sampling method that approximates the true integral of features contained within each camera ray's view frustum. Although it trains faster than Mip-NeRF, it is explicitly not designed for fast rendering as the multi-sampling adds significant overhead. Mip-VoG  downsamples and blurs a voxel grid according to the volume of each sample in world coordinates. We compare their reported numbers to ours in Section 4.2. Tri-MipRF  uses a similar prefiltering approach, but with triplanes instead of a 3D voxel grid.
+
+**Classical methods.** Similar to PyNeRF, classic image processing methods, such as Gaussian  and Laplacian  hierarchy, maintain a coarse-to-fine pyramid of different images at different resolutions. Compared to Mip-NeRF, which attempts to learn a single MLP model across all scales, one could argue that our work demonstrates that the classic pyramid approach can be efficiently adapted to neural volumetric models. In addition, our ray sampling method is similar to Crassin et al.'s approach , which approximates cone tracing by sampling along camera rays and querying different mipmap levels according the spatial footprint of each sample (stored as a voxel octree in their approach and as a NeRF model in ours).
+
+Figure 2: We visualize renderings from a pyramid of spatial grid-based NeRFs trained for different voxel resolutions. Models at finer pyramid levels tend to capture finer content.
+
+## 3 Approach
+
+### Preliminaries
+
+**NeRF.** NeRF  represents a scene within a continuous volumetric radiance field that captures geometry and view-dependent appearance. It encodes the scene within the weights of a multi-layer perceptron (MLP). At render time, NeRF casts a camera ray \(\) for each image pixel. NeRF samples multiple positions \(_{i}\) along each ray and queries the MLP at each position (along with the ray viewing direction \(\)) to obtain density and color values \(_{i}\) and \(_{i}\). To better capture high-frequency details, NeRF maps \(_{i}\) and \(\) through an \(L\)-dimensional positional encoding (PE) \((x)=[(2^{0} x),(2^{0} x),,(2^{L} x),(2^{L}  x)]\) instead of directly using them as MLP inputs. It then composites a single color prediction \(()\) per ray using numerical quadrature \(_{i=0}^{N-1}T_{i}(1-(-_{i}_{i}))\,c_{i}\), where \(T_{i}=(-_{j=0}^{i-1}_{j}_{j})\) and \(_{i}\) is the distance between samples. The training process optimizes the model by sampling batches \(\) of image pixels and minimizing the loss \(_{}\|()-() \|^{2}\). We refer the reader to Mildenhall et al.  for details.
+
+**Anti-aliasing.** The original NeRF suffers from aliasing artifacts when reconstructing scene content observed at different distances or resolutions due to its reliance on point-sampled features. As these features ignore the volume viewed by each ray, different cameras viewing the same position from different distances may produce the same ambiguous feature. Mip-NeRF  and variants instead reason about _volumes_ by defining a 3D conical frustum per camera pixel. It featurizes intervals within the frustum with a integrated positional encoding (IPE) that approximates each frustum as a multivariate Gaussian to estimate the integral \([(x)]\) over the PEs of the coordinates within it.
+
+**Grid-based acceleration.** Various methods [6; 9; 20; 25; 26] eschew NeRF's positional encoding and instead store learned features into a grid-based structure, e.g. implemented as an explicit voxel grid, hash table, or a collection of low-rank tensors. The features are interpolated based on the position of each sample and then passed into a hard-coded function or much smaller MLP to produce density and color, thereby accelerating training and rendering by orders of magnitude. However, these approaches all use the same volume-insensitive point sampling of the original NeRF and do not have a straightforward analogy to Mip-NeRF's IPE as they no longer use positional encoding.
+
+### Multiscale sampling
+
+Assume that each sample \(\) (where we drop the \(i\) index to reduce notational clutter) is associated with an integration volume. Intuitively, samples close to a camera correspond to small volumes, while samples far away from a camera correspond to large volumes (Figure 3). Our crucial insight for enabling multiscale sampling with grid-based approaches is remarkably simple: _we train separate NeRFs at different voxel resolutions and simply use coarser NeRFs for samples covering larger volumes_. Specifically, we define a hierarchy of \(L\) resolutions that divide the world into voxels of length \(1/N_{0},...,1/N_{L-1}\), where \(N_{l+1}=sN_{l}\) and \(s\) is a constant scaling factor. We also define a function \(f_{l}(,)\) at each level that maps from sample location \(\) and viewing direction \(\) to color \(\) and density \(\). \(f_{l}\) can be implemented by any grid-based NeRF; in our experiments, we use a
+
+Figure 3: **Overview.****(a)** We sample frustums along the camera ray corresponding to each pixel and derive the scale of each sample according to its width in world coordinates. (**b**) We query the model heads closest to the scale of each sample. (**c**) We derive a single color and density value for each sample by interpolating between model outputs according to scale.
+
+hash table followed by small density and color MLPs, similar to iNGP. We further define a mapping function \(M\) that assigns the integration volume of sample \(\) to the hierarchy level \(l\). We explore different alternatives, but find that selecting the level whose voxels project to the 2D pixel area \(P()\) used to define the integration volume works well:
+
+\[M(P())=_{s}(P()/N_{0})\] (1) \[l=(L-1,(0, M(P())))\] (2) \[,=f_{l}(,),\] **[GaussPyNeRF]** (3)
+
+where \(\) is the ceiling function. Such a model can be seen as a (Gaussian) pyramid of spatial grid-based NeRFs (Fig. 2). If the final density and color were obtained by _summing_ across different pyramid levels, the resulting levels would learn to specialize to residual or "band-pass" frequencies (as in a 3D Laplacian pyramid ):
+
+\[,=_{i=0}^{l}f_{i}(,).\] **[LaplacianPyNeRF]** (4)
+
+Our experiments show that such a representation is performant, but expensive since it requires \(l\) model evaluations per sample. Instead, we find a good tradeoff is to linearly interpolate between two model evaluations at the levels just larger than and smaller than the target integration volume:
+
+\[,=wf_{l}(,)+(1-w)f_{l-1}(, ),\] where \[w=l-M(P()).\] **(Default) [PyNeRF]** (5)
+
+This adds the cost of only a _single_ additional evaluation (increasing the overall rendering time from 0.0045 to 0.005 ms per pixel) while maintaining rendering quality (see Section 4.6). Our algorithm is summarized in Algorithm 1.
+
+```
+0:\(m\) rays \(\), \(L\) pyramid levels, hierarchy mapping function \(M\), base resolution \(N_{0}\), scaling factor \(s\)
+0:\(m\) estimated colors \(\) \(,,P() sample()\)\(\) Sample points \(\) along each ray with direction \(\) and area \(P()\)\(M(P())_{s}(P()/N_{0})\)\(\) Equation 1 \(l(L-1,(0, M(P())))\)\(\) Equation 2 \(w l-M(P())\)\(\) Equation 5 \(model\_out zeros(len())\)\(\) Zero-initialize model outputs for each sample \(\) for\(i\) in unique(\(l\))do\(\) Iterate over sample levels \(model\_out[l=i]\)\(+=w[l=i]f_{i}([l=i],[l=i])\)\(model\_out[l=i]\)\(+=(1-w)[l=i]f_{i-1}([l=i],[l=i])\) endfor c\( composite(model\_out)\)\(\) Composite model outputs into per-ray color \(\) return\(\) ```
+
+**Algorithm 1** PyNeRF rendering function
+
+**Matching areas vs volumes.** One might suspect it may be better to select the voxel level \(l\) whose volume best matches the sample's 3D integration volume. We experimented with this, but found it more effective to match the projected 2D pixel area rather than volumes. Note that both approaches would produce identical results if the 3D volume was always a cube, but volumes may be elongated along the ray depending on the sampling pattern. Matching areas is preferable because most visible 3D scenes consist of empty space and surfaces, implying that when computing the composite color for a ray \(r\), most of the contribution will come from a few samples \(\) lying near the surface of intersection. When considering the target 3D integration volume associated with \(\), most of the contribution to the final composite color will come from integrating along the 2D surface (since the rest of the 3D volume is either empty or hidden). This loosely suggests we should select levels of the voxel hierarchy based on (projected) area rather than volume.
+
+**Hierarchical grid structures.** Our method can be applied to any accelerated grid method irrespective of the underlying storage. However, a drawback of this approach is an increased on-disk serialization footprint due to training a hierarchy of spatial grid NeRFs. A possible solution is to exploit hierarchical grid structures that already exist _within_ the base NeRF. Note that multi-resolution grids such as those used by iNGP  or K-Planes  already define a scale hierarchy that is a natural fit for PyNeRF. Rather than learning a separate feature grid for each model in our pyramid, we can reuse the same multi-resolution features across levels (while still training different MLP heads).
+
+**Multi-resolution pixel input.** One added benefit of the above is that one can train with multiscale training data, which is particularly helpful for learning large, city-scale NeRFs [27; 30; 31; 36; 38]. For such scenarios, even storing high-resolution pixel imagery may be cumbersome. In our formulation, one can store low-resolution images and quickly train a coarse scene representation. The benefits are multiple. Firstly, divide-and-conquer approaches such as Mega-NeRF  partition large scenes into smaller cells and train using different training pixel/ray subsets for each (to avoid training on irrelevant data). However, in the absence of depth sensors or a priori 3D scene knowledge, Mega-NeRF is limited in its ability to prune irrelevant pixels/rays (due to intervening occluders) which empirically bloat the size of each training partition by \(2\). With our approach, we can learn a coarse 3D knowledge of the scene on downsampled images and then filter higher-resolution data partitions more efficiently. Once trained, lower-resolution levels can also serve as an efficient initialization for finer layers. In addition, many contemporary NeRF methods use occupancy grids  or proposal networks  to generate refined samples near surfaces. We can quickly train these along with our initial low-resolution model and then use them to train higher-resolution levels in a sample-efficient manner. We show in our experiments that such course-to-fine multiscale training can speed up convergence (Section 4.5).
+
+**Unsupervised levels.** A naive implementation of our method will degrade when zooming in and out of areas that have not been seen at training time. Our implementation mitigates this by maintaining an auxiliary data structure (similar to an occupancy grid ) that tracks the coarsest and finest levels queried in each region during training. We then use the structure at inference time to only query levels that were supervised during training.
+
+## 4 Experiments
+
+We first evaluate PyNeRF's performance by measuring its reconstruction quality on bounded synthetic (Section 4.2) and unbounded real-world (Section 4.3) scenes. We demonstrate PyNeRF's generalizability by evaluating it on additional NeRF backbones (Section 4.4) and then explore the convergence benefits of using multiscale training data in city-scale reconstruction scenarios (Section 4.5). We ablate our design decisions in Section 4.6.
+
+### Experimental Setup
+
+**Training.** We implement PyNeRF on top of the Nerfstudio library  and train on each scene with 8,192 rays per batch by default for 20,000 iterations on the Multiscale Blender and Mip-NeRF 360 datasets, and 50,000 iterations on the Boat dataset and Blender-A. We train a hierarchy of 8 PyNeRF levels backed by a single multi-resolution hash table similar to that used by iNGP  in Section 4.2 and Section 4.3 before evaluating additional backbones in Section 4.4. We use 4 features per level with a hash table size of \(2^{20}\) by default, which we found to give the best quality-performance trade-off on the A100 GPUs we use in our experiments. Each PyNeRF uses a 64-channel density MLP with one hidden layer followed by a 128-channel color MLP with two hidden layers. We use similar model capacities in our baselines for fairness. We sample rays using an occupancy
+
+    &  &  \\  & \(\)PSNR & \(\)SSIM & \(\)IPIPS & \(\)Avg Error & \(\)Train Time (h) & \(\)PSNR & \(\)SSIM & \(\)IPIPS & \(\)Avg Error & \(\)Train Time (h) \\  Premoels  & 24.98 & 0.843 & 0.161 & 0.080 & 0.28 & 18.13 & 0.511 & 0.523 & 0.190 & **0.40** \\ K-Planes  & 29.88 & 0.946 & 0.058 & 0.022 & 0.32 & 21.17 & 0.593 & 0.641 & 0.405 & 1:22 \\ TensorRF  & 30.04 & 0.948 & 0.056 & 0.021 & 0.27 & 27.01 & 0.785 & 0.197 & 0.054 & 1:20 \\ iNGP  & 30.21 & 0.958 & 0.040 & 0.022 & **0.20** & 20.85 & 0.767 & 0.244 & 0.089 & 0.56 \\ Nerfato  & 29.56 & 0.947 & 0.051 & 0.022 & 0.25 & 27.46 & 0.796 & 0.195 & 0.053 & 1:07 \\ Mip-NeRF  & 30.42 & 0.954 & 0.053 & — & — & — & — & — & — & — \\ Mip-NeRF  & 34.50 & 0.974 & 0.017 & 0.009 & 29-49 & 31.33 & 0.894 & 0.098 & 0.063 & 30:12 \\  PyNeRF & **34.78** & **0.976** & **0.015** & **0.008** & 0.25 & **41.99** & **0.986** & **0.007** & **0.004** & 1:10 \\   
+
+Table 1: **Synthetic results.** PyNeRF outperforms all baselines and trains over 60\(\) faster than Mip-NeRF. Both PyNeRF and Mip-NeRF properly reconstruct the brick wall in the Blender-A dataset, but Mip-NeRF fails to accurately reconstruct checkerboard patterns.
+
+grid  on the Multiscale Blender dataset, and with a proposal network  on all others. We use gradient scaling  to improve training stability in scenes with that capture content at close distance (Blender-A and Boat). We parameterize unbounded scenes with Mip-NeRF 360's contraction method.
+
+**Metrics.** We report quantitative results based on PSNR, SSIM , and the AlexNet implementation of LPIPS , along with the training time in hours as measured on a single A100 GPU. For ease of comparison, we also report the "average" error metric proposed by Mip-NeRF  composed of the geometric mean of \(=10^{-/10}\), \(}\), and LPIPS.
+
+### Synthetic Reconstruction
+
+**Datasets.** We evaluate PyNeRF on the Multiscale Blender dataset proposed by Mip-NeRF along with our own Blender scenes (which we name "Blender-A") intended to further probe the anti-aliasing ability of our approach (by reconstructing a slanted checkerboard and zooming into a brick wall).
+
+**Baselines.** We compare PyNeRF to several fast-rendering approaches, namely Instant-NGP  and Nerfacto , which store features within a multi-resolution hash table, Plenoxels  which optimizes an explicit voxel grid, and TensoRF  and K-Planes , which rely on low-rank tensor decomposition. We also compare our Multiscale Blender results to those reported by Mip-VoG , a contemporary fast anti-aliasing approach, and to Mip-NeRF  on both datasets.
+
+**Results.** We summarize our results in Table 1 and show qualitative examples in Figure 4. PyNeRF outperforms all fast rendering approaches as well as Mip-VoG by a wide margin and is slightly better than Mip-NeRF on Multiscale Blender while training over 60\(\) faster. Both PyNeRF and Mip-NeRF properly reconstruct the brick wall in the Blender-A dataset, but Mip-NeRF fails to accurately reconstruct checkerboard patterns.
+
+### Real-World Reconstruction
+
+**Datasets.** We evaluate PyNeRF on the Boat scene of the ADOP  dataset, which to our knowledge is one of the only publicly available unbounded real-world captures that captures its primary object of
+
+Figure 4: **Synthetic results.** PyNeRF and Mip-NeRF provide comparable results on the first three scenes that are crisper than those of the other fast renderers. Mip-NeRF does not accurately render the tiles in the last row while PyNeRF recreates them near-perfectly.
+
+interest from different camera distances. For further comparison, we construct a multiscale version of the outdoor scenes in the Mip-NeRF 360  dataset using the same protocol as Multiscale Blender .
+
+**Baselines.** We compare PyNeRF to the same fast-rendering approaches as in Section 4.2, along with two unbounded Mip-NeRF variants: Mip-NeRF 360  and Exact-NeRF . We report numbers on each variant with and without generative latent optimization  to account for lighting changes.
+
+**Results.** We summarize our results in Table 2 along with qualitative results in Figure 5. Once again, PyNeRF outperforms all baselines, trains 40x faster than Mip-NeRF 360, and 100x faster than Exact-NeRF (the next best alternatives).
+
+### Additional Backbones
+
+**Methods.** We demonstrate how PyNeRF can be applied to any grid-based NeRF method by evaluating it with K-Planes  and TensoRF  in addition to our default iNGP-based implementatino. We take advantage of the inherent multi-resolution structure of iNGP and K-Planes by reusing the same feature grid across PyNeRF levels and train a separate feature grid per level in our TensoRF variant.
+
+**Results.** We train the PyNeRF variants along with their backbones across the datasets described in Section 4.2 and Section 4.3, and summarize the results in Table 3. All PyNeRF variants show clear improvements over their base methods.
+
+### City-Scale Convergence
+
+**Dataset.** We evaluate PyNeRF's convergence properties on the the Argoverse 2  Sensor dataset (to our knowledge, the largest city-scale dataset publicly available). We select the largest overlapping subset of logs and filter out moving objects through a pretrained segmentation model . The resulting training set contains 400 billion rays across 150K video frames.
+
+**Methods.** We use SUDS  as the backbone model in our experiments. We begin training our method on 8x downsampled images (containing 64x fewer rays) for 5,000 iterations and then on
+
+    &  &  \\   & PSNR & SSIM & LPIPS & \(\)Avg Error & \(\)Train Time (h) & \(\)PSNR & \(\)ISSM & \(\)LPIPS & \(\)Avg Error & \(\)Train Time (h) \\  Plenecks  & 17.05 & 0.505 & 0.617 & 0.185 & 2.14 & 21.58 & 0.606 & 0.524 & 0.117 & 1.00 \\ K-Planes  & 18.00 & 0.501 & 0.590 & 0.168 & 2.41 & 21.53 & 0.577 & 0.500 & 0.120 & 1.06 \\ TensorRF  & 14.75 & 0.398 & 0.630 & 0.234 & 2.30 & 18.07 & 0.439 & 0.677 & 0.181 & 1.07 \\ inSOF  & 15.34 & 0.433 & 0.646 & 0.222 & **1.42** & 21.14 & 0.568 & 0.521 & 0.126 & **0.40** \\ Merfcas  & 19.27 & 0.570 & 0.425 & 0.135 & 2.12 & 22.47 & 0.616 & 0.431 & 0.105 & 1.02 \\ Mip-NeRF 360 w/ GLO  & 20.03 & 0.595 & **0.416** & 0.124 & 37.28 & 22.76 & **0.664** & **0.342** & 0.095 & 37.35 \\ Mip-NeRF 360 w/ GLO  & 15.92 & 0.480 & 0.501 & 0.194 & 37.10 & 22.70 & **0.664** & **0.342** & 0.095 & 37.22 \\ Exact-NeRF 9 GLO  & 20.21 & **0.601** & 0.425 & 0.123 & 109.11 & 21.40 & 0.619 & 0.416 & 0.121 & 110.06 \\ Exact-NeRF 9 GLO  & 16.33 & 0.489 & 0.510 & 0.187 & 107.52 & 22.56 & 0.619 & 0.410 & 0.121 & 108.11 \\  PyNeRF & **20.43** & **0.601** & 0.422 & **0.121** & 2.12 & **23.09** & 0.654 & 0.358 & **0.094** & 1.00 \\   
+
+Table 2: **Real-world results.** PyNeRF outperforms all baselines in PSNR and average error, and trains 40x faster than Mip-NeRF 360 and 100x faster than Exact-NeRF (the next best methods).
+
+Figure 5: **Real-world results.** PyNeRF reconstructs higher-fidelity details (such as the spokes on the bicycle and the lettering within the boat) than other methods.
+
+[MISSING_PAGE_FAIL:9]
+
+## 5 Limitations
+
+Although our method generalizes to any grid-based method (Section 4.4), it requires a larger on-disk serialization footprint due to training a hierarchy of spatial grid NeRFs. This can be mitigated by reusing the same feature grid when the underlying backbone uses a multi-resolution feature grid [9; 20], but this is not true of all methods [6; 25].
+
+## 6 Societal Impact
+
+Our method facilitates the rapid construction of high-quality neural representations in a resource efficient manner. As such, the risks inherent to our work is similar to those of other neural rendering papers, namely privacy and security concerns related to the intentional or inadvertent capture or privacy-sensitive information such as human faces and vehicle license plate numbers. While we did not apply our approach to data with privacy or security concerns, there is a risk, similar to other neural rendering approaches, that such data could end up in the trained model if the employed datasets are not properly filtered before use. Many recent approaches [15; 16; 29; 31; 42] distill semantics into NeRF's representation, which may be used to filter out sensitive information at render time. However this information would still reside in the model itself. This could in turn be mitigated by preprocessing the input data used to train the model .
+
+## 7 Conclusion
+
+We propose a method that significantly improves the anti-aliasing properties of fast volumetric renderers. Our approach can be easily applied to any existing grid-based NeRF, and although simple, provides state-of-the-art reconstruction results against a wide variety of datasets (while training 60-100\(\) faster than existing anti-aliasing methods). We propose several synthetic scenes that model common aliasing patterns as few existing NeRF datasets cover these scenarios in practice. Creating and sharing additional real-world captures would likely facilitate further research.
+
+**Acknowledgements.** HT and DR were supported in part by the Intelligence Advanced Research Projects Activity (IARPA) via Department of Interior/ Interior Business Center (DOI/IBC) contract number 140D0423C0074. The U.S. Government is authorized to reproduce and distribute reprints for Governmental purposes notwithstanding any copyright annotation thereon. Disclaimer: The views and conclusions contained herein are those of the authors and should not be interpreted as necessarily representing the official policies or endorsements, either expressed or implied, of IARPA, DOI/IBC, or the U.S. Government.
+
+   Method & Our Interp. & Shared & 2D Features & \(\)PSNR & \(\)SSIM & \(\)LPIPS & \(\) Avg Error & \(\) Train Time (h) \\  GaussPyNeRF (Eq. 3) & ✗ & ✓ & ✓ & 28.72 & 0.803 & 0.201 & 0.056 & **0.43** \\ LaplacianPyNeRF (Eq. 4) & ✗ & ✓ & ✓ & **29.48** & **0.813** & **0.190** & **0.052** & 2:44 \\ Feature grid interpolation & ✗ & ✗ & ✓ & 28.45 & 0.767 & 0.244 & 0.070 & 0.46 \\ Separate hash tables & ✓ & ✗ & ✓ & 29.41 & **0.813** & 0.196 & 0.054 & 0:52 \\ Levels w/ 3D Volumes & ✓ & ✓ & ✗ & 29.19 & 0.811 & 0.184 & 0.054 & 0:48 \\  PyNeRF & ✓ & ✓ & ✓ & 29.44 & 0.812 & 0.191 & 0.053 & 0:48 \\   
+
+Table 5: **Diagnostics.** The rendering quality of our interpolation method is near-identical to the full residual approach while training 3\(\) faster, and is significantly better than other alternatives. Reusing the same feature grid across levels performs comparably to storing separate hash tables per level while training faster.

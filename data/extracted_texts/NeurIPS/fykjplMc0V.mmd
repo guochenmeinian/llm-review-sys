@@ -1,0 +1,192 @@
+# ReFT: Representation Finetuning
+
+for Language Models
+
+ Zhengxuan Wu\({}^{*}\)\({}^{}\) Aryaman Arora\({}^{*}\)\({}^{}\) Zheng Wang\({}^{}\) Atticus Geiger\({}^{}\)
+
+Dan Jurafsky\({}^{}\) Christopher D. Manning\({}^{}\) Christopher Potts\({}^{}\)
+
+\({}^{}\)Stanford University \({}^{}\)Pr(Ai)\({}^{2}\)R Group
+
+{wuzhengbx,aryamana,peterwz,atticusg}@stanford.edu
+
+{jurafsky,manning,cgpotts}@stanford.edu
+
+###### Abstract
+
+Parameter-efficient finetuning (PEFT) methods seek to adapt large neural models via updates to a small number of _weights_. However, much prior interpretability work has shown that _representations_ encode rich semantic information, suggesting that editing representations might be a more powerful alternative. We pursue this hypothesis by developing a family of **Representation Finetuning (ReFT)** methods. ReFT methods operate on a frozen base model and learn task-specific interventions on hidden representations. We define a strong instance of the ReFT family, Low-rank Linear Subspace ReFT (LoReFT), and we identify an ablation of this method that trades some performance for increased efficiency. Both are drop-in replacements for existing PEFTs and learn interventions that are 15\(\)-65\(\) more parameter-efficient than LoRA. We showcase LoReFT on eight commonsense reasoning tasks, four arithmetic reasoning tasks, instruction-tuning, and GLUE. In all these evaluations, our ReFTs deliver the best balance of efficiency and performance, and almost always outperform state-of-the-art PEFTs. We release a generic ReFT training library publicly at https://github.com/stanfordnlp/pyreft.
+
+## 1 Introduction
+
+Pretrained language models (LMs) are frequently finetuned to adapt them to new domains or tasks . With finetuning, a single base model can be adapted to a variety of tasks given only small amounts of in-domain data. However, finetuning large LMs is expensive. Parameter-efficient finetuning (PEFT) methods propose to address the high costs of full finetuning by updating a small number of weights. This reduces memory usage and training time, and PEFTs achieve similar performance to full finetuning in many settings .
+
+A hallmark of current state-of-the-art PEFTs is that they modify _weights_ rather than _representations_. However, much prior interpretability work has shown that representations encode rich semantic information, suggesting that editing representations might be a more powerful alternative to weight updates. In this paper, we pursue this hypothesis by developing and motivating **Representation Finetuning (ReFT)**. Instead of adapting model weights, ReFT methods train interventions that manipulate a small fraction of model representations in order to steer model behaviours to solve downstream tasks at inference time. ReFT methods are drop-in replacements for weight-based PEFTs. This approach is inspired by recent work in LM interpretability that intervenes on representations to find faithful causal mechanisms  and to steer model behaviours at inference time , and it can be seen as a generalisation of the representation-editing work of Wu et al. , Turner et al. , and Zou et al.  (see appendix B for details).
+
+We focus on a strong and highly efficient instance of the ReFT family that we call **Low-rank Linear Subspace ReFT (LoReFT)**. LoReFT is a parametrisation of ReFT that intervenes on hiddenrepresentations in the linear subspace spanned by a low-rank projection matrix, building directly on the distributed alignment search (DAS) method of Geiger et al. (2023) and Wu et al. (2023). We also identify an ablation of this method (DiReFT) that trades some performance for increased efficiency. We evaluate our ReFTs on LLaMA-family models and small-scale LMs against existing PEFTs on standard benchmarks from four domains: commonsense reasoning, arithmetic reasoning, instruction-following, and natural language understanding. Compared to LoRA, we find that LoReFT uses 15x-65x times fewer parameters while achieving state-of-the-art performance on commonsense reasoning, instruction-following, and natural language understanding against the strongest PEFTs. These findings indicate that ReFT methods are worthy of further exploration, as they may emerge as more efficient and effective alternatives to weight-based PEFTs.
+
+## 2 Related work
+
+**Parameter-efficient finetuning methods (PEFTs).** PEFTs train a fraction of the model's parameters to adapt it to downstream tasks. We classify PEFTs into three categories:
+
+1. **Adapter-based methods** train additional modules (e.g. fully-connected layers) on top of the frozen pretrained model. _Series adapters_ insert components between LM attention or MLP layers (Houlsby et al., 2019; Pfeiffer et al., 2020; Wang et al., 2022; He et al., 2022; Fu et al., 2021), while _parallel adapters_ add modules alongside existing components (He et al., 2022). Since adapters add new components that cannot be easily folded into existing model weights, they impose an additional burden at inference time.1 2. **LoRA**[Hu et al., 2022] and DoRA (Liu et al., 2024) use low-rank matrices to approximate additive weight updates during training, and require no additional overhead during inference since the weight updates can be merged into the model. These are the strongest PEFTs currently.2
+3. **Prompt-based methods** add randomly-initialised soft tokens to the input (usually as a prefix) and train their embeddings while keeping the LM weights frozen (Li and Liang, 2021). These methods are often far from optimal compared to other PEFTs, and come at the cost of significant
+
+Figure 1: Parameter count vs. performance for LoReFT and other PEFTs across four benchmarks when applied to LLaMA, Llama-2, Llama-3, and RoBERTa models. Despite training far fewer parameters than existing PEFTs, LoReFT achieves competitive or even state-of-the-art performance on all tasks. Its value is most apparent for the largest models in our evaluations. **Note**: FT is full-parameter finetuning, which is not a PEFT or ReFT method. Additional results are in section 4.
+
+inference overhead. A variant of this method where hidden-layer activations are also tuned was introduced as a baseline in Hu et al. (2022), with better performance.
+
+Representation editing.Recent work on _activation steering_ and _representation engineering_ shows that adding fixed or task-specific steering vectors (Subramani et al., 2022; Turner et al., 2023; Zou et al., 2023; Liu et al., 2024; Vogel, 2024; Li et al., 2024) or applying concept erasure (Ravfogel et al., 2022; Belrose et al., 2023; Avitan et al., 2024; Singh et al., 2024) to the residual stream can enable a degree of control over pretrained LM generations without the need for resource-intensive finetuning (Wu et al., 2024). The success of these methods affirms that representations induced by pretrained LMs carry rich semantic structure.
+
+Interventional interpretability.Much recent work has used interventions on model-internal states to test hypotheses about how LMs implement various behaviours. In particular, interventions on linear subspaces of representations have provided increasing evidence that human-interpretable concepts are encoded linearly (Smolensky, 1986; Rumelhart et al., 1986; McClelland et al., 1986). This includes linguistic features such as gender and number (Lasri et al., 2022; Wang et al., 2023; Hanna et al., 2023; Chintam et al., 2023; Yamakoshi et al., 2023; Hao and Linzen, 2023; Chen et al., 2023; Amini et al., 2023; Guerner et al., 2023; Arora et al., 2024), logical and mathematical reasoning (Wu et al., 2023), entity attributes (Huang et al., 2024), and a number of other domains (Mikolov et al., 2013; Elhage et al., 2022; Park et al., 2023; Nanda et al., 2023; Guerner et al., 2023).
+
+## 3 ReFT
+
+We now define the ReFT family of methods. To do this, we first summarize the core motivation, which emerges from work on intervention-based model interpretability. We then show how this leads directly to Low-rank Linear Subspace ReFT (LoReFT). Finally, we generalize this to a family of ReFT methods. Appendix A provides a brief overview of our generic ReFT training library.
+
+To keep the presentation simple, we assume throughout that our target model is a Transformer-based (Vaswani et al., 2017) LM that produces contextualised representations of sequences of tokens. Given a sequence of \(n\) input tokens \(=(x_{1},,x_{n})\), the model first embeds these into a list of representations \(^{(0)}=(^{(0)}_{1},,^{(0)}_{n})\). Then, \(m\) layers successively compute the \(j\)-th list of hidden representations \(^{(j)}\) as a function of the previous list of hidden representations \(^{(j-1)}\). Each hidden representation is a vector \(^{d}\). The LM uses the final hidden representations \(^{(m)}\) to produce its predictions. In our experiments, we consider both autoregressive LMs and masked LMs (Devlin et al., 2019). An autoregressive LM predicts \(p(x_{n+1} x_{1},,x_{n})=(^{(m )}_{n})\), while a masked LM predicts \(p(x_{i} x_{1},,x_{i-1},x_{i+1},,x_{n})= (^{(m)}_{i})\), where \(\) is a learned matrix mapping from representations to logits over the vocabulary space.
+
+### Motivation
+
+In interpretability research, the framework of causal abstraction (Geiger et al., 2021) uses **interchange interventions** to establish the causal role of representations in deep learning models. An interchange intervention fixes a representation to the value it would take if a counterfactual input were processed by the model. Experiments investigating how such interventions affect model behavior form the evidence for claims about the causal role of a representation and the concept it encodes.
+
+To test whether a concept is encoded in a linear subspace of a representation, one may use a **distributed interchange intervention** (DII) (Geiger et al., 2023).3 Let \(_{b}\) be the hidden representation created at row \(i\) and column \(k\) when our model processes input \(b\), and let \(_{s}\) be the corresponding representation when that same model processes input \(s\). A distributed interchange intervention on \(_{b}\) given a counterfactual source representation \(_{s}\) is then defined as
+
+\[_{b},_{s},= +^{}_{s}-_{b} \] (1)
+
+where \(^{r d}\) is a low-rank projection matrix with orthonormal rows, \(d\) is the representation dimensionality, and \(r\) is the dimensionality of the subspace we are intervening on. We learn the subspace \(\) using distributed alignment search (DAS), which finds the subspace that maximises the probability of the expected counterfactual output after intervention (Geiger et al., 2023). DAS is highly expressive, and can effectively localize concepts within model representations (Wu et al., 2023; Arora et al., 2024; Wu et al., 2024; Huang et al., 2024). This suggests that subspace representation interventions could also be a powerful tool for model control.
+
+### Two low-rank ReFT instantiations
+
+**LoReFT.** The formulation of DII in eq.1 immediately suggests a way to control model generations via interventions. The guiding intuition is that we can learn how to perform interventions that steer the model towards predicting our task labels. The resulting method, Low-rank Linear Subspace ReFT (LoReFT), is defined by the following variant of eq.1:
+
+\[_{}()=+^{}(+-)\] (2)
+
+This is identical to eq.1, except we use a _learned projected source_\(=+\). LoReFT thus edits the representation in the \(r\)-dimensional subspace spanned by the rows of \(\) to take on the values obtained from our linear projection \(+\). We depict this operation in fig.2. The learned parameters are \(=\{,,\}\); the parameters of the LM are frozen. As with DII, \(^{r d}\) is a low-rank matrix with orthonormal rows where \(d\) is the hidden-state dimensionality and \(r d\) is the rank of the subspace. We further define a linear projection \(^{r d}\) and bias vector \(^{r}\).
+
+**DiReFT.** In addition, we define an ablation of LoReFT which removes the orthogonality constraint and the difference operation, reducing training time:
+
+\[_{}()=+_{2}^{}( _{1}+)\] (3)
+
+Both \(_{1},_{2}^{r d}\) are low-rank projection matrices. Note that eq.3 resembles LoRA, and thus DiReFT can be thought of as LoRA applied **di**rectly to hidden representations at certain positions.4 Empirical evidence from previous work suggests that adding orthogonal constraints to LoRA weights increases performance (Liu et al., 2024). (Appendix E reports results for additional ablations of LoReFT.)
+
+**Training objective.** We consider both generation tasks using decoder-only or encoder-decoder LMs and classification tasks using encoder-only models with \(m\) layers. The pretrained language model induces a distribution over token sequences \(p()\). We denote the model that results from the ReFT intervention \(\) on \(p()\) as \(p_{}()\) with trainable parameters \(\). To simplify notation, we refer to the hidden representations produced by the LM on input \(\) as \(()\), and those by the intervened LM as \(_{}()\).
+
+For generation tasks, our training objective is language modelling. Given an input sequence \(=(x_{1},,x_{n})\) with \(n\) tokens as the prompt, the goal is to predict the output sequence \(=(y_{1},,y_{k})\)
+
+Figure 2: **Illustration of ReFT. (1) The left panel depicts an intervention \(I\): the intervention function \(\) is applied to hidden representations at positions \(P\) in layer \(l\). (2) The right panel depicts the intervention function used in LoReFT, which finds an edit vector that only modifies the representation in the linear subspace spanned by the rows of \(\). Specifically, we show how a rank-2 LoReFT operates on 3-dimensional hidden representations.**
+
+with \(k\) tokens. We minimise the cross-entropy loss with teacher-forcing over all output positions.
+
+\[_{}\{-_{i=1}^{k} p_{}(y_{i}_{<i})\}\] (4)
+
+For single-label classification tasks, we add a classification head \(H_{}()\) with parameters \(\) that takes the final-layer (i.e., layer \(m\)) representation at the first token (CLS) \(_{1}^{(m)}\) as input and outputs a distribution over classes. \(H\) has the learned parameters \(=\{_{o},_{o},_{d},_{d}\}\).
+
+\[H_{}()=(_{o}(( _{d}_{1}^{(m)}+_{d}))+_{o})\] (5)
+
+We learn the parameters of the head and those of the intervention function \(\). We minimise the cross-entropy loss of the target class \(y\) given input \(\):
+
+\[_{,}\{- H_{}(y_{}())\}\] (6)
+
+### The ReFT family of methods
+
+It is straightforward to generalise the above intervention functions to define a family of intervention-based representation finetuning methods. We first define a general notion of _intervention_, i.e. the modification of hidden representations during the model forward pass:
+
+**Definition 3.1**.: An **intervention**\(I\) is a tuple \(\{,P,l\}\) that encapsulates a single inference-time modification of the representations computed by a Transformer-based LM. The three components of an intervention are (1) the **intervention function**\(:^{d}^{d}\) with learned parameters \(\), (2) a set of **input positions**\(P\{1,,n\}\) that the intervention is applied to, and (3) the **layer**\(l\{1,,m\}\) at which the intervention is applied.
+
+We implement the intervention \(I\) as the following operation that overwrites some representations \(\):
+
+\[^{(l)}((_{p}^{(l)})p P_{p}^{(l)})_{p 1,,n}\] (7)
+
+The intervention is applied immediately after the computation of \(^{(l)}\) and thus affects the representations computed in later layers \(^{(l+1)},,^{(m)}\).
+
+Figure 2 provides a schematic overview of an intervention. A ReFT is then defined as a constrained set of non-overlapping interventions:
+
+**Definition 3.2**.: A **ReFT method** is a set of \(f\) interventions \(=\{I_{1},,I_{f}\}\). We enforce that for any two interventions \(I_{j},I_{k}\) such that they operate on the same layer \(l_{j}=l_{k}\), their intervention positions must be disjoint, i.e. \(P_{j} P_{k}=\). The parameters \((_{1},,_{f})\) of all of the intervention functions are independent.
+
+ReFT is thus a generic framework encompassing interventions on hidden representations during the model forward pass. In appendix B, we show how a variety of existing inference-time intervention methods can be described within this framework.
+
+## 4 Experiments
+
+To evaluate our ReFTs against existing PEFTs, we conduct experiments across four diverse NLP benchmarks covering more than 20 datasets (extensive details on our datasets are in appendix C). Our goal is to provide a rich picture of how LoReFT and DiReFT perform in different scenarios. We experiment with both masked and autoregressive LMs at different scales, ranging from RoBERTbase (Liu et al., 2019) with 125M to LLaMA models (Touvron et al., 2023, 2023) with 13B parameters. We benchmark against existing PEFTs such as prefix-tuning (Li and Liang, 2021), adapter-tuning with both Series Adapters and Parallel Adapters, BitFit (Ben Zaken et al., 2022), RED (Wu et al., 2024), LoRA (Hu et al., 2022), and DoRA (Liu et al., 2024). Our comparisons focus on both performance and parameter efficiency. In our comparisons, we use hyperparameter-tuned scores from previous works when possible. We load our base LMs in torch.bfloat16 to save memory. **All of our experiments are run with a single GPU: NVIDIA A100 40G/80G or RTX 6000**. Examples of raw model generations are in appendix I. The performance results of all baseline methods are adapted from Liu et al. (2024) and represent the best performance achieved after hyperparameter tuning.
+
+### Hyperparameter configuration
+
+For our experiments, we must decide how many interventions to learn and which layers and input positions to apply each one on. We propose learning interventions on a fixed number of \(p\) prefix and \(s\) suffix positions in the prompt. Specifically, we tune four hyperparameters:
+
+1. The number of prefix positions \(p\) to intervene on, i.e. positions \(\{1,,p\}\).
+2. The number of suffix positions \(s\) to intervene on, i.e. positions \(\{n-s+1,,n\}\).
+3. Which set of layers \(L\) to intervene on.
+4. Whether or not to tie intervention parameters \(\) across different positions in the same layer.
+
+This simplifies the hyperparameter search space; compared to LoRA, the only additional consideration is which positions to intervene on. Since the number of positions edited is constant, LoReFT and DiReFT contribute a fixed additional inference cost that does not scale with prompt length.
+
+Given the positions \(P=\{1,,p\}\{n-s+1,,n\}\), we define the untied and tied variants:
+
+\[_{}=\{\{,\{p\},l\} p P,l L\} _{}=\{\{,P,l\} l L\}\]
+
+Additionally, when applying LoReFT and DiReFT to a prompt with length \(n\) where \(n<p+s\), we set \(p(p, n/2)\) and \(s(s, n/2)\) and do not apply the truncated interventions in \(_{}\). We also tune neural-network training hyperparameters.
+
+Unlike previous work (Hu et al., 2022, 2023; Liu et al., 2024c) where hyperparameter tuning may involve optimising performance directly on test sets, we only tune our hyperparameters on development sets which do not contain any overlapping examples with the test sets of our tasks. We further describe hyperparameter tuning for each benchmark in appendix D.1.
+
+### Commonsense reasoning
+
+We replicate the experimental setup in Hu et al. (2023) and finetune LLaMA-1 7B/13B, Llama-2 7B, and Llama-3 8B5 on a combined dataset of eight commonsense reasoning tasks (Commonsense170K). We report scores on each task's test set individually. We compare with PEFTs benchmarked in Hu et al. (2023) as well as the identical experiment reported in Liu et al. (2024c) for DoRA.
+
+**Datasets.** Our benchmark contains eight commonsense reasoning datasets, including BoolQ (Clark et al., 2019), PIQA (Bisk et al., 2020), SIQA (Sap et al., 2019), HellaSwag (Zellers et al., 2019), WinoGrande (Sakaguchi et al., 2021), ARC-e, ARC-c (Clark et al., 2018), and OBQA (Mihaylov et al., 2018). Examples are formulated as multiple-choice problems where the model needs to directly generate the correct choice without rationales. We use the same prompt template as in Hu et al. (2023) with additional string normalisation (removing leading and trailing whitespace).
+
+**Hyperparameter tuning.** We do not do hyperparameter selection based on test set results. Rather, we use the hyperparameter settings of the model that performs best on a development set created from the GSM8K training set, except we use a lower number of epochs (6 instead of 12) because the Commonsense170K training set is more than 20 times larger than GSM8K. This allows us to tune relevant hyperparamters, and also serves to test the robustness of these settings across different domains. We additionally report scores on 3 epochs in appendix D.3.
+
+**Results.** We report results in table 1. LoReFT sets state-of-the-art performance on the commonsense reasoning tasks, outperforming all other methods by a considerable margin. While being more compute-efficient, DiReFT achieves only slightly worse performance consistently.
+
+### Arithmetic reasoning
+
+Similar to the previous experiment, we follow the experimental setup in Hu et al. (2023) and finetune LLaMA-1 7B and 13B on a combined dataset of seven arithmetic reasoning tasks with LM-generated chain-of-thought steps (Math10K) and report scores on four of the tasks' test sets. We only evaluate correctness on the final numeric or multiple-choice answer.
+
+Hyperparameter tuning.We use the same hyperparameter settings as for the Commonsense Reasoning benchmark, but with 12 epochs for training. We also report scores on 3 epochs.
+
+Datasets.Our benchmark contains four datasets for math world problems, including AQuA (Ling et al., 2017), GSM8K (Cobbe et al., 2021), MAWPS (Koncel-Kedziorski et al., 2016), and SVAMP (Patel et al., 2021). Models need to generate chain-of-thought (Wei et al., 2022) before the final answer. We use the same prompt template and hyperparameter settings as in the previous experiment.
+
+Results.We report results in table 2. We find that both LoReFT and DiReFT do not perform as well at arithmetic reasoning tasks compared to LoRA and adapters, but do outperform prefix-tuning. Our results suggest that our ReFTs may have more trouble on chain-of-thought reasoning than the single-step commonsense reasoning tasks due to the length of generations (greater length necessarily reduces the effect of the intervention) and overall greater difficulty of the task. Our results show that our ReFTs perform better with the 13B model than the 7B model, which suggests that our methods scale with model size. Overall, we note that the arithmetic reasoning results show a lot of variation, with no single method emerging as a clear winner across all of them.
+
+### Instruction-following
+
+Base LMs require instruction finetuning to follow human prompts (Ouyang et al., 2022). We follow the experimental setup in Wu et al. (2024) and finetune Llama-2 7B with Ultrafeedback (Cui et al., 2023). We compare against full parameter finetuning, LoRA, and RED. For evaluation, we use Alpaca-Eval v1.0 (Li et al., 2023), which computes the win-rate against text-davinci-003 using GPT-4 as the annotator. We use the same prompt template as in Taori et al. (2023).
+
+Datasets.Ultrafeedback is high-quality instruction dataset where responses are generated via scoring a diverse set of model responses from a list of candidates (e.g. ChatGPT and Bard). The score is calculated as a weighted score of instruction-following, truthfulness, honesty, and helpfulness.
+
+Some of the best 7B and 13B chat-models (e.g. UltraLM-13B (Ding et al., 2023)) are finetuned with Ultrafeedback.
+
+**Hyperparameter tuning.** We do hyperparameter-tuning on the unseen instruction-following dataset Alpaca-52K (Taori et al., 2023) with only LLAMA-7B to prevent test-set hill-climbing. We then use the hyperparameter settings of our best performing model to finetune on Ultrafeedback. For hyperparameter tuning, we use Alpaca-Eval v1.0 with GPT-4 turbo as the annotator for fast turnaround, which also prevents overfitting with GPT-4 as a judge.
+
+**Results.** We report results in table 3. When matched in parameter count to the previous most parameter-efficient PEFT (RED) and trained on Llama-2 7B, LoReFT outperforms all reported finetuning methods (including full finetuning) and achieves a win-rate within 1% of GPT-3.5 Turbo 1106. Furthermore, after halving the parameter count or using only 1/64-th of the data, LoReFT still outperforms other finetuning methods. This result shows that LoReFT can succeed at long-form text generation. DiReFT is again slightly worse than LoReFT but is highly competitive.
+
+    &  &  &  \\   & & & **AQua** & **GSM8K** & **MAWPS** & **SVAMP** & **Avg.** \\   & PreFT\({}^{*}\) & 0.039\% & 14.2 & 24.4 & 63.4 & 38.1 & 35.0 \\  & Adapter\({}^{*}\) & 1.953\% & 15.0 & 33.3 & 77.7 & **52.3** & 44.6 \\  & Adapter\({}^{p*}\) & 3.542\% & 18.1 & 35.3 & **82.4** & 49.6 & 46.4 \\  & LoRA\({}^{*}\) & 0.826\% & 18.9 & **37.5** & 79.0 & 52.1 & **46.9** \\   & **DiReFT (ours)** & 0.031\% & 21.3 & 24.1 & 74.5 & 42.7 & 40.6 \\  & **LoReFT (ours)** & 0.031\% & **21.4** & 26.0 & 76.2 & 46.8 & 42.6 \\   & PreFT\({}^{*}\) & 0.031\% & 15.7 & 31.1 & 66.8 & 41.4 & 38.8 \\  & Adapter\({}^{*}\) & 1.586\% & 22.0 & 44.0 & 78.6 & 50.8 & 48.9 \\   & Adapter\({}^{*}\) & 2.894\% & 20.5 & 43.3 & 81.1 & **55.7** & 50.2 \\   & LoRA\({}^{*}\) & 0.670\% & 18.5 & **47.5** & **83.6** & 54.6 & **51.1** \\    & **DiReFT (ours)** & 0.025\% & 20.5 & 35.8 & 80.8 & 54.8 & 48.0 \\   & **LoReFT (ours)** & 0.025\% & **23.6** & 38.1 & 82.4 & 54.2 & 49.6 \\   
+
+Table 2: Accuracy comparison of LLAMA-1 7B/13B against existing PEFT methods on four arithmetic reasoning datasets. \({}^{*}\)Performance results of all baseline methods are taken from Hu et al. (2023). We report averaged performance of three runs with distinct random seeds for our method.
+
+  
+**Model \& PEFT** & **Params (\%)** & **Win-rate (\(\))** \\  GPT-3.5 Turbo 1106\({}^{}\) & — & 86.30 \\  Llama-2 Chat 13B\({}^{}\) & — & 81.10 \\ Llama-2 Chat 7B\({}^{}\) & — & 71.40 \\ Llama-2 7B \& FT\({}^{*}\) & 100\% & 80.93 \\ Llama-2 7B \& LoRA\({}^{*}\) & 0.1245\% & 81.48 \\ Llama-2 7B \& RED\({}^{*}\) & 0.0039\% & 81.69 \\  Llama-2 7B \& **DiReFT (ours)** & 0.0039\% & 84.85 \\ Llama-2 7B \& **LoReFT (ours)** & 0.0039\% & **85.60** \\ Llama-2 7B \& **LoReFT (ours, half)** & 0.0019\% & 84.12 \\ Llama-2 7B \& **LoReFT (ours, \(IK\))\({}^{}\)** & 0.0039\% & 81.91 \\   
+
+Table 3: Instruction tuning evaluation results for instruction-tuned Llama-2 7B with Alpaca-Eval v1.0. We report averaged performance of two runs with distinct random seeds for our method. _half_ denotes our runs with half of the rank; \(IK\) denotes our runs with a low-resource setting where there is only 1K training examples. \({}^{}\)Performance results of baseline methods are taken from Li et al. (2023). \({}^{*}\)Performance results of baseline methods are taken from Wu et al. (2024). \({}^{}\)**It takes 18 minutes to train our Llama-2 Chat 7B on 1K examples using a single A100 40G GPU with \(\)1MB parameters on disk.**
+
+### Natural language understanding
+
+We evaluate LoReFT on the GLUE benchmark (Wang et al., 2018) against existing PEFTs. We use this set of experiments to show LoReFT works well even with small-scale LMs, and can improve representations for classification tasks and not just text generation. We finetune RoBERTa-base (125M) as well as RoBERTa-large (350M) on GLUE, a sequence classification benchmark for natural language understanding (NLU) which covers domains such as sentiment classification and natural language inference. Details about the GLUE benchmark can be found in its original paper. We follow Wu et al. (2024) for proper evaluation on GLUE validation set: we split the validation set into two sets guarded by a random seed, and we pick the best model with highest in-training validation accuracy to evaluate on the other held-out half for testing accuracy.
+
+Hyperparameter tuning.We tune our hyperparameters for each task separately. which is standard for PEFTs. To avoid overfitting to random seeds, we hyperparameter-tune our models with a constant seed, and report averaged results over that and four additional unseen seeds. We describe hyperparameter tuning experiments in Appendix D.1.
+
+Results.We report results in table 4. LoReFT obtains comparable performance with PEFT methods on both model sizes when parameter matched with RED, the previous most parameter-efficient PEFT for this task. Furthermore, DiReFT achieves worse performance than most of the PEFTs suggesting LoReFT is a better choice when LM is small. Full results with standard deviation is in table 13. We additionally compare against VeRA (Kopiczko et al., 2024) in appendix D.3.
+
+## 5 Limitations
+
+Due to limited resources, we mainly explored the LLaMA-family of models. In future work, we hope to explore the effectiveness of ReFT on other model families as well as vision-language models such as LLaVA (Liu et al., 2024). The capabilities of ReFT have not yet been fully explored due to the large hyperparameter search space; we are interested in automating this search. We provide some initial explorations of LM personalisation with ReFT in a few-shot setting in appendix G.2. We hope to explore why ReFT works, and we provide some of our early explorations focused on memorisation (appendix F.1, appendix F.2). We are also investigating whether learned orthogonal subspaces can be composed together without adaptation. Some encouraging initial findings are in appendix G.1.
+
+## 6 Conclusion
+
+We propose a strong alternative to PEFTs, LoReFT, and we identify an ablation of this method, DiReFT, that trades some performance for increased efficiency. Overall, LoReFT achieves strong per
+
+    &  &  &  \\   & & & **MNLI** & **SST-2** & **MRPC** & **CoLA** & **QNLI** & **QQP** & **RTE** & **STS-B** & **Avg.** \\   & FT & 100\% & 87.3 & 94.4 & 87.9 & 62.4 & 92.5 & 91.7 & 78.3 & 90.6 & 85.6 \\   & Adapter\({}^{*}\) & 0.318\% & 87.0 & 93.3 & 88.4 & 60.9 & 92.5 & **90.5** & 76.5 & **90.5** & **85.0** \\  & LoRA\({}^{*}\) & 0.239\% & 86.6 & 93.9 & 88.7 & 59.7 & **92.6** & 90.4 & 75.3 & 90.3 & 84.7 \\  & Adapter\({}^{*}\) & 0.239\% & **87.1** & 93.0 & 88.8 & 58.5 & 92.0 & 90.2 & 77.7 & 90.4 & 84.7 \\  & BiFit\({}^{*}\) & 0.080\% & 84.7 & **94.0** & 88.0 & 54.0 & 91.0 & 87.3 & 69.8 & 89.5 & 82.3 \\  & RED\({}^{*}\) & 0.016\% & 83.9 & 93.9 & **89.2** & **61.0** & 90.7 & 87.2 & 78.0 & 90.4 & 84.3 \\   & **DiReFT (ours)** & 0.015\% & 82.5 & 92.6 & 88.3 & 58.6 & 91.3 & 86.4 & 76.4 & 89.3 & 83.2 \\  & **LoReFT (ours)** & 0.015\% & 83.1 & 93.4 & **89.2** & 60.4 & 91.2 & 87.4 & **79.0** & 90.0 & 84.2 \\   & FT & 100\% & 88.8 & 96.0 & 91.7 & 68.2 & 93.8 & 91.5 & 85.8 & 92.6 & 88.6 \\   & Adapter\({}^{*}\) & 0.254\% & 90.1 & 95.2 & 90.5 & 65.4 & 94.6 & **91.4** & 85.3 & 91.5 & 88.0 \\   & LoRA\({}^{*}\) & 0.225\% & 90.2 & 96.0 & 89.8 & 65.5 & **94.7** & 90.7 & 86.3 & **91.7** & 88.1 \\   & Adapter\({}^{*}\) & 0.225\% & **90.3** & 96.1 & **90.5** & 64.4 & 94.3 & 91.3 & 84.8 & 90.2 & 87.7 \\   & RED\({}^{*}\) & 0.014\% & 89.5 & 96.0 & 90.3 & **68.1** & 93.5 & 88.8 & 86.2 & 91.3 & 88.0 \\    & **DiReFT (ours)** & 0.014\% & 88.7 & 95.4 & 88.5 & 66.7 & 93.9 & 88.1 & 86.9 & 91.2 & 87.4 \\   & **LoReFT (ours)** & 0.014\% & 89.2 & **96.2** & 90.1 & 68.0 & 94.1 & 88.5 & **87.5** & 91.6 & **88.2** \\   
+
+Table 4: Accuracy comparison of RoBERTa-base and RoBERTa-large against existing PEFT methods on the GLUE benchmark. \({}^{*}\)Performance results of all baseline methods are taken from Wu et al. (2024). We report averaged performance of five runs with distinct random seeds for our method.
+
+formance across benchmarks from four domains while being 15\(\)-65\(\) more efficient than LoRA. Notably, LoReFT establishes new state-of-the-art performance on commonsense reasoning, instruction-following, and natural language understanding against the strongest PEFTs. We also show how our method can be described under a generic framework - ReFT. ReFT is a new approach to finetuning that is more powerful, more parameter-efficient, and more interpretable than any existing PEFTs.

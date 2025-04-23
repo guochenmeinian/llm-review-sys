@@ -1,0 +1,187 @@
+# Learning Goal-Conditioned Representations for Language Reward Models
+
+Vaskar Nath
+
+Equal contribution Corresponding author: vaskar.nath@scale.com
+
+Dylan Slack
+
+Equal senior authorship
+
+Jeff Da
+
+Yuntao Ma &Hugh Zhang &Spencer Whitehead
+
+Scale AI
+
+Equal contribution
+
+###### Abstract
+
+Techniques that learn improved representations via offline data or self-supervised objectives have shown impressive results in traditional reinforcement learning. Nevertheless, it is unclear how improved representation learning can benefit reinforcement learning from human feedback on language models. In this work, we propose training reward models (RMs) in a contrastive, _goal-conditioned_ fashion by increasing the representation similarity of future states along sampled preferred trajectories and decreasing the similarity along randomly sampled dispreferred trajectories. This objective significantly improves reward model performance by up to 0.09 AUROC across challenging benchmarks, such as MATH and GSM8k. These findings extend to general alignment as well - on the Helpful-Harmless dataset, we observe 2.3% increase in accuracy. Beyond improving reward model performance, we show this way of training RM representations enables improved _steerability_ because it allows us to evaluate the likelihood of an action achieving a particular goal-state (_e.g.,_ whether a solution is correct or helpful). Leveraging this insight, we find that we can filter up to 55% of generated tokens during majority voting by discarding trajectories likely to end up in an "incorrect" state, which leads to significant cost savings. We additionally find that these representations can perform fine-grained control by conditioning on desired future goal-states. For example, we show that steering a Llama 3 model towards helpful generations with our approach improves helpfulness by \(9.6\)% over a supervised-fine-tuning trained baseline. Similarly, steering the model towards complex generations improves complexity by \(21.6\)% over the baseline. Overall, we find that training RMs in this contrastive, goal-conditioned fashion significantly improves performance and enables model steerability. 1
+
+## 1 Introduction
+
+Aligning Language Models (LMs) with human preferences has proven to be an essential step for the adoption and safe use of these models, with the dominant paradigm being Reinforcement Learning from Human Feedback (RLHF) . To accomplish this, a standard setup is to collect labels from humans for generated responses (_e.g.,_ preferences, quality ratings) . These labels can then be used to train a reward model to produce a ranking/scoring of a given sequence or set of sequences.
+
+The policy LM is then trained to maximize the expected returns from this reward model using a Reinforcement Learning (RL) algorithm.
+
+High-quality representations have been shown to be an important piece for the success of RL algorithms [6; 42]. Although such representations can be learned during end-to-end training, many efforts have found it important to integrate more explicit representation learning components into RL algorithms, such as via data augmentation  or auxiliary losses . Some work even casts certain RL algorithms as representation learning methods where using the similarity between state representations serves as a value function, demonstrating success on manipulation and navigation tasks . Despite these successes in different areas, representation learning for aligning LMs has been less explored, while more emphasis has been placed on, e.g., pre-training reward models [7; 37] or learning from different types of rewards [15; 38].
+
+In this paper, we present a simple yet effective approach to improve the representations learned by reward models for aligning LMs. We train LM-based reward models to learn representations that capture the expected reward or likelihood of achieving a goal state (_e.g.,_ correct solution to a problem, helpful response) at intermediate steps of the input sequence, inspired by goal-conditioned RL [5; 13; 20]. To do so, we use a contrastive objective and apply it to the reward model's hidden representations from desirable and undesirable sequences. Enforcing this loss on representations from intermediate steps of the sequence helps encode a dense signal as to which trajectories are more promising at different points in the sequence, which we show offers several useful properties, such as helping to localize errors or evaluating partial completed sequences. This method is flexible enough to support different kinds of alignment data and does not require further annotations beyond common sequence-level annotations.
+
+We find that this approach improves the reward model's ability to identify correct/incorrect solutions in mathematical reasoning, boosting the AUROC on the task by up to 0.09 over standard preference ranking training. Towards natural language alignment, we find this method is able to increase the reward model's accuracy of identifying helpful versus harmless responses by 2.3% on the Helpful-Harmless dataset .
+
+We also demonstrate the utility of the learned representations themselves, e.g., for filtering solutions to improve accuracy and steering the outputs towards responses with certain attributes in guided decoding. On mathematical reasoning, we show that we are able to filter up to \(55\)% of generated
+
+Figure 1: **Overview of contrastive goal-conditioned learning for text.** Pictured is a prompt with a preferred and dispreferred response. Both source state tokens (ten) for the positive and negative trajectory are sampled from the preferred response. For illustrative purposes, the positve and negative source states are sampled as the same token, but in practice they can be different. The positive goal state is sampled as some future token (subtract) from the preferred response, and the negative goal state is sampled from any token (add) from the dispreferred response. The corresponding representations are retrieved from the last hidden state of the reward model. The training objective is then to maximize and minimize the similarity of the positive and negative representation pairs, respectively.
+
+tokens by discarding trajectories that are likely to lead to incorrect solutions as deemed by the learned representations while achieving similar or better performance. Similarly, using these representations to steer a Llama 3  model by conditioning on desired future goal-states, we improve helpfulness by \(9.6\)%, correctness by \(12.2\)%, coherence by \(16.5\)%, and complexity by \(21.6\)% over the supervised-fine-tuning trained baseline.
+
+In summary, our contributions are as follows: 1) We explore improving the learned representations of reward models and its effect on LM alignment. Towards this, we present a simple and effective representation learning method based on a goal-conditioned contrastive objective. 2) We demonstrate that training reward models with this method can improve reward model performance on mathematical reasoning and helpfulness/harmlessness benchmarks. 3) We show that simply utilizing a reward model trained with this method can improve policy LM alignment on math reasoning benchmarks. 4) We investigate using these representations as a mechanism to evaluate the likelihood of achieving a desired goal state by filtering generations in a majority-vote scheme and guided decoding, showing that they can be used to increase accuracy and control policy LM outputs.
+
+## 2 Related Work
+
+**Language model (LM) alignment and Reinforcement Learning from Human Feedback (RLHF).** The goal of RLHF [50; 71; 76] for aligning LMs is to train a policy LM that generates responses that are preferred by humans. This framework has proven instrumental for increasing the utility and generalization of LMs, improving their capabilities on a wide variety of tasks, and their safety [8; 9; 45; 61; 49]. Critically, RLHF improves the policy LM along a scalar _reward_ signal, which indicates the value of a generated piece of text, and their efforts have focused on different means of providing such signals [7; 56]. Typically, researchers train a _reward model_ that learns to score generations based on pair-wise human preference data. Subsequently, the model provides reward signals during reinforcement learning (RL) training of the policy, often via Proximal Policy Optimization (PPO) . While reward models have often been trained to score text with just a single scalar value, several works have shown that training the reward model to provide fine-grained reward signals over _spans_ of text can help improve model performance by providing intermediate rewards for the policy LM to learn from during RL [43; 68]. Nevertheless, fine-grained reward methods often require extensive and costly human annotations on the sentence or token level to train the model, which can be prohibitive.
+
+**Representation learning for RL.** Reinforcement learning (RL) methods often learn representations as part of policy learning from reward signals. However, learning representations from solely reward signals can be highly sample inefficient, leading to poor generalization, and struggles in high-dimension state and action settings [41; 63; 74]. Consequently, techniques that learn improved representations have been shown to significantly improve RL performance [73; 19; 25; 40; 24]. Typically, these methods construct additional supervision via offline data or self-supervised objectives to drive representation learning [12; 11]. These methods have achieved significant success in a variety of settings, such as vision-based control and multi-task RL [10; 44; 30]. One such way of constructing supervision for representation learning is by leveraging future states and actions sampled from offline trajectories [48; 18; 60]. In particular, prior work has shown that increasing the similarity between state-action pairs sampled from the same trajectory can serve as a simple yet powerful way to learn improved representations for RL, that additionally acts as a type of goal-conditioning by making representations more similar along the same trajectory [20; 22]. Still, representation and goal-conditioned RL largely have not been considered for natural language domains.
+
+## 3 Method
+
+Drawing on recent efforts on goal-conditioned reinforcement learning [5; 13] and representation learning [20; 31] in other areas, we show that we can learn representations that approximate a Q-function within a language reward model using contrastive learning. Since the Q-function quantifies the expected cumulative future rewards of taking a specific action from a given state , forcing the reward model's output scores to be entangled with an approximated Q-function has the potential to improve the reward model's credit assignment and preference ranking accuracy. We first present preliminaries on reward modeling and contrastive learning in Section 3.1 and present our method in Section 3.2.
+
+### Preliminaries
+
+**Preference ranking reward modeling for LMs.** Typically, a reward model is parameterized \(r(x,y)\) to return a scalar reward, given prompt \(x\) and completion sequence of tokens \(y=[y_{0},...,y_{T}]\). Given a dataset \(\) consisting of triples \((x,y^{w},y^{})\) of preferred and dispreferred completions, \(y^{w}\) and \(y^{}\), respectively, the reward model is optimized via a paired loss:
+
+\[^{R}=-|}\ _{(x,y^{w},y^{}) }\ ((r(x,y^{w})-r(x,y^{}))).\] (1)
+
+Note, the reward model, \(r(x,y)\), is trained to provide a scalar feedback on the _entire_ completion \(y\).
+
+**Approximating Q-functions via contrastive learning.** In deep reinforcement learning, the Q-function quantifies the expected cumulative future rewards of taking an action from a given state and is parameterized by a neural network [47; 20]. Let \(s_{t}\) be the current state from which a model can take an action \(a_{t}\). Taking action \(a\) at the current state and continuing on that trajectory will lead to some future state \(s_{k}\). The future states reached along this trajectory can be positive, \(s_{k}^{+}\), by reaching a target goal state or negative, \(s_{k}^{-}\), by reaching a different or undesired state. A critic function \(f\) can approximate a Q-function up to a multiplicative constant by optimizing a contrastive learning objective :
+
+\[=((f(s_{t},a_{t},s_{k}^{+})))+(1-( f(s_{t},a_{t},s_{k}^{-}))).\] (2)
+
+Here, the critic function \(f\) is a scoring function between a state-action encoder and state encoder.
+
+### Learning Goal-Conditioned Representations in Language Reward Models
+
+In this section, we describe how to efficiently learn goal-conditioned representations using decoder-only transformer models [64; 54]. Additionally, we describe how to use these representations as Q-values that can be leveraged to detect generation errors and in guided decoding .
+
+**Reward modeling through the bottleneck of a Q-function.** Given the prompt \(x\) and a corresponding completion sequence \(y\), we seek to learn a language reward model that both scores \(y\) and has representations that can be used to approximate a goal-conditioned Q-function. This Q-function \(Q^{}_{y_{g}}(y_{\{0,...,t\}},y_{t+1})\), \(t[0,...,T]\), captures the expected reward for a policy \((y_{t+1}|y_{\{0,...,t\}},x)\), for some goal state \(y_{g}\) and next token \(y_{t+1}\), where rewards are defined as likelihood of achieving the goal at the next token generation. Intuitively, the goal state could be an optimal generation from the policy that a human would find satisfactory, such as the correct solution to a math problem or a helpful response. The Q-function captures the expected rewards from choosing token \(y_{t+1}\) at the current step, considering the prompt \(x\) and tokens generated so far \(y_{\{0,...,t\}}\).
+
+We initialize our reward model, \(r\), from an instruction-tuned causal LM. We consider this reward model to be decomposed into two components: 1) feature extractor \(\), which produces a representation for a given token; 2) a reward projection head \(r^{}\) that predicts a reward score based on that token representation. We use \(\) to obtain representations of our state-action pair, \(h_{t+1}\), and arbitrary future states, \(h_{k}\):
+
+\[h_{t+1}=(y_{t+1}|y_{\{0,...,t\}},x) h_{k}=(y_{k}|y _{\{0,...,k-1\}},x).\] (3)
+
+Hence, we parameterize our reward model as
+
+\[r(x,y)=r^{}((y_{T}|y_{\{0,...,T-1\}},x)).\] (4)
+
+In practice, the feature extractor is the LM decoder and the representations that we use are the hidden token representations prior to predicting an output token. Meanwhile, the reward projection is either a linear layer or multi-layered perceptron (MLP) in our experiments.
+
+With this reward model, we train the representations from the feature extractor \(\) using a contrastive loss , which becomes:
+
+\[^{C}=((f(y_{\{0,...,t\}},y_{t+1},y_{g}^{+})))+\ \ (1-(f(y_{\{0,...,t\}},y_{t+1},y_{g}^{-}))),\] (5)
+
+where \(f(y_{\{0,...,t\}},y_{t+1},y_{k})\) is the cosine similarity between the representations of the state-action pair \((y_{\{0,...,t\}},y_{t+1})\) and a future state \(y_{k}\). In Equation 5, \(y_{g}^{+}\) and \(y_{g}^{-}\) are our positive and negativegoal states, which we discuss how to obtain in practice later in this section. By forcing the reward scores predicted by \(r^{}\) to depend on the representations from \(\), which is learned via this contrastive objective, the reward score incorporates a signal as to which actions are closer to a desired goal state.
+
+We jointly train the reward model on the contrastive objective in Eq. 5 and the preference ranking objective optimized by Eq. 1. Thus, our final objective is given by
+
+\[=^{R}+^{C},\] (6)
+
+where \(\) is a hyperparameter to balance the tradeoff between optimizing the contrastive loss and the rewards.
+
+In the context of RLHF, given that we have preference labels between two or more generations for the same prompt and recalling that \(^{C}\) approximates a Q-function, we can improve the term's alignment with human preferences by sampling positive goal states from preferred generations \(y^{w}\) and negative goal states from dispreferred generations \(y^{}\).
+
+**Computing contrastive loss in practice.** Given a preference-ranking instance from a training batch, let the preferred completion, \(y^{w}\), and dispreferred completion, \(y^{}\), have lengths \(T\) and \(T^{}\), respectively. The representations of the positive state-action and goal state pair, (\(y_{s}\), \(y_{g}^{+}\)), are given by sampling two points, \(i,j[0,T],i<j\), from the preferred completion and retrieving hidden states \(h_{i}^{w}\) and \(h_{j}^{w}\). Similarly, the representations of the negative pair, (\(y_{s^{}}\), \(y_{g}^{-}\)), are given by sampling any index \(m[0,T]\) from the preferred completion and any index \(n[0,T^{}]\) from the dispreferred completion and then retrieving hidden states \(h_{m}^{w}\) and \(h_{n}^{}\). We note that source states \(h_{i}^{w}\) and \(h_{m}^{w}\) are sampled independently and are not necessarily equal. The cosine similarities between positive and negative pair representations are passed through the sigmoid function and averaged across the training batch. We will refer to this method as the Single Goal State (SGS) contrastive loss.
+
+**Computing Q-values.** Once the reward model has been trained, we can use it to compute an additional _Q-value_, which gives us a measure proportional to the expected future rewards given the current state and a specific action. The Q-value at a token \(t\) is the cosine similarity between the trained reward model's hidden state, \(h_{t}\), and a goal state, \(h_{g}\). The the choice of goal state here is flexible. For our experiments in Section 4.1, unless specified otherwise, we set the goal state to be the mean representation of all the preferred completion in the reward model training set. More explicity, the goal state is computed as:
+
+\[h_{g}=_{y_{w}}h(y_{w})\] (7)
+
+where \(h(.)\) represents the reward model's last hidden layer of the final token of the completion. In Appendix C, we ablate this choice and find this to be the best method for computing the goal state during inference. Thus, we do not require any additional annotations aside from the starting preference ranking dataset. In experiments on LM steering, we construct a prototype to be used as the goal state. The prototype is constructed using generations labeled as helpful, complex, coherent, and correct by annotators in Nvidia's HelpSteer dataset . Out of the highly-scored generations, we sample a subset and use the mean represetations of the sample as the goal state for the reward model. We ablate these choices in Appendix D.2.
+
+## 4 Experiments
+
+To explore our method, we experiment with two settings: First, mathematical reasoning with code (Section 4.1), where LMs must use reasoning and coding to answer mathematical questions. The ability to code has become increasingly important for LLMs as it enables a broad set of capabilities for reasoning (_e.g.,_ tool use ). This line of experiments elucidates the ability of our method, and the resulting representations, to guide and improve step-by-step reasoning capabilities. Second, natural language alignment (Section 4.2), in which an LM's responses must align with certain desired properties, such as helpfulness and harmlessness. These experiments show the capacity of reward models trained with our method to steer LM outputs in a more open-ended setting. In particular, we focus on helpfulness, harmlessness, and other desirable characteristics (_e.g.,_ correctness, coherence).
+
+### Mathematical Reasoning with Code
+
+#### 4.1.1 Experimental Setup
+
+For training reward models, we use the OpenMathInstruct-1 dataset , a math instruction tuning dataset with 1.8M problem-solution pairs on the training sets of GSM8k and MATH, which are generated by the Mixtral-8x7B model . To form our reward model training set, we create pairs of solutions for the same problem, where one solution is correct (_i.e.,_ preferred) and the other is incorrect (_i.e.,_ dispreferred).
+
+Our base model is OpenMath-CodeLlama-7b-Python-hf , a strong decoder-only LM that has been instruction tuned on OpenMathInstruct-1 to use a Python interpreter in order to solve mathematical problems, which we add a reward head to predict reward scores (Section 3.2). This model trained with the traditional preference ranking objective serves as our baseline (**Codellama 7b Reward**), which we compare with the same model trained using our method (**Q-Function 7b Reward**).
+
+We evaluate on several popular math benchmarks. Since the problems in the preference ranking dataset come from the training sets of GSM8k and MATH, we consider their respective test splits to be in-distribution (ID). We also evaluate on test sets we consider to be out-of-distribution (OOD), namely algebra222 , GSM-Hard , Asdiv , mawps , and svamp , to test for further generalization.
+
+Detailed information on data, models, and training can be found in Appendix A.
+
+#### 4.1.2 Reward Modeling Evaluations
+
+We obtain completions from the base model by greedy decoding, following prior work , and measure the reward score AUROC. This quantifies the ability of a model's reward score to discern between correct/incorrect sequences across different thresholds. In Appendix E, we additionally assess Q-Function 7b Reward's ability to rank completions.
+
+**Learned representations help reward scores discern correct/incorrect solutions.** In Figure 2, we see that the reward model trained with our representation learning approach consistently achieves higher AUROC scores compared to the model trained with only the standard preference ranking loss. On the ID datasets, we see a gain of approximately 0.05 and 0.09. Meanwhile, on the OOD datasets, the average improvement is 0.04, with maximum of roughly 0.08 on svamp. Although these datasets are math problems, they vary in the types and difficulties of questions asked. Despite being OOD, we see that our method improves the performance when judging these prompts and generations. Overall, these results suggest that the representations learned using our approach help improve the reward score predictions such that they are more accurate and generalizable.
+
+Figure 2: AUROC scores comparing the baseline Codellama 7b Reward vs. our proposed method Q-Function 7b Reward on the rewards attributed to the base-model greedy generations across several math benchmarks.
+
+**These representations also help reward scores judge which partial solutions are promising.** Part of the motivation and design of our approach is to encode the likelihood of reaching a certain goal state at intermediate steps in the generated sequence. To examine how well our method accomplishes this, we measure reward score AUROC when the model is only shown up to a certain percentage of the generated sequence (_i.e.,_ percentile). Here, we show this on the ID datasets, where we consider the 50 sample generations from the base model and plot the mean AUROC across the 50 samples. Plots for other benchmarks can be found in Appendix F. Looking at Figure 3, we find that the AUROC scores for both reward models tend to increase as they see more of the generated sequence, but Q-Function 7b Reward largely maintains higher AUROC across different percentiles and generally exhibits fewer significant drops between percentiles. These improvements across percentiles imply that the reward scores do indeed better capture which generated sequence are likely to be correct or incorrect.
+
+#### 4.1.3 Directly Using the Learned Representations
+
+Our experiments thus far illustrate the effect of the learned representations on the reward scores. Here, we turn our attention to utilizing these representations directly to explore some of the encoded properties. In these experiments, we filter generations from the base model using the Q-values (_i.e.,_ cosine similarities between intermediate and goal state representations). We take 50 base model generations for all the GSM8k and MATH test problems, which are provided by Toshiniwal et al., and we filter any generation that has a Q-value less than zero . We compare this against a baseline of majority voting over the \(50\) generations.
+
+**Q-values can prune incorrect sequences.** We find that filtering based on Q-values provides meaningful improvements in accuracy compared to majority voting over all 50 samples, based on Table 1. Specifically, the majority vote accuracy improves by 1.2% and 3.9% on GSM8k and MATH, respectively. Looking at the increased proportion of correct sequences after filtering, it appears that sequences with the negative Q-values generally correspond to incorrect sequences and are filtered out in this setting, thereby improving the accuracy. On the other hand, we also see that the average percentage of sequences that are filtered out can be quite large, such as 65.6% on the MATH dataset, and some correct solutions can also be filtered out. Nevertheless, using the Q-values based on these learned representations can help improve the accuracy of such majority voting schemes.
+
+**Q-values can detect errors in reasoning.** Experiments on rewards scores for partial sequences (Section 4.1.2) suggest that the learned representations help capture the likelihood that a sequence will reach a goal state from an intermediate step. We can also qualitatively explore this property using the Q-values and the representations themselves. In Figure 4, we show examples that are filtered based on the Q-value filtering process above. In the left example, the Q-value drops when there is a mistake of multiplying the "donuts_price_per_dozen" by "donuts_per_dozen". The Q-value in the right example similarly shifts once the "jazz_dance_percentage" is naively added to the
+
+Figure 3: AUROC scores on the rewards attributed to partial base-model generations across 50 samples on GSM8k and MATH. The error bars depict the 95% confidence intervals (with sample size \(n=50\)) at each percentile of generation considered. The Q-Function reward model has incremental increase in performance with more information, whereas, the traditional reward model’s performance is a lot more varied in attributing intermediate rewards.
+
+"contemporary_dance_percentage". Overall, these examples illustrate the potential effectiveness of using the representations and resulting Q-values for localizing errors and identifying promising sequences.
+
+#### 4.1.4 Aligning Policy Models with RLHF
+
+We investigate whether the reward model trained with our proposed method provides a better reward signal when performing RLHF, which is an important usage of these reward models. We compare the math problem solving performance of a policy model that is aligned using a preference-ranking reward model versus our Q-Function reward model in the Proximal Policy Optimization (PPO)  algorithm. We additionally compare the performance against DPO as it serves as a strong baseline . The prompt dataset is given by problems in the training sets of GSM8k and MATH. To introduce diversity in the prompts, which has been shown to improve PPO, we also add problems from the MathQA dataset - a large scale dataset with real world math problems . We keep the settings and hyperparameters during PPO constant, and further details are in Appendix A.
+
+Table 2 shows that, given the same settings, utilizing a reward model trained with our method improves policy model accuracy across several benchmarks. We see an average gain, weighted by benchmark size, of \(1.7\%\). Intuitively, this shows that the improvements we observe in reward scores (Section 4.1.2) do translate to improvements in the policy model via RL, which further supports the value of the representations learned via our approach. Although, the gains in accuracy are not as significant compared to those observed with the reward scores. A possible explanation for this is that, due to experimental constraints such as additional data collection, the preference-ranking dataset used for reward model training are off-policy Mixtral-8x7B model  generations. Hence, a clear next step for this setting would be to retrain the reward model with on-policy preference-rankings and iterate. Interestingly, we observe that DPO performs on par with our method for the ID tasks
+
+    &  \\   & Accuracy (\%) & Prop. Correct (\%) & Avg. Filtered (\%) & Avg. Tokens Saved (\%) \\ Maj. @ 50 & 84.8 & 74.9 & - & - \\ Filtered & **86.0** & **84.0** & 35.9 & 25.5 \\   &  \\   & Accuracy (\%) & Prop. Correct (\%) & Avg. Filtered (\%) & Avg. Tokens Saved (\%) \\ Maj. @ 50 & 55.6 & 40.2 & - & - \\ Filtered & **59.6** & **52.0** & 65.6 & 55.6 \\   
+
+Table 1: Majority vote versus Q-value filtering performance. Accuracy shows the final majority voting accuracy on the respective benchmarks. Prop. Correct is the proportion of the correct class in the final sample set considered. Avg. Filtered is the average percentage (out of 50 total generations) that were discarded across all problems in the benchmark. Avg. Tokens Saved is the average percentage of tokens that are saved with the assumption that the remaining tokens after the first negative Q-value is discarded across all the problems in the benchmark. Both the difference in accuracy and proportion of correct class are t-test significant.
+
+Figure 4: Two examples from the GSM8K dataset that was filtered via the Q-value pruning. The token level Q-values are portrayed as a heat map where the colors red and blue represents scores close to \(-1\) and \(1\), respectively. Both examples illustrate that the Q-values pinpoint the exact logical error in reasoning. The full version of these examples can be found in Appendix G
+
+(GSM8k and MATH). However, the policy trained with the contrastive RM performs much better on OOD tasks (algebra222, GSM-Hard, Asdiv, mawps, and svamp) when compared to DPO. These findings could be explained by related works that analyze DPO and find it can perform poorly in OOD settings . All in all, these results indicate that PPO training with the contrastive RM leads to better generalization than training with DPO, particularly in OOD settings.
+
+### Natural Language Alignment
+
+While fine-grained feedback (and subsequently, Q-values) are most sensible in reasoning environments with explicitly incorrect logical steps, a natural extension of the experiment is to apply our approach to reward models in the natural language setting, where we expect models to learn improved representations with respect to their alignment towards human preferences. We first explore this for training a reward model for helpfulness and harmlessness . Then, we explore if the learned representations can be further used for steering language model at inference time, via guided decoding, to generate sequences that are more helpful, complex, or coherent. The backbone of our reward model is Llama 3-8B-Instruct , and detailed information can be found in Appendix B.2.
+
+#### 4.2.1 Improving Reward Modeling for Helpfulness and Harmlessness
+
+We use the Helpful-Harmless dataset  for training and evaluation. We select this dataset because of it's large scale, established representation in the RLHF community, and general purpose nature which is helpful to avoid restricting our natural language reward model towards a specific domain. Similar to our previous experiments, we compare training with our approach versus standard reward model training. Table 3 (left) shows that training with our method also improves reward scores on this natural language data, increasing the ability of the reward model to discern between helpful and unhelpful responses.
+
+#### 4.2.2 Reward Model Representations can Steer Language Models Towards Helpful Generations
+
+A practical extension of learning stronger natural language representations is using the extensions for steering the LM. To test this, we experiment with guided decoding [33; 70] with Llama-3-8B-Instruct, which defines a decoding objective function to guide inference during beam search. In traditional guided decoding (and our SFT baseline), the confidence score of the model is extracted from an additional inference step on each beam. In our method (Q-Function Prototype), the confidence score is the cosine similarity between the sequence embedding from the reward model and the hidden state [20; 2]. We construct the prototype by embedding 20 examples that score highly in all categories (helpfulness, correctness, coherence, complexity) using HelpSteer, a model alignment and steering dataset . The reward model is trained using HelpfulHarmless as per previous sections . Details for guided decoding are in the Appendix B.
+
+Table 3 (right) shows our results, and evaluation is done via LLM-as-a-judge (GPT-4) . Using the representations fine-tuned by the contrastive loss improves across all categories and generally steers generations towards more helpful generations. We find that complexity improves the most, suggesting that the generations produced by the using the prototype helps the model avoid beams that are too simple. Suprisingly, the correctness of the responses is increased also, suggesting that
+
+    &  &  \\   & GSM8k & MATH & algebra222 & GSM-Hard & Asdiv & mawps & svamp \\  Codellama Base & 75.9 & 43.6 & 65.6 & 60.1 & 77.7 & 93.5 & 79.6 \\  DPO & 80.1 & 44.8 & 64.8 & 59.9 & 76.9 & 90.3 & 76.6 \\ Codellama PPO & 79.3 & 43.4 & 65.8 & 61.1 & 77.4 & 91.6 & 78.5 \\ Q-Function PPO & **80.5** & **45.1** & **70.9** & **62.7** & **79.5** & **93.6** & **81.2** \\   
+
+Table 2: Accuracy of the policy model trained via PPO using a preference ranking reward model vs our Q-Function reward model. We present average accuracy across 4 independent runs. The base model results are also shown as a reference point presented in  and DPO results are shown as a strong baseline. The full table with confidence intervals is in the appendix (Table 6).
+
+although the SFT prototype usually prefers beams that are simple and correct, the prototype succeeds at picking beams with added complexity without sacrificing correctness or helpfulness.
+
+## 5 Limitations and Future Work
+
+**Deriving more informative goal states.** In Appendix D.2, we demonstrate the importance of having a precise and meaningful goal state. At train time, our SGS method achieves this by looking at future tokens of the preferred and dispreferred completions. During inference, however, we take the mean representation of multiple goal state completions from the training data. Although we see that the SGS method generalizes despite this discrepancy, future work could investigate other methods to derive more precise inference-time goal states.
+
+**Partial Q-values correlate with partial reward scores.** An interesting observation, shown in Appendix H, is that the reward scores for _partial_ completions are correlated with the Q-values. While our experiments show that this can benefit reward scores, especially for math reasoning, disentangling these values may be desirable in some instances. For example, one may want to incorporate the completeness of the generated sequence in the reward score, such as for creative writing, meaning incomplete sequences should strictly get low reward scores. However, currently, partial sequences may still score highly if they are likely to reach a goal state. This is expected as the final reward score is derived by a linear projection from the hidden representation, while the Q-values are derived as the cosine similarity between that same representation and goal state. In Appendix H, we explore the effects of learning an MLP projection for the rewards to help decouple the two signals. Further disentangling these signals in the representations could be an interesting direction for future work.
+
+**Further advancing policy models.** A clear line of future work here is to integrate the additional Q-value signal that we gain from this method into the RL algorithm to further improve policy model training. Future work should also investigate the impacts of iteratively retraining the reward model on on-policy completions and the policy model on the updated reward model.
+
+## 6 Conclusion
+
+Learning proper representations in the reward model is essential for the model's generalization and ability to produce accurate rewards during RLHF. We introduce a method of applying goal-conditioned Q-functions to learn representations that capture the expected reward for a goal-conditioned policy. On math benchmarks, such as GSM8k, we improve performance and show that the reward model has a greater ability to discern between correct and incorrect solutions. On natural language alignment experiments, we show improvement in reward model performance and that the embedding can be used for natural language steering. Our findings show that using Q-values during reward model training can improve the representations of the reward model and suggest promising future directions for further advancing language models via RLHF.

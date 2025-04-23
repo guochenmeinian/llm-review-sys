@@ -1,0 +1,215 @@
+# S-STE: Continuous Pruning Function for
+
+Efficient 2:4 Sparse Pre-training
+
+Yuezhou Hu\({}^{1}\), Jun Zhu\({}^{1}\), Jianfei Chen\({}^{1}\)
+
+\({}^{1}\)Dept. of Comp. Sci. & Tech., Institute for AI, BNRist Center,
+
+Tsinghua-Bosch Joint ML Center, THBI Lab, Tsinghua University.
+
+huyz21@mails.tsinghua.edu.cn, {dcszj,jianfeic}@tsinghua.edu.cn
+
+Corresponding author.
+
+###### Abstract
+
+Training deep neural networks (DNNs) is costly. Fortunately, Nvidia Ampere and Hopper GPUs can accelerate matrix multiplications twice as fast as a dense equivalent by implementing 2:4 sparsity. However, previous STE-based 2:4 pre-training methods (_e.g._ STE with hard-thresholding, SR-STE) suffer from optimization difficulties because of discontinuous pruning function. In this study, we comprehensively analyse the bottleneck of traditional N:M sparse training and recognize three drawbacks with discontinuity: incorrect descending direction, inability to predict the amount of descent and sparse mask oscillation. In light of this, we propose S-STE, a simple yet powerful 2:4 training method that contains two parts: to continuously project weights to be 2:4 sparse, and to rescale sparse weights with a per-tensor fixed scaling factor. Besides, we adopt minimum-variance unbiased estimation for activation gradient and FP8 quantization for whole process. Results show that our method surpasses previous 2:4 pre-training recipes and is comparable even with full parameter models. Our toolkit is available at https://github.com/huyz2023/2by4-pretrain.
+
+## 1 Introduction
+
+Large scale transformers have achieved many impressive results such as chatbots , text-to-video generation , and robot manipulation . However, the pre-training of these models is extremely expensive, typically requiring thousands of GPUs to train for months . One possible way to accelerate deep learning computation is sparsity. N:M sparsity  is a hardware-friendly sparsity pattern, where every group of \(M\) dimensions only has \(N\) non-zero entries. Nvidia Ampere GPUs can multiply a 2:4 sparse matrix with a dense matrix, twice as fast as multiplying two dense matrices.
+
+While N:M sparsity has been successfully applied to accelerate inference , extending the acceleration to pre-training is highly challenging. To accelerate pre-training, the sparse model must be trained from scratch (random initialization), and the network must stay sparse at all training iterations. To meet these requirements, the algorithm should be able to actively explore connectivity patterns within the constrained N:M parameter space. Therefore, popular pruning methods such as single-shot pruning , iterative magnitude pruning , and RigL  cannot be directly applied to this scenario. Moreover, besides forward propagation, the matrix multiplications in back propagation must be sparsified as well, to provide reasonable training speedup.
+
+Methods based on the straight-through estimator (STE)  have shown promise towards solving the challenging problem of sparse pre-training. They maintain a dense weight, which is sparsified in each iteration for fast forward&backward computation, and the dense weight is then updated with STE gradients. In this way, connectivity patterns can be learned jointly with weights in an end-to-endfashion with stochastic gradient optimizers. SR-STE  is such a method to train sparse networks from scratch, with a regularization term to stabilize the training. Several subsequent works [21; 51; 8] further accelerate back propagation with sparse computations, and Hu et al.  applied it for pre-training language models. However, these sparse training methods still have an accuracy gap compared to dense training. Moreover, SR-STE introduces a regularization strength hyper-parameter, which is hard to tune. Due to these limitations, N:M sparsity is not yet used to accelerate pre-training.
+
+In this work, we study STE-based pre-training from the optimization perspective. We point out that STE-based pre-training defines a _discontinuous_ loss function, which existing optimization theory and algorithms cannot handle. We reveal several intriguing phenomena highlighting the difficulty of discontinuous optimization, including incorrect descending direction, inability to predict the amount of descent, and oscillation. We sidestep the curse of discontinuity by proposing smooth straight-through estimator (S-STE) as a solution. Cruically, S-STE introduces a new pruning function, which uses a continuous projection function to prune weights to be 2:4 sparse, and scales all nonzero elements to minimize the mean-square-error between original dense weight vector and sparse weight vector. The proposed 2:4 soft-thresholding function is _continuous_ but can still generate N:M sparse weights at all times. In this way, the objective function is continuous, and gradient-based optimizers can be readily used. Furthermore, S-STE does not introduce any hyper-parameter, so its practical adoption is easier than SR-STE.
+
+We devise comprehensive pre-training experiments on S-STE, including WMT machine translation, GPT-2 pre-training and, DeiT image classification. Results show that our method surpass previous 2:4 pre-training recipes on a wide range of tasks.
+
+## 2 Formulation of sparse pre-training
+
+The training a neural network can be formalized as an optimization problem \(_{}F(),\) where \(^{d}\) is the parameter and \(F\) is a differentiable empirical risk function: \(F()=R_{n}()=_{i=1}^{n}f(; _{[i]}).\) Here, \(f\) is the loss function, \(n\) is the size of data set \(=\{_{[i]}\}_{i=1}^{n}\) and \(_{[i]}\) is the \(i\)-th sample. The optimization can be solved with standard stochastic gradient method (SG) . Suppose the network is initialized with \(_{1}\), \(\{_{k}\}\) is a positive learning rate sequence, and \(_{[i_{k}]}\) is randomly chosen from \(\{_{[i]}\}_{i=1}^{n}\). Then, iteratively we have \(_{k+1}=_{k}-_{k}_{_{k}}f( _{k};_{[i_{k}]}).\) As we consider pre-training tasks, \(_{1}\) is simply a random initialization.
+
+The training of a sparse network involves optimizing the parameter \(\) in a constrained space \(^{d}\). For an N:M-sparse network, the parameter can only have \(N\) non-zero elements in each contiguous \(M\) dimensions.
+
+Alternative to constrained optimization, we can solve the unconstrained problem:
+
+\[_{}F(})}=S( ).\] (1)
+
+Here, \(S\) is a pruning function which converts a dense weight \(\) to a sparse weight \(}\). One common choice is the hard-thresholding pruning function [52; 45]. For every block of four adjacent elements \(=[a_{1},...,a_{M}]^{}^{M}\) in the weight vector \(\), the pruning function can be defined as
+
+\[(S_{h}())_{i}=a_{i}&|a_{i}| t\\ 0&|a_{i}|<t,i=1,...,M,\] (2)
+
+where \(t\) is \(N\)-th largest element in \(\).1 This essentially performs magnitude-based pruning, by zeroing out the two smallest elements. The hard thresholding function can also be written as \(S_{h}()= m_{h}()\), where \(m_{h}()\) is a 0/1 mask vector, with \((m_{h}())_{i}=1\) if \(|a_{i}|>t\).
+
+However, Eq. (1) cannot be directly optimized since the pruning function \(S\) is not differentiable. Particularly, the derivative of the hard-thresholding function \(S_{h}\) is undefined on boundary where the second largest and third largest element have the same magnitude. Therefore, straight-through estimator (STE)  is for training, by approximating \(_{}f_{}}f\) and therefore \( S_{h}()/\):
+
+\[_{k+1}=_{k}-_{k}_{}_{k}}f( }_{k};_{[i_{k}]}).\] (3)With the pruning function and STE, each iteration of sparse training involves: (1) prune the dense weight to get the sparse weight: \(}=S()\); (2) compute the loss and gradient with the _sparse_ weight; and (3) update the _dense_ weight with the gradient. Among these, step 2 is most time-consuming, and it can be accelerated with sparse tensor cores given \(}\) is N:M-sparse. Next, we will focus on the optimization aspects of sparse training and defer the discussion of computation details to Sec. 4.
+
+## 3 The curse of discontinuity
+
+Classical stochastic optimization theory  guarantees the convergence for nonconvex and _smooth_ (i.e., differentiable with Lipschitz continuous gradients) objective \(F\). It can be also extended to handle non-differentiable functions such as ReLU . The real problem of STE-based sparse training is the _discontinuity_ of the pruning function \(S_{h}\), as visualized in Fig. 2. For a discontinuous function, an arbitrarily small change in input a can cause an unbounded change of the output \(S_{h}()\). Such discontinuity appears on the boundary when the \(N\)-th and \(N+1\)-th largest elements have same magnitude. For example, for a 1:2-sparse pruning function, \(S_{h}(1,0.999)=(1,0)\), but \(S_{h}(0.999,1)=(0,1)\), and the boundary is the line \(a_{1}=a_{2}\).
+
+When \(S_{h}\) is discontinuous, the parameter space \(^{d}\) can be partitioned into regions \(\{_{}|\}\), where \(\{0,1\}^{d}\) is the space of 0/1 masks with N:M pattern, and all the parameters in each region \(_{}\) have the same mask \(m_{h}()=\). The loss landscape \(F(S_{h}())=F(m_{h}())\) is continuous and differentiable within each region, where gradient-based algorithms can work well. However, when the optimization trajectory crosses the boundary: \(m_{h}(_{k+1}) m_{h}(_{k})\), the behavior is unpredictable. We highlight several intriguing phenomena observed in optimizing such discontinuous objective. We study these phenomena in both a toy problem and real neural networks.
+
+### Phenomenon 1: incorrect descending direction
+
+Here, we run a gradient descent algorithm (without stochasticity) on a small dataset. For a dense model where \(F\) is differentiable, with Taylor's formula we should have
+
+\[F(_{k})-F(_{k+1})(_{_{k}}F( _{k}))^{}(_{k}-_{k+1})=_{k}\| _{_{k}}F(_{k})\|^{2} 0.\] (4)
+
+That is, the objective function will monotonically decrease in each iteration once the learning rate \(_{k}\) is sufficiently small. However, it is not the case for sparse training. In Fig. 2(d), we measure the distribution of the amount of descent (AoD) \( F_{k}:=F(_{k})-F(_{k+1})\) for training a GPT-2 large 774M model with Eq. (2, 3), across each iteration \(k\). The results clearly shows that the objective frequently fails to descent.
+
+We can take a closer look to the weight and mask sequence \((_{k},m_{h}(_{k}))\) generated by the training algorithm. We compare the following two quantities: the AoD by updating both weight and mask \( F_{1}=F(_{k}_{k})-F(_{k+1} _{k+1})\) and the AoD by only updating the weight \( F_{2}=F(_{k}_{k})-F(_{k+1} _{k})\). In Fig. 1, we can observe \( F_{2}\) is mostly positive due to the piecewise continuity of \(F\). However, \( F_{1}\) is frequently negative and very often even smaller than \( F_{2}\) (updating mask is worse than not updating). This indicates that the main problem is the discontinuity make it hard to estimate the correct descending direction of \(\).
+
+### Phenomenon 2: inability to predict the amount of descent
+
+Besides making mistakes in finding the correct descending direction, algorithms do not know that they make a mistake, in the sense that they fail to predict the AoD at each step. From Eq. (4), we should have \(F(_{k})-F(_{k+1})(_{_{k}}F(_{k}))^{}(_{k}-_{k+1})\), where the left hand side is the _actual_
+
+Figure 1: Scatter plot of \( F_{1}\) with \( F_{2}\) and their distributions on GPT-2 small 124M for iteration \(k\).
+
+AoD, and the right hand side is the _predicted_ AoD. We plot the actual AoD against predicted AoD for dense (Fig. 2(a)) and sparse training (Fig. 2(b)). While for dense training, the two quantities closely matches, for hard-thresholding the actual AoD is often lower for the predicted AoD, particularly when the predicted AoD is large. To understand this, note that Eq. (4) only holds for \(_{m_{h}()}\). Once \(_{k+1}-_{k}\) is large enough that \(m_{h}(_{k+1}) m_{h}(_{k})\), the function crosses a border of \(S_{h}\), and \(F\) will have a sudden change which is unpredictable by the gradient.
+
+### Phenomenon 3: oscillation
+
+Oscillation is probably the most significant problem in STE-based sparse training. Here, we revisit existing discussions about oscillation [52; 28; 20], and then illustrate this issue using a toy example.
+
+Flip rateFlip rate is a simple metric to measure the stability of sparse training : \(r_{k}=\|m_{h}(_{k}) m_{h}(_{k-1})\|_{1}/d\), where \(\) indicates XOR operation. As Hu et al.  points out, taking the flip rate of the dense model as standard, they observe larger flip rate of hard-thresholding: when training transformers, the flip rate can stay at 6% in the entire training process. However, a healthy training process should have a large flip rate in the early stage to explore connectivity patterns, and the flip rate should decrease to zero in later stage for the optimization to converge. Hu et al.  describe this phenomenon as "flip rate explosion", which is harmful to sparse training.
+
+An exemplar toy problemModern deep neuron networks have billions of parameters and is not strictly convex. These non-ideal conditions make our analysis more difficult with sparse weights. To analyze the characteristics of STE and hard-thresholding on the smallest problem, we devise a simple toy problem that contains two parameters: \(_{w_{1},w_{2}}g(w_{1},w_{2})=(w_{1}-w_{2})^{2}\). This may differ from the real DNN optimization problem, but can help us understand what happens in the process. We are going to show that while using a feasible \(_{k}\) that can make the dense model converge to global minima, STE with hard-thresholding fails to converge and it oscillates back and forth.
+
+First, for the dense model, the global minima lies on the line \(w_{1}=w_{2}\). Suppose we start from \(_{1}=[0.2,0.1]^{}\), by taking \(_{k}=0.25\) we can reach global minima in one step. On the other hand, if we are in 1:2 sparse situation, the global minima should be the point \(w_{1}=w_{2}=0\). By starting from \(_{1}=[0.2,0.1]^{}\) and taking \(_{k}=0.25\), we invariably jumps between \(_{2t+1}=[0.2,0.1]^{}\) and \(_{2t}=[0.1,0.2]^{}\), and \(g\) never decreases.
+
+High flip rate is harmful, because there are frequent changes on the connection of neurons, which means that a number of previous optimization steps on the neuron is deprecated. That is fatal at the end of training . The reason of high flip rate on hard-thresholding can be explained by discontinuity: as there are no gentle transitions on both sides of the border, the gradient on the boundary is inaccurate and is unable to indicate the right descending direction. This misalignment is easy to make the tuple \(\) to oscillate back and forth near the boundary, and cause extremely higher flip rate than the dense model.
+
+### Overcoming the curse of discontinuity
+
+One way to mitigate discontinuity is sparse-refined straight-through estimator (SR-STE), which adds a sparse-refined regularization on the gradients : \(_{}F(})+\| )}\|_{2}^{2}\). While
+
+Figure 2: (a)-(c) shows scatter plots of the predicted and actual loss reduction of dense, hard-thresholding and S-STE with GPT-2 large 774M model for iteration \(k\). The diagonal line is for reference. (d) shows empirical cumulative distribution of their actual AoD for \(k\).
+
+SR-STE works on a wide range of tasks and optimization algorithms [52; 20], it still has some issues. First, the performance is quite sensitive to the hyper-parameter \(_{W}\). Second, the new regularization term leads to a competition between loss function and sparse regularization. Finally, the loss function is still discontinuous unless \(_{W}\).
+
+From the above analysis, discontinuity causes optimization problems. It would be ideal to have a _continuous_ pruning function, yet the iterates \((}_{k})\) still need to be sparse during the entire training process.
+
+## 4 Methodology
+
+In this section we propose a training algorithm (smooth straight-through estimator, S-STE) that contains two main parts combined with STE: 2:4 specific soft-thresholding, and fixed weight rescaling. They together work as the sparsifying function described in Sec. 2: \(}=S()= S_{soft}()\). Results in Fig. 2(c)(d) and 4(d) show that S-STE successfully overcome the three curses of discontinuity. Notably, flip rate curves of S-STE are surprisingly consistent with their dense counterparts, indicating that S-STE is more natural and feasible than SR-STE.
+
+### 2:4 specific soft-thresholding \(S_{soft}\)
+
+Motivation for the designAs discussed in Sec. 3, hard-thresholding suffer from the discontinuous problem near the boundary of taking a flip. When input vector changes continuously across the border, two of the four elements simultaneously jump between zeroes and none-zero values. In a continuous pruning function, we need to overcome this drawback and keep these two elements zero on both sides of the border. This means when a flip happens in a four-element block, at lease three of the target elements should be zeroed out simultaneously (except the largest one).
+
+With the above analysis, we modify soft-thresholding function for traditional pruning in Vanderschueren and Vleeschouwer  as our 2:4 specific soft-thresholding. Given a vector \(=[a_{1},a_{2},a_{3},a_{4}]^{}^{4}\), S-STE picks out the largest two elements and meanwhile, subtracts the third largest element from weight magnitudes. Assume, without loss of generality, that \([t_{1},t_{2},t_{3},t_{4}]\) is an rearrangement of \(^{}\), _s.t.\(|t_{1}||t_{2}||t_{3}||t_{4}|\)_. Then, the pruning function can be defined as
+
+\[(S_{soft}())_{i}=a_{i}-t&a_{i}[t,+)\\ 0&a_{i}(-t,t)\\ a_{i}+t&a_{i}(-,-t],t=|t_{2}|.\] (5)
+
+The plots of soft-thresholding is drawn in Fig. 3, showing \(S_{soft}\) is continuous everywhere. Note that although we define \(S_{soft}\) by a block \(^{4}\), \(S_{soft}\) can be extended to arbitrary \(^{4t}\) for \(t 1\), by doing block-wise pruning.
+
+**Theorem 4.1**.: \(S_{soft}()\) _is a continuous projection for \(^{d}\)._
+
+A detailed discussion of the proof can be found in Appendix A.1.
+
+  \(\) & Val loss & Test BLEU \\ 
+0 & 4.007 & 26.30 \\
+0.33 & 4.014 & 26.01 \\
+0.67 & 4.015 & 26.16 \\
+1 & 4.072 & 25.63 \\  
+
+Table 1: Validation loss and test accuracy of S-STE with different \(\) on Transformer-base.
+
+Figure 3: Pruning function of hard-thresholding and soft-thresholding for 1:2-sparsity. (a)(b) show the outputs of hard-thresholding, and (c)(d) show that of soft-thresholding. A sudden jump exists in hard-thresholding if \(|a_{1}|=|a_{2}|\), while soft-thresholding is continuous in the domain.
+
+Choosing optimal thresholdTheoretically, any real number in \(|{{{{t}_{2}}}}|\), \({{{t}_{3}}}\|\) can be used as a feasible threshold. This gives us infinite options and we describe it with an interpolation as \(t=|{{{t}_{2}}}|+(1-)|{{{t}_{3}}}|\) with \(\). The larger \(\) is, the closer \(t\) is to \(|{{{t}_{3}}}|\), and the smaller \(\|{{{S}_{soft}}({})}\|\) is. This may affect model's capacity. In order to maximize the retention of information, using a small \(\) is necessary. In our method we propose to set \(=0\). Experimental results in Table 1 also show that the network has the best accuracy when \(=0\), _i.e._, \(t=|{{{t}_{2}}}|\).
+
+### Fixed weight rescaling \(\)
+
+Because \({{{S}_{soft}}}\) reduce the total magnitude of \({}\), it is not a close simulation of dense weights. Like Vanderschueren and Vleeschouwer , we scale up \({{{S}_{soft}}}({})\) in our method as \({{{S}_{soft}}}({})=_{soft}}}({})\), but we modify weight rescaling in their study to adapt to our approach. First, we use a _per-tensor scale_\(\) rather than a per-channel \(\) for simplicity. Besides, two important improvements are made: to compute scale factor only at the beginning of training, rather than to dynamically update scale factor during training, and to minimize the mean-square-error (MSE) between original dense weights and sparse weights, rather than to keep the total magnitude of weights unchanged.
+
+Freezing scaling factorAs Vanderschueren and Vleeschouwer  use a dynamic \(\) for every iteration, we argue that this doesn't align with our approach. We explain our solutions in two parts.
+
+First, we find it interesting that \(\) have a subtle correlation with flip rate: _in a sparse model, larger \(\) usually results in higher flip rate._ The reason can be explained by the accuracy of gradients. As we use STE in the backward pass, the approximation \(_{}f_{}}f\) is valid when \(}\) and \({}\) are close enough. However, if scale is too large then optimal, \({}\) and \(}\) are too far apart to guarantee this. Such a mismatch leads to incorrectness in descending directions, and thus unstability in optimization increase flip rate; see Fig. 4(a).
+
+Second, we argue that dynamically computing scaling factor for each iteration leads to high flip rate in our training process. Fig. 4(b) shows the results dynamically changing \(\) will make it increase with iterations, especially for later layers. Fig. 4(c) shows flip rate of this network, which has a significantly higher tail than the dense one. Considering high flip rate is harmful, we propose to compute scaling factor \(\) only in the first iteration. After that, we use the same \(\) in the rest of the training. Fig. 4(d) shows the flip rate of our fixed scaling S-STE, which perfectly aligns with the dense one.
+
+Minimizing MSEVanderschueren and Vleeschouwer  choose to scale up \({{{S}_{soft}}}({})\) to have the same L1-norm as \({}\): \(=\|{{{}}}\|_{1}/\|{{{{S}_{soft}}}({})}\|_ {1}\). However, we choose to minimize the MSE gap of \({{{S}_{soft}}}({})\) and \({}\). As  point out, sparsifying weights in the forward pass should minimize MSE rather than an unbiased estimation. In our method, to determine an optimal scale \(\), we need to minimize
+
+\[=\|{{{}}-_{soft}}}({})}\|^{2}=\| {{{}}}\|^{2}-2{{{}}^{}}{{{S}_{soft}}}({})+\| {{{S}_{soft}}({})}\|^{2}^{2}.\] (6)
+
+Rearrange the terms and taking partial derivative of \(\), we choose \(={{{}}^{}}{{{S}_{soft}}}({})/\|{{{{S}_{soft}}}({})}\|^{2}\). The comparison between no scaling, our minimizing MSE and keeping L1-norm can be found in Table 2. Result show that our method yields the best results in practice.
+
+Figure 4: (a) Flip rate curve over the training process with different \(\) on Transformer-base. (b) Dynamically recalculated \(\) at each layer on different epochs. Results show that frequently updating \(\) will cause it to be unexpectedly large. (c) Flip rate curve over the training process with fixed and dynamic \(\) on Transformer-base. (d) Flip rate of dense, SR-STE and S-STE algorithm on Transformer-base.
+
+## 5 Other implementation skills
+
+### Minimum-variance unbiased estimation
+
+To accelerate the backward propagation, Chmiel et al.  suggest using a minimum-variance unbiased estimator (MVUE). For every linear layer \(_{l}=_{l}S(_{l})^{}\), there are two matrix multiplications of the backward pass in total: \(_{_{l}}=_{_{l}}S(_{l})\) and \(_{_{l}}=_{_{l}}^{}_{l}\), where \(_{l}\) is the input of the \(l\)-th layer, \(_{l}\) and \(_{l}\) are the weight matrix and output activation. We conduct MVUE on both two matrix multiplications and compare their results: \(_{_{l}}=_{_{l}}(S(_{l})^{})^{}\) and \(_{_{l}}=(_{_{l}}^{}) _{l}\). Specifically, we choose \(S(_{l})\) and \(_{_{l}}\) because they both have built-in sparsity . However, we only choose to sparsify the latter one. Firstly, it is proven by Hu et al.  and Chmiel et al.  that minimum loss of accuracy is guaranteed for MVUE on \(_{_{l}}\). Secondly, using MVUE on \(S(_{l})\) will make errors accumulate along the back propagation, and results in large standard deviation of gradient for the first few layers. Besides, results in Table 3 also show minimum loss of accuracy of MVUE on \(_{_{l}}\) while obvious accuracy loss on \(S(_{l})\). Thus, we choose to sparsify only \(_{_{l}}\) in the backward pass.
+
+### FP8 training
+
+To further accelerate pre-training of networks, we utilize popular FP8 workflow in training. Similar to Transformer Engine 2, we use FP8 e3m4 in forward pass and e5m2 in backward pass. Besides, we use per-tensor rescaling before casting to FP8 formats.
+
+Theoretical acceleration of S-STEWhile 2:4 sparsity can accelerate GEMMs up to 2x faster, FP8 quantization can accelerate an additional 2x on this basis. Thus, the three GEMMs in Sec. 5.1 can be 4x, 2x, 4x faster. To sum up, we have theoretically 3x faster in forward and backward pass.
+
+## 6 Experiments
+
+We validate the feasibility of our proposed method S-STE on machine translation (Transformer ), image classification (DeiT ) and generative large language models (GPT-2  series). For all models, we replace the two linear layers in the feed forward network of each transformer block with
+
+   \(\) Recipe & Test BLEU & Val loss & Avg epoch loss \\  No scaling & 25.28 & 4.044 & 4.670 \\ Keeping L1-norm same  & 25.85 & 4.019 & 4.627 \\
+**Minimizing MSE (S-STE)** & **26.3** & **4.007** & **4.605** \\   
+
+Table 2: Experimental result of different \(\) on Transformer-base.
+
+   S-STE & \((S()^{})\) & \((_{}^{})\) & comment & loss \\  - & ✗ & ✗ & dense & 3.3948 \\ - & ✗ & ✗ & SR-STE & 3.4739 \\ ✓ & ✗ & ✗ & & 3.4333 \\ ✓ & ✓ & ✗ & & 3.4644 \\ ✓ & ✓ & ✓ & & 3.4773 \\ ✓ & ✗ & ✓ & & **3.4480** \\   
+
+Table 3: Results of different MVUE strategies on GPT-2 774M with 4000 steps. Sparsifying \(S()^{}\) introduces huge loss of accuracy while sparsifying \(_{}^{}\) is acceptable with little loss.
+
+S-STE. We keep the rest of the networks, the optimization algorithms as well as all hyperparameters the same as their dense counterparts.
+
+For Transformer, we train Transformer-base models on WMT 14 En-De dataset  with fairseq  codebase and evaluate it with BLEU  scores. For DeiT, we pre-train Deit-small model for ImageNet-1K  classification task. For GPT-2, we pre-train GPT-2 124M, 350M and 774M models on OpenWebText  and evaluate it on GLUE  and SQuAD  benchmarks. We also compare our method with state-of-the-art 2:4 training methods (SR-STE , Bi-Mask  and STEP ). The pre-training and evaluation scripts are publicly available at https://github.com/thu-ml/2by4-pretrain-acc-examples.
+
+Machine translationWe first apply S-STE to train a 12-layer Transformer-base and compare it with SR-STE and STEP. Note that we use fairseq codebase with SacreBleu metric, whose baseline should be 26.5 (the result of our reproduction is 26.42). The results are shown in Table 4. Compared with SR-STE, our method improves by 0.3 and 0.5 on test set and validation set respectively, which is the closest to baseline. Besides, we improve by 0.6 compared to STEP on test set.
+
+Image classificationWe further investigate the effectiveness of S-STE to train DeiT-tiny and DeiT-small on ImageNet-1k; see Table 5. Results show S-STE also achieve the best performance among different methods, with only has 1.4% degradation from the dense model. Notably, S-STE surpasses SOTA 2:4 training method Bi-Mask on this task (0.9% top1 accuracy improvement) and popular SR-STE method (2.8% top1 accuracy improvement).
+
+Generative language modelsWe compare S-STE with dense, normal SR-STE and SR-STE with dense fine-tuning  (SR-STE+DF) models on GLUE and SQuAD tasks. The SR-STE+DF models first use SR-STE to train a 2:4 sparse model, and switch to dense training for the last 1/6 iters of pre-training (which stands for "dense fine-tune"). In downstream tasks it also use dense parameters to make predictions, similar to dense models. Results in Table 6 and 9 show that S-STE completely surpasses SR-STE on both tasks. Even for SR-STE+DF models, S-STE still have an advantage, with an improvement of 1.5 on GLUE average and 1.2/0.9 on SQuAD for GPT-2 774M.
+
+Fine-tuningWe illustrate the viability of S-STE for fine-tuning a pre-trained model, presenting a coherent workflow of accelerating both training and inference (dense fine-tuning cannot produce a sparse model for inference acceleration); see Table 7, 6.
+
+   Method & Avg epoch loss & Test BLEU & Val BLEU & Val loss \\  Dense & 4.555 & 26.42 & 26.49 & 3.977 \\ SR-STE & 4.61 & 25.84 & 26.08 & 4.023 \\ STEP & 4.682 & 25.52 & 26.01 & 4.085 \\
+**S-STE** & \(\) & \(\) & \(\) & \(\) \\   
+
+Table 4: Experimental Results for Transformer-base on En-De dataset.
+
+   Model & Method & Test acc1 & Test acc5 \\   & Dense & 72.2 & 91.1 \\  & SR-STE  & 67.8 & 88.6 \\  & **S-STE** & \(\) & \(\) \\   & Dense & 79.9 & 95 \\  & SR-STE  & 75.7 & - \\   & Bi-Mask  & 77.6 & - \\   & **S-STE** & \(\) & \(\) \\   
+
+Table 5: Experimental Results for DeiT-small on ImageNet-1k. The Bi-Mask and SR-STE results are from .
+
+Ablation studyIn this part, We explore the effectiveness of S-STE, MVUE, and FP8 separately. We pre-train DeiT-small model on ImageNet-1K dataset for image classification. Combinations of these partitions in Table 8 show that: 1) FP8 training has little affect on pre-training accuracy (0.2% of acc1); 2) MVUE leads to minimal loss of performance (0.1% of acc1).
+
+    &  &  & Pre-train &  &  \\  & & & & &  &  \\   & Dense & Dense & 2.907 & 67.6 & 78.8 & \(73.9 1.1\) \\  & T-SR-STE+DF  & Dense & 2.952 & 67.5 & 78.5 & \(74.3 0.5\) \\  & T-SR-STE & Dense & 3.076 & 66.3 & 77.2 & \(72.6 0.2\) \\  & SR-STE & Dense & 2.982 & 66.2 & 77.5 & \(73.8 0.3\) \\  & **S-STE** & **S-STE** & **2.984** & **68** & **78.8** & **74.1 \(\) 0.4** \\   & Dense & Dense & 2.618 & 73.2 & 83.6 & \(76.3 0.1\) \\  & T-SR-STE+DF  & Dense & 2.688 & 71.9 & 82.4 & \(77.1 0.2\) \\  & T-SR-STE & Dense & 2.718 & 72.3 & 82.6 & \(76.3 0.4\) \\  & SR-STE & Dense & 2.690 & 72.0 & 82.4 & \(76.8 0.4\) \\  & **S-STE** & **S-STE** & **2.713** & **72.2** & **82.7** & **76.9 \(\) 0.6** \\   & Dense & Dense & 2.493 & 74.3 & 84.9 & \(76.2 0.4\) \\  & T-SR-STE+DF  & Dense & 2.564 & 74.3 & 84.6 & \(77.1 0.4\) \\   & **S-STE** & **S-STE** & **2.547** & **75.5** & **85.5** & **78.6 \(\) 0.8** \\   
+
+Table 6: SQuAD and GLUE scores of different sizes and pre-training methods on GPT-2. We use 2:4 sparse weights to evaluate S-STE model, while dense parameters to evaluate the rest. Of note, SR-STE denotes the original SR-STE workflow (without backward MVUE), and “T-SR-STE+DF” denotes the combination of transposable SR-STE & backward MVUE & sparse-dense training workflow, proposed by Hu et al. . S-STE settings here include backward MVUE & FP8 training.
+
+   Model & Downstream task & Pre-train & Fine-tune & Avg score \\   & GLUE & S-STE & Hard-thresholding & \(73.9 0.6\) \\  & **GLUE** & **S-STE** & **S-STE** & **74.1 \(\) 0.4** \\  & SQuAD & S-STE & Hard-thresholding & \(67.6/78.6\) \\  & **SQuAD** & **S-STE** & **S-STE** & **68\(/\)78.8** \\   
+
+Table 7: Different fine-tuning results on GLUE and SQuAD.
+
+    &  & }^{})\)} &  &  &  &  \\ thresholding & rescaling & & & & & \\  - & - & & & & & \\ - & - & & & & & \\ \(\) & \(\) & \(\) & \(\) & Hard-thresholding & 77.7 & 93.9 \\ \(\) & \(\) & \(\) & \(\) & & 78.8 & 94.6 \\ \(\) & \(\) & \(\) & \(\) & & 78.9 & 94.7 \\ \(\) & \(\) & \(\) & \(\) & & 78.6 & 94.4 \\ \(\) & \(\) & \(\) &AccelerationFor acceleration, we measure the acceleration ratio of a typical GPT-2 model using implementation from Hu et al. . Note that on H100 GPUs, FP8 2:4-spMM kernel turns out to be unsatisfying; see Appendix A.4. Consequently, we fall back to use RTX3090 GPUs with FP16 training. For inference, we achieve 1.53x speedup with FFN layer and 1.23x speedup with the network; for pre-training, we achieve 1.32x speedup for FFN layer and 1.18x speedup for the network (Appendix A.3).
+
+## 7 Related work
+
+Unstructured pruning and coarse-grained structured pruningPruning is to remove redundant weights from the dense model. Traditional one-shot pruning methods [17; 18; 12; 14; 31; 24] and dynamic sparse training methods [11; 6; 7; 50] mostly target on unstructured sparsity. While most of them have acceleration effect on CPUs, it is hard for these methods to work well on modern GPUs. Coarse-grained structured sparsity [49; 23; 19; 22] takes effect to acceleration, but since they often remove a whole chennel or a block, loss of information is non-negligible.
+
+Fine-grained N:M sparsity for inference and pre-trainingAmong all pruning techniques for pre-training, N:M sparsity is a promising approach towards accelerating large models, which is also known as fine-grained structured sparsity. Nvidia demonstrates 2x theoretical speedup on its Ampere GPUs with 2:4 sparsity for post-training  and inference [40; 15; 35; 9]. To leverage this property to accelerate pre-training, a number of approaches and their improvements are proposed [52; 28; 51; 1; 8; 21; 20]. However, all these methods are based on a discontinuous pruning function that is hard to optimize and results in unsatisfactory accuracy, which we will discuss in this study.
+
+FP8 quantizationWhile 16-bit float tensors are widely used in pre-training, FP8 - where float numbers stored in 8 bits - is a popular quantization methods which theoretically accelerates GEMMs up to 4x faster than its fp32 counterparts and 2x faster than its FP16/BF16 counterparts [30; 37; 44; 48; 32]. With e3m4 data format used in forward and e5m2 format  in backward, pre-trained models can achieve minimum loss of accuracy while greatly boosting the efficiency of training.
+
+## 8 Conclusions and future work
+
+In this study we discuss the importance of pruning continuity in effective 2:4 sparse pre-training. We analyse the drawback of traditional hard-thresholding pruning function and its variation (SR-STE) and argue that the main limits being discontinuity. Based on our analysis and soft-thresholding for channel pruning, we propose S-STE, which prunes weights in a continuous manner. Experiments show that our method surpasses previous state-of-the-art methods on a wide range of tasks.
+
+Our proposed S-STE approach primarily targets linear layers within FFN networks. Nevertheless, QKV projection layers necessitate further exploration to devise an effective dynamic sparse training strategy that harmonizes with attention mechanisms. Furthermore, our current choice of continuous pruning function represents only one possible solution; alternative, smoother pruning functions may be necessary to achieve improved continuity and mitigate potential discontinuities.

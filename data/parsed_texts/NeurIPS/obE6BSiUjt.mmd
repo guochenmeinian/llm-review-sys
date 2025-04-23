@@ -1,0 +1,279 @@
+# DYAD: A Descriptive Yet Abjuring Density efficient approximation to linear neural network layers
+
+Sarin Chandy Varun Gangal Yi Yang Gabriel Maggiotti
+
+ASAPP Inc.
+
+{schandy,vgangal,yyang,gmaggiotti}@asapp.com
+
+Equal Contribution. Sarin proposed the dyad model, modified the models in the transformers library with the Dyad layer and wrote the formulation section. Varun proposed the evaluation frameworks, organized the experiments and led the paper writing
+
+###### Abstract
+
+We devise, implement and performance-asses Dyad, a layer which can serve as a faster and more memory-efficient approximate replacement for linear layers, (_nn.Linear()_ in Pytorch). These layers appear in common subcomponents, such as in the _ff_ module of Transformers. Dyad is based on a bespoke near-sparse matrix structure which approximates the dense "weight" matrix \(W\) that matrix-multiplies the input in the typical realization of such a layer, a.k.a Dense. Our alternative near-sparse matrix structure is decomposable to a sum of 2 matrices permutable to a block-sparse counterpart. These can be represented as 3D tensors, which in unison allow a faster execution of matrix multiplication with the mini-batched input matrix \(X\) compared to Dense\((O(rows(W)\times cols(W))\to O(\frac{rows(W)\times cols(W)}{\#\ of\ blocks}))\). As the crux of our experiments, we pretrain both Dyad and Dense variants of 2 sizes of the OPT arch and 1 size of the Pythia arch, including at different token scales of the babyLM benchmark. We find Dyad to be competitive (\(\geq 90\)%) of Dense performance on zero-shot (e.g. Blimp), few-shot (OpenLM) and finetuning (GLUE) benchmarks, while being \(\geq\)7-15% faster to train on-GPU even at 125m scale, besides surfacing larger speedups at increasing scale and model width.
+
+## 1 Introduction
+
+Riding on the back of the already pivotal decade-long rise of GPU-driven deep learning [1], Transformers [2] in 2017 crescendoed the ambition, scale and task-generality of ML models. With cross-sequence in-training parallelizability and representation power through all-pair interactions, transformers disrupted NLP and its incumbent recurrent paradigm [3], but since became key components in other modalities such as CV [4]. Pretrained models as base representations, limited then to CV, emerged via LLMs like BERT [5], T5 [6] etc reaching SOTA across tasks with limited finetuning.
+
+A natural consequence of a module's ubiquity is that even a small improvement to one of its aspect can have major impact on its application and research -- as seen by the recent impact of e.g., quantization [7]. A result of this is that an inefficient component (attention) sees a barrage of research (e.g.hashing [8], softmax alternatives [9], FlashAttention [10] etc) until some other component emerges as a bottleneck. We believe this is the case with the dense linear layers in the Transformer's _ff_ module. Moreover, models have larger hidden dimension (4096 for Pythia, 8192 for Llama2), leading to quadratic rise in compute from _ff_ module linear layers. Thus inspired, we devise DYAD (_Descriptive Yet Abjuring Density_) -- an efficient linear layer approximation using block-sparsity.
+
+## 2 Formulation
+
+### Linear Layer
+
+A Linear layer is the basic building block of all neural networks, represented in pytorch by nn.Linear(). It maps input \(X\) to output \(Y\) via a dense matrix multiplication with weight matrix \(W\), given by the equation \(Y=G_{Linear}(X)=WX+b\). Here, \(W\) is a matrix of shape \(f_{out}\times f_{in}\) where \(f_{out}\) and \(f_{in}\) represent the no. of output & input features. \(Y\), \(X\) and the bias \(b\) have shapes \(f_{out}\times n_{batch}\), \(f_{in}\times n_{batch}\) and \(f_{out}\times 1\). Frameworks like pytorch pose the shape of \(X\) and \(Y\) as \(n_{batch}\times f_{in}\) and \(n_{batch}\times f_{out}\) but here we adhere to the former convention.
+
+### Dyad : Definition and Properties
+
+We introduce a family of sparse layers named Dyad that can serve as an approximate replacement for the dense linear layer. Dyad has 3 variants called Dyad-IT, Dyad-OT and Dyad-DT. The initials stand for Input Transpose, Output Transpose and Double Transpose. They are named such because transpose operations on either the input or output enables to compute their outputs efficiently. We describe Dyad-IT here and will describe the other two in a later section. Dyad is a linear layer with a sparse weight matrix having shape shown in Fig 1. The output of this layer can be calculated using \(G_{Linear}\). However, this won't lead to any efficiency gain compared to the linear layer. We can split the Dyad matrix into 2 components as shown in Fig 1. These components share some non-zero elements but their sum's representational power would be identical to the Dyad matrix. We call the first component the _Block Diagonal Component_ (BlockDiag) and the second one the _Block Transposed Component_ (BlockTrans). The ability to split Dyad into 2 components is what inspires its name. A Dyad matrix can be defined using 3 parameters, \(n_{dyd}\), \(n_{in}\) and \(n_{out}\). \(n_{out}\)\(\times\)\(n_{in}\) is the size of each submatrix in BlockDiag and \(n_{dyd}\) represents the no. of submatrices in each component. Thus, all the figures for Dyad shown here have \(n_{dyd}=n_{in}=n_{out}=4\). With the 2 components of Dyad split up, we can write its layer output as in Eq 1.
+
+\[Y=W_{1}X+W_{2}X+b\] (1)
+
+Naively implementing this as in Eq 1, will be as expensive as its dense counterpart. To exploit the joint properties of sparsity and block structure in these 2 components, we need to transform \(W_{1}X\) and \(W_{2}X\) to an equivalent sequence of 3D tensor operands and operations.
+
+Hereforth, we ease representing 3D tensors in our equations by overloading pytorch tensor operators.
+
+#### 2.2.1 Efficient Computation of BlockDiag
+
+Let \(Y_{1}=W_{1}X\) be the output of BlockDiag. From Fig 1, we can see that for any \(Y_{1}[i\times n_{out}:(i+1)\times n_{out},:]\) only depends on \(X[i\times n_{in}:(i+1)\times n_{in},:]\) where \(i\in[0,\!n_{dyd})\). This shows that each pair of \(Y_{1}[i\times n_{out}:(i+1)\times n_{out},:]\),\(X_{1}[i\times n_{in}:(i+1)\times n_{in},:]\) can be calculated individually using a matrix multiplication. The weights needed for this are \(W_{1}[i\times n_{out}:(i+1)\times n_{out},i\times n_{in}:(i+1)\times n_{in}]\). We can store the weights needed for all these pairs of outputs and inputs as a 3D tensor,\(W_{1}^{{}^{\prime}}\) of shape (\(n_{dyd}\),\(n_{out}\),\(n_{in}\)) as per Eq 2.
+
+\[W_{1}^{{}^{\prime}}[i,j,k]=W_{1}[i*n_{out}+j,i*n_{in}+k]\] (2)
+
+This is a factor of \(n_{dyd}\) times smaller when compared to \(W_{1}\) since it has the shape (\(n_{dyd}\times n_{out}\), \(n_{dyd}\times n_{in}\)). Thus, the whole output of the layer can be computed together with a single batched matrix multiplication as shown in Eq 4 after the input has been also converted to a 3D tensor as
+
+Figure 1: Dyad Weight Matrix [L] vs its Components [R], BlockDiag & BlockTrans. Green is \(\neq 0\).
+
+[MISSING_PAGE_FAIL:3]
+
+### Dyad implementation in pytorch
+
+The Dyad layer can be written relatively efficiently with a few lines of code in native pytorch. Here we present a simple implementation of Dyad, more specifically the exemplary Dyad-IT. Note that, in the code, we use \(dim\) instead of \(n\) to denote dimension. We also note that this code has some overhead in terms of multiple kernel launches, sequential processing of the components and some copying that could be avoided. Even with all of this we are still able to observe significant speedups especially at higher model scales.
+
+``` classDyad(torch.nn.Module): def__init__(self,shape,bias=True): super()__init__() self.dyad_dim,self.dim_in,self.dim_out=shape self.has_bias=bias k=1.0/float(np.sqrt(dim_in*dyad_dim)) self.wu=torch.nn.Parameter(torch.empty((dyad_dim,dim_out,dim_in))) torch.nn.init.uniform_(self.wu,-k,k) self.wl=torch.nn.Parameter(torch.empty((dyad_dim,dim_out,dim_in))) torch.nn.init.uniform_(self.wl,-k,k) ifself.has_bias: self.bias= torch.nn.Parameter(torch.empty((dyad_dim*dim_out,1))) torch.nn.init.uniform_(self.bias,-k,k) defforward(self,x): #The shape of xis(dyad_dim xdim_in, batch_size) x1=x.reshape(self.dyad_dim,self.dim_in,-1) #The shape of x1, which is a view of x, is now(dyad_dim, dim_in, batch_size) x2=x.reshape(self.dim_in,self.dyad_dim,-1).transpose(0,1) out = (self.wl.bmm(x1)+self.wu.bmm(x2)).reshape(self.dyad_dim*self.dim_out,-1) ifself.has_bias: out+=self.bias returnout ```
+
+### Dyad Variants
+
+In this section we will describe the other two variants of Dyad, Dyad-OT and Dyad-DT. Both of these variants can be split into two components. As in the case of Dyad-IT, the first component is a block diagonal matrix and the second component can be converted back into a block diagonal by means of transposes.
+
+#### 2.4.1 Dyad-OT
+
+The weight matrix and the two split components of Dyad-OT is shown in Fig 4. The first component can be calculated exactly the same way as in Dyad-IT. The output of the second component can be calculated as \(Y_{2}=W_{2}X\). Here, \(Y_{2}\) is the output of the second component, \(W_{2}\) is the weight matrix
+
+Figure 4: Dyad Output Transposed
+
+Figure 3: Illustrations of BlockTrans computation, in particular the Equation 9 stepand \(X\) is the activation. Similar to the case of Dyad-IT, we can see that if we permute the second component along the rows we can get back a block diagonal matrix. Let the permutation matrix which achieves this be \(P\). Since, we are permuting the rows here this permutation matrix needs to be pre multiplied i.e \(W_{2}^{P}=PW_{2}\) where \(W_{2}^{P}\) is the resultant block diagonal matrix. We can convert \(W_{2}X\) to use this form as shown below.
+
+\[Y_{2} =(P^{T}P)W_{2}X\] (11) \[Y_{2} =P^{T}(PW_{2})X\] (12) \[Y_{2} =P^{T}W_{2}^{P}X\] (13)
+
+Here, we can calculate \(W_{2}^{P}X\) similar to the first component and then the permutation by per-multiplying \(P^{T}\) can be achieved by transposing the output similar to how it was done for Dyad-IT. Thus, similar to Dyad-IT we will have a compute complexity of \(O(n_{dyd}\times n_{out}\times n_{in})\).
+
+#### 2.4.2 Dyad-DT
+
+Fig 5 shows the weight matrix and the components of Dyad-DT. The important thing to note is that the second component can be converted into a block diagonal matrix through a combination of transposing the cloumns as well as transposing the rows. So, in other words it's basically a combination of Dyad-IT and Dyad-OT. We have to transpose the input before we multiply by the block diagonal weight matrix and then we have to transpose the output to get the final output of the layer.
+
+\[Y_{2} =(P_{2}^{T}P_{2})W_{2}(P_{1}P_{1}^{T})X\] (14) \[Y_{2} =P_{2}^{T}(P_{2}W_{2}P_{1})(P_{1}^{T}X)\] (15) \[Y_{2} =P_{2}^{T}W_{2}^{P}X^{{}^{\prime}}\] (16)
+
+The above equations show this. \(X^{{}^{\prime}}=P_{1}^{T}X\) is the result of transposing the input while \(W_{2}^{P}\) is the equivalent block diagonal matrix obtained by permuting both the columns and rows (\(P_{2}W_{2}P_{1}\)). As in the case with the other two variants, this variant also achieves a complexity of \(O(n_{dyd}\times n_{out}\times n_{in})\).
+
+As further food for thought, we present a sketch discussing some thoughts about the representational power of Dyad in Appendix SS5.4.
+
+## 3 Experimental Setup: Architectures, Benchmarks and Metrics
+
+### Choice of Pretraining Corpus
+
+Since our experiments need multiple pretraining runs to create different pretrained variants of the same architectures, each with the linear layers of the _ff_ module replaced by our Dyad variants, in addition to the baseline Dense, it would be infeasible to pretrain manyfold on full corpora, especially for a new method that can show on-the-fly challenges. Since TinyStories [12], there has been an emerging class of lean pretraining corpora (others being [13, 14]) carefully curated to forsake on superficial aspects of scale (e.g. internet-scale vocab), while being linguistically rich enough. They present a reasonable Golliocks choice, being small enough to pretrain many runs on, while being large enough to learn emergent LLMesque skills. Hence, we choose BabyLM [14], which comes in two scales - 100M and 10M tokens respectively. The authors also provide an easy-to-use and "hackable" setup, with repos that support a) pretraining b) evaluating on Blimp/GLUE.
+
+### Models, Architecture, Hyperparameters & Compute
+
+We seek a setting which allows direct comparison between Dense vs Dyad, with preferably simple loss function and minimally randomized training. We avoid encoder-only and encoder-decoder
+
+Figure 5: Dyad Double Transposed
+
+architectures for this reason. To compare with BabyLM baselines, we pick the sole decoder-only architecture they evaluate, i.e. OPT-125m [15], as the architecture to try our variants with. We lay greater emphasis on exhaustive experiments at 10M data scale, though we also perform a core subset at the 100M scale. To show generalization to higher architecture size, we also repeat some experiments with OPT 350-m. We also present promising results at 10M with Pythia 160-M in Appendix SS5.6.4. We refer to the pretrained Dense checkpoint shared from BabyLM as DenseExt, Dense being our replication of it keeping pretraining details same for Dyad. Dyad variants have \(n_{dyd}=4\) unless mentioned (\(-8\) i.e. \(n_{dyd}=8\)). All experiments are on 1 GPU. More compute details are noted in AppendixSS5.5
+
+### Benchmarks & Metrics
+
+**Zero-Shot:****Blimp** Benchmark of Linguistic Minimal Pairs (Blimp) [16] consists of pairs of grammatical-ungrammatical sentences grouped by 12 broad phenomena e.g. anaphora and noun-verb agreement. A good LLM ought to assign higher probability to the grammatical member.
+
+**Few-Shot:****OpenLlm** The OpenLlm leaderboard [17] has become a prevalent way to benchmark LLMs based on 4 few-shot openbook MCQesque benchmarks. Internally, it uses LMEvalHarness [18], which we replicate to compute numbers for our models as well as BabyLm's pretrained checkpoints.
+
+**Finetuned:****Glue+** General Lang. Understanding Eval (Glue) [19], is a set of 7 NLU tasks, each evaluated post-finetuning. Also, we compute results on WSC and BoolQ. We christen this Glue+.
+
+**Training Time** We report both total and _FF_-only (time spent just on _ff_ modules) time per minibatch.
+
+**Memory & Parameter Footprint** By storing the dense subset of \(W\) as 3D tensor form, Dyad has lesser space complexity. To gauge real space saved, we measure various notions of memory and parameter size:
+
+i) **Non-Embedding Parameters:** As in Pythia [20], we report total Non-Embedding Parameters.
+
+ii) **Model Checkpoint Size:** On-disk size of the model checkpoint.
+
+iii) **In-Training GPU Memory Usage:** During training, models may use memory well beyond parameters, e.g. optimizer state, cached activations etc. In-Training GPU Memory Usage as a metric incorporates this.
+
+### Results
+
+#### 3.4.1 Dyad vs Dense with 10M tokens
+
+Through Tables 2 and 3 (and Appendix Tables 6, 7 & 8), we see that Dyad variants are well competitive (\(\leq\) 5%) of the best Dense baseline.
+
+In addition, through Figures 7, and Tables 11, 4 and 5 (as well as Appendix Tables 9 and 10), we see that all Dyad variants can translate the better complexity to actual speedups. We see that the quantum of these speedups to be much higher for larger architecture sizes i.e. OPT-350m
+
+#### 3.4.2 Promising Results With Pythia
+
+The Pythia suite [20] of models by EleutherAI, trained based on a permissively licensed collected dataset named The Pile [21].
+
+The results we get by pretraining Pythia on the 10M scale of BabyLM are shared in Table 3. We also see that, just as we did for OPT 125-m, the promised time complexity improvements translate into speedups considering both FF-only time (as we can see in Table 5) and overall time (as we can see in Table 4)
+
+#### 3.4.3 *-Cat experiments
+
+As can be seen in the forward() function of our implementation of Dyad-IT laid out in SS2.3, and as we note explicitly therewith ("_We also note that this code... has some overhead...sequential processing of the components_"), having to process the two components underlying our layer, i.e. BlockDiag and BlockTrans in separate steps does introduce an unnecessary overhead that did not exist for Dense. To mitigate this, one can conceptualize a slightly faster forward layer that first concatenates the two components to enable parallel processing, before adding them up. We refer to implementations which use this variation by the -Cat suffix, such as in Dyad-IT-Cat. We perform a pretraining run of this variant at 10M scale, and find that this is indeed faster as anticipated, while retaining near-identical performance. Specifically, the \(ff\)-only time per minibatch taken by Dyad-IT-Cat along with OPT-125m is 3.27 ms, rather than 3.90ms taken by the simple, no -Cat, Dyad-IT, which is about 16% faster. For OPT-350m, the fractional speedup goes up even more, with Dyad-IT-Cat taking 5.46 ms and with Dyad-IT taking 7.92ms, being 45% faster.
+
+The gains seen by optimizing away even this small overhead point to the promise held by the opportunity to optimize other steps of this layer once matrix multiplication itself has been optimized [through using Dyad style layers].
+
+#### 3.4.4 Profiling Experiments At Wider Architectural Scales
+
+Since Dyad is primarily applied herein to _ff_ module, assessing its benefits at higher relative width would give us important additional insight on its salience and generalizability in terms of benefit.
+
+To do this, we take the OPT-1.3B model's architecture but cap its depth down to 6 layers so that the model continue to fit within our computational constraints at levels of width all the way upto 4096.
+
+#### 3.4.5 Testing Waters with Vision Applicability - MNIST Experiment(s)
+
+Since the bulk of our experiments as well as intuitions and writing is in a large language model/NLP context, a natural question that may perplex a reader is if using a Dyad style linear layer rather than a Dense one holds promise in other modalities e.g. computer vision. To make a basic probe in this direction, we do experiments with the simple but foundational MNIST digit classification task [22], replacing linear layers with both their plain Dense and our Dyad-IT, again with \(n_{dyad}=4\). Furthermore, we also test the waters in terms of trying our approaches with diverse accelerators by performing these experiments directly on a Macbook CPU without using a GPU or MPS etc.
+
+We find the properties of reasonable performance preservation and speedups in both ff and overall time carry over to this situation too. Specifically, we find Dyad-IT achieves 98.51% test accuracy vs the 98.43% achieved by Dense, while taking 3.76 seconds of _ff_-only time per minibatch compared to 4.85 seconds by Dense.
+
+\begin{table}
+\begin{tabular}{|l|l|l|l|l|} \hline Model & Forward Pass & Backward Pass & Total & Total speedup ratio \\ \hline Dense & 1.458818136 & 2.843522568 & 4.302340703 & 1 \\ \hline Dyad-IT & 1.037282137 & 2.864683089 & 3.901965226 & 1.102608674 \\ \hline Dyad-OT & 1.005873492 & 2.833987413 & 3.839860905 & 1.12044181 \\ \hline Dyad-DT & 1.048527787 & 2.955974824 & 4.004502611 & 1.074375802 \\ \hline Dyad-IT-8 & 0.7726907735 & 1.836098994 & 2.608789767 & 1.649171105 \\ \hline \end{tabular}
+\end{table}
+Table 1: Mean time taken per minibatch by the ff transformer modules of OPT-125m training on account of forward, backward passes and in total. All times are in milliseconds. Speedup ratio is computed w.r.t. Dense
+
+Figure 6: Dyad vs Dense Speedup At Different Model Widths of 6-Layer Capped OPT-like architecture.
+
+## 4 Future Work
+
+In the future, we aim to explore i) using a heterogeneous mix of Dyad variants to approximate different ff layers ii) Replicating our experiments other minified corpora such as Minipile [13].
+
+\begin{table}
+\begin{tabular}{|c|c|c|c|c|} \hline Model & Forward Pass & Backward Pass & Total & Total speedup ratio \\ \hline Dense & 101.89 & 220.16 & 332.64 & 1 \\ \hline Dyad-IT & 89.40 & 229.86 & 310.62 & 1.071 \\ \hline \end{tabular}
+\end{table}
+Table 4: Mean time taken per minibatch by all modules of Pythia-160m training on account of forward, backward passes and in total. Times are in milliseconds. Speedup ratio is computed w.r.t. Dense
+
+\begin{table}
+\begin{tabular}{|c|c|c|c|c|c|c|c|} \hline Benchmark & Task & Dense & Dense-Ext & Dyad-IT & Dyad-OT & Dyad-DT & Dyad-IT-8 \\ \hline \hline \multirow{2}{*}{GLUE+Mean} & GLUE+QA & 68.32 & 63.38 & 67.33 & 68.46 & 68.59 & 67.30 \\  & GLUE+QA & 66.37 & 63.67 & 66.27 & 66.27 & 63.69 & 64.02 \\  & GLUE+NLI & 68.27 & 59.78 & 65.64 & 68.27 & **68.67** & 67.65 \\ \hline \hline \multirow{2}{*}{Blimp Mean} & Blimp & 59.16 & 60.31 & **60.47** & **62.55** & **60.36** & 58.88 \\ \hline \hline \multirow{2}{*}{OrealLim} & OpenLim & 30.27 & 30.39 & **30.61** & **30.74** & **30.58** & **30.65** \\ \hline \end{tabular}
+\end{table}
+Table 2: Performance on GLUE+ (finembing), BLIMP (0-shot), OpenLim (few-shot) benchmarks for Dense baselines vs 3 Dyad variants with \(n_{dyd=4}=4\) and a sparser version of the 1st (Dyad-IT-8). Numbers which exceed Dense/Dense-Ext are bolded/underlined respectively. All Dyad variants are \(\geq 0.95\times max(\text{Dense},\text{Dense-Ext})\). We present aggregates for brevity and defer individual values to Appendix Table 2
+
+\begin{table}
+\begin{tabular}{|c|c|c|c|c|c|} \hline Benchmark & Task & Dense & Dras-IT & Dyad-OT & Dyad-DT & Dyad-IT-8 \\ \hline \hline \multirow{2}{*}{GLUE+Mean} & GLUE+QA & 68.38 & 67.33 & 68.46 & 68.59 & 67.30 \\  & GLUE+QA & 66.37 & 66.27 & 66.27 & 63.69 & 64.02 \\  & GLUE+NLI & 68.27 & 59.78 & 65.64 & 68.27 & **68.67** & 67.65 \\ \hline \end{tabular}
+\end{table}
+Table 3: Benchmark numbers for Pythia-160m pretrained at the 10M scale comparing Dense with Dyad-IT. Instances where Dyad-IT exceeds Dense are marked in bold, while instances where Dyad-IT falls below 0.95* Dense are marked in Red. Dyad-IT falls below the 0.95% mark w.r.t. Dense on only 3 zero-shot and 2 **GLUE+** tasks, falling above the mark on all GLUE+ aggregate tasks and OpenLim. We present aggregates for brevity and defer individual values to Appendix Table 7
+
+Figure 8: Memory and parameter footprint of OPT-125m/OPT-350m training as per various static estimates on the left and dynamic GPU mem usage on the right.
+
+\begin{table}
+\begin{tabular}{|c|c|c|c|c|} \hline Model & Forward Pass & Backward Pass & Total & Total speedup ratio \\ \hline Dense & 1.414 & 2.826 & 4.240 & 1 \\ \hline Dyad-IT & 1.070 & 2.879 & 3.949 & 1.074 \\ \hline Dyad-IT-8 & 0.795 & 1.843 & 2.637 & 1.607 \\ \hline \end{tabular}
+\end{table}
+Table 5: Mean time taken per minibatch by the \(ff\) (feedforward) modules of Pythia-160m training on account of forward, backward passes and in total. All times are in milliseconds. Speedup ratio is computed w.r.t. Dense
+
+Figure 7: Mean training per minibatch by FF modules of OPT-125m/OPT-350m training spent on forward, backward passes and total (Times in ms). Dyad variants are faster, and \(\uparrow\)\(n_{dydd}\) (Dyad-IT-8) improves this.
+
+**Acknowledgements:** We thank Ryan McDonald and Nirmal Mukhi (ASAPP Inc.), the workshop organizers of the WANT and ESNLP workshops as well as anonymous reviewers for their helpful feedback.
+
+## References
+
+* [1] Krizhevsky, A., I. Sutskever, G. E. Hinton. Imagenet classification with deep convolutional neural networks. _Advances in neural information processing systems_, 25, 2012.
+* [2] Vaswani, A., N. Shazeer, N. Parmar, et al. Attention is all you need. _Advances in neural information processing systems_, 30, 2017.
+* [3] Sutskever, I., O. Vinyals, Q. V. Le. Sequence to sequence learning with neural networks. _Advances in neural information processing systems_, 27, 2014.
+* [4] Srinivas, A., T.-Y. Lin, N. Parmar, et al. Bottleneck transformers for visual recognition. In _Proceedings of the IEEE/CVF conference on computer vision and pattern recognition_, pages 16519-16529. 2021.
+* [5] Devlin, J., M.-W. Chang, K. Lee, et al. Bert: Pre-training of deep bidirectional transformers for language understanding. _arXiv preprint arXiv:1810.04805_, 2018.
+* [6] Raffel, C., N. Shazeer, A. Roberts, et al. Exploring the limits of transfer learning with a unified text-to-text transformer. _The Journal of Machine Learning Research_, 21(1):5485-5551, 2020.
+* [7] Dettmers, T., A. Pagnoni, A. Holtzman, et al. Qlora: Efficient finetuning of quantized llms. _arXiv preprint arXiv:2305.14314_, 2023.
+* [8] Kitaev, N., L. Kaiser, A. Levskaya. Reformer: The efficient transformer. _arXiv preprint arXiv:2001.04451_, 2020.
+* [9] Qin, Z., W. Sun, H. Deng, et al. cosformer: Rethinking softmax in attention. _arXiv preprint arXiv:2202.08791_, 2022.
+* [10] Dao, T., D. Fu, S. Ermon, et al. Flashattention: Fast and memory-efficient exact attention with io-awareness. _Advances in Neural Information Processing Systems_, 35:16344-16359, 2022.
+* [11] Wikipedia, W. contributing authors. Permutation matrix: Properties. https://en.wikipedia.org/wiki/Permutation_matrix#Properties, 2023.
+* [12] Eldan, R., Y. Li. Tinvories: How small can language models be and still speak coherent english? _arXiv preprint arXiv:2305.07759_, 2023.
+* [13] Kaddour, J. The minipile challenge for data-efficient language models. _arXiv preprint arXiv:2304.08442_, 2023.
+* [14] Warstadt, A., L. Choshen, A. Mueller, et al. Call for papers-the babylm challenge: Sample-efficient pretraining on a developmentally plausible corpus. _arXiv preprint arXiv:2301.11796_, 2023.
+* [15] Zhang, S., S. Roller, N. Goyal, et al. Opt: Open pre-trained transformer language models. _arXiv preprint arXiv:2205.01068_, 2022.
+* [16] Warstadt, A., A. Parrish, H. Liu, et al. Blimp: The benchmark of linguistic minimal pairs for english. _Transactions of the Association for Computational Linguistics_, 8:377-392, 2020.
+* [17] Beeching, E., C. Fourrier, N. Habib, et al. Open llm leaderboard. https://huggingface.co/spaces/HuggingFaceH4/open_llm_leaderboard, 2023.
+* [18] Gao, L., J. Tow, S. Biderman, et al. A framework for few-shot language model evaluation, 2021.
+* [19] Wang, A., A. Singh, J. Michael, et al. Glue: A multi-task benchmark and analysis platform for natural language understanding. In _Proceedings of the 2018 EMNLP Workshop BlackboxNLP: Analyzing and Interpreting Neural Networks for NLP_, pages 353-355. 2018.
+* [20] Biderman, S., H. Schoelkopf, Q. G. Anthony, et al. Pythia: A suite for analyzing large language models across training and scaling. In _International Conference on Machine Learning_, pages 2397-2430. PMLR, 2023.
+* [21] Biderman, S., K. Bicheno, L. Gao. Datasheet for the pile. _arXiv preprint arXiv:2201.07311_, 2022.
+* [22] LeCun, Y. The mnist database of handwritten digits. _http://yann. lecun. com/exdb/mnist/_, 1998.
+
+Appendix
+
+### Important Additional Caveats About Formulation & Implementation
+
+1. **Constraints on Rectangular \(W\) dimensions:** Since \(n_{dydad}\) denotes the number of equi-sized blocks (with W's dimensions being factorable out at \(n_{in}\times n_{dyd}\) and \(n_{out}\times n_{dyd}\), for a non-trivial sparse reduction, the dimensions of W would need to be both divisible by some \(n_{dyd}>1\) -- one cannot divide a \(7\times 6\) matrix into \(4\times 4\) blocks. However, we can see that for practical usage this aspect is somewhat pedantic, one can always pad up the dimensions with zeroes to different extents such that \(n_{dydad}\), i.e., the desired level of sparsity is attained - e.g, in the \(7\times 6\) case, zero-padding up the number of rows by 1, our dimensions will now have a common factor \(2\),
+2. **Additional Kernel Launches in Implementation:** The code for Dyad-IT described in the Formulation section does have some overhead in terms of additional kernel launches but for larger sized models this overhead will amortize away.
+
+### Hyperparameter Choices & Compute Details
+
+For simplicity, we avoid mixed precision training (use fp32 throughout), gradient checkpointing or quantization. Since BabyLM's training setup required using earlier versions of Pytorch than would be compatible don't use FlashAttention. These techniques are in either case not intertwined directly to our method. All our OPT-125m experiments for both the Strict and StrSma scales were done on a NVIDIA V100. For OPT-350m experiments, we use a A10G.
+
+We use the optimizers for dense layers from the typical Dense setting as-is, sans any changes particular to our method. Initialization for the various Sparse approaches too, was done in the same fashion as for Dense. Optimizers same
+
+### Additional Results
+
+#### 5.3.1 Complete Benchmark Result Tables
+
+#### 5.3.2 Complete Timing Results
+
+#### 5.3.3 Complete Memory Results
+
+In this section, we enclose complete results of evaluating each of our experiments along the aspects of memory & parameter footprint we earmarked in SS3.3
+
+#### 5.3.4 Results on 100M Scale
+
+#### 5.3.4 Representational power of Dyad
+
+Consider a network with two square Dyad layers i.e. \(n_{in}=n_{out}\) sequentially applied one after the other to the input. Let the weight matrixes for the layers be, \(W_{1}^{d}\) and \(W_{2}^{d}\) and the input be \(X\). The output \(Y\) can be calculated as \(Y=W_{2}^{d}W_{1}^{d}X\).
+
+Consider an input dimension \(i\) of \(X\) and an output dimension \(j\) of \(Y\). If \(i//n_{in}=j//n_{in}\) i.e. they fall in the same block of the BlockDiag then there exists \(O(n_{in})\) connections between them through the middle layer. If \(i//n_{in}\neq j//n_{in}\) then only through the BlockDiag there wouldn't be any interactions between this pair of input and output. However, the BlockTrans interacts with outputs that are spaced uniformly apart at a stride of \(n_{dyd}\). On average \(O(n_{in}/n_{dquad})\) fall in the same block as that of the output dimension \(j\), i.e. if the middle dimension was \(k\) then \(k//n_{in}=j//n_{in}\). Each of these middle dimensions will have a direct connection to j. Thus, in this second case the input dimension \(i\) will have \(O(n_{in}/n_{dyd})\) connections to output dimension \(j\). This is summarized in Eq 17.
+
+\[\text{No. of connections in Dyad}=\begin{cases}O(n_{in}),&\text{if }j//n_{in}=i//n_{in}\\ O(n_{in}/n_{dquad}),&\text{otherwise}\end{cases}\] (17)
+
+In the case of a sequence of two dense linear layers with the same shape, the number of connections would be \(O(n_{in}\times n_{dyd})\) between each input and output. Thus, the ratio of connections between dense and linear are as shown in Eq 18.
+
+\[\text{Ratio of connections in Linear to Dyad}=\begin{cases}O(n_{dyad}),&\text{ if }j/n_{in}=i//n_{in}\\ O(n_{dyad}{}^{2}),&\text{ otherwise}\end{cases}\] (18)
+
+Hence, Dyad layer has the ability to mix dimensions that are both near by and far away but the ability to mix information in nearby dimensions falls linearly with sparsity but far away dimensions fall quadratically. This means that Dyad will have a bias for pushing information that needs to interact with each other a lot close by and thus more efficiently using it's parameter space when compared to linear layers. Also the inter connections between the input and output dimensions fall gradually with \(n_{dyad}\) and thus provides a way to tradeoff between representational power and computational cost.
+
+\begin{table}
+\begin{tabular}{|c|c|c|c|c|c|c|c|} \hline Benchmark & Task & Dense & Dense-Ext & Dyad-IT & Dyad-OT & Dyad-DT & Dyad-IT-8 \\ \hline \hline \multirow{9}{*}{GLUE+} & CALA & 68.50 & 64.60 & 68.20 & 68.11 & 67.32 & 67.42 \\  & SST2 & 86.42 & 81.90 & 86.61 & 85.83 & 85.04 & 85.24 \\  & MRPC (FI) & 76.56 & 72.50 & 77.44 & 76.98 & 78.49 & 73.56 \\  & QOP (FI) & 80.50 & 60.40 & 79.79 & 80.26 & 80.91 & 80.85 \\  & MNI1 & 70.77 & 57.60 & 71.12 & 71.32 & 70.89 & 70.82 \\  & MNI-mm & 71.80 & 60.60 & 72.06 & 72.52 & 72.57 & 70.99 \\  & QNI & 69.90 & 61.50 & 70.91 & 76.73 & 74.67 & 70.21 \\  & RTE & 60.61 & 60.00 & 48.49 & 52.53 & 56.57 & 58.59 \\  & BoulQ & 66.25 & 63.30 & 64.32 & 63.90 & 63.62 & 64.18 \\  & Moulker & 56.30 & 55.20 & 57.07 & 57.94 & 48.96 & 54.33 \\  & WSC & 49.40 & 60.20 & 44.58 & 49.99 & 55.42 & 48.19 \\ \hline \multirow{2}{*}{GLUE+Mons} & GLUE+ & 68.82 & 63.38 & 67.33 & 68.46 & 68.59 & 67.70 \\  & GLUE+QA & 66.37 & 66.73 & 66.27 & 66.27 & 63.69 & 64.02 \\  & GLUE+NLI & 68.27 & 59.78 & 65.64 & 68.27 & 68.67 & 67.65 \\ \hline \hline \multirow{9}{*}{BLHP} & Anhydro Age & 49.49 & 63.80 & 67.33 & 64.88 & 73.93 & 59.25 \\  & Age Structure & 68.10 & 76.00 & 71.34 & 68.47 & 68.65 & 67.82 \\  & Binding & 68.67 & 67.10 & 65.95 & 65.18 & 63.60 & 68.94 \\  & Content/Kingsings & 66.64 & 66.50 & 63.52 & 64.27 & 63.83 & 62.73 \\  & D-N Age & 74.20 & 75.50 & 61.05 & 81.25 & 80.15 & 74.25 \\  & Elipasi & 57.33 & 62.00 & 61.09 & 67.51 & 54.22 & 55.08 \\  & Filter-Gap & 65.36 & 63.80 & 64.58 & 65.64 & 66.67 & 65.95 \\  & Irregular Forms & 77.66 & 67.50 & 82.75 & 75.88 & 81.78 & 66.62 \\  & Island Effects & 44.02 & 48.60 & 54.75 & 49.89 & 47.35 & 48.28 \\  & NPI Lacious & 41.19 & 46.70 & 47.46 & 42.96 & 49.59 & 39.31 \\  & Quantities & 61.57 & 59.60 & 53.66 & 71.46 & 44.87 & 67.13 \\  & Subject-Web Agreement & 54.42 & 66.90 & 55.77 & 61.12 & 56.95 & 63.88 \\  & Hypernym & 49.19 & 50.00 & 48.72 & 46.74 & 49.30 & 50.70 \\  & QA Consequence (Zavy) & 57.81 & 54.70 & 59.38 & 60.94 & 54.69 & 57.81 \\  & QA Consequence (Ticky) & 32.73 & 31.50 & 35.78 & 47.88 & 39.39 & 39.39 \\  & Subject Auxiliary Inversion & 73.92 & 80.30 & 56.01 & 70.77 & 72.92 & 73.566 \\  & Turn Taking & 63.21 & 57.10 & 58.93 & 68.57 & 66.79 & 55.00 \\ \hline \multirow{2}{*}{Mons} & BLHP & 59.16 & 60.31 & 60.47 & 62.55 & 60.86 & 58.88 \\ \cline{2-8}  & AccLAnaloges-25 & 22.78 & 23.72 & 22.87 & 25.26 & 23.29 & 23.293 \\ \hline \multirow{2}{*}{OresLLM} & RHelmose-10 & 25.81 & 25.11 & 25.16 & 24.77 & 24.80 & 25.43 \\  & Truth/MoMC-0 & 49.39 & 49.79 & 51.12 & 48.83 & 49.84 & 49.68 \\ \cline{1-1}  & MML-U-5 & 23.11 & 23.01 & 23.30 & 24.10 & 24.40 & 24.20 \\ \hline \multirow{2}{*}{Mons} & OrsiLlim & 30.27 & 30.39 & 30.61 & 30.74 & 30.58 & 30.65 \\ \cline{1-1} \cline{2-8}  & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} \\ \end{tabular}
+\end{table}
+Table 6: Performance on GLUE+ (post-finetuning), Blimp (zero-shot), OpenLlm (few-shot) benchmarks for the Dense and Dense-Ext baselines and all 3 Dyad variants as well as a doubly sparser version of the 1st variant. These results are with OPT-125m when pretrained at the 10M scale, a summary of which is presented in the results - the rows corresponding to Benchmark aggregate means from this table were presented in Table 1 of the main paper.
+
+\begin{table}
+\begin{tabular}{|c|c|c|c|} \hline Benchmark & Task & Dense & Dyad-IT \\ \hline \hline \multirow{8}{*}{GLUE+} & CoLA & 70.069 & 69.48 \\  & SST-2 & 85.039 & 85.039 \\  & MPRC (F1) & 80.435 & 79.715 \\  & QQP (F1) & 81.125 & 81.356 \\  & MNLI & 71.853 & 70.908 \\  & MNLI-mm & 73.297 & 71.929 \\  & QNLI & 80.315 & 76.859 \\  & RTE & 53.535 & 43.434 \\  & BoolQ & 64.73 & 64.315 \\  & MultiRC & 49.726 & 50.383 \\  & WSC & 53.012 & **59.036** \\ \hline \multirow{2}{*}{Means} & GLUE+ & 69 376 & **72.220** \\  & GLUE+-QA & 64.964 & 64.804 \\  & GLUE+-NLI & 69.750 & **73.232** \\ \hline \hline \multirow{8}{*}{Blimp} & Anzhor Agr. & 62.168 & 60.685 \\  & Agr. Structure & 69.241 & 67.083 \\  & Binding & 72.069 & 66.014 \\  & Control/Raising & 67.852 & 61.6 \\  & D-N Agr. & 87.019 & 84.633 \\  & Ellipsis & 62.875 & 63.279 \\  & Filler-Gap & 68.830 & 68.659 \\  & Irregular Forms & 84.173 & 73.323 \\  & Island Effects & 46.375 & **52.342** \\  & NPI Licensing & 57.060 & 46.083 \\  & Quantities & 68.959 & 66.718 \\  & Subject Verb Agreement & 67.66 & 59.422 \\  & Hypenym & 44.651 & **50** \\  & QA Congruence (Easy) & 54.688 & 50 \\  & QA Congruence (Tricky) & 47.879 & **50.303** \\  & Subject Auxiliary Inversion & 78.970 & 64.089 \\  & Turn Taking & 64.286 & 61.071 \\ \hline \multirow{2}{*}{Means} & Blimp & 64.98 & 61.47 \\ \hline \hline \multirow{3}{*}{OpenLlm} & ArcChallenge-25 & 23.379 & 24.500 \\  & Hellissaug-10 & 25.085 & 25.035 \\ \cline{1-1}  & TruthfulQA-MC-0 & 48.661 & 50.291 \\ \cline{1-1}  & MMLU-5 & 23.190 & 22.910 \\ \hline \multirow{2}{*}{Means} & OpenLlm & 30.078 & 30.680 \\ \hline \end{tabular}
+\end{table}
+Table 7: Benchmark numbers for OPT-350m pretrained at the 10M scale comparing Dense with Dyad-IT. Instances where Dyad-IT exceeds Dense are marked in bold, while instances where Dyad-IT falls below 0.95* Dense are marked in Red. We can see this happens only for four zero-shot tasks and none of the few-shot tasks.
+
+\begin{table}
+\begin{tabular}{|l|l|l|l|l|} \hline Model & Forward Pass & Backward Pass & Total & Total speedup ratio \\ \hline Dense & 96.57443477 & 218.1589193 & 315.6306277 & 1 \\ \hline Dyad-IT-4 & 83.38802419 & 208.3585416 & 292.6851179 & 1.078396572 \\ \hline Dyad-OT-4 & 82.48964827 & 207.7835725 & 291.2115524 & 1.083853388 \\ \hline Dyad-DT-4 & 83.34073742 & 210.0591608 & 294.3693217 & 1.072226636 \\ \hline Dyad-IT-8 & 78.16424509 & 194.1724526 & 273.3341317 & 1.154742826 \\ \hline \end{tabular}
+\end{table}
+Table 8: Benchmark numbers for Pythia-160m pretrained at the 10M scale comparing Dense with Dyad-IT. Instances where Dyad-IT exceeds Dense are marked in bold, while instances where Dyad-IT falls below 0.95* Dense are marked in Red. Dyad-IT falls below the 0.95% mark w.r.t. Dense on only 3 zero-shot and 2 **GLUE+** tasks, falling above the mark on all GLUE+ aggregate tasks and OpenLlm
+
+\begin{table}
+\begin{tabular}{|l|l|l|l|l|} \hline Model & Checkpoint Size (MB) & \# Params & In-Train GPU Use (MB) & \% Drop In GPU Mem vs Dense \\ \hline Dense & 478 & 86.63 & 9838 & 0 \\ \hline Dyad-IT-4 & 370 & 58.32 & 9666 & 1.74832283 \\ \hline Dyad-OT-4 & 370 & 58.32 & 9666 & 1.74832283 \\ \hline Dyad-OT-4 & 370 & 58.32 & 9666 & 1.74832283 \\ \hline Dyad-DT-4 & 370 & 58.32 & 9666 & 1.74832283 \\ \hline Dyad-DT-4 & 370 & 58.32 & 9666 & 1.74832283 \\ \hline Dyad-DT-8 & 316 & 44.16 & 9540 & 3.029070949 \\ \hline \end{tabular}
+\end{table}
+Table 11: Mem./Param. Usage Metrics Across Dense and other Dyad variants for OPT-125m
+
+\begin{table}
+\begin{tabular}{|l|l|l|l|} \hline Benchmark & Task & Dense & Dyad-IT \\ \hline \hline  & CULA & 68.4 & **68.937** \\ \hline  & SST-2 & 85.26 & 84.843 \\  & MRCE (F) & 78.873 & 78.261 \\  & OPO (F) & 80.36 & 80.54 \\  & MNLI & 70.451 & 69.918 \\ GLUE+ & MNLI-mm & 70.321 & **70.974** \\  & QNL & 55.118 & **73.447** \\  & RTE & 48.485 & 44.444 \\  & Boolo & 66.113 & 65.422 \\  & MathRC & 57.55 & 51.698 \\  & WSC & 42.169 & **56.101** \\ \hline  & GLUE+ & 73.36818182 & **73.71942857** \\ \hline  & GLUE+ & 69.875 & **72.7185** \\  & GLUE+NLI & 73.188 & **72.7675** \\ \hline \hline  & Angror Apr. & 56.851 & 55.419 \\  & Agr. Structure & 68.671 & **68.708** \\  & Binding & 67.584 & 64.619 \\  & Conrot/Raising & 58.948 & **59.677** \\  & D-N Agr. & 75.55 & **75.961** \\  & Ellipsi & 62.366 & 60.624 \\  & Filter-Gap & 59.835 & **61.656** \\  & Inregular Forms & 56.132 & **57.303** \\ Blimp & Island Effects & 51.345 & **53.812** \\  & NPI LICE & 48.585 & **58.421** \\  & Quantitative & 60.768 & 58.733 \\  & Subject Web Agreement & 58.229 & 53.64 \\  & Hypernym & 49.07 & **52.791** \\  & QA Corpenture (Ginvox) & 53.125 & **57.812** \\  & QA Corpenture (Ginvox) & 59.394 & **51.515** \\  & Subject Auxiliary Inversion & 68.119 & 61.308 \\  & Turn Taking & 66.071 & 58.571 \\ \hline  & BLimp & 58.87623259 & **59.2688233** \\ \hline \hline  & Arcalline-2x & 21.549 & 22.696 \\ OpenLlm & Infelawg-10 & 26.260 & 25.423 \\  & Trulld/A-MC-0 & 46.972 & **46.418** \\  & MNLI-5 & 21.218 & **23.498** \\ \hline  & OrusLlm & 29.9997 & **30.05875** \\ \hline \end{tabular}
+\end{table}
+Table 9: Mean time taken per minibatch by all modules of OPT-125m training on account of forward, backward passes and in total. All times are in milliseconds. Speedup ratio is computed w.r.t. Dense
+
+\begin{table}
+\begin{tabular}{|l|l|l|l|l|} \hline Model & Forward Pass & Backward Pass & Total & Total speedup ratio \\ \hline Dense & 96.57443477 & 218.1589193 & 315.6306277 & 1 \\ \hline Dyad-IT-4 & 83.38802419 & 208.3585416 & 292.6851179 & 1.078396572 \\ \hline Dyad-OT-4 & 82.48964827 & 207.7835725 & 291.2115524 & 1.08385388 \\ \hline Dyad-DT-4 & 83.34073742 & 210.0591608 & 294.3693217 & 1.072226636 \\ \hline Dyad-IT-8 & 78.16424509 & 194.1724526 & 273.3341317 & 1.154742826 \\ \hline \end{tabular}
+\end{table}
+Table 8: Benchmark numbers for Pythia-160m pretrained at the 10M scale comparing Dense with Dyad-IT. Instances where Dyad-IT exceeds Dense are marked in bold, while instances where Dyad-IT falls below 0.95* Dense are marked in Red. Dyad-IT falls below the 0.95% mark w.r.t. Dense on only 3 zero-shot and 2 **GLUE+** tasks, falling above the mark on all GLUE+ aggregate tasks and OpenLlm
+
+\begin{table}
+\begin{tabular}{|l|l|l|l|l|} \hline Benchmark & Task & Dense & Dense-Ext & Dyad-IT \\ \hline \multirow{8}{*}{GLUE+} & CoLA & 76.742 & 73.7 & 74.877 \\  & SST-2 & 87.992 & 86.6 & 89.567 \\  & MPRC (F1) & 82.129 & 82.1 & 80.292 \\  & QQP (F1) & 83.993 & 77.8 & 82.151 \\  & MNL1 & 77.339 & 70.1 & 76.623 \\  & MNL1-mm & 78.326 & 71.9 & 77.912 \\  & QNLL & 83.552 & 80.1 & 84.208 \\  & RTE & 53.535 & 67.7 & 63.366 \\  & BoolQ & 65.284 & 66.0 & 65.145 \\  & MultiRC & 62.212 & 61.1 & 64.294 \\  & WSC & 61.446 & 59.0 & 59.036 \\ \hline \multirow{2}{*}{Means} & GLUE+ & 73.5808 & 72.24 & 74.2594 \\  & GLUE+ & 69.875 & 69.7333 & 69.91033 \\  & QA & & & \\  & GLUE+ & 73.188 & 72.45 & 75.52725 \\  & NLI & & & \\ \hline \hline \multirow{8}{*}{Blimp} & Anaphor & 97.90 & 94.9 & 90.03 \\  & Agr. Structur & & & \\  & Binding & 72.306 & 73.8 & 73.89 \\  & Control/Raising & 74.105 & 72.2 & 72.67 \\  & D-N Agr. & 93.039 & 93.1 & 91.46 \\  & Ellipsis & 81.062 & 80.5 & 81.64 \\  & Fuller-Gap & 74.214 & 73.6 & 74.167 \\  & Irregular & 89.924 & 80.8 & 85.55 \\  & Forms & & & \\  & Island Effects & 62.780 & 57.8 & 57.81 \\  & NPI Licensing & 61.160 & 51.6 & 50.42 \\  & Quantifiers & 71.303 & 74.5 & 67.46 \\  & Subject & 82.240 & 77.3 & 78.64 \\  & Verb Agreement & & & \\  & Hypermym & 47.791 & 46.3 & 47.56 \\  & QA Congruence (Easy) & 70.312 & 76.5 & 76.56 \\  & QA Congruence & 52.121 & 47.9 & 50.91 \\  & (Tricky) & & & \\  & Subject & 85.045 & 85.3 & 83.85 \\  & Auxiliary & & & \\  & Inversion & 79.643 & 82.9 & 79.28 \\ \hline Means & Blimp & 74.8723 & 73.1058 & 72.9633 \\ \hline \hline \multirow{4}{*}{OpenLlm} & ArcChallenge & 25.256 & 23.293 & 24.659 \\  & 25 & 25.234 & 25.055 & 25.473 \\  & Hellaswag- & 10 & & \\  & TruthfulQA- & 48.868 & 48.448 & 49.332 \\  & MC-0 & & & \\  & MNL-5 & 23.567 & 23.181 & 23.080 \\ \hline Means & OpenLLM & 30.73 & 29.99 & 30.636 \\ \hline \end{tabular}
+\end{table}
+Table 12: Benchmark numbers for OPT-125m pretrained on Str (100M) comparing internal and external Dense baselines with Layer Variant

@@ -1,0 +1,166 @@
+# Meta 3D AssetGen: Text-to-Mesh Generation with High-Quality Geometry, Texture, and PBR Materials
+
+**Yawar Siddiqui\({}^{}\) Tom Monnier* Filippos Kokkinos* Mahendra Kariya Yanir Kleiman Emilien Garreau Oran Gafni Natalia Neverova Andrea Vedaldi Roman Shapovalov* David Novotny* GenAI, Meta \({}^{}\)TU Munich; intern with Meta *core technical contributors**
+
+We present Meta 3D AssetGen (AssetGen), a significant advancement in text-to-3D generation which produces faithful, high-quality meshes with texture and material control. Compared to works that bake shading in the 3D object's appearance, AssetGen outputs physically-based rendering (PBR) materials, supporting realistic relighting. AssetGen generates first several views of the object with separate shaded and albedo appearance channels, and then reconstructs colours, metalness and roughness in 3D, using a deferred shading loss for efficient supervision. It also uses a sign-distance function to represent 3D shape more reliably and introduces a corresponding loss for direct shape supervision. This is implemented using fused kernels for high memory efficiency. After mesh extraction, a texture refinement transformer operating in UV space significantly improves sharpness and details. AssetGen achieves \(17\%\) improvement in Chamfer Distance and \(40\%\) in LPIPS over the best concurrent work for few-view reconstruction, and a human preference of \(72\%\) over the best industry competitors of comparable speed, including those that support PBR. Project page with generated assets: https://assetgen.github.io
+
+Figure 1: We present **Meta 3D AssetGen**, a novel text- or image-conditioned generator of 3D meshes with physically-based rendering materials (top). Meta 3D AssetGen produces meshes with detailed geometry and high-quality textures, and decomposes materials into albedo, metalness, and roughness (bottom left), which allows to realistically relight objects in new environments (bottom right).
+
+Introduction
+
+Generating 3D objects from text or image prompts has enormous potential for 3D graphics, with applications in animation, gaming and virtual reality. However, while image and video generators have improved dramatically [68; 44; 55; 42; 97; 103], 3D generators are not ready yet for professional use. In fact, 3D generators are often slow and produce artifacts in the generated 3D meshes and textures. Many 3D generators, furthermore, "bake" appearance as albedo, ignoring how materials respond to variable environmental illumination. This results in visually unattractive outputs, especially for reflective materials, which look out of place when put in novel environments.
+
+In this paper, we introduce _Meta 3D AssetGen_, a significant step-up in text-conditioned 3D generation. AssetGen generates assets in under 30 seconds while outperforming prior methods of comparable speed in faithfulness, in quality of the generated 3D meshes and, especially, in quality and control of materials, by supporting _Physically-Based Rendering_ (PBR) . The model generates albedo, metalness, and roughness so that rendered scenes can accurately reflect environmental illumination. In addition, we focus on meshes as the output representation due to their prevalence in applications and compatibility with PBR.
+
+AssetGen uses the two-stage design epitomized by . The first stage _stochastically_ generates four images of the object from four canonical viewpoints, and the second stage _deterministically_ reconstructs the 3D shape, appearance and materials of the object from these views (Fig. 1). The two-stage approach is faster and more robust than SDS-based techniques that perform test-time optimization  and, so far, produces better results than single-stage 3D generators [37; 61; 94; 79].
+
+The first question we ask is how this design should be extended to support PBR. We show that it is difficult for the image-to-3D stage to predict PBR channels from an image as this problem is ambiguous and the model is deterministic. However, we also show that it is difficult offload PBR prediction to the text-to-image model; while this is stochastic, which handles ambiguity, the PBR channels are statistically different from the natural images used for pre-training, which makes fine-tuning difficult. Our solution is to give the text-to-image model the simpler task of outputting shaded appearance and albedo only, and task the image-to-3D stage with inferring the PBR channels from these. This reduces the statistical gap for the text-to-image model and still removes most of the ambiguity for the image-to-3D model.
+
+We also note that the quality of 3D shapes and meshes is crucial for PBR modelling. Hence, the second question we study is how to improve 3D quality. We do so by learning a reconstruction network, _MetaLRM_, which outputs directly a signed-distance field (SDF). SDFs are better than opacity fields for meshing, as the zero level set of an SDF traces the object's surface more reliably. Furthermore, the SDF can be directly supervised using ground-truth depth maps, which is not immediately possible for opacity. The crucial contribution here is to add SDF support, including the VolSDF  formulation for differentiable rendering, to the memory-efficient Lightplane kernels . In this way, we can use the stronger SDF representation together with larger batches and photometric loss supervision on high-resolution renders, improving both shapes and textures.
+
+Finally, we note that much of the quality of the final asset depends on texture quality. MetaLRM's textures can still be slightly blurrier than the input image due to the limited resolution of the volumetric representation. The third question we investigate is how to maximize the texture quality. To this end, we introduce a new texture refiner network which upgrades the extracted albedo and materials by fusing information extracted from the original views, resolving possible conflicts between them.
+
+We demonstrate the effectiveness of AssetGen on the image-to-3D and text-to-3D tasks. For image-to-3D, we attain state-of-the-art performances among existing few-view mesh-reconstruction methods when measuring the accuracy of the recover shaded and PBR texture maps. For text-to-3D, we conduct extensive user studies to compare the best methods from academia and industry that have comparable inference time, and outperform them in terms of visual quality and text alignment.
+
+## 2 Related Work
+
+**Text-to-3D.** Inspired by text-to-image models, early text-to-3D approaches [39; 31; 64; 34; 26; 110] train 3D diffusion models on datasets of captioned 3D assets. Yet, the limited size and diversity of 3D data prevents generalization to open-vocabulary prompts. Recent works thus pivoted into basingsuch generators on text-to-image models that are trained on billions of captioned images. Among these, works like [75; 56] finetune 2D diffusion models to output 3D representations, but the quality is limited due to the large 2D-3D domain gap. Other approaches can be dived into two groups.
+
+The first group contains methods that build on DreamFusion, a seminal work by , and distill 3D objects by optimizing NeRF via the SDS loss, matching its renders to the belief of a pre-trained text-to-image model. Extensions have considered: (i) other 3D representations like hash grids [44; 69], meshes  and 3D Gaussians (3DGS) [81; 111; 12]; (ii) improved SDS [91; 95; 119; 30]; (iii) monocular conditioning [69; 82; 113; 78]; (iv) predicting additional normals or depth for better geometry [70; 78]. Yet, distillation methods are prone to issues such as the Janus effect (duplicating object parts) and content drift . A common solution is to incorporate view-consistency priors into the diffusion model, by either conditioning on cameras [47; 73; 32; 11; 69] or by generating multiple object views jointly [74; 98; 93; 40; 118]. Additionally, SDS optimization is slow and requires minutes to hours per assets; this issue is partly addressed in [52; 101] with amortized SDS.
+
+The second group of methods includes faster two-stage approaches [46; 51; 49; 107; 106; 8; 83; 28; 23] that start by generating multiple views of the object using a text-to-image or text-to-video model [54; 13] tuned to output multiple views of the object followed by per-scene optimization using NeRF  or 3DGS . However, per-scene optimization requires several highly-consistent views which are difficult to generate reliably. Instant3D  improves speed and robustness by generating a grid of just four views followed by a feed-forward network (LRM ) that reconstructs the object from these. One-2-3-45++  replaces the LRM with a 3D diffusion model. Our AssetGen builds on the Instant3D paradigm and upgrades the LRM to output PBR materials and an to use a SDF-based representation of 3D shape. Furthermore, it starts from grids of four views with shaded and albedo channels, key to predicting accurate 3D shape and materials from images.
+
+**3D reconstruction from images.** 3D scene reconstruction, in its traditional _multi-view stereo_ (MVS) sense, assumes access to a dense set of scene views. Recent reconstruction methods such as NeRF  optimize a 3D representation by minimizing multi-view rendering losses. There are two popular classes of 3D representation: (i) explicit representations like meshes [22; 114; 24; 63; 59; 76] or 3D points/Gaussians [38; 25], and (ii) implicit representations like occupancy fields , radiance fields [58; 62] and signed distance functions (SDF) . Compared to occupancy fields, SDF [66; 108; 92; 17; 21] simplifies surface constraints integration, improving scene geometry. For this reason, we also use SDFs and demonstrate that they outperform occupancy fields.
+
+_Sparse-view reconstruction_ instead assumes few input views (usually 1 to 8). An approach to mitigate the lack of dense multiple views is to leverage 2D diffusion priors in optimization [55; 99], but this is often slow and fragile. More recently, authors have focused on training feed-forward reconstructors on large datasets [14; 36; 57; 48; 100; 60; 94]. In particular,  trains a large Transformer  to predict NeRF using a triplane representation [7; 9]. Followups study 3D representations like meshes [103; 97] and 3DGS [120; 105; 80; 115], improved backbones [96; 97] and training protocols [86; 35]. We introduce three extensions to LRM: (i) an SDF formulation for improved geometry, (ii) PBR material prediction for relighting, and (iii) a texture refiner for better texture details.
+
+**3D modeling with PBR materials.** Most 3D generators output 3D objects with baked illumination, either view-dependent [58; 38] or view-independent . Since baked lighting ignores the model's response to environmental illumination, it is unsuitable for graphics pipelines that simulate lighting. Physically-based rendering (PBR) defines material properties so that a suitable shader can account for illumination realistically. Several MVS works have considered estimating PBR materials using NeRF [4; 3; 102], SDF , differentiable meshes [63; 27] or 3DGS [33; 43]. In generative modelling, [10; 70; 50; 104] augment the text-to-3D SDS optimization  with a PBR model. Differently from them, we integrate PBR modeling in our feed-forward text-to-3D network, unlocking for the first time fast text-based generation of 3D assets with controllable PBR materials.
+
+## 3 Method
+
+AssetGen is a two-stage pipeline (Fig. 2). The first stage, text-to-image (Sec. 3.1), maps text to an image grid containing four object views with material information. The second stage, image-to-3D, comprises a novel PBR-based sparse-view reconstruction model (Sec. 3.2) and a new texture refiner (Sec. 3.3). As such, AssetGen is applicable to two tasks: text-to-3D (stage 1+2) and image-to-3D (stage 2 only).
+
+### Text-to-image: Generating shaded and albedo images from text
+
+The goal of the text-to-image module is to generate several views of the generated 3D object. To this end, we employ an internal text-to-image diffusion model pre-trained on billions of text-annotated images, with an architecture similar to Emu . Similar to [74; 42], we finetune the model to predict a grid of four images \(I_{i}\), \(i=1,,4\), each depicting the object from canonical viewpoints \(_{i}\). Note that \(I_{i}\) are RGB images of the shaded object. We tried deferring the PBR parameter extraction to the image-to-3D stage, but this led to suboptimal results. This is due to the determinism of the image-to-3D stage, which fails to model ambiguities when assigning materials to surfaces.
+
+A natural solution, then, is to predict the PBR parameters directly in the text-to-image stage. These consists of the albedo \(_{0}\) (by which we mean the base color, which is the same as albedo only for zero metalness), the metalness \(\), and the roughness \(\). However, we found this to be ineffective too because the metalness and roughness maps deviate from the distribution of natural images making them a hard target for finetuning. Our novel solution is to train the model to generate instead a **4-view grid with 6 channels**, 3 for the shaded appearance \(I\) and 3 more for the albedo \(_{0}\). This reduces the finetuning gap, and removes enough ambiguity for accurate PBR prediction in the image-to-3D stage.
+
+### Image-to-3D: A PBR-based large reconstruction model
+
+We now describe the image-to-3D stage, which solves the reconstruction tasks given either a small number of views \(I_{i}\) (few-view reconstruction), or the 4-view 6-channel grid of Sec. 3.1.
+
+At the core of our method is a new PBR-aware reconstruction model, MetaLRM, that reconstructs the object given \(N 1\)_posed_ images \((I_{i},_{i})_{i=1}^{N}\), where \(I_{i}^{H W D}\) and \(_{i}\) is the camera viewpoint. As noted in Sec. 3.1, we consider \(N=4\) canonical viewpoints \(_{1},,_{4}\) (fixed to 20\({}^{}\) elevation and 0\({}^{}\), 90\({}^{}\), 180\({}^{}\), 270\({}^{}\) azimuths) and \(D=6\) input channels. The output is a 3D field representing the shape and PBR materials of the object as an SDF \(s:^{3}\), where \(s()\) is the signed distance from the 3D point \(\) to the nearest object surface point, and a PBR function \(k:^{3}^{5}\), where \(k()=(_{0},,)\) are the albedo, metalness and roughness.
+
+The key to learning the model is the _differentiable rendering_ operator \(\). This takes as input a field \(:^{3}^{D}\), the SDF \(s\), the viewpoint \(\), and a pixel \(u U=[0,W)[0,H)\), and outputs the projection of the field on the pixel according to the rendering equation , which has the same number of channels \(D\) as the rendered field \(\):
+
+\[(u,s,)=_{0}^{}(_{t})(_{ t} s)e^{-_{0}^{t}(_{} s)\,d}dt.\] (1)
+
+Here \(_{t}=_{0}-t_{}\), \(t[0,)\) is the ray that goes from the camera center \(_{0}\) through the pixel \(u\) along direction \(-_{}^{2}\). The function \(( s)\) is the opacity of the 3D point \(\) and is obtained
+
+Figure 2: **Overview. Given a text prompt, AssetGen generates a 3D mesh with PBR materials in two stages. The first text-to-image stage (blue) predicts a 6-channel image depicting 4 views of the object with shaded and albedo colors. The second image-to-3D stage includes two steps. First, a 3D reconstructor (dubbed MetaLRM) outputs a triplane-supported SDF field converted into a mesh with textured PBR materials (orange). Then, PBR materials are enhanced with our texture refiner which recovers missing details from the input views (green).**from the SDF value \(s()\) using the VolSDF  formula
+
+\[( s)=1+s()\,1- e^{-|s()|/b},\] (2)
+
+where \(a,b\) are the hyper-parameters. We use Eq. (1) to render several different types of fields \(\), the most important of which is the radiance field, introduced next along with the material model.
+
+**Reflectance model.** The appearance of the object \((u)=(u L,s,)\) in a shaded RGB image \(\) is obtained by rendering its _radiance field_\(()=L(,_{} k,)\), where \(\) is the field of unit normals. The radiance is the light reflected by the object in the direction \(_{}\) of the observer (see App. A.8 for details), which in PBR is given by:
+
+\[L(,_{} k,)=_{H()}f(_{ },_{} k(),())L(,-_{})(()_{})\ d_{ },\] (3)
+
+where \(_{},_{} H()=\{ ^{2}: 0\}\) are two unit vectors pointing outside the object and \(L(,-_{})\) is the radiance incoming from the environment at \(\) from direction \(_{}\) in the solid angle \(d_{}\). The _Bidirectional Reflectance Distribution Function_ (BRDF) \(f\) tells how light received from direction \(-_{}\) (incoming) is scattered into different directions \(_{}\) (outgoing) by the object .
+
+In PBR, we consider a physically-inspired model for the BRDF, striking a balance between realism and complexity ; specifically, we use the Disney GGX model , which depends on parameters \(_{0}\), \(\), and \(\) only (see App. A.12.1 for the parametric form of \(f\)). Hence, the Metal LRM predicts the triplet \(k()=(_{0},,)\) at each 3D point \(\).
+
+**Deferred shading.** In practice, instead of computing \((u)=(u L,s,)\) using Eqs. (1) and (3), we use the process of _deferred shading_:
+
+\[(u)=_{}(u k,s,)=_{H()}f(_{},_{},})L_{}(-_{})(}_{}) \,d_{},\] (4)
+
+where \(L_{}\) is the environment radiance (assumed to be the same for all \(\)), \(=(u k,s,)\) and \(}=(u,s,)\) are rendered versions of the material and normal fields. The advantage of Eq. (4) is that the BRDF \(f\) is evaluated only once per pixel, which is much faster and less memory intensive than doing so for each 3D point during the evaluation of Eq. (1), particularly for training/backpropagation. During training, furthermore, the environment light is assumed to be a single light source at infinity, so the integral (4) reduces to evaluating a single term.
+
+**Training formulation and losses.** MetaLRM is thus a neural network that takes as input a set of images \((I_{i},_{i})_{i=1}^{N}\) and outputs estimates \(\) and \(\) for the SDF and PBR fields. We train it from a dataset of mesh surfaces \(M^{3}\) with ground truth PBR materials \(k:M^{5}\).
+
+Reconstruction models are typically trained via supervision on renders . However, physically accurate rendering via Eq. (1) is very expensive. We overcome this hurdle in two ways. First, we render the raw ground-truth PBR fields \(k\) and use them to supervise their predicted counterparts with the MSE loss, skipping Eq. (1). For the rendered albedo \(_{0}\) -- which is similar enough to natural images -- we also use the LPIPS  loss:
+
+\[_{}=( _{0},,),(_{0},M,)+(,,)-( k,M,)^{2}.\] (5)
+
+We further supervise the PBR field by adding a computationally-efficient deferred shading loss:
+
+\[_{}=\|(_{}( ,,)-_{}( k,M,))\|^{2}.\] (6)
+
+The weight \(w(u)=}(u)(u)\) is the dot product of the predicted and ground-truth normals at pixel \(u\). It discounts the loss where the predicted geometry is not yet learnt. Fig. 14 (b) visualizes deferred shading and the rendering loss.
+
+Finally, we also supervise the SDF field with a direct loss \(_{}\) (implemented as in ), a depth-MSE loss \(_{}\) between the depth renders and the ground truth, and with a binary cross-entropy \(_{}\) between the alpha-mask renders and the ground-truth masks. Refer to App. A.6.2 for more details.
+
+**LightPlane implementation.** We base MetaLRM on LightplaneLRM , a variant of LRM  exploiting memory and compute-efficient Lightplane splatting and rendering kernels, offering better quality reconstructions. However, since LightplaneLRM uses density fields, which are suboptimal for mesh conversion , we extend the Lightplane rendering GPU kernel with a VolSDF  renderer using Eq. (2). Additionally, we also fuse into the kernel the direct SDF loss \(_{}\) since a naive autograd implementation is too memory-heavy.
+
+### Mesh extraction and texture refiner
+
+The MetaILRM module of Sec. 3.2 outputs a sign distance function \(s\), implicitly defining the object surface \(A=\{^{3} s()=0\}\) as a level set of \(s\). We use the Marching Tetrahedra algorithm  to trace the level set and output a mesh \(M A\). Then, xAtlas  extracts a UV map \(:[0,V]^{2} M\), mapping each 2D UV-space point \(v=()\) to a point \( M\) on the mesh.
+
+Next, the goal is to extract a high-quality 5-channel PBR texture image \(^{V V 5}\) capturing the albedo, metalness, and roughness of each mesh point. The texture image \(K\) can be defined directly by sampling the predicted PBR field \(\) as \(K(v)((v))\), but this often yields blurry results due to the limited resolution of MetaILRM. Instead, we design a texture refiner module which takes as input the coarse PBR-sampled texture image as well as the \(N\) views representing the object and outputs a much sharper texture \(\). In essence, this modules leverages the information from the different views to refine the coarse texture image. The right part of Fig. 2 illustrates this module.
+
+More specifically, it relies on a network \(\) which is fed \(N+1\) texture images \(\{K_{i}\}_{i=0}^{N}\). First, each pixel \(v[0,V]^{2}\) of \(K_{0}^{V V 11}\) is annotated with the concatenation of the normal, the 3D location, and the output of MetaILRM's PBR field \(k((v))\) evaluated at \(v\)'s 3D point \((v)\). The remaining \(K_{1},,K_{N}\) correspond to partial texture images with 6 channels (for the base and shaded colors) which are obtained by back-projecting the object views to the mesh surface. The network \(\) utilises two U-Nets to fuse \(\{K_{i}\}_{i=0}^{N}\) into the enhanced texture \(\). \(\)'s goal is to select, for each UV point \(v\), which of the \(N\) input views provides the best information. Specifically, each partial texture image \(K_{i}\) is processed in parallel by a first U-Net, and the resulting information is communicated via cross attention to a second U-Net whose goal is to refine \(K_{0}\) into the enhanced texture \(\). Please refer to App. A.7 for further details.
+
+Such a network is trained on the same dataset and supervised with the PBR and albedo rendering losses as MetaILRM. The only difference is meshes (whose geometry is fixed) are rendered differentiably using PyTorch3D's  mesh rasterizer instead of the Lightplane SDF renderer.
+
+## 4 Experiments
+
+Our **training data** consists of 140,000 meshes of diverse semantic categories created by 3D artists. For each asset, we render \(36\) views at random elevations within the range of \([-30^{},50^{}]\) at uniform intervals of \(30^{}\) around the object, lit with a randomly selected environment map. We render the shaded images, albedo, metalness, roughness, depth maps, and foreground masks from each viewpoint. The text-to-image stage is based on an internal text-to-image model architecturally similar to Emu , fine-tuned on a subset of 10,000 high-quality 3D samples, captioned by a Cap3D-like pipeline  that uses Llama3 . The other stage utilizes the entire 3D dataset instead.
+
+For **evaluation**, following [105; 103; 42], we assess visual quality using PSNR and LPIPS  between the rendered and ground-truth images. PSNR is computed in the foreground region to avoid metric inflation due to the empty background. Geometric quality is measured by the L1 error between the rendered and ground-truth depth maps (of the foreground pixels), as well as the IoU of the object silhouette. We further report Chamfer Distance (CD) and Normal Correctness (NC) for 20,000 points uniformly sampled on both the predicted and ground-truth shapes. Material decomposition
+
+   Method &  LPIPS\(\) \\ albedo \\  &  PSNR\(\) \\ albedo \\  &  PSNR\(\) \\ metal \\  & 
+ PSNR \\ rough \\  \\  C = LightplaneLRM w/ SDF & 0.117 & 17.14 & 12.39 & 15.25 \\ E = C + Material prediction & 0.097 & 20.66 & 15.99 & 20.25 \\ F = E + Deferred shading loss & 0.093 & 21.12 & 18.64 & 20.66 \\ G = F + Texture refinement & **0.087** & **21.97** & **22.19** & **20.85** \\  H = F + Albedo \& shaded input & 0.084 & 23.02 & 20.43 & **21.18** \\ I = H + Texture refinement & **0.069** & **24.39** & **27.28** & 20.63 \\   
+
+Table 1: **Four-view reconstruction with PBR** evaluating the accuracy of the PBR renders for Metal LRM and ablations. Methods in top / bottom accept 4 views with shaded / shaded& albedo color channels.
+
+   Method &  Visual \\ quality \\  & 
+ Text \\ fidelity \\  & PBR \\  GRM  & 96.7 \% & 93.3 \% & ✗ \\ InstantMesh  & 99.3 \% & 97.3 \% & ✗ \\ LightplaneLRM  & 66.6 \% & N/A & ✗ \\ Meshy v3  & 94.6 \% & 91.3 \% & ✓ \\ Luma Genie 1.0  & 72.3 \% & 72.8 \% & ✓ \\   
+
+Table 2: **Win-rate of AssetGen in text-to-3D user study** evaluating visual quality and the alignment between the prompt and the generated meshes. AssetGen beats all baselines at 30 sec budget (on an A100 GPU).
+
+is evaluated with LPIPS and PSNR on the albedo image, and PSNR alone for the metalness and roughness channels. All metrics are calculated on magnified outputs rather than on neural renders.
+
+### Sparse-view reconstruction
+
+We tackle the sparse-view reconstruction task of predicting a 3D mesh from 4 posed images of an object on a subset of 332 meshes from Google Scanned Objects (GSO) . We compare against state-of-the-art Instant3D-LRM , GRM , InstantMesh , and MeshLRM . We also include LightplaneLRM , an improved version of Instant3D-LRM, which serves as our base model. MeshLRM  has not been open-sourced so we compare only qualitatively to meshes from their webpage. All methods are evaluated using the same input views at \(512^{2}\) resolution. Since none of the latter predict PBR materials and since GSO lacks ground-truth PBR materials, for fairness, we use a variant of our model that predicts shaded object textures.
+
+As shown in Figs. 4 and 9 and Tab. 3, our method outperforms all baselines across all metrics. GRM captures texture detail well but struggles with fine geometric structures when meshified. InstantMesh and LightplaneLRM improve geometry but fall short on finer details and texture quality. Our approach excels in reconstructing shapes with detailed geometry and high-fidelity textures.
+
+Ablations in Tab. 3 and Fig. 4 show that incorporating our scalable SDF-based rendering and direct SDF loss into the base LightplaneLRM model enhances geometric quality. Adding texture refinement further brings fine texture details.
+
+Next, we consider the task of **sparse-view reconstruction with PBR materials**, where the goal is to reconstruct the 3D geometry and texture properties (albedo, metalness, and roughness) from four posed shaded 2D views of an object. This is done on an internal dataset of 256 artist-created 3D meshes, curated for high-quality materials. Since there are no existing few-view feed-forward PBR reconstructors, we conduct an ablation study in Tab. 1 and Figs. 3 and 13.
+
+While adding material prediction with additional MLP heads provides some improvements, we observe that incorporating the deferred shading loss and texture refinement is essential for high-quality PBR decomposition. Example PBR predictions are shown in Fig. 8.
+
+### Text-to-3D generation
+
+Finally, we evaluate text-to-3D with PBR materials. We compare against state-of-the-art feed-forward methods that generate assets at comparable speed (\( 10\) to \(30\) s per asset). This includes text-to-3D variants of GRM , InstantMesh , and LightplaneLRM . GRM uses Instant3D's 4-view grid generator, InstantMesh receives the first view from our 2D diffusion model and subsequently generates 6 views, while LightplaneLRM accepts 4 views from our grid generator. Since these methods bake lighting instead of generating PBR materials, for evaluation we apply flat texture
+
+   Method & LPIPS\(\) & PSNR\(\) & Depth\(\) & IoU\(\) & CD\(\) & NC\(\) \\  Instant3D-LRM  & 0.124 & 18.54 & 0.325 & 0.930 & 1.630 & 0.844 \\ GRM  & 0.100 & 19.87 & 0.364 & 0.949 & 1.490 & 0.873 \\ InstantMesh  & 0.113 & 20.63 & 0.334 & 0.937 & 1.364 & 0.848 \\
+**MetalR.M (ours)** & **0.057** & **22.49** & **0.173** & **0.968** & **1.137** & **0.885** \\   
+
+* A = LightplaneLRM  & 0.095 & 18.60 & 0.456 & 0.953 & 1.313 & 0.872 \\ B = A + VoSIDF rendering & 0.094 & 20.91 & 0.201 & 0.957 & 1.212 & 0.875 \\ C = B + Direct SDF loss & 0.083 & 21.75 & **0.173** & **0.968** & **1.137** & **0.885** \\ D = C + Texture refinement & **0.057** & **22.49** & **0.173** & **0.968** & **1.137** & **0.885** \\   
+
+Table 3: **Four-view reconstruction on GSO** comparing the appearance and geometry of MetaLRM (outputting baked-light texture) to baselines (top) and ablations (bottom). CD values multiplied by \(10^{-2}\).
+
+Figure 3: **Qualitative ablation on albedo generation. In text-to-3D, generating 4 views representing albedo colors alongside shaded RGB colors improves material estimation for our 3D reconstructor. With both inputs, the model accurately predicts the armor as metallic and smooth, while the bear’s fur is rough.**
+
+Figure 4: **Qualitative comparison for sparse-view reconstruction.** AssetGen gives better geometry (shown in orange) and higher fidelity texture (inset) compared to state of the art. SDF representation along with the direct SDF loss gives a better geometry compared to the base LightplaneLRM model which uses occupancy (row 4 and 5). Furthermore, our texture refiner greatly enhances texture fidelity (row 5 and 6).
+
+shading to our outputs. Additionally, we compare with the preview stage of Meshy v3  and LumaAI Genie 1.0 , proprietary text-to-3D methods with PBR workflow capable of creating assets within \(30\) and \(15\) s respectively. A comparison with the significantly longer refinement stages for Luma and Meshy is provided in the appendix. Fig. 5 shows that AssetGen meshes are visually more appealing and have meaningful materials Figs. 6 and 12 provide more examples and comparisons and showcase fine-grained material control.
+
+For quantitative evaluation, we conducted an extensive user study in Tab. 2 using the 404 deduplicated text prompts from DreamFusion . Users were shown \(360^{}\) videos of the generated and baseline meshes and were asked to rate them based on 3D shape quality and alignment with the text prompt. A total of 11,080 responses were collected, with significant preference for AssetGen's meshes.
+
+Finally, we ablate the effect of generating dual-channel albedo+shaded grids compared to albedo-only input in Fig. 3 revealing significant PBR decomposition superiority of the former. Additionally, Fig. 13 illustrates the effect of our deferred shading loss.
+
+## 5 Conclusions
+
+We have introduced Meta 3D AssetGen, a significant advancement in sparse-view reconstruction and text-to-3D. Meta 3D AssetGen can generate 3D meshes with high-quality textures and PBR materials faithful to the input text. This uses several key innovations: generating multi-view grids with both shaded and albedo channels, introducing a new reconstruction network that predicts PBR materials from this information, using deferred shading to train this network, improving geometry via a new scalable SDF-based renderer and SDF loss, and introducing a new texture refinement network. Comprehensive evaluations and ablations demonstrate the effectiveness of these design choices and state-of-the-art performance.
+
+Figure 5: **Qualitative comparison for text-to-3D.** We compare 3D meshes generated by Meta 3D AssetGen and state-of-the-art baselines. We include material decomposition for methods producing PBR materials (Luma Genie and our Meta 3D AssetGen). Our approach produces higher quality materials with better-defined metalness and roughness, and a more accurate decoupling of lighting effects in the albedo.
+
+## 5 Conclusion
+
+Figure 6: **Text-to-3D meshes generated by Meta 3D AssetGen along with their PBR decomposition. Note that Meta 3D AssetGen provides detailed albedo and material properties, as highlighted by the metalness of the platter (top right) and the golden objects (last row).**

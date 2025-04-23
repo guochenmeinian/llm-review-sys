@@ -8,7 +8,7 @@ This project uses LLM to auto-reviews the research paper.
 
 - We used [Nougat-OCR](https://github.com/facebookresearch/nougat) to parse the PDF. Here's a [usage](https://github.com/ad17171717/YouTube-Tutorials/blob/main/Machine%20Learning%20with%20Python/Optical_Character_Recognition_(OCR)_with_Meta's_Nougat!.ipynb) guide I found. With the raw dataset, We used GPT-4-mini to format/merge reviews to prepare the dataset for training.
 
-- (To-Do): We applied LoRA/QLora to finetune on LLama3-8b-instruct-8k model with our dataset.
+- We applied QLora to finetune on LLama3.1-8b-instruct-8k model with our dataset using LLama-Factory on the AutoDL platform.
 
 - (To-Do): We further trained the model with DPO alignment training to ensure our reviews are structured and consist of standardized sections: summary, strengths/weaknesses, and improvement suggestions.
 

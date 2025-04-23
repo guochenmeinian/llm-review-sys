@@ -1,0 +1,173 @@
+# DHA: Learning Decoupled-Head Attention from Transformer Checkpoints via Adaptive Heads Fusion
+
+Yilong Chen\({}^{1,2}\), Linhao Zhang\({}^{3*}\), Junyuan Shang\({}^{31}\), Zhenyu Zhang\({}^{3}\),
+
+**Tingwen Liu\({}^{1,2}\), Shuohuan Wang\({}^{3}\), Yu Sun\({}^{3}\)**
+
+\({}^{1}\) Institute of Information Engineering, Chinese Academy of Sciences
+
+\({}^{2}\) School of Cyber Security, University of Chinese Academy of Sciences
+
+\({}^{3}\) Baidu Inc.
+
+{chenyilong, liutingwen}@iie.ac.cn
+
+{zhanglinhao, shangjunyuan, zhangzhenyu07, wangshuohuan, sunyu02}@baidu.com
+
+denotes equal contribution. \({}^{}\) denotes corresponding author. \({}^{}\) denotes project lead.
+
+###### Abstract
+
+Large language models (LLMs) with billions of parameters demonstrate impressive performance. However, the widely used Multi-Head Attention (MHA) in LLMs incurs substantial computational and memory costs during inference. While some efforts have optimized attention mechanisms by pruning heads or sharing parameters among heads, these methods often lead to performance degradation or necessitate substantial continued pre-training costs to restore performance. Based on the analysis of attention redundancy, we design a Decoupled-Head Attention (DHA) mechanism. DHA adaptively configures group sharing for key heads and value heads across various layers, achieving a better balance between performance and efficiency. Inspired by the observation of clustering similar heads, we propose to progressively transform the MHA checkpoint into the DHA model through linear fusion of similar head parameters step by step, retaining the parametric knowledge of the MHA checkpoint. We construct DHA models by transforming various scales of MHA checkpoints given target head budgets. Our experiments show that DHA remarkably requires only 2.5% of the original model's pre-training budgets to achieve 96.1% of performance while saving 75% of KV cache. Compared to Group-Query Attention (GQA), DHA achieves a 5\(\) training acceleration, a maximum of 13.93% performance improvement under 0.01% pre-training budget, and 5% relative improvement under 0.05% pre-training budget.
+
+## 1 Introduction
+
+Transformer-based large language models (LLMs) shine in various natural language tasks due to their powerful understanding and generation capabilities [1; 2; 3]. Multi-Head Attention (MHA) is widely used in LLMs, with the number of heads increasing as the model size grows. However, MHA inference overhead increases linearly with the expansion of the context and model sizes, due to the surprisingly large memory consumption of the _KV Cache_ mechanism. For instance, a 7 billion-parameter model with 32 heads and 32 layers, an input batch size of 4, and a sequence length of 32k results in 64GB of KV cache, which is \(4.7\) larger than the model weights.
+
+To reduce computational and memory overhead during inference, a widely used approach involves adapting the MHA model to a more efficient structure through the reuse of parameters across multiple heads [4; 5; 6], such as Multi-Query Attention (MQA)  and Grouped-Query Attention (GQA) . These methods utilize a portion of the original training computation which avoid information lossdue to training-inference inconsistencies, a common issue in pruning-based [7; 8; 9; 10; 11] works. However, the training computation is prohibitively expensive for recovering the model's performance, due to the information loss in the parameters when creating the initial point.
+
+Thus, in this work, we seek to address the following question:
+
+_How can we construct a **more efficient** model while keeping **costs as low as possible**?_
+
+With the limited understanding of parameter characteristics in modern LLMs, we first perform an empirical analysis from the perspectives of heads' parameter similarity. We observe that there are some head-clusters with high internal similarity in MHA checkpoints. Similar head clusters imply enormous redundancy in MHA, which coincides with the sparsity found in previous studies [12; 13]. In particular, the clusters of key heads and value heads across different layers show a **decoupled** distribution, meaning that there is a significant variation in the distribution of head-cluster similarities across layers, key heads and value heads, as illustrated in Fig. 2a,2b. Intuitively, we can prune redundant heads based on the above characteristics. Nonetheless, each head has its unique role, and thus no heads should be arbitrarily discarded. Furthermore, we find that linear fusion based on multiple similar heads can reconstruct the original head functionality without causing a significant performance drop (see Sec. 3.1). Based on this observation, we believe that selectively fusing corresponding heads in clusters can construct a more efficient architecture with minimum loss.
+
+In this paper, we propose **Decoupled-Head Attention (DHA)**, an efficient attention architecture developed through the **Adaptive Head Fusion** of checkpoints' parameters. Recalling the decoupled heads parameter characteristics, DHA allocates different numbers of key heads and value heads at different layers to balance model efficiency and performance. The MHA checkpoint can be rapidly transformed into DHA with three stages: **Search**, **Fusion**, and **Continued Pre-training (CT)**. During the Search stage, we group similar functional heads together and determine reasonable allocations of key heads and value heads for each layer. Specifically, we reconfigure the original key and value head into multiple linear combinations of heads within the same layer. Thus, we can allocate the heads based on the loss after replacement. In the Fusion stage, we perform linear fusion on similar heads, ensuring the preservation of original functionality. Leveraging the Augmented Lagrangian approach [14; 15], the Fusion operator initializes from MHA and explores possible head combinations in the early training, followed by refined intra-group head fusion in the later. Based on well-trained operators on unlabeled data, we can rapidly obtain high-performing initial points for DHA from MHA checkpoints, requiring only a minimal amount of Continued Pre-training to restore performance.
+
+Figure 1: **Upper: Overview of Decoupled-head method. Multi-Head attention (MHA) has equal query, key and value heads. Grouped-Query attention (GQA) instead shares single key and value heads for each group of query heads. Decoupled-Head attention (DHA) shares key heads and value heads for different groups of query heads in different layers. Lower: GQA Initialization: Heads are mean pooled into a single head; DHA Initialization: DHA search head grouping and progressively fuse heads to maintain parameter functions.**
+
+To verify the effectiveness, we construct DHA on models of different sizes, such as LLaMA2-7B , Sheared-LLaMA-2.7B & -1.3B  with the heads budget ratio set at 50% and 25%. With a modest fusion training of just 0.2 billion tokens, DHA learns sufficiently competent initial points. As the continued pretraining progresses, DHA continuously outperforms GQA narrowing the gap with MHA on 9 representative downstream tasks. DHA only requires 0.25% of MHA pre-training budget. Meanwhile, DHA is capable of reducing _KV Cache_ by up to 75% compared to MHA with minimal accuracy trade-off (maximum of 5.6%). Compared to GQA, DHA achieves a 5\(\) training acceleration, a maximum 13.93% performance improvement under 0.01% pre-training budget, and 5% relative improvement under 0.05% pre-training budget. Overall, DHA exhibits great performance and efficiency, which can be quickly adapted to various existing MHA Transformer models.
+
+## 2 Background
+
+Let \(=(_{1},,_{p})^{p d_{ }}\) denote the input prompts of hidden states of a Transformer layer, where \(p\) stands for the number of tokens and \(d_{}\) for the hidden state dimension.
+
+Multi-Head Attention (MHA)MHA  performs the attention with \(H\) different heads. For \(h\)-th head, different weight matrices \(^{h}_{q},^{h}_{k},^{h}_{v}^{d_{} d_{k}}\) are used to project the input sequence into query, key, value vector, where \(d_{k}\) represents head dim. Denote softmax function as \(\), we have:
+
+\[=(_{1},,_{ })_{O},_{h}=( ^{h}_{q}(^{h}_{k})^{T}}} )^{h}_{v}\] (1)
+
+Ultimately MHA combines heads' outputs through the output projection \(_{O}^{d_{} d_{}2}\).
+
+Grouped-Query Attention (GQA) & Multi-Query Attention (MQA)To accelerate inference, MQA  and GQA  have been proposed based on the idea of reusing head parameter weights. In these variants, \(H\) different query heads are divided into \(G\) groups, where the heads within the same group share the same key heads and value heads parameter matrices. Given the mapping relationship from the \(h\)-th query head to a GQA key and value heads using the many-to-one function \(g(h)\), we define the \(h\)-th head forward pass as:
+
+\[_{h}=(^{h}_{q}(^{g (h)}_{k})^{T}}})^{g(h)}_{v}, {where W}^{g(h)_{}}_{k/v}=_{k/v}/ _{g(h)_{}}}_{k/v}}{|/_{g(h)_ {}}|}\] (2)
+
+Here, \(/_{g(h)_{}}\) refers to MHA key/value heads parameters within the \(g(h)_{}\)-th group during GQA initialization. When transitioning from an MHA checkpoint, GQA uses the mean pooling method for heads within the group. MQA is a special case of GQA where \(G=1\)3.
+
+Due to mean pooling for initialization, GQA results in loss of capability when converting from MHA, necessitating expensive pre-training to recover. We aim to identify better initialization and more refined head mapping relationships to achieve superior performance with reduced training costs.
+
+Figure 2: Visualization of the similarity between heads within the MHA of LLaMA2-7B model at the 0th layer (a) and the 21st layer (b). Details in Appendix E.1. Key heads and value heads exhibit decoupled distributions.
+
+Observation
+
+To study the inherent characteristics of head parameters in MHA, we use Centered Kernel Alignment  to calculate the heads' similarity within each layer's W\({}_{k},\) W\({}_{v}\). Based on the average heads' similarity, we define the redundancy of each MHA layer. For details, please refer to Appendix B.1.
+
+### Head clusters in MHA
+
+ObservationFrom Fig. 1(a) and Fig. 1(b), we observe that clusters form spontaneously among heads, with high similarity within clusters and low similarity between clusters. It indicates that heads among different clusters may have distinct functionalities, processing linguistic features in various aspects.
+
+AnalysisGiven the numerous similar head clusters in W\({}_{k}\) and W\({}_{v}\), we identified the opportunity to linearly fuse functionally similar heads within clusters while retaining each head's parameterized knowledge. We conducted an empirical study, transforming the parameters of Head 0 in MHA into a linear fusion of the parameters from Heads 0, 1, 2, and 3. We share the fusion head across four query heads and progressively optimize the fusion ratio under the LmLLoss. For details, please refer to Sec. 4.2. As shown in Fig. 2(a), the loss remains unchanged as the proportion of Head 0 decreases and only increases when four heads parameters' ratios approach an even distribution. It suggests that fusing similar parameters can reduce the number of heads without significant information loss.
+
+### Variability across Layers and KV pairs
+
+ObservationThe distribution of similar head clusters varies between different layers. As illustrated in Fig.1(a), 1(b), the 0th layer of MHA shows few similar head clusters, while the 21st layer exhibits many. Within the same layer, value heads exhibit more clusters and higher similarity compared to key heads, indicating a divergence between the two. Fig. 2(b) shows that the redundancy is lower in the initial and final layers, and higher in the middle layers. Moreover, W\({}_{v}\) redundancy significantly exceeding that of W\({}_{k}\).
+
+AnalysisInspired by layer and key-value head variability, we propose allocating more heads to layers with lower redundancy to enhance learning and expression. Since W\({}_{v}\) shows higher redundancy than W\({}_{k}\), we can decouple and allocate more heads budget to critical key components, while compressing redundant value heads at a higher compression rate. Finer grouping and sharing based on the parameters function may contribute to compression rates and performance improvements.
+
+## 4 Method
+
+In this section, we propose a more efficient Decoupled Head Attention (DHA) architecture and its construction process. We define DHA in Sec. 4.1 and Adaptive Head Fusion algorithm in Sec. 4.2. Then we demonstrate the adaptive construction based on the MHA checkpoint, which can be divided into: **Search**, **Fusion**, and **Continued Pre-training** (Discussed in Sec. 4.3). Finally, we introduce practical application of our DHA architecture on the LLaMA2 model in Sec. 4.3.
+
+### Decoupled-Head Attention (DHA)
+
+We present a more efficient attention architecture called Decoupled-Head Attention (DHA). Based on observed significant functional differences among different layers' key value heads, DHA adaptively allocates more heads to critical components, thus enhancing overall model efficiency and performance.
+
+Figure 3: (a) Model loss with heads proportions in linear fusion. (b) Layer Redundancy of the query, key, value head parameter matrices in the LLaMA2-7B model MHA.
+
+DefinitionDefined model with \(L\) layers and \(H^{}\) heads in a layer, the numbers of Key heads and Value heads in the \(l\)-th layer are denoted as \(H^{}_{l},H^{}_{l}\). We define the **many-to-one** mapping functions \(d^{}(h,l)\) and \(d^{}(h,l)\) representing key and value head corresponding to the \(h\)-th query head in \(l\)-th DHA layer. The computation be formalized as follows:
+
+\[_{h,l}=(_{q}^{h}(_{k}^{d^{}(h,l)})^{T}}}) _{v}^{d^{}(h,l)}\] (3)
+
+DHA shares a key and value head in multi query heads' computation based on independent mapping functions at different layers4. GQA can be considered a special case of DHA, where not only all layers share the same mapping functions, but the mapping functions for keys and values are identical.
+
+### Learning Efficient MHA Transformation via Linear Heads Fusion
+
+Due to the high cost of building an efficient Attention mechanism in LLM from scratch, we construct DHA based on the existing MHA checkpoint using minimal computational budgets. Based on the head clustering phenomenon in MHA, we propose a linear fusion method for similar heads within clusters. By incrementally fusing head parameters, we compress the number of heads while retaining the original model's knowledge, significantly reducing training budgets and improving performance.
+
+GoalFormally, we define a model with Layer number \(L\) and Head number \(H\) as \(_{L,H}=[_{1},,_{L}]\), where \(_{l}^{D D}\) denotes the weight of layer \(l\) with input and output dimension \(D\). In the initialization, our goal is to transfer knowledge from a MHA model \(_{L,H_{1}}^{}\) to a DHA model \(_{L,H_{2}}^{}\), where \(H_{1}>H_{2}\). By learning a fusion operation that minimizes the functional difference between MHA and DHA model, the goal can be formalized as
+
+\[*{arg\,min}_{,}_{ }\ [_{}(;(^{ }))+_{}(; (^{}),^{})]\] (4)
+
+Where \(\) is the fusion operator, \(\) is the training dataset, \(_{}\) is the training loss function, \(_{}\) measures the transformation from MHA to DHA, and \(\) is the learnable scale factor.
+
+Fusion OperatorDuring DHA initialization, the fusion operator \(\) constructs new heads based on the linear combinations of the original key and value heads within the group, and shares the new heads among the query heads' forward. Define each group \(_{d^{}(h,l)},_{d^{}(h,l)}\) represents key, value heads group corresponding to the \(h\)-th query head in \(l\)-th layer, \(g=\{g^{},g^{}\}\) as the group size. By introducing variables \(_{h}=\{_{hj}\}_{j=1}^{g},\) represents the proportion of \(j\)-th key, value head
+
+Figure 4: An illustration of DHA. First, we reconstruct the a single head forward as a linear combination of multiple heads’ forward with proportions \(\), grouping heads with similar functions based on multi-step optimization. Next, we initialize and optimize the fusion operators. \(\) indicates the optimization narrows the distance between proportions \(\). Finally, we fuse heads within groups and continued pre-training DHA model.
+
+involved in the \(h\)-th query head forward within group. For each group, a head have forward pass as:
+
+\[_{h,l}=(_{q}^{h}(_{ k}^{d^{}(h,l)})^{T}}})_{v}^{d^{ }(h,l)},_{k/v}^{d^{}(h,l)}=_{j=1}^{g^{ }}_{hj}_{k/v}^{j}\] (5)
+
+where \(_{hj}\) will be initialized to Kronecker delta function, which equals 1 if and only if \(h=j\), and equals 0 otherwise. Under this initialization setting, the forward computation of DHA is completely equivalent to that of MHA, see Fig. 4.
+
+OptimizationDuring the optimization phase, we design a fusion loss to optimize the initialized model towards DHA target architecture. Note that after initialization, the mapping of heads within the group \(_{q}^{h,l}_{k/v}^{j}\) is a **many-to-many** mapping, denoted by the function \(d^{}_{}(h,l)\). This indicates that in the forward process of each query, the key head or value head can be expressed as different linear combinations of \(g\) MHA heads. According to Eq. 3, we aim to achieve a **many-to-one** mapping that a single fused key head or value head are shared across multiple query heads in DHA, denoted by the function \(d^{}(h,l)\). Thus, we design a fusion loss \(_{}\) to optimize the initial mapping functions to converge to a single mapping function, i.e., \(d^{}_{}(h,l) d^{}(h,l),  h_{n}/_{n}\). Specifically, we define the optimization objective as minimizing the difference between the mapping functions of different query heads \(h\) and \(h^{}\) within the \(l\)-th layer and \(n\)-th group:
+
+\[_{_{l}^{}}(h,h^{})=\| _{j=1}^{g}_{hj}_{k/v}^{j}-_{j=1}^{g}_{h^{}j} _{k/v}^{j}\|^{2}=(_{j=1}^{g}(_{hj}- _{h^{}j})_{k/v,ij}^{j})^{2}\] (6)
+
+where \(g=g^{}\) represents the number of heads within a group. Since \(W_{k/v,ij}^{j,}\) can be regarded as an orthogonal scalar, and thus we only need to optimize fusion variables \(\), so we have:
+
+\[_{}=_{l=1}^{L}_{n=1}^{N}_{h=1}^{g}_{h^ {}=h+1}^{g}_{_{l}^{}}(h,h^{}), _{_{l}^{}}(h,h^{})=_{h=1 }^{g}_{j=1}^{g}(_{hj}-_{h^{}j})^{2}\] (7)
+
+Where \(N\) represents the number of groups, \(N=}{g}\). The fusion loss can be measured as the mean squared error loss of the head and head fusion variables within each group at each layer.
+
+Augmented Lagrangian approachWhen the fusion loss is zero, the key and value heads corresponding to query heads within the group are optimized to share the same fusion variables. This allows the new DHA key-value head parameters to be effectively shared among the queries in the group. Given that it is challenging to optimize the loss to a very small value, we use an augmented Lagrangian approach [14; 15] for incremental architectural transformations. Define \(t\) as the target loss, \(b\) as the base decay factor, \(s\) as the current global step, \(k\) as the total number of steps in the warm-up phase, the overall training optimization is an adversarial game:
+
+\[_{}_{,}_{} [_{}(;(^{ }))+(_{}-t,0) ],t=(0,b^{s}(1-))\] (8)
+
+Our Augmented Lagrangian approach enforces the constraint \(_{} t\), where the Lagrange multiplier \(\) is updated during training. The update increases the loss unless the constraint is satisfied. Early in training, the model tolerates more significant discrepancies between head weights, promoting exploration. As training progresses, the margin shrinks, enforcing stricter adherence to minimizing discrepancies and refining head alignment within the group.
+
+### Adaptive DHA Transformation on LLaMA Model
+
+Based on the observation of similar head clusters and key-value head parameter variability across layers, DHA employs the adaptive transformation. It allows DHA to search for and fuse similar heads while allocating different group sizes across layers. As shown in Fig. 4, the transformation can be divided into three stages: **Search**, **Fusion** and **Continued Pre-training**.
+
+In the beginning, we initialize the DHA operators to the MHA model. Next, we perform 240 **Search** steps, calculating \(_{}\) for each layer and \(_{}\) for all heads. Based on the \(_{}\), we perform head grouping intending to minimize the average loss of heads within each group and maximize the average loss of heads between groups and groups. Based on \(_{}\), we use a dynamic programmingalgorithm to allocate more head budget to layers with higher loss within a total budget. It allows us to fuse the most similar heads to minimize loss during the fusion process and selectively compress the model's most redundant components. For more details, see Appendix B.3, B.4.
+
+During **Fusion** phase, we modified the forward propagation path of MHA in the form of DHA based on the layer head budget and head grouping obtained during the **Search** phase. Then we antagonistically optimize the fusion operator and update Lagrangian multipliers \(\), the \(_{}\) that marks this DHA fusion process decreases. When \(_{}\) is less than 1e-3, we terminate the fusion algorithm and enter the **Continued Pre-training** phase.
+
+During the **Continued Pre-training** phase, we fuse MHA head parameters based on averaged fusion weights to construct DHA initialization. DHA initialization can recover the performance with a small amount of restorative pre-training. For more information, please refer to Appendix B.2.
+
+Our method can theoretically transform MHA architecture in any transformer model to efficient DHA architecture. Using LLaMA models as case studies, we implemented DHA transformation with various compression rates on all MHA layers. Notably, we expanded the dimension of each head's fusion coefficient \(\) from 1 to the head's dimension \(d_{k}\), allowing for finer-grained parameter fusion and better knowledge retention. Intuitively, we learn different fusion ratios for each dimension of the head. Only a very small number of additional parameters need to be introduced, DHA significantly accelerates training and improves performance.
+
+## 5 Empirical Evaluation
+
+### Experimental Setup
+
+Data.To train DHA operators and extend pre-training, we employ the RedPajama , which parallels the LLaMA training data across seven domains: CommonCrawl, C4, GitHub, Wikipedia, Books, ArXiv, and Stack-Exchange. This dataset comprises a validation set with 2 million tokens, a training set containing 4 billion tokens and an additional pre-training set totaling 50 billion tokens.
+
+Training.Our experimental framework utilizes the Sheared-LLaMA codebase  implemented on the Composer package , and is executed on 8 NVIDIA A100 GPUs (80GB). The models are trained with a sequence length of 4096, employing a global batch size of 64 during the fusion phase and 256 during the continued pre-training phases. The learning rates were set at 1e-4 for language modeling loss, and 1e-2 for Lagrangian multipliers and fusion operators respectively.
+
+Budget.DHA models were trained for 1000 steps (0.2B token budget) during the fusion phases. For the continued pre-training, we trained both baseline models and DHA for up to 50000 steps (50B token budget). To evaluate the training acceleration capability of DHA, we evaluate its performance under two budget scenarios. First, we set a budget of **1B tokens** to compare the early-stage rapid convergence capabilities of DHA and GQA. Then, we set a budget of **50B tokens** to further assess the performance of DHA over a more extended training period.
+
+Evaluation.We employed the lm-evaluation-harness  to evaluate our models. For common sense and reading comprehension tasks, we report 0-shot accuracy results for SciQ , PIQA , WinoGrande (Wino.) , ARC Easy(ARC-E.) , and HellaSwag (HellaS.) , alongside 25-shot accuracy for ARC Challenge (ARC-C.) . In the assessments of continued QA and text understanding, we report 0-shot accuracy for LogiQA , 32-shot BoolQ , and 0-shot LAMBADA . All reported results were calculated with the mean and stderr of multiple experiments.
+
+Instruction tuning evaluation.To assess our models' capabilities after instruct tuning [31; 32], we fine-tune both DHA and baseline models on 10,000 instruction-response pairs from the ShareGPT dataset 5 and evaluate on another 1,000 instructions, using GPT-4 for response evaluator . The win rate of our model relative to the baseline is reported. For detailed information, refer to Appendix C.1.
+
+[MISSING_PAGE_FAIL:8]
+
+[MISSING_PAGE_EMPTY:9]
+
+demonstrates the necessity and effectiveness of the fusion stage under low-resource conditions. When we have a larger training budget, we can allocate more resources to the fusion stage to achieve a better initialization point for DHA.
+
+Heads Budget Allocation.We investigated how the model adaptively allocates decoupled head group sizes across different layers under global head budgets. As illustrated in Fig. 8, the head numbers of DHA layers decrease from higher to lower across layers. Deeper layers exhibit higher compression rates due to greater redundancy. However, the initial and crucial layers need more heads, suggesting they may have specialized functions. As shown in Fig. 7, we presented the LM loss for the cold-start training of DHA models initialized with parameter averaging under different DHA configurations obtained at various search steps. Despite using the same initialization method as GQA, DHA exhibits a faster loss decline and a lower final loss. This indicates that DHA's architecture can accelerate training and achieve better performance, even without Linear Heads Fusion method.
+
+Parameter Characteristics in DHA.For interpretability analysis, we visualized the parameter characteristics of the post-fusion DHA model in Fig. 9 (details in Appendix E.2), and compared them with those prior to fusion. The DHA parameter distribution shows consistency with MHA's. This indicates that DHA effectively aggregates multiple similar functional heads within clusters and new fused heads successfully reconstruct the functionalities of multiple origin heads in MHA. It is noteworthy that the significant reduction in the number of similar heads within the DHA architecture indicates that our method effectively reduces redundancy among the heads.
+
+## 6 Related Work
+
+Advanced Multi-Head Attention.Some efforts have been converting the traditional Multi-Head Attention (MHA)  to Multi-Query Attention (MQA) , Group-Query Attention (GQA)  or GQKVA . These methods achieve a balance between performance and efficiency by reducing the number of head parameters through parameter reuse across grouped heads. DHA is inspired by these methods and has a much higher optimization rate and much less training overhead.
+
+Efficient Pre-training Approaches.In recent years, the ability of incremental training to accelerate large-scale model training by studying how to obtain the optimal initialization point for training has thus attracted much attention [34; 35]. Net2Net  uses function-holding transformations to expand the width by duplicating neurons, and uses a unitary layer implementation to expand the depth. LiGO  proposes a learnable expansion method that can be used at the initial initialization point of a transformer. DHA is inspired by these methods, but we investigate how to learn to map the parameter matrix from large to small without losing the ability of the larger model itself. For additional related work, please refer to Appendix A.
+
+## 7 Conclusion
+
+In this paper, we propose an efficient attention architecture and a method for fast converting an MHA checkpoint into an efficient structure. By grouping similar heads and performing controlled linear fusion, we develop an initial DHA architecture that decouples head components at various layers, reducing training overhead while maintaining performance. Experimental results show that our method preserves the knowledge of the original model, improving training acceleration, inference efficiency, and computational cost savings. This transformation paradigm offers research value and potential for broader application with minimal performance loss and reduced computational effort.

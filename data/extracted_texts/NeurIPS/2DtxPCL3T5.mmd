@@ -1,0 +1,185 @@
+# Learning to Compress Prompts with Gist Tokens
+
+Jesse Mu, Xiang Lisa Li, Noah Goodman
+
+Stanford University
+
+muj@cs.stanford.edu, {xlisali,ngoodman}@stanford.edu
+
+###### Abstract
+
+Prompting is the primary way to utilize the multitask capabilities of language models (LMs), but prompts occupy valuable space in the input context window, and repeatedly encoding the same prompt is computationally inefficient. Finetuning and distillation methods allow for specialization of LMs without prompting, but require retraining the model for each task. To avoid this trade-off entirely, we present _gisting_, which trains an LM to compress prompts into smaller sets of "gist" tokens which can be cached and reused for compute efficiency. Gist models can be trained with no additional cost over standard instruction finetuning by simply modifying Transformer attention masks to encourage prompt compression. On decoder (LLaMA-7B) and encoder-decoder (FLAN-T5-XXL) LMs, gisting enables up to 26x compression of prompts, resulting in up to 40% FLOPs reductions, 4.2% wall time speedups, and storage savings, all with minimal loss in output quality.
+
+## 1 Introduction
+
+Consider the prompt of a Transformer  language model (LM) like ChatGPT:1
+
+You are ChatGPT, a large language model trained by OpenAI. You answer as concisely as possible for each response (e.g. don't be verbose). It is very important that you answer as concisely as possible, so please remember this. If you are generating a list, do not have too many items. Keep the number of items short. Knowledge cutoff: 2021-09 Current date: <TODAY>
+
+With millions of queries a day, an unoptimized ChatGPT would encode this prompt over and over with a self-attention mechanism whose time and memory complexity is quadratic in the length of the input. Caching the Transformer activations of the prompt can prevent some recomputation, yet this strategy still incurs memory and storage costs as the number of cached prompts grows. At large scales, even small reductions in prompt length could lead to substantial compute, memory, and storage savings over time, while also letting users fit more content into an LM's limited context window.
+
+How might we reduce the cost of this prompt? One typical approach is to finetune or distill [1; 30] the model to behave similarly to the original model without the prompt, perhaps with parameter-efficient adaptation methods [15; 16; 19]. Yet a fundamental drawback of this approach is that it requires retraining the model for each new prompt (Figure 1, bottom left).
+
+Instead, we propose **gisting** (Figure 1, top right), which compresses arbitrary prompts into a smaller set of Transformer activations on top of virtual "gist" tokens, _a la_ prefix-tuning . But where prefix-tuning requires learning prefixes via gradient descent for each task, gisting adopts a meta-learning approach, where we simply predict the gist prefixes zero-shot given only the prompt, allowing for generalization to unseen instructions without any additional training. Since gist tokens are much shorter than the full prompt, gisting allows arbitrary prompts to be compressed, cached, and reused for compute efficiency.
+
+In this paper, we further propose a very simple way to learn a gist model: doing instruction tuning  with gist tokens inserted after the prompt, and a modified attention mask preventing tokens _after_ the gist tokens from attending to tokens _before_ the gist tokens. This allows a model to learn prompt compression and instruction following at the same time, with no additional training cost.
+
+On decoder-only (LLaMA-7B) and encoder-decoder (FLAN-T5-XXL) LMs, gisting achieves prompt compression rates of up to **26x**, while maintaining output quality similar to the original models in human evaluations. This results in up to 40% FLOPs reduction and 4.2% latency speedups during inference, with greatly decreased storage costs compared to traditional prompt caching approaches.
+
+## 2 Gisting
+
+We will first describe gisting in the context of instruction finetuning . We have an instruction-following dataset \(=\{(t_{i},x_{i},y_{i})\}_{i=1}^{N}\), where \(t\) is a task encoded with a natural language prompt (e.g. Translate this to French), \(x\) is an (optional) input for the task (e.g. The cat), and \(y\) is the desired output (e.g. Le chat). Given a (usually pretrained) LM, the aim of instruction finetuning is to learn a distribution \(p_{}(y t,x)\), typically by concatenating \(t\) and \(x\), then having the LM autoregressively predict \(y\). At inference time, we can _prompt_ the model with a novel task \(t\) and input \(x\), decoding from the model to obtain its prediction.
+
+However, this pattern of concatenating \(t\) and \(x\) has drawbacks: Transformer LMs have limited context windows, bounded either by architecture or memory limits. Furthermore, given that attention scales quadratically in the length of the input, long prompts \(t\), especially those that are repeatedly reused, are computationally inefficient. What options do we have to reduce the cost of prompting?
+
+One simple option is to finetune the LM for a _specific_ task \(t\). That is, given \(^{t}=\{(x_{i},y_{i})\}_{i=1}^{N^{t}}\), the dataset containing input/output examples only under task \(t\), we can learn a specialized LM \(p_{}^{t}(y x)\) which is faster because it does not condition on \(t\). Parameter-efficient finetuning methods such as prefix-/prompt-tuning [18; 19] or adapters [15; 16] promise to do so at a fraction of the cost of full finetuning, and newer methods like HyperTuning  eliminate gradient descent entirely, instead predicting the parameters of the specialized model directly from \(^{t}\). Yet problems with these methods still remain: we must store at least a subset of model weights for each task, and more importantly, for each task \(t\), we must collect a corresponding dataset of input/output pairs \(^{t}\) to adapt the model.
+
+Gisting is a different approach that amortizes both (1) the inference-time cost of prompting \(p_{}\) with \(t\) and (2) the train-time cost of learning a new \(p_{}^{t}\) for each \(t\). The idea is to learn a _compressed_ version of \(t\), \(G(t)\), such that inference from \(p_{}(y G(t),x)\) is faster than \(p_{}(y t,x)\). In LM terms, \(G(t)\) will be the key/value activations on top a set of _gist tokens_, smaller than the number of tokens in \(t\), yet still inducing similar behavior from the LM. Also known as a Transformer _prefix_, \(G(t)\) can then be cached and reused for compute efficiency. Crucially, we expect \(G\) to generalize to unseen tasks: given a new task \(t\), we can predict and use the gist activations \(G(t)\)_without any additional training_.
+
+### A Context Distillation Perspective
+
+An alternative way to view gisting is through the lens of distillation of an already instruction-tuned LM \(p_{}(y t,x)\). Askell et al.  and Snell et al.  define _context distillation_ as the process of finetuning a new LM \(p_{}^{t}\) to mimic the original LM without the prompt ("context") \(t\), via the loss
+
+\[_{}(p_{}^{t},\,t)=_{x}[D_{}(p_{}(y t,x) p_{}^{t}(y x))].\] (1)
+
+Figure 1: **Prompting** retains the multitask capabilities of LMs, but is inefficient. **Finetuning/distillation** is more efficient, but requires training a model for each task. **Gisting** compresses prompts into activations on top of “gist tokens”, saving compute and generalizing to novel tasks at test time. Each vertical rectangle represents a stack of Transformer activations.
+
+The insight to be gained from this perspective is that we do not need any external data \(\): this KL objective can be approximated by finetuning \(p_{}^{t}\) on a synthetic sampled dataset \(}^{t}=\{(_{i},_{i})\}\) where \((_{i},_{i}) p_{}( t)\). This is precisely the approach taken by recent work [1; 7; 30], including Wingate et al. , who notably learn to compress a single discrete prompt into a soft prompt via gradient descent, similar to this paper.
+
+However, we differ from this prior work in that we are not interested in distilling just a single task, but in amortizing the cost of distillation across a _distribution_ of tasks \(T\). That is, given a task \(t T\), instead of obtaining the distilled model via gradient descent, we use \(G\) to simply _predict_ the gist tokens (\(\) parameters) of the distilled model, in the style of HyperNetworks  and HyperTuning . Our "meta" distillation objective is thus (with changes highlighted in blue):
+
+\[_{}}(p_{}},T)=_{t T,x} [D_{}(p_{}(y t,x) p_{}}(y  G(t),x))].\] (2)
+
+In the experiments we describe below, we train on synthetic instruction-following data sampled from instruction-tuned variants of GPT-3 [3; 23]. Thus, these experiments can indeed be seen as a form of context distillation for the GPT-3 series models.
+
+## 3 Learning Gisting by Masking
+
+Having just described the general framework of gisting, here we will explore an extremely simple way of learning such a model: using the LM itself as the gist predictor \(G\). This not only leverages the pre-existing knowledge in the LM, but also allows us to learn gisting by simply doing standard instruction finetuning while modifying the Transformer attention masks to enforce prompt compression. This means that gisting incurs _no_ additional training cost on top of standard instruction finetuning!
+
+Specifically, we add a _single_ gist token \(g\) to the model vocabulary and embedding matrix. Then, given a (task, input) pair \((t,x)\), we concatenate \(t\) and \(x\) with a set of \(k\) copies of \(g\) in between: \((t,g_{1},,g_{k},x)\), e.g. Translate French: <G1> <G2> The cat.2 The model is then restricted such that input tokens _after_ the gist tokens cannot attend to any of the prompt tokens _before_ the gist tokens (but they _can_ attend to the gist tokens). This forces the model to compress the prompt information into the gist prefix, since the input \(x\) (and output \(y\)) cannot attend to the prompt \(t\).
+
+Figure 2 illustrates the required changes. For **decoder-only** LMs such as GPT-3  or LLaMA  that normally admit an autoregressive, causal attention mask, we simply mask out the lower-left corner of the triangle (Figure 1(a)). For **encoder-decoder** LMs (e.g. T5; ) with a bidirectional encoder followed by an autoregressive decoder, two changes are needed (Figure 1(b)). First, in the encoder, which normally has no masking, we prevent the input \(x\) from attending to the prompt \(t\). But
+
+Figure 2: **Gist Masking**. Attention mask modifications for (a) decoder-only and (b) encoder-decoder Transformer LMs to encourage prompt compression into gist tokens <G1> <G2>. In these tables, cell \((r,c)\) shows whether token \(r\) can attend to token \(c\) during self- or cross-attention.
+
+we must also prevent the prompt \(t\) and gist tokens \(g_{i}\) from attending to the input \(x\), since otherwise the encoder learns different representations depending on the input. Finally, the decoder operates as normal, except during cross-attention, we prevent the decoder from attending to the prompt \(t\).
+
+Overall, these masking changes are extremely simple and can be implemented in roughly 10 source lines of code. See Appendix A for a sample PyTorch implementation which can be used as a drop-in replacement for attention masking in deep learning libraries such as Hugging Face Transformers .
+
+## 4 Experiments
+
+### Data
+
+A dataset with a large variety of tasks (prompts) is crucial to learn gist models that can generalize. To obtain the largest possible set of tasks for instruction finetuning, we create a dataset called Alpaca+, which combines the Self-Instruct  and Stanford Alpaca  instruction tuning datasets, each consisting of \((t,x,y)\) tuples sampled from OpenAI's text-davinci-001 and text-davinci-003 variants of GPT-3, respectively. In total, Alpaca+ has 130,321 examples, with 104,664 unique tasks \(t\), 48,530 unique inputs \(x\), and anywhere from 0-5 inputs per task (0.64 on average).
+
+Note that ~59% of tasks in Alpaca+ have no inputs (e.g. Write me a poem about frogs), in which case we simply omit the input \(x\). While it is less interesting to cache such prompts since they are not input-dependent, they still serve as valuable training signal for learning prompt compression. Overall, while Alpaca+ is noisy and imperfect, Wang et al.  and Taori et al.  nevertheless show that models trained on such data achieve comparable performance to the original models from which the data is sampled, making this a promising testbed for studying gisting.
+
+From Alpaca+ we hold out 3 validation splits: 1000 **Seen** prompts (with unseen, non-empty inputs); 1000 **Unseen** prompts (with non-empty inputs); and the 252 hand-written **Human** prompts and completions used in Wang et al. , of which 83% have non-empty inputs. The latter two splits test generalization to unseen instructions, with the **Human** split posing a stronger out-of-distribution (OOD) challenge: the average training prompt has ~20 tokens, compared to ~26 in the human split.
+
+### Models
+
+To demonstrate gisting across multiple Transformer LM architectures, we experiment with LLaMA-7B , a decoder-only GPT-style model with ~7B parameters, and FLAN-T5-XXL , an encoder-decoder T5 model  with 11B parameters. For each of these models, we train models with a varying number of gist tokens \(k\{1,2,5,10\}\), using the modified attention masks described in Section 3. To assess how the model is learning prompt compression, we calibrate performance against upper- and lower-bound baselines and a simple discrete compression strategy:
+
+Positive Control.As an upper bound on performance, we train a model with a single gist token, but without any modifications to the attention mask. This is akin to doing standard instruction finetuning.
+
+Negative Control.As a lower bound on performance, we train a model without access to the task \(t\). This is similar to a "random gist token" baseline, which allows us to measure how the model would do if it failed to compress _any_ information into the gist prefix.
+
+Discrete Compression with TF-IDF.An alternative approach to compression is simply using fewer discrete tokens to express the same task. Achieving compression rates similar to gisting, however, requires compression far beyond any threshold of fluency. Nevertheless, as a baseline, we compute TF-IDF statistics over the set of instructions in the Alpaca+ training set to extract the most relevant keyword in each instruction. Some examples from the training set include (see Appendix G for more):
+
+``` Write alettertoyourbossaskingforanincreaseinsalary\(\)salary Giventwointegers,findtheiraverage\(\)average ```
+
+We then replace each instruction in Alpaca+ with the first subword token from each keyword, resulting in compression rates equivalent to a model trained with a single gist token. Similarly to the positive control, we do standard instruction finetuning over Alpaca+ with these compressed instructions.
+
+For full training, data, and compute details, and a link to code, see Appendix B.
+
+### Evaluation
+
+Our evaluation uses a combination of automated metrics and AI- and human-assisted evaluation:
+
+ROUGE-L.We first use ROUGE-L, a simple lexical overlap statistic , used in previous open-ended instruction finetuning work [37; 38]. The text-davinci-{001,003} completions are used as references, except for the Human split, where we use the gold-standard human reference.
+
+ChatGPT.Next, we use ChatGPT-3.5  to compare the outputs of our models to the positive control. While this is an imperfect metric, it allows for much faster and cheaper evaluation than human experiments, with an arguably more meaningful semantic signal than ROUGE-L. Recent work has found that ChatGPT can be used for text annotation and evaluation [12; 17; 35] with near-human performance, and similar model-based evaluations have been conducted with recent LMs [5; 11; 31].
+
+Specifically, given a task \(t\), input \(x\), and outputs from two models \((y_{1},y_{2})\) identified only as Assistants A and B, ChatGPT was asked to choose which assistant response is better, explaining its reasoning in Chain-of-Thought fashion . If the models produced the same output, or were equally bad, ChatGPT was allowed to call a tie. We gave examples of desired outputs in ChatGPT's prompt, and randomized the order of presentation between the models for each query to avoid order effects. The full prompt given to ChatGPT and evaluation details are in Appendix C. Using these outputs, we measure the win rate of a model against the positive control: a win rate of 50% indicates that the model is of comparable quality to a model that does no prompt compression.
+
+Human eval.Finally, after prototyping with ChatGPT, we select the best gist compression models and do a Human evaluation on a random subset of 100 of the 252 examples in the Human validation split. For each of the 100 examples, we recruited 3 US or UK-based, English-fluent annotators from Prolific, and asked them to rate model outputs in the same style as the ChatGPT evaluation above (see Appendix D for full details, including the annotation interface). The only difference is that human participants were allowed to select "I Don't Know" in cases where they had inadequate domain knowledge to accurately judge the responses, e.g. if the question was a coding question; we drop these responses (~10%) during analysis. With this human evaluation, we are not only interested in evaluating our final models, but also validating whether ChatGPT can be used as a reliable replacement for human annotation on this task.
+
+## 5 Results
+
+ROUGE-L and ChatGPT evaluations for LLaMA-7B and FLAN-T5-XXL, with varying numbers of gist tokens, are shown in Figure 3. Models were generally insensitive to the number of gist tokens \(k\): compressing prompts into a single token prefix did not substantially underperform larger prefixes. In fact, having too many gist tokens hurts performance in some cases (e.g. LLaMA-7B, 10 gist tokens), perhaps because the increased capacity enables overfitting to the training distribution. Thus, we use the single gist token models for the rest of the experiments in the paper, and report the exact numbers for the single-token models, with the positive, negative, and TF-IDF baselines, in Table 1.
+
+On **Seen** instructions, gist models attain near-identical ROUGE and ChatGPT performance as their positive control models (48.6% and 50.8% win rates for LLaMA-7B and FLAN-T5-XXL, respectively). But we are most interested in generalization to unseen tasks, as measured by the other two splits. On **Unseen** prompts within the Alpaca+ distribution, we again see competitive performance: 49.7% (LLaMA) and 46.2% (FLAN-T5) win rates against the positive controls. It is on the most challenging OOD **Human** split where we see slight drops in win rate to 45.8% (LLaMA) and 42.5% (FLAN-T5), though these numbers are still quite competitive with the positive control. Finally, gist compression is vastly superior to discrete compression; the TF-IDF models in Table 1 only marginally outperform the negative control models across the board.
+
+Table 2 shows the human evaluation results on the Human validation split, comparing the single gist token models to the positive control. Overall, human annotators agree with ChatGPT, with average win rates of 52.3% (vs. 48.0%) for LLaMA-7B and 40.6% (vs. 42.0%) for FLAN-T5-XXL. Importantly, this agreement persists at the level of individual responses. The average pairwise Cohen's \(\) among human annotators is.24 for LLaMA-7B and.33 for FLAN-T5-XXL. Because humans will often arbitrarily choose one response over another even for samples of equal quality, these numbers
+
+    &  &  &  \\  & & ROUGE-L & ChatGPT \% & ROUGE-L & ChatGPT \% & ROUGE-L & ChatGPT \% \\  LLaMA- & Pos & 58.0 (100) & 50.0 (100) & 48.1 (100) & 50.0 (100) & 27.0 (100) & 50.0 (100) \\
+7B & Gist & 57.8 (99.2) & 48.6 (92.4) & 46.6 (91.0) & 49.7 (98.8) & 23.9 (75.4) & 45.8 (84.9) \\  & TF-IDF & 38.1 (24.5) & 34.5 (16.2) & 34.0 (15.6) & 29.3 (15.9) & 16.5 (16.7) & 24.6 (8.6) \\  & Neg & 31.5 (0) & 31.5 (0) & 31.4 (0) & 25.4 (0) & 14.4 (0) & 22.2 (0) \\  FLAN- & Pos & 50.6 (100) & 50.0 (100) & 45.7 (100) & 50.0 (100) & 23.9 (100) & 50.0 (100) \\ T5-XXL & Gist & 48.9 (93.2) & 50.8 (103.9) & 43.8 (88.6) & 46.2 (84.4) & 21.7 (80.9) & 42.5 (63.2) \\  & TF-IDF & 32.0 (25.9) & 35.9 (30.5) & 34.3 (31.3) & 31.0 (22.1) & 13.5 (9.6) & 28.4 (-5.9) \\  & Neg & 25.5 (0) & 29.7 (0) & 29.1 (0) & 25.6 (0) & 12.4 (0) & 29.6 (0) \\   
+
+Table 1: **Results for single gist tokens.** ROUGE-L and ChatGPT scores for Gist, TF-IDF, and positive/negative controls. Parentheses are scores normalized between positive/negative controls.
+
+Figure 3: **Varying the number of gist tokens.** ROUGE-L and ChatGPT scores for (a) **LLaMA-7B** and (b) **FLAN-T5-XXL** for different gist tokens. Dashed lines indicate positive and negative control performance. Error bars are 95% exact binomial confidence intervals, splitting ties equally between models  and rounding down in favor of the positive control in case of an odd number of ties. Compression factors are calculated by computing the average token length of the validation split and dividing by the number of gist tokens.
+
+are fairly low; however, ChatGPT shows similar levels of agreement, with average \(\) across each of the 3 human annotators at.29 for both models. These results, paired with the similar overall win rates, show that using ChatGPT is similar to simply recruiting an additional human annotator, and corroborates the broader results in Figure 3. See Appendix D for more human evaluation results, including a breakdown of agreement across annotators, and Appendix G for examples of instructions, model outputs, and human/ChatGPT judgments in the Human validation split.
+
+Since our aim is having the gist models mimic the original models, one might ask how often the gist model is identical to the positive control. Figure A.3 in Appendix E shows how often this happens: for **Seen** tasks (but unseen inputs), the gist model outputs exactly match the positive control nearly 50% of the time. This drops to \(\)20-25% for **Unseen** tasks and \(\)10% for the OOD **Human** tasks.
+
+Overall, our results show that gist models can reliably compress prompts, even to some degree those that lie outside the training distribution, especially for decoder-only LMs (LLaMA). Encoder-decoder LMs like FLAN-T5 show slightly worse OOD performance; one possible reason is that gist masking inhibits the bidirectional attention flow in the encoder, which is more challenging to adjust to than simply limiting the history of a decoder LM. Future work will be needed to investigate this hypothesis.
+
+### Failure cases
+
+While the responses from the gist models are often indistinguishable from the positive control, we nevertheless do see failure cases where the gist token models do not perfectly compress the prompt. We give two examples where this occurs in the Human validation split: first, when the instruction contains **specific details**, e.g. phrases that must be copied verbatim into the output (in the snippets below, the names of Assistants A/B are hidden to ChatGPT):
+
+Instruction: Give the news title a category. Pick a category from the list of News & Buzz, Travel, Style, Arts & Culture, Politics, Tech, and Science & Health. <G1> Input: The #Banksy Exhibit in Cambridge, MA is absolutely terrific. Assistant A (FLAN-T5-XXL gist): Culture Assistant B (pos control): Arts & Culture
+
+**ChatGPT choice: B ChatGPT reason:** The news title is about an art exhibit, so Assistant B's response of 'Arts & Culture' is more accurate and specific than Assistant A's 'Culture'.
+
+We also see more cases of **runaway generations** that do not occur with the positive control model:
+
+Instruction: Provide an example of how a table of contents can be generated automatically in a LATEX document. Make sure your example contains the necessary commands. <G1> Assistant A (pos control): tableof contents <chapter[Introduction] <chapter[Theory] <chapter[Experiments] <chapter[Conclusion] Assistant B (LLaMA-7B gist): tableofcontents <chapter[Introduction] <section[The Basics] <subsection[The Basics] <subsubsection[The Basics] <subsubsection[The Basics] <subparagraph[The Basics] <subparagraph[The Basics] <repeats for hundreds of tokens] <subparagraph[The Basics]
+
+**ChatGPT choice: A ChatGPT reason: Assistant A provides a simple and correct example of generating a table of contents in LaTeX. Assistant B's example is unnecessarily long and does not follow the standard structure of a table of contents.**
+
+While it is unclear why only the gist models exhibit this behavior, these issues can likely be mitigated with more careful sampling techniques.
+
+    & &  &  \\
+**Model** & H1 & H2 & H3 & **Human (H1–H3)** & **ChatGPT** & **Human** & **ChatGPT** \\  LLaMA-7B & 51.1 & 44.5 & 59.8 & 52.3 (46.1, 58.4) & 48.0 (38.0, 58.2) &.24 &.29 \\ FLAN-T5-XXL & 43.0 & 41.9 & 37.2 & 40.6 (34.6, 46.8) & 42.0 (32.2, 52.3) &.33 &.29 \\   
+
+Table 2: **Human evaluation results.** Win rate and inter-annotator agreement of single token gist models over positive control according to 3 Human annotators (H1–H3), their average, and ChatGPT (95% confidence intervals in parentheses), for 100 out of 252 examples in the Human validation split.
+
+## 6 Compute, Memory, and Storage Efficiency
+
+Finally, we return to one of the central motivations of this paper: what kind of efficiency gains does gisting enable? To answer this question, we compare the compute requirements (CUDA wall time and FLOPs) during inference with the single-token gist models using different caching strategies:
+
+1. **No caching**: just encoding the full prompt \(t\).
+2. **Instruction caching**: caching the activations of the uncompressed instruction \(t\) (keys and values for all layers) into what is called the **KV cache**. This is the most common caching behavior for Transformer inference  and is supported in libraries like Hugging Face Transformers . However, it is only applicable to _decoder-only_ models, since in models with bidirectional encoders like T5, the instruction representations \(t\) depend on the input \(x\).
+3. **Gist caching**: Compressing the prompt into the gist prefix \(G(t)\).
+
+Table 3 displays the results of profiling a single forward pass through the model (i.e. one step of decoding with a single input token) with PyTorch  2.0, averaged across the 252 Human instructions. Gist caching improves significantly over unoptimized models, with 40% FLOPs savings and 4-7% lower wall time for both models. Note that at these (relatively) small scales, the wall time improvements are smaller than the FLOPs reductions because much of the inference latency is caused by moving tensors from high-bandwidth memory (HBM) to the chip compute cores, i.e. what Pope et al.  call the "memory time". Larger sequence lengths and batch sizes will lead to additional speedups, as the overall latency becomes dominated by the actual matrix computations.
+
+For LLaMA-7B, the picture is more nuanced when compared to caching the full instruction. Compute improvements of gist caching are smaller: a negligible decrease in FLOPs (0.11%) and a modest 1% speedup in wall time. This is because the FLOPs required for a Transformer forward pass is dominated by processing of the new input tokens, rather than self-attention with the KV cache. For example, a forward pass through LLaMA-7B with a single input token and a _2000-length_ KV cache is only ~10% more expensive than the same forward pass with no KV cache--see Appendix F for more details. Nevertheless, this small decrease in FLOPs leads to a disproportionate decrease in wall time (1%), likely because the self-attention computations are slower relative to their FLOPs contribution.
+
+At large scales and with heavily reused prompts, a 1% latency speedup can still accumulate into significant cost savings over time. More importantly, however, there are key benefits of gist caching over instruction caching besides latency: compressing 26 tokens into 1 gives more space in the input context window, which is bounded by absolute position embeddings or GPU VRAM. For example, for LLaMA-7B, each token in the KV cache requires 1.05 MB storage.3 While the total contribution of the KV cache relative to the memory needed for LLaMA-7B inference is negligible at the prompt lengths we tested, an increasingly common scenario is developers caching many prompts across a large number of users, where storage costs quickly add up. In these scenarios, gisting allows caching of up to **26x** more prompts than full instruction caching, using the same amount of storage!
+
+    &  &  &  \\  & & **None** & **Instruction\({}^{}\)** & **Gist\({}^{}\)** & **vs. None** & **vs. Instruction** \\  LLaMA-7B & CUDA & 23.4 \(\) 6.88 & 22.1 \(\) 6.58 & **21.8 \(\) 6.55** & 1.60 (1.29, 1.90) & 2.21 (1.40, 302) \\  & time (ms) \(\) & & & & 6.8\% (5.5, 8.1) & 1.0\% (.63, 1.4) \\  & GFLOPs \(\) & 915 \(\) 936 & 553 \(\) 900 & **552 \(\) 899** & 362 (337, 387) &.607 (.448, 766) \\  & & & & & 40\% (37, 42) &.11\% (.08, 1.4) \\  FLAN-T5-XXL & CUDA & 31.0 \(\) 5.31 & N/A & **29.7 \(\) 5.07** & 1.30 (1.10, 1.51) & N/A \\  & time (ms) \(\) & & & & 4.2\% (3.6, 4.9) & \\  & GFLOPs \(\) & 716 \(\) 717 & N/A & **427 \(\) 684** & 289 (268, 310) & N/A \\  & & & & & 40\% (37, 43) & \\   
+
+\({}^{}\)Average KV Cache Length = 26 \({}^{}\)Average KV Cache Length = 1
+
+Table 3: **Gist efficiency improvements**. For different caching strategies (**None**, **Instruction**, **Gist**), we record CUDA wall time and GFLOPs (\(\) std dev). Then we report the absolute/relative improvement of **Gist Caching** over these alternative strategies, with 95% confidence intervals in parentheses.
+
+Additional Related Work
+
+Gisting builds upon past work in (parameter-efficient) instruction finetuning and context distillation, as discussed in Section 2. Here we will outline some additional connections to related work:
+
+Adapting LMs without Backprop.As mentioned in Section 2, listing can be viewed as a way to adapt LMs _without_ gradient descent, by predicting the the prefix (\(\) parameters) of the adapted model. Similarly, HyperTuning  predicts the prefix of a model for a task using (input, output) pairs for that task. If HyperTuning is a "few-shot" adaptation method, predicting the prefix from few-shot examples, then listing can be seen as a "zero-shot" version, predicting the prefix from the language instruction alone. Gisting also has the additional benefit over HyperTuning of being conceptually simpler: instead of training a separate LM to predict the prefix, the LM itself is used as the HyperNetwork , with only a tiny change to the attention masks needed for prompt compression.
+
+Compression and memory in transformers.The idea of "compressing" prompts is closely related to previous attempts at storing past representations to improve memory and long-range sequence modeling in Transformers [9; 21; 27; 42; 43]. In particular, the Compressive Transformer  compresses transformer activations into a smaller _compressed memory_ using a learned convolutional operator. Gisting can be seen as a variant of the Compressive Transformer with 3 key differences. First, the compression function is not a separately learned function, but the LM's own self-attention mechanism, controlled by an input-dependent gist token. Second, the compression function is learned jointly with instruction finetuning via the standard language modeling loss, not a specialized auxiliary reconstruction loss as in . Finally, our task of interest is not long-range sequence modeling, but caching and reusing instruction following prompts for efficiency reasons.
+
+Sparse attention mechanisms.By restricting attention masks, gisting draws inspiration from efficient/sparse attention methods in Transformers (see  for review). For example, some sliding window attention mechanisms [2; 6] may remove the need to keep the entire KV cache around during decoding, but these more general methods are not optimized for caching arbitrary parts of the input sequence of varying length, which prompt compression demands. In light of this, gisting can be viewed as an input-dependent sparse attention mechanism specifically aimed at improving efficiency of the prompting workflow now commonly used in LMs.
+
+## 8 Discussion and Limitations
+
+In this paper we presented gisting, a framework for prompt compression in LMs, and a simple way of implementing gist models by modifying Transformer attention masks that incurs no additional cost over standard instruction finetuning. Gisting can be seen either as a modified form of instruction finetuning or a method for (meta-)context distillation of an LM. Gist models can compress unseen OOD prompts up to 26x while maintaining output quality, resulting in up to 40% FLOPs reduction and 4.2% wall clock speedups over unoptimized models, and enabling new methods for prompt caching in encoder-decoder models. While wall-time improvements for decoder-only LMs are smaller, gisting nevertheless enables caching 1 _order of magnitude_ (26x) more prompts relative to full instructions.
+
+Gisting is a promising method for improving LM efficiency, but carries some limitations. While gisting seems to succeed in capturing the "gist" of instructions (hence the name), achieving such compression necessarily results in some loss of nuance of the original instruction; Secton 5.1 illustrates a concrete failure case we observed. Since the behavior of LMs on edge cases is already not well understood, it is _especially_ important for practitioners to carefully evaluate whether the compute/accuracy tradeoff of gisting is sufficiently safe and robust for their use case, _before_ deployment.
+
+Nevertheless, we believe gisting opens several interesting directions for future work. First, the masking method presented here can be easily integrated into existing instruction finetuning workflows, but another exciting approach is to retrofit an existing, frozen LM by training a _smaller_ model to compress prompts, if finetuning the larger LM is inconvenient. Second, the largest efficiency gains from gisting will result from compressing very long prompts, for example \(k\)-shot prompts for large \(k\) that may even exceed a single context window. Finally, compression performance can likely be improved through "gist pretraining": first learning to compress arbitrary spans of natural language, before then learning prompt compression. Such objectives could be devised by inserting gist tokens into other pretraining objectives, perhaps during language modeling or T5's span corruption objective.

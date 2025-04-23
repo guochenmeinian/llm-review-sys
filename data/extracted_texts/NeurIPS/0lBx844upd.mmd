@@ -1,0 +1,177 @@
+# _Alps_: Improved Optimization for Highly Sparse One-Shot Pruning for Large Language Models
+
+Xiang Meng
+
+Operations Research Center
+
+Massachusetts Institute of Technology
+
+mengx@mit.edu &Kayhan Behdin
+
+Operations Research Center
+
+Massachusetts Institute of Technology
+
+behdink@mit.edu &Haoyue Wang
+
+Operations Research Center
+
+Massachusetts Institute of Technology
+
+haoyuew@mit.edu &Rahul Mazumder
+
+Operations Research Center
+
+Massachusetts Institute of Technology
+
+rahulmaz@mit.edu
+
+###### Abstract
+
+The impressive performance of Large Language Models (LLMs) across various natural language processing tasks comes at the cost of vast computational resources and storage requirements. One-shot pruning techniques offer a way to alleviate these burdens by removing redundant weights without the need for retraining. Yet, the massive scale of LLMs often forces current pruning approaches to rely on heuristics instead of optimization-based techniques, potentially resulting in suboptimal compression. In this paper, we introduce _ALPS_, an optimization-based framework that tackles the pruning problem using the operator splitting technique and a preconditioned conjugate gradient-based post-processing step. Our approach incorporates novel techniques to accelerate and theoretically guarantee convergence while leveraging vectorization and GPU parallelism for efficiency. _ALPS_ outperforms state-of-the-art methods in terms of the pruning objective and perplexity reduction, particularly for highly sparse models. On the LLaMA3-8B model with 70% sparsity, _ALPS_ achieves a 29% reduction in test perplexity on the WikiText dataset and a 8% improvement in zero-shot benchmark performance compared to existing methods. Our code is available at https://github.com/mazumder-lab/ALPS.
+
+## 1 Introduction
+
+Large Language Models (LLMs) have revolutionized the field of natural language processing, demonstrating remarkable performance across a wide spectrum of tasks, from question answering and text generation to sentiment analysis and named entity recognition . The success of LLMs can in part be attributed to their massive scale--state-of-the-art models like OPT-175B  and LLaMA3  have hundreds of billions of parameters. However, this enormous size comes at a steep cost in terms of storage and computational resources. For instance, the OPT-175B model requires at least 320 GB of memory to store its parameters in half-precision (FP16) format, necessitating the use of multiple high-end GPUs for inference . To make LLMs more accessible and efficient, considerable efforts have been made to compress these models, with a particular emphasis on model quantization techniques .
+
+Network pruning , a complementary approach to quantization, has received comparatively less attention in the realm of LLMs. Pruningaims to reduce the model size by identifying and removing redundant or less important weights, resulting in a sparser and more efficient network. Traditional pruning methods rely on iterative retraining to recover accuracy after each pruning stage , which can be computationally expensive and time-consuming. To address this, recent research has focused on one-shot pruning methods  that compress a pre-trained model using only a small amount of data (e.g., a few thousand samples)--the key idea here is to perform pruning while retaining model accuracy as much as possible without expensive fine-tuning/retraining on the entire dataset. Many prior works  on one-shot pruning address such pruning-accuracy tradeoffs using optimization based approaches.
+
+Despite the progress made in one-shot pruning, the massive scale of LLMs poses additional challenges, as many one-shot pruning methods designed for vision models cannot be directly applied due to their large model sizes. To overcome this, existing LLM pruning methods often rely on heuristic approaches to prune instead of solving optimization problems. For instance, SparseGPT  approximates the OBS  algorithm by employing partial weight updates and adaptive mask selection to reduce costly Hessian computation. Similarly, Wanda  prunes weights based on the product of their magnitudes and corresponding input activations. Zhang et al.  propose to iteratively grow and prune the weight mask according to the change in reconstruction error achieved by each update. While these heuristics enable pruning at scale, they may lead to suboptimal compression (and hence, suboptimal compression-accuracy tradeoffs) compared to advanced optimization-based approaches, as we show in this paper.
+
+In this paper, we propose _ALPS1_, an optimization-based framework for one-shot LLM pruning. _ALPS_ consists of two key components. First, it formulates pruning LLMs as an \(_{0}\)-constrained optimization problem and solves it directly using the operator splitting technique (i.e., ADMM)  without any simplification. The proposed algorithm simultaneously finds the support2 of the weights and updates them. After the support stabilizes, _ALPS_ fixes the support and employs preconditioned conjugate gradient (PCG) [18, Section 5] to compute the optimal weights on the support. Our modified PCG leverages sparse matrix structure (arising from pruning) and GPU computation to solve large systems efficiently, providing a significant speed advantage over direct matrix inversion. An outline of our proposed optimization-based framework _ALPS_ is given in Figure 1. Compared to previous heuristics, _ALPS_ offers higher quality supports and weights, as demonstrated in Section 4.1. This improvement translates to a better performance of the pruned model compared to existing methods, particularly in the challenging high-sparsity regime.
+
+**Contributions.** Our technical contributions are:
+
+1. We introduce _ALPS_, a novel one-shot LLM pruning framework that formulates an \(_{0}\)-constrained optimization problem with a layer-wise reconstruction objective. By extending the operator splitting technique (i.e., ADMM) to this non-convex, non-continuous problem, _ALPS_ simultaneously
+
+Figure 1: Overview of the proposed _ALPS_ algorithm. (**Left**) The pruning problem with a layerwise reconstruction objective and an \(_{0}\) constraint on the weights (Section 3.1). (**Middle**) ADMM with a \(\)-update scheme (Algorithm 1) is employed to determine high-quality support for the weight matrix \(\) (Section 3.2). (**Right**) The optimization problem is restricted to the obtained support, and a modified PCG method (Algorithm 2) is used to solve for the optimal weight values within the support (Section 3.3).
+
+finds a high-quality support and updates the weights on the support. This approach leads to improvements over state-of-the-art heuristics in terms of the pruning objective. Furthermore, we provide theoretical convergence guarantees for our proposed algorithm, which, to the best of our knowledge, is a novel convergence result for \(_{0}\)-constrained problems.
+2. We further enhance the performance of _ALPS_ through two techniques. First, we design a novel penalty parameter updating scheme that enables _ALPS_ to find better support and accelerates its convergence. Second, we propose a post-processing technique to further improve the performance of the pruned models--we fix the support determined by ADMM and optimally solve the resulting quadratic problem using the PCG method. We utilize vectorization to solve the problem in a single pass and leverage GPU parallelism to further accelerate PCG. Our proposed method achieves a 20x-200x speedup compared to the vanilla backsolve approach.
+3. _ALPS_ substantially improves upon state-of-the-art methods for one-shot unstructured pruning of LLMs. For the LLMaMA3-8B model with 70% sparsity, _ALPS_ achieves a 29% reduction in test perplexity on the WikiText dataset and a 4%-13% improvement in performance on zero-shot benchmark evaluations. We also adapt _ALPS_ to the popular N:M sparsity format (Zhou et al., 2021) and observe a 3%-10% higher performance compared to existing methods. Our code is publicly available at: https://github.com/mazumder-lab/ALPS.
+
+## 2 Related Work
+
+Network pruning.Network pruning is a well-established technique for reducing the complexity of deep neural networks by removing redundant weights (LeCun et al., 1989; Han et al., 2015). Pruning methods can be classified based on the structure of the resulting sparse network and the training requirements. In terms of structure, pruning can be categorized into unstructured pruning, which removes individual weights (Han et al., 2015; Guo et al., 2016), and structured pruning, which removes entire structures such as channels, filters, or attention heads (Lebedev and Lempitsky, 2016; Wen et al., 2016; Voita et al., 2019; El Halabi et al., 2022). Unstructured pruning offers better flexibility and higher sparsity levels but requires specialized hardware for acceleration, while structured pruning is more hardware-friendly but may suffer from larger performance loss. Based on the training requirements, pruning methods can be classified into three categories: (i) one-shot pruning, which directly removes weights from a pre-trained model without further training (Gale et al., 2019; Frantar and Alistarh, 2022; Meng et al., 2024, 2024), (ii) gradual pruning, which begins with a pre-trained model but alternates between pruning and fine-tuning via SGD to recover performance (Molchanov et al., 2016; Zhu and Gupta, 2017; Blalock et al., 2020; Kurtic et al., 2022), and (iii) training from scratch, where the model is trained from randomly initialized weights, and the sparse network structure is either determined before training or evolves during the training process, (Mocanu et al., 2018; Dettmers and Zettlemoyer, 2019; Evci et al., 2020; Kusupati et al., 2020; Chen et al., 2021). In this paper, we focus on one-shot unstructured pruning.
+
+Post-training unstructured pruning.Based on their pruning objectives, there are three types of post-training unstructured pruning methods: (i) Importance-based methods, which assign a score to each weight (e.g., its absolute value) to assess its significance and decide whether it should be eliminated (Han et al., 2015; Lee et al., 2018; Molchanov et al., 2019; Sun et al., 2023). (ii) Second-order techniques, which consider a local quadratic approximation of the loss function around the pre-trained model and remove weights based on their influence on the loss (Hassibi and Stork, 1992; Singh and Alistarh, 2020; Yu et al., 2022; Benbaki et al., 2023). These approaches employ the empirical Fisher information matrix to estimate the Hessian matrix efficiently. (iii) Layer-wise pruning algorithms, which adapt OBS (Hassibi and Stork, 1992) framework to the layer-wise reconstruction objective (Dong et al., 2017; Frantar and Alistarh, 2022, 2023). These methods prune each layer separately to address the computational challenge of calculating the full Hessian required in OBS. This work considers layer-wise reconstruction error as the pruning objective.
+
+Unstructured pruning in LLMs.While pruning algorithms designed for convolutional networks (Singh and Alistarh, 2020; Chen et al., 2020; Frantar and Alistarh, 2022) can be readily adapted to moderate-sized language models like BERT (Vaswani et al., 2017), pruning LLMs with billions of parameters presents distinct challenges. The immense model size and extensive datasets associated with LLMs render traditional pruning methods computationally infeasible (Ma et al., 2023). SparseGPT (Frantar and Alistarh, 2023) utilizes partial weight updates and adaptive mask selection to mitigate the expensive Hessian computation, while Wanda (Sun et al., 2023) directly obtains a sparse LLM model using a criterion that considers the product of the absolute values of weights and their activations. DSnoT (Zhang et al., 2023) iteratively grow and prune the weight mask according to the change in reconstruction error achieved by each update. (Boza, 2024) introduces an efficient approach to determine the optimal weights on a given support and extends this technique to develop heuristics for updating the support.
+
+**ADMM in network pruning.** The operator-splitting technique (Boyd et al., 2011; Davis and Yin, 2016) (also known as Alternating Direction Method of Multipliers, ADMM) is a well-known approach for solving composite optimization or optimization problems with coupled variables (or constraints), and has been used earlier in network pruning. Ye et al. (2018) applied ADMM to solve the original loss function under sparsity constraint, and Boza (2024) used ADMM to solve a convex pruning problem with fixed support. Moreover, Zhang et al. (2018) employed ADMM to train deep neural networks under sparsity constraints, while Ye et al. (2019) utilized ADMM to perform concurrent adversarial training and weight pruning. Our proposed method differs significantly from previous methods in two key aspects: (i) _ALPS_ solves the pruning problem with an \(_{0}\) constraint at LLM scale, simultaneously optimizes over the weights and the sparsity pattern. (ii) We introduce a novel penalty parameter update scheme that ensures convergence both practically and theoretically.
+
+## 3 _Alps_: Effective LLM pruning in One-shot
+
+### Problem formulation
+
+A common approach in post-training unstructured pruning of LLMs is to decompose the full-model compression problem into layer-wise subproblems. The quality of the solution for each subproblem is assessed by measuring the \(_{2}\) error between the output of the dense layer and that of the pruned one, given a set of input activations.
+
+Formally, let \(}^{N_{in} N_{out}}\) denote the (dense) weight matrix of layer \(\), where \(N_{in}\) and \(N_{out}\) denote the input and output dimension of the layer, respectively. Given a set of \(N\) calibration samples, the input activations can be represented as \(^{NL N_{in}}\), where \(L\) is the sequence length. The goal of pruning is to find a sparse weight matrix \(\) that minimizes the reconstruction error between the original and pruned layer outputs, while satisfying a target sparsity constraint. In addition, we add a ridge term that penalizes the distance between \(\) and \(}\), preventing \(\) from diverging too far from the original weights. This layer-wise pruning problem can be formulated as an \(_{0}\)-constrained optimization problem:
+
+\[_{^{N_{in} N_{out}}}~{}\|}-\|_{F}^{2}+_{2}\|}- \|_{F}^{2}~{}~{}~{}~{}~{}~{}~{}\|\|_{0} k,\] (1)
+
+where \(_{2} 0\) and \(\|\|_{0}\) denotes the \(_{0}\)-(pseudo)norm, which counts the number of non-zero elements.
+
+### Operator-splitting for layer-wise pruning
+
+Optimization of Problem (1) is quite challenging: we need to simultaneously find a support of \(\) and a corresponding set of optimal weights (that minimize the objective restricted to the support). Notably, \(\) may contain over 100 million parameters in the LLM setting, making (1) even more computationally demanding. To address this, we employ an operator-splitting technique (Boyd et al., 2011; Davis and Yin, 2016) (also known as ADMM), which decomposes the problem into two computationally 'friendlier' subproblems. Specifically, we reformulate problem (1) by introducing a copy \(\) of weight matrix \(\):
+
+\[_{,^{N_{in} N_{out}}}~{}~{}\| }-\|_{F}^{2}+_{2}\| }-\|_{F}^{2}+_{\| \|_{0}>k}~{}~{}~{}~{}~{}~{}~{}=,\] (2)
+
+where the penalty function "\(_{\|\|_{0}>k}\)" imposes the \(_{0}\) constraint \(\|\|_{0} k\) by assigning a value of zero when this condition is met and infinity otherwise. This reformulation separates the objective function into two independent parts while coupling the variables \(\) and \(\) through the linear constraint \(=\). We consider the augmented Lagrangian function of this problem:
+
+\[L_{}(,,)=\|}- \|_{F}^{2}+_{2}\|}-\|_ {F}^{2}+_{\|\|_{0}>k}+, -+\|-\|_{F}^{2},\] (3)where \(>0\) is the quadratic penalty parameter. We minimize the augmented Lagrangian with respect to \(\) and \(\) alternatively, followed by a dual update. We get the following update at iteration \(t\):
+
+\[^{(t+1)} =_{}L_{}(,^{(t)}, ^{(t)})=(+)^{-1} }-^{(t)}+^{(t)}\,,\] (4) \[^{(t+1)} =_{}L_{}(^{(t+1)},, ^{(t)})=P_{k}^{(t+1)}+^{(t)}/,\] \[^{(t+1)} =^{(t)}+(^{(t+1)}-^{(t+1)}),\]
+
+where \(=^{}+_{2}\). Here, the \(\)-update aims to minimize the objective by solving a system of equations, while the \(\) update enforces sparsity by using the projection operator \(P_{k}()\), which projects an input matrix onto the set of matrices with at most \(k\) non-zero elements. The dual update on matrix \(\) ensures consistency between \(\) and \(\). As the iterations (4) progress, our proposed method concurrently identifies the support of the weight matrix and updates the weights on the determined support.
+
+\(\) **update scheme.** In practice, we observe that the sequence of updates (4) and the resulting solution can be sensitive to the choice of the penalty parameter \(\). A small \(\) leads to slow convergence due to large changes in the support of \(\) across iterations, while a large \(\) may compromise solution quality though the support stabilizes early on. To balance support quality and convergence speed, we introduce a novel penalty parameter update scheme. Starting with a small \(\), we gradually increase it every few iterations, with the increase rate proportional to the change in the support of \(\). The detailed \(\) update scheme is provided in Appendix B.1. This scheme allows our algorithm to explore and find a good support when \(\) is small and to converge rapidly as \(\) grows, as demonstrated experimentally in Appendix B.2.1.
+
+Algorithm 1 outlines the proposed operator-splitting technique with the \(\) update scheme. The convergence of Algorithm 1 is guaranteed by the following theorem, with its proof provided in Appendix A. We note that existing convergence results for operator-splitting type methods (e.g., ADMM) focus on convex or continuous problems (Hong et al., 2016; Wang et al., 2019). However, our result guarantees the convergence on a non-convex, non-continuous \(_{0}\)-constrained problem, which, to the best of our knowledge, is a novel convergence result for such a problem.
+
+**Theorem 1**.: _Let \(^{(t)}}_{t=0}^{}\) and \(^{(t)}}_{t=0}^{}\) be the sequences generated in Algorithm 1. Suppose the penalty parameter \(\{_{t}\}_{t=1}^{}\) chosen in Algorithm 1 satisfies \(_{t=1}^{}1/_{t}<\). It then holds_
+
+\[\|^{(t+1)}-^{(t)}\|_{F},\|^{(t+1)}- ^{(t+1)}\|_{F}} C/_{t},\] (5)
+
+_where \(C\) is a constant depending on \(\), \(}\), \(_{2}\), and \(_{t=1}^{}1/_{t}\). In particular, there exists a matrix \(}\) such that \(^{(t)}}\) and \(^{(t)}}\) as \(t\)._
+
+```
+0: Initial penalty \(_{0}\).
+1: Initialize \(^{(0)}=_{N_{in} N_{out}}\) and \(^{(0)}=^{(0)}=}\)
+2:for\(t=0,1,\)do
+3: Update \(^{(t+1)},^{(t+1)}\) and \(^{(t+1)}\) according to (4) with \(=_{t}\).
+4: Increase \(_{t}\) to get \(_{t+1}\) based on the change in the support of \((^{(t)})\).
+5:endfor ```
+
+**Algorithm 1** ADMM for layer-wise pruning with \(_{0}\) constraint
+
+Computational cost.The primary computational cost of Algorithm 1 arises from the \(\)-update step in display (4), which involves solving a system of linear equations. In the update, the inverse of \(+\) can be reused across iterations and needs to be updated when \(\) changes. To avoid re-computing the inverse, we store the eigenvalue decomposition \(=^{}\). For varying \(\) values, the inverse can be efficiently calculated as \((+)^{-1}=(+)^{-1} ^{}\), requiring only a single matrix-matrix multiplication. Additionally, the term \(}\) in \(\)-update remains constant across iterations and can be pre-computed and stored. Thus, each iteration of update (4) requires at most two matrix-matrix multiplications, leading to a time complexity of \(O(N_{in}^{2}N_{out})\).
+
+Extension to other sparsity patterns.Algorithm 1 can be extended to support \(N:M\) sparsity (Zhou et al., 2021; Hubara et al., 2021), a pattern in which a neural network has at most \(N\) non-zeroweights in each group of \(M\) consecutive weights. This sparsity pattern enables inference time acceleration on specialized hardware like NVIDIA A100 GPUs. To accommodate \(N:M\) sparsity, we modify the \(\)-update step in (4) by replacing the projection operator \(P_{k}()\) with a projection onto the set of matrices satisfying \(N:M\) sparsity. This modification can be easily implemented by applying magnitude pruning (Zhou et al., 2021) to \(^{(t+1)}+^{(t)}/\). Our approach can be further generalized to handle other structured sparsity patterns, such as block sparsity (Gray et al., 2017) and row sparsity (Meng et al., 2024). Similar to the \(N:M\) sparsity adaptation, this is achieved by modifying the \(\)-update step to project onto the set of matrices satisfying the desired sparsity pattern. Importantly, our convergence results and the refining procedure introduced in Section 3.3 remain applicable to these various sparsity patterns.
+
+### Efficiently refining weights after support stabilization
+
+Our proposed \(\)-update technique enables Algorithm 1 to search for a high-quality support when \(\) is small, and the support stabilizes quickly as \(\) increases. However, once the support stabilizes, the convergence rate of Algorithm 1 becomes slow in practice. To accelerate the optimization process on the support, we employ a Preconditioned Conjugate Gradient (PCG) (Nocedal and Wright, 1999, Section 5) method with GPU parallelism and vectorization for efficient computation.
+
+Formally, we introduce a post-processing technique that fixes the support \(\) of the current solution \(\) and refines the solution within this support, leading to the following problem:
+
+\[_{^{N_{in} N_{out}}}\ \| }-\|_{F}^{2}+_{2}\|}-\|_{F}^{2}\ \ () .\] (6)
+
+(6) decomposes into separate least squares problems across the columns of \(\). However, as illustrated in Figure 1 (Middle), the supports of the columns of \(\) are different. Using direct matrix inversion (backsolve) to solve these problems would involve solving \(N_{out}\) linear equations, each requiring the inversion of a submatrix of \(=^{}+_{2}\). Since the submatrices under consideration vary across different columns, parallelization is not straightforward, and we must solve \(N_{out}\) different linear equations, each with size \(O(N_{in})\). In LLMs, where \(N_{out}\) and \(N_{in}\) are of the order \(10^{4}\), this would result in a significant computational expense. We present a workaround as discussed next.
+
+To efficiently solve problem (6), we propose using the Preconditioned Conjugate Gradient (PCG) method, a high-performance numerical linear algebra technique for approximately solving systems of equations through repeated matrix-matrix multiplications. We further enhance PCG's performance by introducing two novel acceleration strategies. First, instead of solving for each column of \(\) separately, we solve the entire problem in a single pass by directly solving the linear equation \(=}\) using PCG and projecting \(\) onto the given support \(\) in each iteration (Algorithm 2, line 8). We leverage vectorization to significantly enhance the speed. Second, we perform the matrix-matrix multiplications involved in PCG on the GPU, further utilizing GPU acceleration to expedite the computations. Algorithm 2 provides the detailed steps for the PCG method, and Figure1 offers an overview of our proposed _ALPS_ method.
+
+```
+1:Support \(\), pre-conditioner \(=()\), initial solution \(}\)
+2:Set \(_{0}:=(}-_{0})\)
+3:Project \(_{0}\) onto the support \(\) by setting all elements outside the support to zero.
+4:Set \(_{0}=^{-1}_{0}\) and \(_{0}=_{0}\)
+5:for\(t=0,1,\)do
+6:\(_{t}=(_{t}^{}_{t})/\,( _{t}^{}_{t})\)
+7:\(_{t+1}=_{t}+_{t}_{t}\)
+8:\(_{t+1}=_{t}-_{t}_{t}\)
+9:Project \(_{t+1}\) onto the support \(\) by setting all elements outside the support to zero.
+10:\(_{t+1}=^{-1}_{t+1}\)
+11:if\(_{t+1}\) is sufficiently small then
+12:break
+13:endif
+14:\(_{t}=(_{t+1}^{}_{t+1})/\,( _{t}^{}_{t})\)
+15:\(_{t+1}:=_{t+1}+_{t}_{t}\)
+16:endfor ```
+
+**Algorithm 2** PCG with vectorization for solving problem (6)Experimental Results
+
+This section compares our proposed framework, _ALPS_, with state-of-the-art unstructured pruning methods for LLMs. Detailed information on the experimental setup and reproducibility is provided in Appendix B.1, while additional results are presented in Appendix B.2.
+
+**Models and datasets.** We evaluate the performance of _ALPS_ on the OPT model family (Zhang et al., 2022) with sizes ranging from 1.3 billion to 30 billion parameters, the LLaMA2 model family (Touvron et al., 2023) with 7 billion and 13 billion parameters, and the LLaMA3 model (Dubey et al., 2024) with 8 billion parameters. Following the approach of Frantar and Alistarh, 2023, we use 128 segments of 2048 tokens each, randomly selected from the first shard of the C4 dataset (Raffel et al., 2020), as calibration data. We assess the performance using perplexity and zero-shot evaluation benchmarks, with perplexity calculated according to the procedure described by HuggingFace (Per, 2022), using full stride. The test sets of raw-WikiText2 (Merity et al., 2017), PTB (Marcus et al., 1994), and a subset of the C4 validation data, which are popular benchmarks in LLM pruning literature (Yao et al., 2022; Xiao et al., 2023; Meng et al., 2024), are used for evaluation. Additionally, we consider five zero-shot tasks: MMLU (Hendrycks et al., 2021), PIQA (Bisk et al., 2020), LAMBADA (Paperno et al., 2016), ARC-Easy and ARC-Challenge (Clark et al., 2018).
+
+**Competing methods.** We compare _ALPS_ with several one-shot pruning methods for LLMs, including (i) Magnitude Pruning (MP, (Han et al., 2015)), (ii) SparseGPT (Frantar and Alistarh, 2023), (iii) Wanda Sun et al. (2023), and (iv) DSnoT (Zhang et al., 2023).
+
+### Reconstruction error on a single layer
+
+We first evaluate the performance of our proposed _ALPS_ framework on a single layer. Specifically, we prune a linear layer in the OPT-13B model with input and output dimensions of \(5120\) to various sparsity levels and compute the relative reconstruction error of the pruned weight \(\) using \(\|}-\|_{F}^{2}/\| }\|_{F}^{2}\). The results are shown in Figure 2. As demonstrated, _ALPS_ achieves significantly lower reconstruction errors compared to other methods, especially at high sparsity levels. For instance, at a sparsity level of \(0.8\), _ALPS_ yields a \(7.6\%\) relative reconstruction error, while SparseGPT shows a 12% error, and other methods exceed \(20\%\). As demonstrated in Sections 4.2 and 4.3, our method's superior ability to approximate the dense model's output at each layer translates to much better performance in the pruned model.
+
+We attribute the superior performance of _ALPS_ in solving the reconstruction problem at each layer to two key aspects: (i) Algorithm 1 obtains a high-quality support by directly optimizing for an optimal subset of weights that contribute the most to recovering the dense model's output (ii) The PCG method in Algorithm 2 efficiently solves the reconstruction problem on a fixed support, further reducing the reconstruction error. To verify these claims, we conducted the following two ablation studies.
+
+Firstly, we compare the quality of the support determined by various pruning methods. For each method, we prune the layer to different sparsity levels and fix the support of the weights matrix provided by the method. We then solve the post-processing problem (6) with this support to optimality and compute the relative reconstruction error of the resulting weights. This approach ensures that the reconstruction error depends solely on the quality of the support. Table 1 (left) presents the performance of each method. As shown, the support determined by _ALPS_ yields \(20\% 40\%\) lower reconstruction error compared to other methods, demonstrating its effectiveness in finding high-quality supports.
+
+Figure 2: Performance analysis of pruning the “self_attn_k_proj” layer in the first block of the OPT-13B model at various sparsity levels. The plot shows the relative reconstruction error of pruned weights, comparing different pruning methods.
+
+[MISSING_PAGE_FAIL:8]
+
+performance of the pruned LLaMA3-8B model at different sparsity levels on the WikiText2 and PIQA datasets is presented in Figure 3. Table 2 showcases the performance of OPT models with 70% sparsity on various datasets. Additional results on different models, sparsity levels, and datasets are provided in Appendix B.2.5.
+
+Figure 3 demonstrates that _ALPS_ outperforms other competitors when sparsity levels exceed 50%, and the performance gap between _ALPS_ and other methods widens as the sparsity level increases. For instance, _ALPS_ achieves a \(60\%\) perplexity reduction on the WikiText2 dataset compared to other methods at \(80\%\) sparsity level. This observation aligns with our findings in Section 4.1, confirming that _ALPS_'s highly advanced optimization method in solving layer-wise reconstruction problems enables it to better preserve performance at medium-to-high sparsity levels compared to other methods. Table 2 further validates this fact, showing that _ALPS_ outperforms other methods by a large margin across all models on all criteria. This suggests the superiority of _ALPS_ in pruning models at medium-to-high sparsity levels.
+
+### N:M sparsity
+
+We further assess _ALPS_'s performance on \(N:M\) sparsity patterns, with Table 3 listing the results for pruning OPT-30B and LLaMA2-13B models at 2:4 and 4:8 sparse patterns (see Appendix B.2.5 for other models). _ALPS_ outperforms other methods on most datasets, achieving larger performance improvements in \(N:M\) pruning compared to unstructured pruning at the same sparsity level. This is due to the higher complexity of the \(N:M\) sparsity pruning problem, which _ALPS_, as a highly advanced optimization algorithm, can handle more effectively than competing heuristics.
+
+## 5 Conclusion
+
+We present _ALPS_, an efficient optimization-based framework for one-shot unstructured LLM pruning. _ALPS_ employs the operator splitting technique to effectively solve the \(_{0}\)-constrained layer-wise pruning problem. To enhance the performance of our algorithm, we introduce a novel penalty parameter updating scheme and a post-processing procedure using PCG with vectorization/GPU parallelism that takes into account problem-structure. We also establish novel convergence guarantees for our algorithm. _ALPS_ can efficiently perform high-quality pruning of LLMs at scale. Our experiments confirm that _ALPS_ outperforms existing pruning methods in terms of both the pruning objective and the performance of the pruned model. Future work will consider extending _ALPS_ to incorporate structured pruning constraints and quantization to get a better understanding of the strengths and scope of our optimization-based approach.
+
+Figure 3: Performance analysis for one-shot unstructured pruning of LLaMA3-8B model at various sparsity levels on two datasets: WikiText2 (**Left**) and PIQA (**Right**). We run each method five times and plot the shaded region as the area between the mean (solid line) and two standard deviations above and below the mean.
+
+[MISSING_PAGE_FAIL:10]

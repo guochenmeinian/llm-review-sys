@@ -1,0 +1,422 @@
+# Learning Scalar Fields for Molecular
+
+Docking with Fast Fourier Transforms
+
+ Bowen Jing, Tommi Jaakkola, Bonnie Berger
+
+CSAIL, Massachusetts Institute of Technology
+
+bjing@mit.edu, {tommi, bab}@csail.mit.edu
+
+###### Abstract
+
+Molecular docking is critical to structure-based virtual screening, yet the throughput of such workflows is limited by the expensive optimization of scoring functions involved in most docking algorithms. We explore how machine learning can accelerate this process by learning a scoring function with a functional form that allows for more rapid optimization. Specifically, we define the scoring function to be the cross-correlation of multi-channel ligand and protein scalar fields parameterized by equivariant graph neural networks, enabling rapid optimization over rigid-body degrees of freedom with fast Fourier transforms. Moreover, the runtime of our approach can be amortized at several levels of abstraction, and is particularly favorable for virtual screening settings with a common binding pocket. We benchmark our scoring functions on two simplified docking-related tasks: decoy pose scoring and rigid conformer docking. Our method attains similar but faster performance on crystal structures compared to the Vina and Gnina scoring functions, and is more robust on computationally predicted structures.
+
+## 1 Introduction
+
+Proteins are the macromolecular machines that drive almost all biological processes, and much of early-stage drug discovery focuses on finding molecules which bind to and modulate their activity. _Molecular docking_--the computational task of predicting the binding pose of a small molecule to a protein target--is an important step in this pipeline. Traditionally, docking has been formulated as an optimization problem over a _scoring function_ designed to be a computational proxy for the free energy (Torres et al., 2019; Fan et al., 2019). Such scoring functions are typically a sum of pairwise interaction terms between atoms with physically-inspired functional forms (Quiroga and Villarreal, 2016). While these terms are simple and hence fast to evaluate, exhaustive sampling or optimization over the space of ligand poses is difficult and leads to the significant runtime of docking software.
+
+ML-based scoring functions for docking have been an active area of research, ranging in sophistication from random forests to deep neural networks (Yang et al., 2022; Cramon et al., 2022). These efforts have largely sought to more accurately model the free energy based on a docked pose, which is important for downstream identification of binders versus non-binders (_virtual screening_). However, they have not addressed nor reduced the computational cost required to produce these poses in the first place. Hence, independently of the accuracy of these workflows, molecular docking for large-scale structure-based virtual screening remains computationally challenging, especially with the growing availability of large billion-compound databases such as ZINC (Tingle et al., 2023).
+
+In this work, we explore a different paradigm and motivation for machine learning scoring functions, with the specific aim of _accelerating scoring and optimization_ of ligand poses for high-throughput molecular docking. To do so, we forego the physics-inspired functional form of commonly used scoring functions, and instead frame the problem as that of learning _scalar fields_ independently associated with the 3D structure of the protein and ligand, respectively. We then define the score tobe the cross-correlation between the overlapping scalar fields when oriented according to the ligand pose. While seemingly more complex than existing scoring functions, these cross-correlations can be rapidly evaluated over a large number of ligand poses simultaneously using Fast Fourier Transforms (FFT) over both the translational space \(\mathbb{R}^{3}\) and the rotational space \(SO(3)\). This property allows for significant speedups in the optimization over these degrees of freedom.
+
+Further contrasting with existing ML scoring functions, the computational cost of our method can be _amortized_ at several levels of abstraction, significantly accelerating runtimes for optimized workflows. For example, unlike methods that require one neural network forward pass per pose, our network is evaluated once per protein structure or ligand conformer _independently_. Post-amortization, we attain translational and rotational optimization runtimes as fast as 160 \(\mu\)s and 650 \(\mu\)s, respectively, with FFTs. Such throughputs, when combined with effective sampling and optimization, could make docking of very large compound libraries feasible with only modest resources.
+
+Empirically, we evaluate our method on two simplified docking-related tasks: (1) decoy pose scoring and (2) rigid conformer docking. On both tasks, our scoring function is competitive with--but faster than--the scoring functions of Gnina (Ragoza et al., 2017; McNutt et al., 2021) and Vina (Trott and Olson, 2010) on PDBBind crystal structures and is significantly better on ESMFold structures. We then demonstrate the further advantages of runtime amortization on the virtual screening-like setup of the PDE10A test set (Tosstorff et al., 2022), where--since there is only one unique protein structure--our method obtains a 50x speedup in total inference time at no loss of accuracy.
+
+## 2 Method
+
+### Equivariant Scalar Fields
+
+We consider the inputs to a molecular docking problem to be a pair of protein structure and ligand molecule, encoded as a featurized graphs \(G^{P},G^{L}\), and with the protein structure associated with alpha carbon coordinates \(\mathbf{X}^{P}=[\mathbf{x}_{1}^{P},\ldots\mathbf{x}_{N_{P}}^{P}]\in\mathbb{R }^{3\times N_{P}}\). The molecular docking problem is to find the ligand atomic coordinates \(\mathbf{X}^{L}=[\mathbf{x}_{1}^{L},\ldots\mathbf{x}_{N_{L}}^{L}]\in\mathbb{R }^{3\times N_{L}}\) of the true binding pose. To this end, our aim is to parameterize and learn (multi-channel) scalar fields \(\phi^{P}:=\phi(\mathbf{x};G^{P},\mathbf{X}^{P})\) and \(\phi^{L}:=\phi^{L}(\mathbf{x};G^{L},\mathbf{X}^{L})\) associated with the protein and ligand structures, respectively, such that the scoring function evaluated on any pose \(\mathbf{X}^{L}\in\mathbb{R}^{3N_{L}}\) is given by
+
+\[E(\mathbf{X}^{P},\mathbf{X}^{L})=\sum_{c}\int_{\mathbb{R}^{3}}\phi_{c}^{P}( \mathbf{x};G^{P},\mathbf{X}^{P})\phi_{c}^{L}(\mathbf{x};G^{L},\mathbf{X}^{L} )\,d^{3}\mathbf{x}\] (1)
+
+where \(\phi_{c}\) refers to the \(c^{\text{th}}\) channel of the scalar field. While neural fields that directly learn functions \(\mathbb{R}^{3}\rightarrow\mathbb{R}\) have been previously developed as encodings of molecular structures (Zhong et al., 2019), such a formulation is unsuitable here as the field must be defined relative to the variable-sized structure graphs \(G^{P},G^{L}\) and transform appropriately with rigid-body motions of their coordinates.
+
+Figure 1: **Overview** of the scalar field-based scoring function and docking procedure. The translational FFT procedure is shown here; the rotational FFT is similar, albeit harder to visualize. (A) The protein pocket and ligand conformer are independently passed through equivariant scalar field networks (ESFs) to produce scalar fields. (B) The fields are cross-correlated to produce heatmaps over ligand translations. (C) The ligand coordinates are translated to the argmax of the heatmap. Additional scalar field visualizations are in Appendix D.
+
+Instead, we propose to parameterize the scalar field as a sum of contributions from each ligand atom or protein alpha-carbon, where each contribution is defined by its coefficients in a _spherical harmonic expansion_ centered at that atom (or alpha-carbon) coordinate in 3D space. To do so, we choose a set \(R_{j}:\mathbb{R}^{+}\rightarrow\mathbb{R}\) of radial basis functions (e.g., Gaussian RBFs) in 1D and let \(Y_{m}^{\ell}\) be the real spherical harmonics. Then we define
+
+\[\phi_{c}(\mathbf{x};G,\mathbf{X})=\sum_{n,j,\ell,m}A_{cnj\ell m}(G,\mathbf{X}) R_{j}(\|\mathbf{x}-\mathbf{x}_{n}\|)Y_{\ell}^{m}\left(\frac{\mathbf{x}-\mathbf{x}_{ n}}{\|\mathbf{x}-\mathbf{x}_{n}\|}\right)\] (2)
+
+where here (and elsewhere) we drop the superscripts \(L,P\) for common definitions. Given some constraints on how the vector of coefficients \(A_{cnj\ell m}\) transforms under \(SE(3)\), this parameterization of the scalar field satisfies the following important properties:
+
+**Proposition 1**.: _Suppose the scoring function is parameterized as in Equation 2 and for any \(R\in SO(3),\mathbf{t}\in\mathbb{R}^{3}\) we have \(A_{cnj\ell m}(G,R.\mathbf{X}+\mathbf{t})=\sum_{m^{\prime}}D_{mm^{\prime}}^{ \ell}(R)A_{cnj\ell m^{\prime}}(G,\mathbf{X})\) where \(D^{\ell}(R)\) are the (real) Wigner D-matrices, i.e., irreducible representations of \(SO(3)\). Then for any \(g\in SE(3)\),_
+
+1. _The scalar field transforms equivariantly:_ \(\phi_{c}(\mathbf{x};G,g.\mathbf{X})=\phi_{c}(g^{-1}.\mathbf{x};G,\mathbf{X})\)_._
+2. _The scoring function is invariant:_ \(E(g.\mathbf{X}^{P},g.\mathbf{X}^{L})=E(\mathbf{X}^{P},\mathbf{X}^{L})\)_._
+
+See Appendix B for the proof. We choose to parameterize \(A_{cnj\ell m}(G,R.\mathbf{X})\) with E3NN graph neural networks (Thomas et al., 2018; Geiger and Smidt, 2022), which are specifically designed to satisfy these equivariance properties and produce all coefficients in a single forward pass. The core of our method consists of the training of two such equivariant scalar field networks (ESFs), one for the ligand and one for the protein, which then parameterize their respective scalar fields. While the second property (invariance of the scoring function) is technically the only one required by the problem symmetries, the first property ensures that different ligand poses related by rigid-body transformations can be evaluated via transformations of the scalar field itself (without re-evaluating the neural network) and is thus essential to our method.
+
+Next, we show how this parameterization enables ligand poses related by rigid body motions to some reference pose to be rapidly evaluated with fast Fourier transforms (all derivations in Appendix B). There are actually two ways to do so: we can evaluate the score of all poses generated by _translations_ of the reference pose, or via _rotations_ around some fixed point (which we always choose to be the center of mass of ligand). These correspond to FFTs over \(\mathbb{R}^{3}\) and \(SO(3)\), respectively.
+
+### FFT Over Translations
+
+We first consider the space of poses generated by translations. Given some reference pose \(\mathbf{X}^{L}\), the score as a function of the translation is just the cross-correlation of the fields \(\phi^{L}\) and \(\phi^{P}\):
+
+\[E(\mathbf{X}^{P},\mathbf{X}^{L}+\mathbf{t})=\sum_{c}\int_{\mathbb{R}^{3}}\phi _{c}^{P}(\mathbf{x})\phi_{c}^{L}(\mathbf{x}-\mathbf{t})\,d^{3}\mathbf{x}=\sum_ {c}(\phi_{c}^{L}\star\phi_{c}^{P})(\mathbf{t})\] (3)
+
+where we have dropped the dependence on \(G,\mathbf{X}\) for cleaner notation and applied Proposition 1. By the convolution theorem, these cross-correlations may be evaluated using Fourier transforms:
+
+\[\phi_{c}^{L}\star\phi_{c}^{P}=\frac{1}{(2\pi)^{3/2}}\mathcal{F}^{-1}\left\{ \mathcal{F}\left[\phi_{c}^{L}\right]\cdot\mathcal{F}\left[\phi_{c}^{P}\right]\right\}\] (4)
+
+Hence, in order to simultaneously evaluate all possible translations of the reference pose, we need to compute the Fourier transforms of the protein and ligand scalar fields. One naive way of doing so would be to explicitly evaluate Equation 2 at an evenly-spaced grid of points spanning the structure and then apply a fast Fourier transform. However, this would be too costly, especially during training time. Instead, we observe that the functional form allows us to immediately obtain the Fourier transform via the expansion coefficients \(A_{cnj\ell m}\):
+
+\[\mathcal{F}\left[\phi_{c}\right](\mathbf{k})=\sum_{n}e^{-i\mathbf{k}\cdot \mathbf{x}_{n}}\sum_{\ell}(-i)^{\ell}\sum_{m,n}A_{cnj\ell m}\mathcal{H}_{\ell} [R_{j}](\|\mathbf{k}\|)Y_{\ell}^{m}\left(\mathbf{k}/\|\mathbf{k}\|\right)\] (5)
+
+where now \(Y_{\ell}^{m}\) must refer to the complex spherical harmonics and the coefficients must be transformed correspondingly, and \[\mathcal{H}_{\ell}[R_{j}](k)=\sqrt{\frac{2}{\pi}}\int_{0}^{\infty}j_{\ell}(kr)R_{j }(r)r^{2}\,dr\] (6)
+
+is the \(\ell^{\text{th}}\) order spherical Bessel transform of the radial basis functions. Importantly, \(\mathcal{H}_{\ell}[R_{j}]\) and \(Y^{m}_{\ell}\) can be precomputed and cached at a grid of points _independently_ of any specific structure, such that only the translation terms and expansion coefficients need to be computed for every new example.
+
+### FFT Over Rotations
+
+We next consider the space of poses generated by rotations. Suppose that given some reference pose \(\mathbf{X}^{L}\), the protein and ligand scalar fields are both expanded around some common coordinate system origin using the complex spherical harmonics and a set of _global radial basis functions_\(S_{j}(r)\):
+
+\[\phi_{c}(\mathbf{x})=\sum_{j,\ell,m}B_{cj\ell m}S_{j}(\|\mathbf{x}\|)Y^{m}_{ \ell}(\mathbf{x}/\|\mathbf{x}\|)\] (7)
+
+We seek to simultaneously evaluate the score of poses generated via rigid rotations of the ligand, which (thanks again to Proposition 1) is given by the rotational cross-correlation
+
+\[E(\mathbf{X}^{P},R.\mathbf{X}^{L})=\sum_{c}\int_{\mathbb{R}^{3}}\phi^{P}_{c}( \mathbf{x})\phi^{L}_{c}(R^{-1}\mathbf{x})\,d^{3}\mathbf{x}\] (8)
+
+Cross-correlations of this form have been previously studied for rapid alignment of crystallographic densities (Kovacs & Wriggers, 2002) and of signals on the sphere in astrophysics (Wandelt & Gorski, 2001). It turns out that they can also be evaluated in terms of Fourier sums:
+
+\[\int_{\mathbb{R}^{3}}\phi^{P}_{c}(\mathbf{x})\phi^{L}_{c}(R^{-1}\mathbf{x})\, d^{3}\mathbf{x}=\sum_{\ell,m,h,n}d^{\ell}_{mh}d^{\ell}_{hn}I^{\ell}_{mn}e^{i(m \xi+h\eta+n\omega)}\] (9)
+
+where \(\xi,\eta,\omega\) are related to the the Euler angles of the rotation \(R\), \(d^{\ell}\) is the (constant) Wigner \(D\)-matrix for a rotation of \(\pi/2\) around the \(y\)-axis, and
+
+\[I^{\ell}_{mn}=\sum_{j,k}B^{P}_{cj\ell m}\overline{B^{L}_{ck\ell n}}G_{jk}\quad \text{where}\quad G_{jk}=\int_{0}^{\infty}S_{j}(r)S_{k}(r)r^{2}\,dr\] (10)
+
+Thus the main task is to compute the complex coefficients \(B_{cj\ell m}\) of the ligand and protein scalar fields, respectively. This is not immediate as the fields are defined using expansions in "local" radial and spherical harmonic bases, i.e., with respect to the individual atom positions as opposed to the coordinate system origin. Furthermore, since we cannot (in practice) use a complete set of radial or angular basis functions, it is generally not possible to express the ligand or protein scalar field as defined in Equation 2 using the form in Equation 7. Instead, we propose to find the coefficients \(B_{cj\ell m}\) that give the best approximation to the true scalar fields, in the sense of least squared error.
+
+Specifically, suppose that \(\mathbf{R}\in\mathbb{R}^{N_{\text{grid}}\times N_{\text{local}}}\) are the values of \(N_{\text{local}}\) real local basis functions (i.e., different origins, RBFs, and spherical harmonics) evaluated at \(N_{\text{grid}}\) grid points and \(\mathbf{A}\in\mathbb{R}^{N_{\text{local}}}\) is the vector of coefficients defining the scalar field \(\phi_{c}\). Similarly define \(\mathbf{S}\in\mathbb{R}^{N_{\text{grid}}\times N_{\text{global}}}\) using the real versions of the global basis functions. We seek to find the least-squares solution \(\mathbf{B}\in\mathbb{R}^{N_{\text{global}}}\) to the overdetermined system of equations \(\mathbf{RA}=\mathbf{SB}\), which is given by
+
+\[\mathbf{B}=(\mathbf{S}^{T}\mathbf{S})^{-1}\mathbf{S}^{T}\mathbf{RA}\] (11)
+
+Notably, this is simply a linear transformation of the local coefficients \(A_{cj\ell m}\). Thus, if we can precompute the inverse Gram matrix of the global bases \((\mathbf{S}^{T}\mathbf{S})^{-1}\) and the inner product of the global and local bases \(\mathbf{S}^{T}\mathbf{R}\), then for any new scalar field \(\phi_{c}\) the real global coefficients are immediately available via a linear transformation. The desired complex coefficients can then be easily obtained via a change of bases. At first glance, this still appears challenging due to the continuous space of possible atomic or alpha-carbon positions, but an appropriate discretization makes the precomputation relatively inexpensive without a significant loss of fidelity.
+
+### Training and Inference
+
+We now study how the rapid cross-correlation procedures presented thus far are used in training and inference. For a given training example with protein structure \(\mathbf{X}^{P}\), the scoring function \(E(\mathbf{X}^{P},\mathbf{X}^{L})\) should ideally attain a maximum at the true ligand pose \(\mathbf{X}^{L}=\mathbf{X}^{L}\). We equate this task to that of learning an _energy based model_ to maximize the log-likelihood of the true pose under the model likelihood \(p(\mathbf{X}^{L})\propto\exp\left[E(\mathbf{X}^{P},\mathbf{X}^{L})\right]\). However, as is typically the case for energy-based models, directly optimizing this objective is difficult due to the intractable partition function.
+
+Instead, following Corso et al. (2023), we conceptually decompose the ligand pose \(\mathbf{X}^{L}\) to be a tuple \(\mathbf{X}^{L}=(\mathbf{X}^{C},R,\mathbf{t})\) consisting of a zero-mean conformer \(\mathbf{X}^{C}\), a rotation \(R\), and a translation \(\mathbf{t}\), from which the pose coordinates are obtained: \(\mathbf{X}^{L}=R.\mathbf{X}^{C}+\mathbf{t}\). Then consider the following _conditional_ log-likelihoods:
+
+\[\log p(\mathbf{t}\mid\mathbf{X}^{C},R) =E(\mathbf{X}^{P},\mathbf{X}^{L})-\log\int_{\mathbb{R}^{3}}\exp \left[E(\mathbf{X}^{P},R.\mathbf{X}^{C}+\mathbf{t}^{\prime})\right]\,d^{3} \mathbf{t}^{\prime}\] (12a) \[\log p(R\mid\mathbf{X}^{C},\mathbf{t}) =E(\mathbf{X}^{P},\mathbf{X}^{L})-\log\int_{SO(3)}\exp\left[E\left( \mathbf{X}^{P}-\mathbf{t},R^{\prime}.\mathbf{X}^{C}\right)\right]\,dR^{\prime}\] (12b)
+
+We observe that these integrands are precisely the cross-correlations in Equations 3 and 8, respectively, and can be quickly evaluated and summed for all values of \(\mathbf{t}^{\prime}\) and \(R^{\prime}\) using fast Fourier transforms. Thus, the integrals--which are the marginal likelihoods \(p(\mathbf{X}^{C},R)\) and \(p(\mathbf{X}^{C},\mathbf{t})\)--are tractable and the conditional log-likelihoods can be directly optimized in order to train the neural network. Although neither technically corresponds to the joint log-likelihood of the pose, we find that these training objectives work well in practice and optimize their sum in our training procedure.
+
+At inference time, a rigid protein structure \(\mathbf{X}^{P}\) is given and the high-level task is to score or optimize candidate ligand poses \(\mathbf{X}^{L}\). A large variety of possible workflows can be imagined; however, for proof of concept and for our experiments in Section 3 we describe and focus on the following relatively simple inference workflows (presented in greater detail in Appendix C):
+
+* **Translational FFT (TF)**. Given a conformer \(\mathbf{X}^{C}\), we conduct a grid-based search over \(R\) and use FFT to optimize \(\mathbf{t}\) in order to find the best pose \((\mathbf{X}^{C},R,\mathbf{t})\). To do so, we compute the Fourier coefficients (Equation 5) of the protein \(\mathbf{X}^{P}\)_once_ and for _each_ possible ligand orientation \(R.\mathbf{X}^{C}\). We then use translational cross-correlations (Equation 3) to find the best translation \(\mathbf{t}\) for each \(R\) and return the highest scoring combination.
+* **Rotational FFT (RF)**. Given a conformer \(\mathbf{X}^{C}\), we conduct a grid-based search over \(\mathbf{t}\) and use FFT to optimize \(R\). To do so, we compute the global expansion coefficients \(B^{P}_{cj\ell m}\) of the protein \(\mathbf{X}^{L}-\mathbf{t}\) relative to _each_ possible ligand position \(\mathbf{t}\) and _once_ for the ligand \(\mathbf{X}^{C}\) relative to its (zero) center of mass (Equation 11). We then use rotational cross-correlations (Equation 8) to find the best orientation \(R\) for each \(\mathbf{t}\) and return the highest scoring combination.
+* **Translational scoring (TS)**. Here we instead are given a list of poses \((\mathbf{X}^{C},R,\mathbf{t})\) and wish to score them. Because the values of \(R\) nor \(\mathbf{t}\) may not satisfy a grid structure, we cannot use the FFT methods. Nevertheless, we can compute the (translational) Fourier coefficients of the protein \(\mathbf{X}^{P}\) and for each unique oriented conformer \(R.\mathbf{X}^{C}\) of the ligand using Equation 5. We then evaluate \[E(\mathbf{X}^{P},R.\mathbf{X}^{C}+\mathbf{t})=\sum_{c}\int_{\mathbb{R}^{3}} \overline{\mathcal{F}[\phi^{P}_{c}](\mathbf{k})}\cdot\mathcal{F}[\phi^{L}_{c} (\,:,R.\mathbf{X}^{C})](\mathbf{k})\cdot e^{-i\mathbf{k}\cdot\mathbf{t}}\,d^{ 3}\mathbf{k}\] (13) Since the Fourier transform is an orthogonal operator on functional space, this is equal to the real-space cross-correlation.
+* **Rotational scoring (RS)**. Analogously, we can score a list of poses \((\mathbf{X}^{C},R,\mathbf{t})\) using the global spherical expansions \(B_{cj\ell m}\). We obtain the real expansion coefficients of the protein relative to each \(\mathbf{t}\) and for each ligand conformer \(\mathbf{X}^{C}\) using Equation 11. The score for \((\mathbf{X}^{C},R,\mathbf{t})\) is then given by the rotational cross-correlation \[E(\mathbf{X}^{P},R.\mathbf{X}^{C}+\mathbf{t})=\sum_{c,j,k,\ell,m,n}B^{P}_{cj\ell m }(\mathbf{X}^{P}-\mathbf{t})B^{L}_{ck\ell n}(\mathbf{X}^{C})D^{\ell}_{mn}(R)G_ {jk}\] (14) where \(G_{jk}\) is as defined in Equation 10 and \(D^{\ell}_{mn}\) are the real Wigner \(D\)-matrices.
+
+The runtime of these workflows can vary significantly depending on the parameters, i.e., number of proteins, ligands, conformers, rotations, and translations, with amortizations possible at several levels. Table 1 provides a summary of the computations in each workflow, their frequencies, and typical runtimes. We highlight that the **RF** workflow is well-suited for virtual screening since the precomputations for the protein and ligand translations within a pocket can be amortized across all ligands. Furthermore, if the ligands are drawn from a shared library, their coefficients can also be precomputed independent of any protein, leaving only the rotational FFT as the cost per ligand-protein pair. Thus our method can lend itself to the engineering of very high-throughput workflows.
+
+## 3 Experiments
+
+We train and test our model on the PDBBind dataset (Liu et al., 2017) with splits as defined by Stark et al. (2022) providing 16379, 968, and 363 train, validation, and test complexes, respectively. We train two variants of our model: ESF and ESF-N, where the latter is trained with rotational and translational noise injected into the examples to increase model robustness. In both, the protein network operates on all heavy atom nodes, but only the alpha-carbons contribute to the scalar field. The input features and message-passing layers are otherwise similar to Corso et al. (2023), except without ESM features. Hyperparameters are detailed in Appendix E. For evaluation, we consider both the co-crystal structures in the PDBBind test split and their counterpart ESMFold complexes as prepared by Corso et al. (2023). We also collect a test set of 77 crystal structures (none of which are in PDBBind) of phosphodiesterase 10A (PDE10A) with different ligands bound to the same pocket (Tostorff et al., 2022). This industrially-sourced dataset is representative of a real-world use case for molecular docking and benchmarks the benefits of runtime amortization with our approach.
+
+To evaluate our method against baselines, we note that a scoring function by itself is not directly comparable to complete docking programs, which also include tightly integrated conformer search, pose clustering, and local refinement algorithms. Here, however, we focus on the development of the _scoring function_ itself independently of these other components. Thus, we consider two simplified settings for evaluating our model: (1) **scoring decoy poses** with the aim of identifying the best pose among them, and (2) **docking rigid conformers** to a given pocket, similar to the re-docking setup in Stark et al. (2022). The first setting focuses on evaluating only the quality of the scoring function itself, whereas the second is a simplified version of a typical docking setting that circumvents some of the confounding factors while still allowing the benchmarking of FFT-accelerated optimization.
+
+We select Gnina (McNutt et al., 2021) as the baseline docking software, which runs parallel MCMC chains to collect pose candidates that are then refined and re-ranked to produce the final prediction. For the scoring function, we evaluate Gnina's namesake CNN (Ragoza et al., 2017) as the state-of-the-art ML scoring function, as well as the traditional scoring function of Vina (Trott and Olson, 2010), one of the most well-established docking programs in the development of the field. Both scoring functions are widely used and are natively supported by the Gnina program.
+
+\begin{table}
+\begin{tabular}{l|l|c|c|c|c|c} \hline \hline Frequency & Computation & TF & RF & TS & RS & Runtime \\ \hline Per protein structure & Coefficients \(A_{cnj\ell m}\) & ✓ & ✓ & ✓ & ✓ & 65 ms \\  & FFT coefficients & ✓ & & ✓ & & 7.0 ms \\ \(\hookrightarrow\) Per translation & Global expansion\(B_{c\ell m}\) & & ✓ & & ✓ & 80 ms \\ \hline Per ligand conformer & Coefficients \(A_{cnj\ell m}\) & ✓ & ✓ & ✓ & ✓ & 4.3 ms \\  & Global expansion \(B_{c\ell m}\) & & ✓ & & ✓ & 17 ms \\ \(\hookrightarrow\) Per rotation & FFT coefficients & ✓ & & ✓ & & 1.6 ms \\ \hline \hline Per conformer \(\times\) rotation & Translational FFT & ✓ & & & & 160 \(\mu\)s \\ Per conformer \(\times\) translation & Rotational FFT & & ✓ & & & 650 \(\mu\)s \\ \hline Per pose & Translational scoring & & & ✓ & & 1.0 \(\mu\)s \\  & Rotational scoring & & & & ✓ & 8.2 \(\mu\)s \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: **Typical runtimes** of the computations involved in inference-time scoring and optimization procedures, measured on PDBBind with one V100 GPU. The three sets of rows delineate computations that are protein-specific, ligand-specific, or involve both protein and ligand, respectively.
+
+### Scoring Decoys
+
+For each PDBBind test complex, we generate \(32^{3}-1=32767\) decoy poses by sampling 31 translational, rotational, and torsional perturbations to the ground truth pose and considering all their possible combinations. On median, the RMSD of the closest decoy is 0.4 angstroms (A), and 1.6% of all poses (\(n=526.5\)) are below 2 A RMSD (Appendix E). We then score all poses using the Vina and Gnina scoring functions and with our method in both **TS** (Equation 13) and **RS** (Equation 14) modes. The quality of each scoring function is evaluated with the AUROC when used as a \(<\)2A RMSD classifier, the RMSD of the top-ranked pose (Top RMSD), the rank of the lowest-RMSD pose (Top Rank), and the fraction of complexes for which the identified pose is under 2 A RMSD.
+
+As shown in Table 2, our method is competitive with the Gnina and Vina scoring functions on crystal structures and better on ESMFold structures. This improved robustness is expected since the interaction terms in traditional scoring functions are primarily mediated by sidechain atoms, which are imperfectly predicted by ESMFold, whereas our scalar fields only indirectly depend on the sidechains via residue-level coefficients. The noise-augmented training obtains higher AUROC but is weaker in terms of identifying the best poses. Curiously, this is also true on ESMFold structures, where we expect robustness to be more important. Overall, **TS** is superior in performance to **RS**, likely due to the spatially coarser representation of the scalar fields in the global spherical harmonic expansion (i.e., Equation 7) relative to the grid-based Cartesian expansion.
+
+In terms of runtime per pose, our method is faster than Vina by several orders of magnitude, with even greater acceleration compared to the neural network-based Gnina. The runtime improvement per complex is more tempered since the different proteins and ligand in every complex limit the opportunity for amortization. In fact, of the total runtime per complex in Table 2, only 1% (**TS**) to 5% (**RS**) is due to the pose scoring itself, with the rest due to preprocessing that must be done for every new protein and ligand independently. Hence, the total possible runtime improvement per complex is significantly greater for more suitable workflows.
+
+### Docking Conformers
+
+We consider the task of pocket-level docking where all methods are given as input the ground-truth conformer in a random orientation. Following common practice (McNutt et al., 2021), we aim to provide \(4\) A of translational uncertainty around the true ligand pose in order to define the binding pocket. To do so, we provide Gnina with a bounding box with 4 A of padding around the true pose, and provide our method with a cube of side length 8 A as the search space for \(\mathbf{t}\) (with a random grid offset). For PDE10A, we define the pocket using the pose of the first listed complex (PDB 5SFS) and cross-dock to that protein structure. In all docking runs, we deactivate all torsion angles so that Gnina docks the provided conformer to the pocket. Default hyperparameters--and results for varying hyperparameters--are detailed in Appendix E and Appendix F, respectively.
+
+As shown in Table 3, the baseline scoring functions obtain excellent performance on the PDBBind crystal structures, with a success rate of 79%. Our method is slightly weaker but also obtains high success rates (73%). The performance decrease in terms of Median RMSD is somewhat larger,
+
+\begin{table}
+\begin{tabular}{l c c c c c c c c c c} \hline \hline  & \multicolumn{4}{c}{Crystal structures} & \multicolumn{4}{c}{ESMFold structures} & \multicolumn{2}{c}{Time per} \\ \cline{2-10} Method & \(<\)2 Å & Top & Top & \% & \(<\)2 Å & Top & Top & \% & \multirow{2}{*}{Pose} & \multirow{2}{*}{Complex} \\  & AUROC & RMSD & Rank & \(<\)2 Å & AUROC & RMSD & Rank & \(<\)2 Å & & \\ \hline Vina & **0.93** & **0.54** & **2** & **91** & 0.86 & 2.43 & 419 & 43 & 3.4 ms & 110 s \\ Gnina & 0.90 & 0.59 & 3 & 83 & 0.84 & 2.19 & 1110 & 46 & 13.0 ms & 426 s \\ \hline ESF-TS & 0.87 & 0.59 & 3 & 87 & 0.82 & **1.38** & 24 & **57** & 1.0 \(\mu\)s & 3.2 s \\ ESF-RS & 0.87 & 0.63 & 3 & 85 & 0.82 & 1.75 & **22** & 53 & 8.2 \(\mu\)s & 5.7 s \\ ESF-N-TS & 0.92 & 0.69 & 4 & 81 & **0.87** & 1.64 & **22** & 54 & 1.0 \(\mu\)s & 3.2 s \\ ESF-N-RS & 0.92 & 0.75 & 5 & 80 & **0.87** & 1.74 & 26 & 53 & 8.2 \(\mu\)s & 5.7 s \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: **Decoy scoring results**. All RMSDs are heavy-atom symmetry aware. For ease of comparison, the best numbers from our method (ESF) are underlined if not bolded.
+
+likely due to the coarse search grid over non-FFT degrees of freedom (Appendix F) and the lack of any refinement steps (which are an integral part of Gnina) in our pipeline. On ESMFold structures, however, our method obtains nearly twice the success rate (47% vs 28%) of the baseline scoring functions. Unlike in decoy scoring, noisy training noticeably contributes to the performance on ESMFold structures, and the **RF** procedure generally outperforms **TF**, likely due to the relatively finer effective search grid in rotational cross-correlations (Appendix F).
+
+Because of the nature of the PDBBind workflow, the total runtime is comparable to or slower than the baselines when precomputations are taken into account. However, in terms of the pose optimization itself, our method is significantly faster than the Gnina baselines, despite performing a brute force search over the non-FFT degrees of freedom. While it is also possible to trade-off performance and runtime by changing various Gnina settings from their default values, our method expands the Pareto front currently available with the Gnina pipeline (Appendix F; Figure 6). This favorable tradeoff affirms the practical value-add of our method in the context of existing approaches.
+
+To more concretely demonstrate the runtime improvements of our method with amortization, we then dock the conformers in the PDE10A dataset. Our method again has similar accuracy to the baselines (Table 3); however, because of the common pocket, all protein-level quantities are computed _only once_ and the total runtime is significantly accelerated. For the **RF** procedure in particular, the computation of global coefficients on the translational grid is by far the most expensive step (Appendix F; Table 5), and the remaining ligand precomputations are very cheap. The amortization of these coefficients leads to a 45x speedup in the overall runtime (67 s \(\rightarrow\) 1.5 s). (The runtime for Gnina is also accelerated, although to a lesser extent, due to the smaller ligand size.) As the number of ligands increases further, the total runtime per complex of our method would further decrease.
+
+## 4 Conclusion
+
+We have proposed a machine-learned based scoring function for accelerating pose optimization in molecular docking. Different from existing scoring functions, the score is defined as a cross-correlation between scalar fields, which enables the use of FFTs for rapid search and optimization. We have formulated a novel parameterization for such scalar fields with equivariant neural networks, as well as training and inference procedures with opportunities for significant runtime amortization. Our scoring function shows comparable performance but improved runtime on two simplified docking-related tasks relative to standard optimization procedures and scoring functions. Thus, our methodology holds promise when integrated with other components into a full docking pipeline. These integrations may include multi-resolution search, refinement with traditional scoring functions, and architectural adaptations for conformational (i.e., torsional) degrees of freedom--all potential directions of future work. In a broader context, we hope our work serves as a bridge between graph-based molecular machine learning and the literature on cross-correlations in computational structural biology and inspire related methods for other applications.
+
+\begin{table}
+\begin{tabular}{l c c c c c c c c} \hline \hline  & \multicolumn{6}{c}{PDBBind test} & \\ \cline{2-9}  & \multicolumn{2}{c}{Crystal} & \multicolumn{2}{c}{ESMFold} & \multicolumn{4}{c}{PDE10A} \\ \cline{2-9} Method & \% \(<\)2 Å & Med. RMSD & \(<\)2 Å & Med. RMSD & Runtime & \% \(<\)2 Å & Med. RMSD & Runtime \\ \hline Vina & **79** & **0.32** & 24 & 6.1 & 20 s & **74** & **0.75** & 6.1 s \\ Gnina & 77 & 0.33 & 28 & 5.9 & 23 s & 73 & 0.77 & 6.0 s \\ \hline ESF-TF & 70 & 1.13 & 31 & 4.6 & 0.8 s / 8.3 s & 67 & 1.20 & 1.0 s / 7.1 s \\ ESF-RF & 71 & 0.97 & 32 & 4.4 & 0.5 s / 67 s & 73 & 0.82 & 0.5 s / 1.5 s \\ ESF-N-TF & 72 & 1.10 & 46 & **2.9** & 0.7 s / 8.2 s & 64 & 1.11 & 1.0 s / 7.2 s \\ ESF-N-RF & 73 & 1.00 & **47** & 3.0 & 0.5 s / 68 s & 70 & 1.00 & 0.5 s / 1.5 s \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: **Rigid conformer docking results.** All RMSDs are heavy-atom symmetry aware. The median RMSD of our method (ESF) is lower-bounded at 0.5–0.6 Å by the resolution of the search grid (Appendix F). The runtime is shown as an average per complex, excluding / including precomputations that can be amortized. The best numbers from ESF are underlined if not bolded.
+
+## Acknowledgments
+
+We thank Hannes Stark, Samuel Sledzieski, Ruochi Zhang, Michael Brocidiacono, Gabriele Corso, Xiang Fu, Felix Faltings, Ameya Daigavane, and Mario Geiger for helpful feedback and discussions. This work was supported by the NIH NIGMS under grant #1R35GM141861 and a Department of Energy Computational Science Graduate Fellowship.
+
+## References
+
+* Chen and Weng (2002) Rong Chen and Zhiping Weng. Docking unbound proteins using shape complementarity, desolvation, and electrostatics. _Proteins: Structure, Function, and Bioinformatics_, 47(3):281-294, 2002.
+* Corso et al. (2023) Gabriele Corso, Hannes Stark, Bowen Jing, Regina Barzilay, and Tommi S Jaakkola. Diffdock: Diffusion steps, twists, and turns for molecular docking. In _The Eleventh International Conference on Learning Representations_, 2023.
+* Crampon et al. (2022) Kevin Crampon, Alexis Giorkallos, Myrtile Deldossi, Stephanie Baud, and Luiz Angelo Steffenel. Machine-learning methods for ligand-protein molecular docking. _Drug discovery today_, 27(1):151-164, 2022.
+* Ding et al. (2020) Xinqiang Ding, Yujin Wu, Yanming Wang, Jonah Z Vilseck, and Charles L Brooks III. Accelerated docker with gpus, parallel simulated annealing, and fast fourier transforms. _Journal of chemical theory and computation_, 16(6):3910-3919, 2020.
+* Fan et al. (2019) Jiyu Fan, Ailing Fu, and Le Zhang. Progress in molecular docking. _Quantitative Biology_, 7:83-89, 2019.
+* Ferreira et al. (2015) Leonardo G Ferreira, Ricardo N Dos Santos, Glaucius Oliva, and Adriano D Andricopulo. Molecular docking and structure-based drug design strategies. _Molecules_, 20(7):13384-13421, 2015.
+* Gabb et al. (1997) Henry A Gabb, Richard M Jackson, and Michael JE Sternberg. Modelling protein docking using shape complementarity, electrostatics and biochemical information. _Journal of molecular biology_, 272(1):106-120, 1997.
+* Geiger and Smidt (2022) Mario Geiger and Tess Smidt. e3nn: Euclidean neural networks. _arXiv preprint arXiv:2207.09453_, 2022.
+* Halgren et al. (2004) Thomas A Halgren, Robert B Murphy, Richard A Friesner, Hege S Beard, Leah L Frye, W Thomas Pollard, and Jay L Banks. Glide: a new approach for rapid, accurate docking and scoring. 2. enrichment factors in database screening. _Journal of medicinal chemistry_, 2004.
+* Jiang et al. (2020) Huaipan Jiang, Mengran Fan, Jian Wang, Anup Sarma, Shruti Mohanty, Nikolay V Dokholyan, Mehrdad Mahdavi, and Mahmut T Kandemir. Guiding conventional protein-ligand docking software with convolutional neural networks. _Journal of Chemical Information and Modeling_, 60(10):4594-4602, 2020.
+* Jing et al. (2022) Bowen Jing, Gabriele Corso, Jeffrey Chang, Regina Barzilay, and Tommi Jaakkola. Torsional diffusion for molecular conformer generation. _arXiv preprint arXiv:2206.01729_, 2022.
+* Katchalski-Katzir et al. (1992) Ephraim Katchalski-Katzir, Isaac Shariv, Miriam Eisenstein, Asher A Friesem, Claude Aflalo, and Ilya A Vakser. Molecular surface recognition: determination of geometric fit between proteins and their ligands by correlation techniques. _Proceedings of the National Academy of Sciences_, 89(6):2195-2199, 1992.
+* Kovacs and Wriggers (2002) Julio A Kovacs and Willy Wriggers. Fast rotational matching. _Acta Crystallographica Section D: Biological Crystallography_, 58(8):1282-1286, 2002.
+* Kozakov et al. (2006) Dima Kozakov, Ryan Brenke, Stephen R Comeau, and Sandor Vajda. Piper: an fft-based protein docking program with pairwise potentials. _Proteins: Structure, Function, and Bioinformatics_, 65(2):392-406, 2006.
+* Kozakov et al. (2017) Dima Kozakov, David R Hall, Bing Xia, Kathryn A Porter, Dzmitry Padhorny, Christine Yueh, Dmitri Beglov, and Sandor Vajda. The cluspro web server for protein-protein docking. _Nature protocols_, 12(2):255-278, 2017.
+* Katchalski et al. (2018)Hongjian Li, Kam-Heung Sze, Gang Lu, and Pedro J Ballester. Machine-learning scoring functions for structure-based virtual screening. _Wiley Interdisciplinary Reviews: Computational Molecular Science_, 11(1):e1478, 2021.
+* Liu et al. (2017) Zhihai Liu, Minyi Su, Li Han, Jie Liu, Qifan Yang, Yan Li, and Renxiao Wang. Forging the basis for developing protein-ligand interaction scoring functions. _Accounts of Chemical Research_, 50(2):302-309, 2017.
+* Lu et al. (2022) Wei Lu, Qifeng Wu, Jixian Zhang, Jiahua Rao, Chengtao Li, and Shuangjia Zheng. Tankbind: Trigonometry-aware neural networks for drug-protein binding structure prediction. _Advances in neural information processing systems_, 2022.
+* Mandell et al. (2001) Jeffrey G Mandell, Victoria A Roberts, Michael E Pique, Vladimir Kotlovyi, Julie C Mitchell, Erik Nelson, Igor Tsigelny, and Lynn F Ten Eyck. Protein docking using continuum electrostatics and geometric fit. _Protein engineering_, 14(2):105-113, 2001.
+* McNutt et al. (2021) Andrew T McNutt, Paul Francoeur, Rishal Aggarwal, Tomohide Masuda, Rocco Meli, Matthew Ragoza, Jocelyn Sunseri, and David Ryan Koes. Gnina 1.0: molecular docking with deep learning. _Journal of cheminformatics_, 13(1):1-20, 2021.
+* Mendez-Lucio et al. (2021) Oscar Mendez-Lucio, Mazen Ahmad, Ehecatl Antonio del Rio-Chanona, and Jorg Kurt Wegner. A geometric deep learning approach to predict binding conformations of bioactive molecules. _Nature Machine Intelligence_, 3(12):1033-1039, 2021.
+* Meng et al. (1992) Elaine C Meng, Brian K Shoichet, and Irwin D Kuntz. Automated docking with grid-based energy evaluation. _Journal of computational chemistry_, 13(4):505-524, 1992.
+* Morris and Lim-Wilby (2008) Garrett M Morris and Marguerita Lim-Wilby. Molecular docking. In _Molecular modeling of proteins_, pp. 365-382. Springer, 2008.
+* Morris et al. (1998) Garrett M Morris, David S Goodsell, Robert S Halliday, Ruth Huey, William E Hart, Richard K Belew, and Arthur J Olson. Automated docking using a lamarckian genetic algorithm and an empirical binding free energy function. _Journal of computational chemistry_, 19(14):1639-1662, 1998.
+* Nguyen et al. (2018) Trung Hai Nguyen, Huan-Xiang Zhou, and David DL Minh. Using the fast fourier transform in binding free energy calculations. _Journal of computational chemistry_, 39(11):621-636, 2018.
+* Padhorny et al. (2016) Dzmitry Padhorny, Andrey Kazennov, Brandon S Zerbe, Kathryn A Porter, Bing Xia, Scott E Mottarella, Yaroslav Kholodov, David W Ritchie, Sandor Vajda, and Dima Kozakov. Protein-protein docking by fast generalized fourier transforms on 5d rotational manifolds. _Proceedings of the National Academy of Sciences_, 113(30):E4286-E4293, 2016.
+* Padhorny et al. (2018) Dzmitry Padhorny, David R Hall, Hanieh Mirzaei, Artem B Mamonov, Mohammad Moghadasi, Andrey Alekseenko, Dmitri Beglov, and Dima Kozakov. Protein-ligand docking using fft based sampling: D3r case study. _Journal of computer-aided molecular design_, 32:225-230, 2018.
+* Quiroga and Villarreal (2016) Rodrigo Quiroga and Marcos A Villarreal. Vinardo: A scoring function based on autodock vina improves scoring, docking, and virtual screening. _PloS one_, 11(5):e0155183, 2016.
+* Ragoza et al. (2017) Matthew Ragoza, Joshua Hochuli, Elisa Idrobo, Jocelyn Sunseri, and David Ryan Koes. Protein-ligand scoring with convolutional neural networks. _Journal of chemical information and modeling_, 57(4):942-957, 2017.
+* Ritchie and Kemp (2000) David W Ritchie and Graham JL Kemp. Protein docking using spherical polar fourier correlations. _Proteins: Structure, Function, and Bioinformatics_, 39(2):178-194, 2000.
+* Ritchie et al. (2008) David W Ritchie, Dima Kozakov, and Sandor Vajda. Accelerating and focusing protein-protein docking correlations using multi-dimensional rotational fft generating functions. _Bioinformatics_, 24(17):1865-1873, 2008.
+* Shoichet et al. (1992) Brian K Shoichet, Irwin D Kuntz, and Dale L Bodian. Molecular docking using shape descriptors. _Journal of computational chemistry_, 13(3):380-397, 1992.
+* Shoichet et al. (2018)Hannes Stark, Octavian Ganea, Lagnajit Pattanaik, Regina Barzilay, and Tommi Jaakkola. Equibind: Geometric deep learning for drug binding structure prediction. In _International Conference on Machine Learning_, pp. 20503-20521. PMLR, 2022.
+* Su et al. (2018) Minyi Su, Qifan Yang, Yu Du, Guoqin Feng, Zhihai Liu, Yan Li, and Renxiao Wang. Comparative assessment of scoring functions: the casf-2016 update. _Journal of chemical information and modeling_, 59(2):895-913, 2018.
+* Thomas et al. (2018) Nathaniel Thomas, Tess Smidt, Steven Kearnes, Lusann Yang, Li Li, Kai Kohlhoff, and Patrick Riley. Tensor field networks: Rotation-and translation-equivariant neural networks for 3d point clouds. _arXiv preprint_, 2018.
+* Tingle et al. (2023) Benjamin I Tingle, Khanh G Tang, Mar Castanon, John J Gutierrez, Munkhzul Khurelbauat, Chinzorig Dandarchuluun, Yurii S Moroz, and John J Irwin. Zinc-22- a free multi-billion-scale database of tangible compounds for ligand discovery. _Journal of Chemical Information and Modeling_, 63(4):1166-1176, 2023.
+* Torres et al. (2019) Pedro HM Torres, Ana CR Sodero, Paula Jofily, and Floriano P Silva-Jr. Key topics in molecular docking for drug design. _International journal of molecular sciences_, 20(18):4574, 2019.
+* Tosstorff et al. (2022) Andreas Tosstorff, Markus G Rudolph, Jason C Cole, Michael Reutlinger, Christian Kramer, Herve Schaffhauser, Agnes Nilly, Alexander Flohr, and Bernd Kuhn. A high quality, industrial data set for binding affinity prediction: performance comparison in different early drug discovery scenarios. _Journal of Computer-Aided Molecular Design_, 36(10):753-765, 2022.
+* Trott and Olson (2010) Oleg Trott and Arthur J Olson. Autodock vina: improving the speed and accuracy of docking with a new scoring function, efficient optimization, and multithreading. _Journal of computational chemistry_, 31(2):455-461, 2010.
+* Wandelt and Gorski (2001) Benjamin D Wandelt and Krzysztof M Gorski. Fast convolution on the sphere. _Physical review D_, 63(12):123002, 2001.
+* Wikipedia (2023) Wikipedia. Hankel transform -- Wikipedia, the free encyclopedia, 2023. URL https://en.wikipedia.org/wiki/Hankel_transform#Fourier_transform_in_three_dimensions.
+* Yan et al. (2020) Yumeng Yan, Huanyu Tao, Jiahua He, and Sheng-You Huang. The hdock server for integrated protein-protein docking. _Nature protocols_, 15(5):1829-1852, 2020.
+* Yang et al. (2022) Chao Yang, Eric Anthony Chen, and Yingkai Zhang. Protein-ligand docking in the machine-learning era. _Molecules_, 27(14):4568, 2022.
+* Yershova et al. (2010) Anna Yershova, Swati Jain, Steven M Lavalle, and Julie C Mitchell. Generating uniform incremental grids on so (3) using the hopf fibration. _The International journal of robotics research_, 29(7):801-812, 2010.
+* Zhang et al. (2022) Yangtian Zhang, Huiyu Cai, Chence Shi, Bozitao Zhong, and Jian Tang. E3bind: An end-to-end equivariant network for protein-ligand docking. _arXiv preprint arXiv:2210.06069_, 2022.
+* Zhong et al. (2019) Ellen D Zhong, Tristan Bepler, Joseph H Davis, and Bonnie Berger. Reconstructing continuous distributions of 3d protein structure from cryo-em images. In _International Conference on Learning Representations_, 2019.
+
+Background
+
+**Molecular docking.** The two key components of a molecular docking algorithm are (1) one or more scoring functions for ligand poses, and (2) a search, sampling, or optimization procedure. There is considerable variation in the design of these components and how they interact with each other, ranging from exhaustive enumeration and filtering (Shoichet et al., 1992; Meng et al., 1992) to genetic, gradient-based, or MCMC optimization algorithms (Trott and Olson, 2010; Morris et al., 1998; McNutt et al., 2021). We refer to reviews elsewhere (Ferreira et al., 2015; Torres et al., 2019; Fan et al., 2019) for comprehensive details. These algorithms have undergone decades of development and have been given rise to well-established software packages in academia and industry, such as AutoDock (Morris and Lim-Wilby, 2008), Vina (Trott and Olson, 2010) and Glide (Halgren et al., 2004). In many of these, the scoring function is designed not only to identify the binding pose, but also to predict the binding affinity or activity of the ligand (Su et al., 2018). In this work, however, we focus on learning and evaluating scoring functions for the rapid prediction of binding poses.
+
+**ML methods in docking.** For over a decade, ML methods have been extensively explored to improve scoring functions for already-docked ligand poses, i.e., for prediction of activity and affinity in structural-based virtual screens (Li et al., 2021; Yang et al., 2022; Crampton et al., 2022). On the other hand, developing ML scoring functions as the direct optimization objective has required more care due the enormous number of function evaluations involved. MedusaNet (Jiang et al., 2020) and Gnina (Ragoza et al., 2017; McNutt et al., 2021) proposed to sparsely use CNNs for guidance and re-ranking (respectively) in combination with a traditional scoring function. DeepDock (Mendez-Lucio et al., 2021) used a hypernetwork to predict complex-specific parameters of a simple statistical potential. Recently, geometric deep learning models have explored entirely different paradigms for docking via direct prediction of the binding pose (Stark et al., 2022; Zhang et al., 2022; Lu et al., 2022) or via a generative model over ligand poses (Corso et al., 2023).
+
+**FFT methods in docking.** Methods based on fast Fourier transforms have been widely applied for the related problem of _protein-protein docking_. Katchalski-Katzir et al. (1992) first proposed using FFTs over the translational space \(\mathbb{R}^{3}\) to rapidly evaluate poses using scalar fields that encode the shape complementarity of the two proteins. Later works extended this method to rotational degrees of freedom (Ritchie and Kemp, 2000; Ritchie et al., 2008; Padhorny et al., 2016) and additional scoring terms, such as pairwise electrostatic potentials and solvent accessibility (Gabb et al., 1997; Mandell et al., 2001; Chen and Weng, 2002). Today, FFT methods are a routine step in protein-protein docking programs such as PIPER (Kozakov et al., 2006), ClusPro (Kozakov et al., 2017), and HDOCK (Yan et al., 2020), where they enable the evaluation of billions of poses, typically as an initial screening step before further evaluation and refinement with a more accurate scoring function.
+
+In contrast, FFT methods have been significantly less studied for protein-ligand docking. While a few works have explored this direction (Padhorny et al., 2018; Ding et al., 2020; Nguyen et al., 2018), these algorithms have not been widely adopted nor been incorporated into established docking software. A key limitation is that protein-ligand scoring functions are typically more complicated than protein-protein scoring functions and cannot be easily expressed as a cross-correlation between scalar fields (Ding et al., 2020). To our knowledge, no prior works have explored the possibility of overcoming this limitation by _learning_ cross-correlation based scoring functions.
+
+## Appendix B Mathematical Details
+
+### Proof of Proposition 1
+
+**Proposition 1**.: _Suppose the scoring function is parameterized as in Equation 2 and for any \(R\in SO(3),\mathbf{t}\in\mathbb{R}^{3}\) we have \(A_{cnj\ell m}(G,R.\mathbf{X}+\mathbf{t})=\sum_{m^{\prime}}D_{mm^{\prime}}^{ \ell}(R)A_{cnj\ell m^{\prime}}(G,\mathbf{X})\) where \(D^{\ell}(R)\) are the (real) Wigner D-matrices, i.e., irreducible representations of \(SO(3)\). Then for any \(g\in SE(3)\),_
+
+1. _The scalar field transforms equivariantly:_ \(\phi_{c}(\mathbf{x};G,g.\mathbf{X})=\phi_{c}(g^{-1}.\mathbf{x};G,\mathbf{X})\)_._
+2. _The scoring function is invariant:_ \(E(g.\mathbf{X}^{P},g.\mathbf{X}^{L})=E(\mathbf{X}^{P},\mathbf{X}^{L})\)Proof.: Let the action of \(g=(R,\mathbf{t})\in SE(3)\) be written as \(g:\mathbf{x}\mapsto R\mathbf{x}+\mathbf{t}\) and hence \(g^{-1}:\mathbf{x}\mapsto R^{T}(\mathbf{x}-\mathbf{t})\). We first note that \(\|\mathbf{x}-g.\mathbf{x}_{n}\|=\|g^{-1}.\mathbf{x}-\mathbf{x}_{n}\|\) and \(R^{T}(\mathbf{x}-g.\mathbf{x}_{n})=g^{-1}.\mathbf{x}-\mathbf{x}_{n}\). Then
+
+\[\phi_{c}(\mathbf{x};G,g.\mathbf{X}) =\sum_{n,j,\ell,m}A_{cnj\ell m}(G,R.\mathbf{X}+\mathbf{t})R_{j}( \|\mathbf{x}-g.\mathbf{x}_{n}\|)Y_{\ell}^{m}\left(\frac{\mathbf{x}-g.\mathbf{x }_{n}}{\|\mathbf{x}-g.\mathbf{x}_{n}\|}\right)\] \[=\sum_{n,j,\ell,m^{\prime}}A_{cnj\ell m^{\prime}}(G,\mathbf{X})R_ {j}(\|\mathbf{x}-g.\mathbf{x}_{n}\|)\sum_{m}D_{mm^{\prime}}^{\ell}(R)Y_{\ell} ^{m}\left(\frac{\mathbf{x}-g.\mathbf{x}_{n}}{\|\mathbf{x}-g.\mathbf{x}_{n}\| }\right)\] \[=\sum_{n,j,\ell,m^{\prime}}A_{cnj\ell m^{\prime}}(G,\mathbf{X})R_ {j}(\|\mathbf{x}-g.\mathbf{x}_{n}\|)Y_{\ell}^{m^{\prime}}\left(\frac{R^{T}( \mathbf{x}-g.\mathbf{x}_{n})}{\|\mathbf{x}-g.\mathbf{x}_{n}\|}\right)\] \[=\sum_{n,j,\ell,m^{\prime}}A_{cnj\ell m^{\prime}}(G,\mathbf{X})R_ {j}(\|g^{-1}.\mathbf{x}-\mathbf{x}_{n}\|)Y_{\ell}^{m^{\prime}}\left(\frac{g^{ -1}.\mathbf{x}-\mathbf{x}_{n}}{\|g^{-1}.\mathbf{x}-\mathbf{x}_{n}\|}\right)\] \[=\phi_{c}(g^{-1}.\mathbf{x};G,\mathbf{X})\]
+
+Next,
+
+\[E(g.\mathbf{x}^{P},g.\mathbf{x}^{L}) =\sum_{c}\int_{\mathbb{R}^{3}}\phi_{c}^{P}(\mathbf{x};G^{P},g. \mathbf{X}^{P})\phi_{c}^{L}(\mathbf{x};G^{L},g.\mathbf{X}^{L})\,d^{3}\mathbf{x}\] \[=\sum_{c}\int_{\mathbb{R}^{3}}\phi_{c}^{P}(g^{-1}\mathbf{x};G^{P},\mathbf{X}^{P})\phi_{c}^{L}(g^{-1}\mathbf{x};G^{L},\mathbf{X}^{L})\,d^{3} \mathbf{x}\] \[=\sum_{c}\int_{\mathbb{R}^{3}}\phi_{c}^{P}(\mathbf{x}^{\prime};G^ {P},\mathbf{X}^{P})\phi_{c}^{L}(\mathbf{x}^{\prime};G^{L},\mathbf{X}^{L})\,d^{ 3}\mathbf{x}^{\prime}\]
+
+where the last line has substitution \(\mathbf{x}^{\prime}=g^{-1}\mathbf{x}\) with \(g\) volume preserving on \(\mathbb{R}^{3}\). 
+
+### Derivations
+
+In this section we describe the derivations for the various equations presented in the main text. We use the following convention for the (one-dimensional) Fourier transform and its inverse:
+
+\[\mathcal{F}[f](k)=\frac{1}{\sqrt{2\pi}}\int e^{-ikx}f(x)\,dx\] (15a) \[\mathcal{F}^{-1}[f](x)=\frac{1}{\sqrt{2\pi}}\int e^{ikx}f(k)\,dk\] (15b)
+
+Equation 5It is well known (Wikipedia, 2023) that given a function over \(\mathbb{R}^{3}\) with complex spherical harmonic expansion
+
+\[f(\mathbf{r})=\sum_{\ell,m}f_{\ell,m}(\|\mathbf{r}\|)Y_{\ell}^{m}(\mathbf{r}/ \|\mathbf{r}\|)\] (16)
+
+its Fourier transform is given by
+
+\[f(\mathbf{k})=\sum_{\ell,m}(-i)^{\ell}F_{\ell,m}(\|\mathbf{k}\|)Y_{\ell}^{m}( \mathbf{k}/\|\mathbf{k}\|)\] (17)
+
+where
+
+\[F_{\ell,m}(k)=\frac{1}{\sqrt{k}}\int_{0}^{\infty}\sqrt{r}f_{\ell,m}(r)J_{\ell+ 1/2}(kr)\,r\,dr\] (18)
+
+with \(J_{\ell}\) the \(\ell^{\text{th}}\)-order Bessel function of the first kind. Relating these to the spherical Bessel functions \(j_{\ell}\) via \(J_{\ell+1/2}(x)=\sqrt{2x/\pi}j_{\ell}(x)\), we obtain
+
+\[F_{\ell,m}(k)=\sqrt{\frac{2}{\pi}}\int_{0}^{\infty}f_{\ell,m}(r)j_{\ell}(kr) \,r^{2}\,dr\quad:=\mathcal{H}_{\ell}[f_{\ell,m}](k)\] (19)
+
+which is the form of Equation 6. To apply this to our scalar fields, we define the _translation operator_\(\mathcal{T}_{\mathbf{r}}[f](\mathbf{x})=f(\mathbf{x}-\mathbf{r})\) and note its composition with the Fourier transform
+
+\[(\mathcal{F}\circ\mathcal{T}_{\mathbf{r}})[f]=e^{-i\mathbf{k}\cdot\mathbf{r}} \mathcal{F}[f]\] (20)We then decompose the form of our scalar fields (Equation 2) into contributions from zero-origin spherical harmonic expansions
+
+\[\phi_{c}(\mathbf{x}) =\sum_{n}\mathcal{T}_{\mathbf{x}_{n}}[\phi_{cn}](\mathbf{x})\] (21a) \[\phi_{cn}(\mathbf{x}) =\sum_{\ell,m}\underbrace{\sum_{j}A_{cnj\ell m}R_{j}(\|\mathbf{x} \|)}_{\phi_{cn\ell m}(\|\mathbf{x}\|)}Y_{\ell}^{m}\left(\mathbf{x}/\|\mathbf{x} \|\right)\] (21b)
+
+Hence, the Fourier transform of each contribution is
+
+\[\mathcal{F}[\phi_{cn}](\mathbf{k}/\|\mathbf{k}\|)=\sum_{\ell,m}(-i)^{\ell} \mathcal{H}_{\ell}[\phi_{cn\ell m}](\|\mathbf{k}\|)Y_{\ell}^{m}(\mathbf{k}/ \|\mathbf{k}\|)\] (22)
+
+Equation 5 is then obtained via Equation 20 and the linearity of the Fourier and spherical Bessel transforms.
+
+Equation 9We source (with some modifications) the derivation from Kovacs & Wriggers (2002). We consider the cross-correlation
+
+\[c(R)=\int_{\mathbb{R}^{3}}\phi(\mathbf{x})\overline{\psi(R^{-1}\mathbf{x})}\, d^{3}\mathbf{x}\] (23)
+
+which is the same as Equation 8 with \(\phi=\phi_{c}^{P}\) and \(\psi=\phi_{c}^{L}\) since \(\phi_{c}^{L}\) is a real field. Expanding in complex spherical harmonics \(Y_{\ell}^{m}\) and radial bases \(S_{j}\):
+
+\[\phi(\mathbf{x})=\sum_{j,\ell,m}\Phi_{j\ell m}S_{j}(\|\mathbf{x}\|)Y_{\ell}^{m }(\mathbf{x}/\|\mathbf{x}\|)\qquad\psi(\mathbf{x})=\sum_{j,\ell,m}\Psi_{j\ell m }S_{j}(\|\mathbf{x}\|)Y_{\ell}^{m}(\mathbf{x}/\|\mathbf{x}\|)\] (24)
+
+We then obtain
+
+\[c(R) =\sum_{j,j^{\prime},\ell,\ell^{\prime},m,n,m^{\prime}}\overline{D _{nm^{\prime}}^{\ell}(R)}\Phi_{j\ell m}\overline{\Psi_{j^{\prime}\ell^{\prime }m^{\prime}}}\int_{\mathbb{R}^{3}}[S_{j}\cdot S_{j^{\prime}}](\|\mathbf{x}\|)[ Y_{\ell}^{m}\cdot\overline{Y_{\ell^{\prime}}^{n}}](\mathbf{x}/\|\mathbf{x}\|)\,d^{3} \mathbf{x}\] (25a) \[=\sum_{j,j^{\prime},\ell,\ell^{\prime},m,n,m^{\prime}}\overline{D _{nm^{\prime}}^{\ell}(R)}\Phi_{j\ell m}\overline{\Psi_{j^{\prime}\ell^{\prime }m^{\prime}}}\underbrace{\int_{0}^{\infty}[S_{j}\cdot S_{j^{\prime}}](r)\,r^{2 }\,dr}_{G_{jj^{\prime}}}\underbrace{\int_{S^{2}}[Y_{\ell}^{m}\cdot\overline{Y _{\ell}^{n}}](\hat{\mathbf{r}})\,d\hat{\mathbf{r}}}_{\delta_{\ell x^{\prime}} \delta_{mn}}\] (25b) \[=\sum_{\ell,m,m^{\prime}}\overline{D_{mm^{\prime}}^{\ell}(R)} \underbrace{\sum_{j,j^{\prime}}\Phi_{j\ell m}\overline{\Psi_{j^{\prime}\ell m ^{\prime}}}G_{jj^{\prime}}}_{I_{mm^{\prime}}^{\ell}}\] (25c)
+
+Now to evaluate the complex Wigner \(D\)-matrix, we adopt the extrinsic \(zyz\) convention for Euler angles (applied right-to-left) and note that any rotation \((\phi,\theta,\psi)\) can be decomposed as
+
+\[R(\phi,\theta,\psi)=R_{z}\underbrace{(\phi-\pi/2)}_{\xi}R_{y}(\pi/2)R_{z} (\underbrace{\pi-\theta}_{\eta})R_{y}(\pi/2)R_{z}(\underbrace{\psi-\pi/2}_{ \omega})\] (26)
+
+Next, one can easily check (using the standard spherical harmonics) that the Wigner \(D\)-matrix for a rotation about the \(z\)-axis is diagonal and given by \(D_{mn}^{\ell}(R_{z}(\omega))=\delta_{mn}e^{-in\omega}\). Hence,
+
+\[D_{mn}^{\ell}(R(\phi,\theta,\psi))=e^{-im\xi}d_{mn}^{\ell}e^{-hn}d_{hn}^{\ell} e^{-i\omega n}\] (27)
+
+where \(d^{\ell}=D^{\ell}(R_{y}(\pi/2))\) are constant and real. Complex conjugation then gives Equation 9.
+
+Equation 12The conditional likelihood is
+
+\[\log p(\mathbf{t}\mid\mathbf{X}^{C},R) =\log\frac{p(\mathbf{X}^{C},R,\mathbf{t})}{p(\mathbf{X}^{C},R)}\] (28a) \[=\log p(\mathbf{X}^{C},R,\mathbf{t})-\log\int_{\mathbb{R}^{3}}p( \mathbf{X}^{C},R,\mathbf{t}^{\prime})\,d^{3}\mathbf{t}^{\prime}\] (28b) \[=\log E(\mathbf{X}^{P},\mathbf{X}^{L})-\log\int_{\mathbb{R}^{3}} \exp\left[E(\mathbf{X}^{P},R.\mathbf{X}^{C}+\mathbf{t}^{\prime})\right]\,d^{3} \mathbf{t}^{\prime}\] (28c)Similarly,
+
+\[\log p(R\mid\mathbf{X}^{C},\mathbf{t}) =\log\frac{p(\mathbf{X}^{C},R,\mathbf{t})}{p(\mathbf{X}^{C},\mathbf{ t})}\] (29a) \[=\log p(\mathbf{X}^{C},R,\mathbf{t})-\log\int_{SO(3)}p(\mathbf{X} ^{C},R^{\prime},\mathbf{t})\,dR^{\prime}\] (29b) \[=\log E(\mathbf{X}^{P},\mathbf{X}^{L})-\log\int_{SO(3)}\exp\left[E (\mathbf{X}^{P},R.\mathbf{X}^{C}+\mathbf{t})\right]\,dR^{\prime}\] (29c)
+
+Finally, we move \(\mathbf{t}\) to the protein coordinates (invoking the invariance of the score \(E\)) to obtain a form consistent with the rotational cross-correlations (Equation 8).
+
+Equation 13Given a pose \(\mathbf{X}^{L}=R.\mathbf{X}^{C}+\mathbf{t}\), we evaluate
+
+\[E(\mathbf{X}^{P},R.\mathbf{X}^{C}+\mathbf{t})=\sum_{c}\int_{\mathbb{R}^{3}} \phi_{c}^{P}(\mathbf{x})\phi_{c}^{L}(\mathbf{x};R.\mathbf{X}^{C}+\mathbf{t}) \,d^{3}\mathbf{x}\] (30)
+
+The functional inner product is equivalent in Fourier space:
+
+\[E(\mathbf{X}^{P},R.\mathbf{X}^{C}+\mathbf{t})=\sum_{c}\int_{\mathbb{R}^{3}} \overline{\mathcal{F}[\phi_{c}^{P}](\mathbf{k})}\cdot\mathcal{F}[\phi_{c}^{L} (\,\cdot\,;R.\mathbf{X}^{C}+\mathbf{t})](\mathbf{k})\;d^{3}\mathbf{k}\] (31)
+
+Then with the translation operator \(\mathcal{T}\) defined previously,
+
+\[\phi_{c}^{L}(\mathbf{x};R.\mathbf{X}^{C}+\mathbf{t}) =\mathcal{T}_{\mathbf{t}}[\phi(\,\cdot\,;R.\mathbf{X}^{C})]( \mathbf{x})\] (32a) \[\mathcal{F}[\phi_{c}^{L}(\,\cdot\,;R.\mathbf{X}^{C}+\mathbf{t})]( \mathbf{k}) =e^{-i\mathbf{k}\cdot\mathbf{t}}\mathcal{F}[\phi_{c}^{L}(\,\cdot \,;R.\mathbf{X}^{C})](\mathbf{k})\] (32b)
+
+We then substitute into Equation 31 to obtain Equation 13.
+
+Equation 14Given a pose \(\mathbf{X}^{L}=R.\mathbf{X}^{C}+\mathbf{t}\), we assume that the field \(\phi_{c}^{P}(\,\cdot\,;\mathbf{X}^{P}-\mathbf{t})\) and \(\phi_{c}^{L}(\,\cdot\,;\mathbf{X}^{C})\) are written in the real global spherical harmonic expansion:
+
+\[\phi_{c}^{P}(\mathbf{x};\mathbf{X}^{P}-\mathbf{t}) =\sum_{j,\ell,m}B_{cj\ell m}^{P}S_{j}(\|\mathbf{x}\|)Y_{\ell}^{m }(\mathbf{x}/\|\mathbf{x}\|)\] (33a) \[\phi_{c}^{L}(\mathbf{x};\mathbf{X}^{C}) =\sum_{j,\ell,m}B_{cj\ell m}^{L}S_{j}(\|\mathbf{x}\|)Y_{\ell}^{m }(\mathbf{x}/\|\mathbf{x}\|)\] (33b)
+
+Then, analogously to Equation 25,
+
+\[E(\mathbf{X}^{P},R.\mathbf{X}^{C}+\mathbf{t}) =E(\mathbf{X}^{P}-\mathbf{t},R.\mathbf{X}^{C})\] (34a) \[=\sum_{c}\int_{\mathbb{R}^{3}}\phi_{c}^{P}(\mathbf{x};\mathbf{X} ^{P}-\mathbf{t})\phi_{c}^{L}(R^{-1}\mathbf{x};\mathbf{X}^{C})\,d^{3}\mathbf{x}\] (34b) \[=\sum_{c,\ell,m,m^{\prime}}D_{mm^{\prime}}^{\ell}(R)\sum_{j,j^{ \prime}}B_{cj\ell m}^{P}B_{cj^{\prime}\ell m^{\prime}}^{L}G_{jj^{\prime}}\] (34c)
+
+Complex conjugation has been omitted because the coefficients and \(D\)-functions are now real.
+
+Algorithmic Details
+
+Below, we present in detail the four inference procedures introduced in Section 2.4. The three blocks of computations are color-coded corresponding to protein preprocessing (green), ligand preprocessing (blue), and the core computation (red) and labelled with typical runtimes from Table 1 (unlabelled lines have negligible runtime). The various loop levels make clear that depending on the workflow, the protein and ligand processing precomputations can be amortized and approaches a negligible fraction of the total runtime. Note, however, that for readability we have presented the algorithms assuming that all possible combinations (i.e., of proteins, ligand conformers, rotations, and translations) are of interest; if this is not true (for example in PDBBind, or in any typical pose-scoring setting), then the full benefits of amortization may not be fully realized.
+
+``` Input: Proteins \(\{(G_{i}^{P},\mathbf{X}_{i}^{P})\}\), conformers \(\{(G_{h}^{L},\mathbf{X}_{h}^{L})\}\) Output: Docked poses \((\mathbf{X}_{i}^{P},\mathbf{X}_{ih}^{L})\)\(\forall i,h\) foreach\((G_{i}^{P},\mathbf{X}_{i}^{P})\)do // protein preprocessing  Compute coefficients \(\mathbf{A}_{i}^{P}=\{A_{\mathit{cjn\ell m}}^{P}(G_{i}^{P},\mathbf{X}_{i}^{P})\}\) with neural network ; // 65 ms  Compute Fourier-space field values \(\mathcal{F}[\phi^{P}]_{i}\) using \(\mathbf{A}_{i}^{P},\mathbf{x}_{i}^{P}\) ; // 7.0 ms foreach\((G_{h}^{L},\mathbf{X}_{h}^{L})\)do // ligand preprocessing  Compute coefficients \(\mathbf{A}_{h}^{L}=\{A_{\mathit{cjn\ell m}}^{L}(G_{h}^{L},\mathbf{X}_{h}^{L})\}\) with neural network ; // 4.3 ms foreach\(R_{k}\in\{R\}_{\mathit{grid}}\subset SO(3)\)do  Compute rotated coefficients \(\mathbf{A}_{h,k}^{L}\) using \(D^{\ell}(R_{k})\);  Compute Fourier-space field values \(\mathcal{F}[\phi^{L}]_{h,k}\) using \(\mathbf{A}_{h,k}^{L},R_{k}\mathbf{X}_{h}^{L}\) ; // 1.6 ms foreach\((G_{i}^{P},\mathbf{X}_{i}^{P})\)do // pose optimization foreach\((G_{h}^{L},\mathbf{X}_{h}^{L})\)do foreach\(R_{k}\in\{R\}_{\mathit{grid}}\subset SO(3)\)do  Compute \(E(\mathbf{X}_{i}^{P},R_{k}\mathbf{X}_{h}^{L}+\mathbf{t}),\forall\mathbf{t}\) using FFT; // 160 \(\mu\)s \(E_{k}^{\star},\mathbf{t}_{k}^{\star}\leftarrow\{\max,\arg\max\}_{\mathbf{t}}E( \mathbf{X}_{i}^{P},R_{k}\mathbf{X}_{h}^{L}+\mathbf{t})\) ; \(k^{\star}\leftarrow\arg\max_{k}E_{k}^{\star}\); \(\mathbf{X}_{ih}^{L}\gets R_{k^{\star}}\mathbf{X}_{h}^{L}+\mathbf{t}_{k^{ \star}}^{\star}\); ```
+
+**Algorithm 1**Translational FFT
+
+``` Input: Proteins \(\{(G_{i}^{P},\mathbf{X}_{i}^{P})\}\), conformers \(\{(G_{h}^{L},\mathbf{X}_{h}^{L})\}\) Output: Docked poses \((\mathbf{X}_{i}^{P},\mathbf{X}_{ih}^{L})\)\(\forall i,h\) foreach\((G_{i}^{P},\mathbf{X}_{i}^{P})\)do // protein preprocessing  Compute coefficients \(\mathbf{A}_{i}^{P}=\{A_{\mathit{cjn\ell m}}^{P}(G_{i}^{P},\mathbf{X}_{i}^{P})\}\) with neural network ; // 65 ms foreach\(\mathbf{t}_{k}\in\{\mathbf{t}\}_{\mathit{grid}}\subset\mathbb{R}^{3}\)do  Compute global expansion \(\mathbf{B}_{i,k}^{P}=\{B_{\mathit{cj\ell m}}\}\) from \(\mathbf{A}_{i}^{P},\mathbf{X}_{i}^{P}-\mathbf{t}_{k}\) ; // 80 ms foreach\((G_{h}^{L},\mathbf{X}_{h}^{L})\)do // ligand preprocessing  Compute coefficients \(\mathbf{A}_{h}^{L}=\{A_{\mathit{cjn\ell m}}^{L}(G_{h}^{L},\mathbf{X}_{h}^{L})\}\) with neural network ; // 4.3 ms  Compute global expansion \(\mathbf{B}_{h}^{L}=\{B_{\mathit{cj\ell m}}\}\) from \(\mathbf{A}_{h}^{L},\mathbf{X}_{h}^{L}\) ; // 17 ms foreach\((G_{i}^{P},\mathbf{X}_{i}^{P})\)do // pose optimization foreach\((G_{i}^{L},\mathbf{X}_{h}^{L})\)do foreach\(\mathbf{t}_{k}\in\{\mathbf{t}\}_{\mathit{grid}}\subset\mathbb{R}^{3}\)do  Compute \(E(\mathbf{X}_{i}^{P}-\mathbf{t}_{k},R.\mathbf{X}_{h}^{L}),\forall R\) using FFT ; // 650 \(\mu\)s \(E_{k}^{\star},R_{k}^{\star}\leftarrow\{\max,\arg\max\}_{R}E(\mathbf{X}_{i}^{P} -\mathbf{t}_{k},R.\mathbf{X}_{h}^{L}+\mathbf{t})\) ; \(k^{\star}\leftarrow\arg\max_{k}E_{k}^{\star}\); \(\mathbf{X}_{ih}^{L}\gets R_{k^{\star}}^{\star}\mathbf{X}_{h}^{L}+\mathbf{t} _{k^{\star}}\); ```
+
+**Algorithm 2**Rotational FFT
+
+[MISSING_PAGE_FAIL:17]
+
+## Appendix D Learned Scalar Fields
+
+Figure 2: **Visualizations of learned scalar fields**. All five channels of the **ESF-N** learned scalar fields \(\phi^{L}\) (top row) and \(\phi^{P}\) (bottom row) are shown on the \(xy\)-plane passing through the center of mass of the ligand, with a box diameter of 20 Å. Positive values of the field are in blue and negative values in red. At left, the ligand and pocket structures are shown looking down the \(z\)-axis. Note that as the fields are only 2D slices, not all 3D features visible in the structures are visible in the fields.
+
+Figure 3: **Visualizations of learned scalar fields**, continued.
+
+Experimental Details
+
+### Decoy Set
+
+Given a zero-mean ground-truth ligand pose \(\mathbf{X}^{L\star}\), we generate \(32^{3}-1=32767\) decoy poses via the following procedure.
+
+* Sample 31 translational pertubations: \(\mathbf{t}_{i}\sim\mathcal{N}(0,\mathbf{I}_{3}),i=1\ldots 31\) and set \(\mathbf{t}_{0}=\mathbf{0}\), with units in A.
+* Sample 31 rotational perturbations: \(R_{j}=\texttt{FromRotvec}(\mathbf{r}_{j}),\mathbf{r}_{j}\sim\mathcal{N}(0,0. 5\mathbf{I}_{3}),j=1\ldots 31\) and set \(R_{0}=\mathbf{I}_{3}\).
+* Sample 31 noisy conformers \(\mathbf{X}_{k}^{C},k=1\ldots 31\) by sampling torsional updates \(\Delta\boldsymbol{\tau}_{k}\sim\mathcal{N}_{\mathbb{T}}(0,(\pi/2)\mathbf{I}_{ m})\) where \(\mathcal{N}_{\mathbb{T}}\) is a wrapped normal distribution (Jing et al., 2022) and \(m\) is the number of torsion angles. The torsional updates are applied to the smaller side of the molecule. Set \(\mathbf{X}_{0}^{C}=\mathbf{X}^{L\star}\).
+* Set \(\mathbf{X}_{ijk}^{L}=R_{j}\mathbf{X}_{k}^{C}+\mathbf{t}_{i},i,j,k=0\ldots 31\) and discard \(\mathbf{X}_{000}^{L}=\mathbf{X}^{L\star}\).
+
+PDB ID 6A73 is excluded from the procedure due to the high level of graph symmetry and significant runtime for computing RMSDs for all decoys. Summary statistics for the decoy sets of the remaining 362 PDB IDs are presented in Figure 4.
+
+### Hyperparameters
+
+Our method involves hyperparameters at several levels.
+
+* The learned scalar fields have 5 channels.
+* To parameterize the scalar field (Equation 2), we use spherical harmonics up to \(\underline{\ell=2}\) and 5 Gaussian RBFs evenly spaced from 0 A to 5 A.
+* All translational Fourier coefficients (Equation 5) are evaluated with a grid of frequencies corresponding to a sampling interval of 1 A and a cubical domain with side length 40 A. The integral over \(\mathbb{R}^{3}\) in the training objective (Equation 12) is computed only over the
+
+Figure 4: **Decoy set statistics. _Top left_: histogram of RMSDs across all decoys sets (12 M total). _Bottom left_: histogram of minimum RMSDs among the decoy sets. All sets have a pose less than RMSD \(<\)1 Å from the true pose. _Right_: cumulative density function of RMSDs in each decoy set. _Bottom right inset_: all decoy sets have at least 23 poses with RMSD \(<\)2 Å.
+
+cubical FFT domain. During training and default inference, the cross-correlation is also computed with a sampling interval of 1 A, but denser sampling intervals at inference-time (i.e., by zero-padding in the Fourier domain) are explored in Appendix F.
+* Global spherical harmonic expansions (Equation 7) are computed up to \(\underline{\ell=10}\), with 25 Gaussian RBFs evenly spaced from 0 A to 20 A. During training and default inference, the evaluation of rotational cross-correlations with FFTs (Equation 9) is always performed up to \(\underline{\ell=50}\) and \(\underline{\ell=25}\), respectively, by zero-padding in the Fourier domain, with other inference orders at inference-time explored in Appendix F.
+* Local-to-global transformation matrices (Equation 11) were precomputed for discretized positions along the \(+z\) axis from 0 A to 20 A at 1 A intervals.
+* Data featurization and model hyperparameters are adapted from the default settings of Corso et al. (2023), giving a model size of 2.2 M parameters for both the ligand and protein model.
+* By default, in the **RF** procedure, we evaluate \(\underline{9^{3}=729}\) translational grid points at inference time, filling a 8 A cube at 1 A intervals. In the **TF** procedure, we use an \(m=2\) grid over \(SO(3)\) as implemented by Zhong et al. (2019) and Yershova et al. (2010), yielding 4608 grid points. Other resolutions are explored in Appendix F.
+
+These hyperparameters were not extensively tuned, and further tradeoffs and improvements in performance and runtime could be explored by modifying them.
+
+### Runtime Measurements
+
+All runtime measurements were performed on a machine with 64 Intel Xeon Gold 6130 CPUs and 8 Nvidia Tesla V100 GPUs. Gnina was run with default thread count settings. All of our processes were run on a single V100 GPU. For our method, we performed runtime analysis using CUDA events to remove the effects of asynchronous CUDA execution. Script loading, model loading, and algorithmic-level precomputations (which, if necessary, can be cached on disk) were excluded from the analysis. For Gnina, we attempted to remove similar overhead by timing single-pose scoring-only runs as representative of constant overhead costs. We report conformer docking runtimes in Table 3 using the PDBBind crystal structures; ESMFold runtimes are marginally shorter. Typical runtimes reported in Table 1 and Appendix C are obtained from timing runs with our method across the entire PDBBind test set.
+
+### Datasets
+
+As noted previously, we use train, validation, and test splits from Stark et al. (2022). However, due to RDKit parsing issues with Gnina-docked poses, the following 30 complexes are excluded (leaving 333 remaining) from all rigid conformer docking comparisons against Gnina, i.e., Tables 3 and Appendix F: 6HZB, 6E4C, 6PKA, 6E3P, 6OXT, 6OY0, 6HZA, 6E6W, 6OXX, 6HZD, 6K05, 6NRH, 6OXW, 6RTN, 6D3Z, 6HLE, 6PY0, 6OXS, 6E3O, 6HZC, 6Q38, 6E7M, 6OIE, 6D3Y, 6D40, 6UHU, 6CJP, 6E3N, 6Q4Q, 6D3X. Scoring comparisons include all test complexes except 6A73, for which decoy poses could not be generated.
+
+We download the 77 PDB IDs provided in Tosstorff et al. (2022) from the PDB to form the PDE10A dataset, keeping the A chain of each assymetric unit and the Ligand of Interest (LOI) interacting with it. We then align all ligands to the crystal structure of 5SFS using the procedure described in Corso et al. (2023) for aligning ESMFold structures, except transforming the ligand rather than the protein. This constitutes the construction of a _cross-docking_ dataset due to the use of the same pocket for all ligands. Due to RDKit parsing errors with the Gnina-docked poses, the following 7 PDB IDs are excluded from all comparisons: 5SFA, 5SED, 5SFO, 5SEV, 5SF9, 5SDX, 5SFC. The remaining 70 ligands are shown superimposed on the 5SFS pocket in Figure 5.
+
+## Appendix F Further Results
+
+In Tables 4-7 below, we explore the impact of inference-time hyperparameters on the performance and runtime of our method on the rigid conformer docking task. We use the **ESF-N** model variant and experiment with the PDBBind crystal test set and PDE10A test set. For the **TF** procedure (Algorithm 1), we adjust (1) the number of grid points over \(SO(3)\) with two possible resolutions, giving 576 and 4608 possible rotations, respectively; (2) the spatial interval at which the translational cross-correlation (Equation 3) is evaluated: either 1 A or 0.5 A (by zero-padding the scalar fields in the Fourier domain), giving a cubical grid of evaluated points with side length 8 A and 9 or 17 points on each side. For the **RF** procedure (Algorithm 2), we adjust (1) the number of translational grid points with three possible resolutions, filling the 8 A cube with 7, 9, or 13 points per side, respectively; (2) the resolution at which the rotational cross-correlation (Equation 8) is evaluated; this can be adjusted by zero-padding in the Fourier domain to include larger values of \(\ell\). The rows corresponding to results in the main Table 3 are bolded.
+
+In all rows, the effective number of poses searched over via both degrees of freedom is computed. To provide an idea of the impact of discretization, we compute the median RMSD of the _closest grid point_ to the ground-truth pose (decomposed into rotational and translational contributions). This serves as a hard lower bound for the median RMSD of the output docked pose. In the **TF** procedure, increasing the resolution is memory-intensive; thus, the **RF** procedure is more effective at leveraging FFT to conduct fine-grained search over the accelerated degree of freedom. The default reported performance is attained with a translational offset of 0.4 A and a rotational offset of 0.16 A. While performance improves with smaller grid offsets, the returns are rapidly diminishing.
+
+The runtime of the method (averaged over 333 PDBBind complexes and 70 PDE10A complexes) is reported and color-coded according to Appendix C: protein preprocessing (green), ligand preprocessing (blue), and the pose optimization (red). The effect of the non-FFT grid resolution is also color-coded, i.e., in **TF** the explicit enumeration over \(SO(3)\) grid points directly scales the ligand preprocessing, whereas in **RF** the enumeration over \(\mathbb{R}^{3}\) scales the protein preprocessing. As the tables show, the preprocessing of these explicit grid points contributes to the majority of the non-amortizeable runtime. In general, the \(SO(3)\) grid / ligand preprocessing in **TF** is less expensive, however, it cannot be amortized when moving from PDBBind to PDE10A (where the ligands are still distinct). On the other hand, the \(\mathbb{R}^{3}\) grid / protein preprocessing time in **RF** is significantly reduced (very roughly on the order of 70-fold, as expected) in PDE10A compared to PDBBind.
+
+Figure 5: **PDE10A ligands** aligned on 5SFS
+
+\begin{table}
+\begin{tabular}{c c c c c c c c c c c c} \hline \hline  & & & \multicolumn{4}{c}{Grid offset} & \multicolumn{4}{c}{Runtime (ms)} \\ \cline{3-13} Trans. & \(SO(3)\) & Effective & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} \\ grid & \(SO(3)\) & Effective & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} \\ grid & \(\ell_{\text{max}}\) & \# poses & Tr. & Rot. & All & Med. & \(<\)2Å & Prot. & Lig. & Opt. \\ \hline
+7 & 10 & 3.2M & 0.65 & 0.38 & 0.80 & 1.25 & 70 & 30k & 85 & 158 \\
+7 & 25 & 45M & 0.67 & 0.15 & 0.70 & 1.15 & 69 & 31k & 87 & 225 \\
+7 & 50 & 353M & 0.65 & 0.08 & 0.67 & 1.16 & 70 & 32k & 85 & 704 \\
+9 & 10 & 6.8M & 0.49 & 0.36 & 0.64 & 1.16 & 73 & 64k & 85 & 333 \\
+**9** & **25** & **97M** & **0.50** & **0.15** & **0.53** & **1.00** & **73** & **67k** & **87** & **476** \\
+9 & 50 & 751M & 0.51 & 0.08 & 0.52 & 0.98 & 74 & 63k & 84 & 1487 \\
+13 & 10 & 20M & 0.33 & 0.37 & 0.51 & 1.05 & 74 & 198k & 85 & 995 \\
+13 & 25 & 291M & 0.33 & 0.15 & 0.37 & 0.90 & 72 & 200k & 86 & 1430 \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: **PDBind RF**
+
+\begin{table}
+\begin{tabular}{c c c c c c c c c c c} \hline \hline  & & & \multicolumn{4}{c}{Grid offset} & \multicolumn{4}{c}{Runtime (ms)} \\ \cline{3-13} Trans. & \(SO(3)\) & Effective & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} \\ grid & \(SO(3)\) & Effective & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} & \multicolumn{1}{c}{} \\ grid & \(\ell_{\text{max}}\) & \# poses & Tr. & Rot. & All & Med. & \(<\)2Å & Prot. & Lig. & Opt. \\ \hline
+7 & 10 & 3.2M & 0.72 & 0.38 & 0.83 & 1.60 & 54 & 476 & 44 & 161 \\
+7 & 25 & 45M & 0.57 & 0.16 & 0.59 & 1.21 & 63 & 549 & 42 & 227 \\
+7 & 50In Figure 6, we further investigate the tradeoff between speed and performance offered by our method compared to Gnina (with the Vina scoring function). While in the main results (Table 3) we run Gnina using all default settings, it is possible to reduce the runtime (and performance) by adjusting these settings. In particular, we explore setting ---max_mc_steps and -minimize_iters to 5 independently and in combination. Together with the default runs and the --score_only runs, these trace out a _Pareto frontier_ representing the tradeoff between runtime per complex and \(<\)2 A RMSD success rate. With the default settings, Gnina outperforms all variants of our method on the PDBBind crystal and PDE10A test sets. However, Figure 6 shows that we can reach previously inaccessible regions in the accuracy v.s. runtime tradeoff landscape.
+
+Figure 6: **Tradeoff between speed and accuracy** using our method compared to Gnina on PDBBind crystal structures (_left_) and PDE10A (_right_). In both cases, variants of our method (blue dots) enable possibilities not reachable with Gnina (orange curve).

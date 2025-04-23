@@ -1,0 +1,194 @@
+# Clustering the Sketch: Dynamic Compression for Embedding Tables
+
+Henry Ling-Hei Tsang
+
+Meta
+
+henrylhtsang@meta.com
+
+Equal contribution.
+
+Thomas Dybdahl Ahle
+
+Meta
+
+Normal Computing
+
+thomas@ahle.dk
+
+Work done mostly at Probability at Meta.
+
+###### Abstract
+
+Embedding tables are used by machine learning systems to work with categorical features. In modern Recommendation Systems, these tables can be very large, necessitating the development of new methods for fitting them in memory, even during training. We suggest Clustered Compositional Embeddings (CCE) which combines clustering-based compression like quantization to codebooks with dynamic methods like The Hashing Trick and Compositional Embeddings (Shi et al., 2020). Experimentally CCE achieves the best of both worlds: The high compression rate of codebook-based quantization, but _dynamically_ like hashing-based methods, so it can be used during training. Theoretically, we prove that CCE is guaranteed to converge to the optimal codebook and give a tight bound for the number of iterations required.
+
+## 1 Introduction
+
+Neural networks can efficiently handle various data types, including continuous, sparse, and sequential features. However, categorical features present a unique challenge as they require embedding a typically vast vocabulary into a smaller vector space for further calculations. Examples of these features include user IDs, post IDs on social networks, video IDs, and IP addresses commonly encountered in Recommendation Systems.
+
+In some domains where embeddings are employed, such as Natural Language Processing (Mikolov et al., 2013), the vocabulary can be significantly reduced by considering "subwords" or "byte pair encodings". In Recommendation Systems like Matrix Factorization or DLRM (see Figure 2) it is typically not possible to factorize the vocabulary this way, leading to large embedding tables that demand hundreds of gigabytes of GPU memory (Naumov et al., 2019). This necessitates splitting models across multiple GPUs, increasing cost and creating a communication bottleneck during both training and inference.
+
+The traditional solution is to hash the IDs down to a manageable size using the Hashing Trick (Weinberger et al., 2009), accepting the possibility that unrelated IDs may share the same representation. Excessively aggressive hashing can impair the model's ability to distinguish its inputs, as it may mix up unrelated concepts, ultimately reducing model performance.
+
+Another option for managing embedding tables is quantization. This typically involves reducing the precision to 4 or 8 bits or using multi-dimensional methods like Product Quantization and Residual Vector Quantization, which rely on clustering (e.g., K-means) to identify representative "code words" for each original ID. (See Gray and Neuhoff (1998) for a survey of quantization methods.) For instance, vectors representing "red", "orange", and "blue" may be stored as simply "dark orange" and "blue", with the first two concepts pointing to the same average embedding. See Section 1 foran example. Clustering also plays a crucial role in the theoretical literature on vector compression (Indyk and Wagner, 2022). However, a significant drawback of these quantization methods is that the model is only quantized _after_ training, leaving memory utilization _during_ training unaffected3
+
+Recent authors have explored more advanced uses of hashing to address this challenge: Tito Svenstrup et al. (2017); Shi et al. (2020); Desai et al. (2022); Yin et al. (2021); Kang et al. (2021). A common theme is to employ multiple hash functions, enabling features to have unique representations, while still mapping into a small shared parameter table. Although these methods outperform the traditional Hashing Trick in certain scenarios, they still enforce random sharing of parameters between unrelated concepts, introducing substantial noise into the subsequent machine learning model has to overcome.
+
+Clearly, there is an essential difference between "post-training" compression methods like Product Quantization which _can utilize similarities between concepts_ and "during training" techniques based on hashing, which are forced to randomly mix up concepts. This paper's key contribution is to bridge that gap: We present a novel compression approach we call "Clustered Compositional Embeddings" (or CCE for short) _that combines hashing and clustering while retaining the benefits of both methods_. By continuously interleaving clustering with training, we train recommendation models with performance matching post-training quantization, while using a fixed parameter count and computational cost throughout training, matching hashing-based methods.
+
+In spirit, our effort can be likened to methods like RigL (Evci et al., 2020), which discovers the wiring of a sparse neural network during training rather than pruning a dense network post-training. Our work can also be seen as a form of "Online Product Quantization" Xu et al. (2018), though prior work
+
+Figure 1: Clustered Compositional Embeddings is a simple algorithm which you run interspersed with your normal model training, such as every epoch of SGD. While the theoretical bound (and the least squares setting shown here) requires a lot of iterations for perfect convergence, in practice we get substantial gains from running 1-6 iterations.
+
+focused only on updating code words already assigned to the concept. Our goal is more ambitious: We want to learn _which_ concepts to group together without ever knowing the "true" embedding for the concepts.
+
+_Why is this hard?_ Imagine you are training your model and at some point decide to use the same vector for IDs \(i\) and \(j\). For the remaining duration of the training, you can never distinguish the two IDs again, and thus any decision you make is permanent. The more you cluster, the smaller your table gets. But we are interested in keeping a constant number of parameters throughout training, while continuously improving the clustering.
+
+In summary, our main contributions are:
+
+* A new dynamic quantization algorithm (CCE) that combines clustering and sketching. Particularly well suited to optimizing the compression of embedding tables in Recommendation Systems.
+* We use CCE to train the Deep Learning Recommendation System (DLRM) to baseline performance with less than 50% of the table parameters required by the previous state of the art, and a wobbling 11,000 times fewer parameters than the baseline models without compression.
+* Using slightly more parameters, but still significantly less than the baseline, we can also improve the Binary Cross Entropy by 0.66%. Showing that CCE helps combat overfitting problems.
+* We prove theoretically that a version of our method for the linear least-squares problem always succeeds in finding the optimal embedding table in a number of steps logarithmic in the approximation accuracy desired.
+
+An implementation of our methods and related work is available at github.com/thomasahle/cce.
+
+## 2 Background and Related Work
+
+We show how most previous work on table compression can be seen in the theoretical framework of linear dimensionality reduction. This allows us to generalize many techniques and guide our intuition on how to choose the quality and number of hash functions in the system.
+
+We omit standard common preprocessing tricks, such as weighting entities by frequency, using separate tables and precision for common vs uncommon elements, or completely pruning rare entities. We also don't cover the background of "post-training" quantization, but refer to the survey by Gray and Neuhoff (1998).
+
+Theoretical work by Li et al. (2023) suggests "Learning to Count sketch", but these methods require a very large number of full training runs of the model. We only consider methods that are practical to scale to very large Recommendation Systems. See also Indyk and Wagner (2022) on metric compression.
+
+### Embedding Tables as Linear Maps
+
+An embedding table is typically expressed as a tall skinny matrix \(T^{d_{1} d_{2}}\), where each ID \(i[d_{1}]\) is mapped to the \(i\)-th row, \(T[i]\). Alternatively, \(i\) can be expressed as a one-hot row-vector \(e_{i}\{0,1\}^{d_{1}}\) in which case \(T[i]=e_{i}T^{d_{2}}\).
+
+Most previous work in the area of table compression is based on the idea of sketching: We introduce a (typically sparse) matrix \(H\{0,1\}^{d_{1} k}\) and a dense matrix \(M^{k d_{2}}\), where \(k<\!<d_{1}\), and take \(T=HM\). In other words, to compute \(T[i]\) we compute \((e_{i}H)M\). Since \(H\) and \(e_{i}\) are both sparse, this requires very little memory and takes only constant time. The vector \(e_{i}H^{k}\) is called "the sketch of \(i\)" and \(M\) is the "compressed embedding table" that is trained with gradient descent.
+
+Figure 2: **Typical Recommendation System Architecture:** The DLRM model Naumov et al. (2019) embeds each categorical feature separately and combines the resulting vectors with pair-wise dot products. Other architectures use different interaction layers or a single embedding table for all categorical features, but the central role of the embedding table is universal. (Picture credit: Nvidia).
+
+In this framework, we can also express most other approaches to training-time table compression. Some previous work has focused on the "problem" of avoiding hash collisions, which intuitively makes sense as they make the model completely blind to differences in the colliding concepts. However, from our experiments, hashing does nearly as well as said proposed methods, suggesting that a different approach is needed. Sketching is a more general way to understand this.
+
+**The Hashing Trick** is normally described by a hash function \(h:[d_{1}][k]\), such that \(i\) is given the vector \(M[h(i)]\), where \(M\) is a table with just \(k d_{1}\) rows. Alternatively, we can think of this trick as multiplying \(e_{i}\) with a random matrix \(H\{0,1\}^{d_{1} k}\) which has exactly one 1 in each row. Then the embedding of \(i\) is \(M[h(i)]=e_{i}HM\), where \(HM^{d_{1} d_{2}}\).
+
+**Hash Embeddings** map each ID \(i V\) to the sum of a few table rows. For example, if \(i\) is mapped to two rows, then its embedding vector is \(v=M[h_{1}(i)]+M[h_{2}(i)]\). Using the notation of \(H\{0,1\}^{m n}\), one can check that this corresponds to each row having exactly two 1s. In the paper, the authors also consider weighted combinations, which simply means that the non-zero entries of \(H\) can be some real numbers.
+
+**Compositional Embeddings** (CE or "Quotient Remainder", Shi et al., 2020), define \(h_{1}(i)= i/p\) and \(h_{2}(i)=i p\) for integer \(p\), and then combines \(T[h_{1}(i)]\) and \(T[h_{2}(i)]\) in various ways. As mentioned by the authors, this choice is, however, not of great importance, and more general hash functions can also be used, which allows for more flexibility in the size and number of tables. Besides using _sums_, like Hash Embeddings, the authors propose element-wise _multiplication4_ and _concatenation_. Concatenation \([T[h_{1}(i)],T[h_{2}(i)]]\) can again be described with a matrix \(H\{0,1\}^{d_{1} k}\) where each row has exactly one 1 in the top half of \(H\) and one in the bottom half of \(H\), as well as a block diagonal matrix \(M\). While this restricts the variations in embedding matrices \(T\) that are allowed, we usually compensate by picking a larger \(m\), so the difference in entropy is not much different from Hash Embeddings, and the practical results are very similar as well.
+
+**ROBE embeddings** are essentially Compositional Embeddings with concatenation as described above, but add some more flexibility in the indexing from the ability of pieces to "wrap around" in the embedding table. In our experiments, ROBE was nearly indistinguishable from CE with concatenation for large models, though it did give some measurable improvements for very small tables.
+
+**Deep Hashing Embeddings** picks 1024 hash functions \(h_{1},,h_{1024}:[d_{1}][-1,1]\) and feed the vector \((h_{1}(i),,h_{1024}(i))\) into a multi-layer perceptron. While the idea of using an MLP to save memory at the cost of larger compute is novel and departs from the sketching framework, the first hashing step of DHE is just sketching with a dense random matrix \(H[-1,1]^{d_{1} 1024}\). While this is less efficient than a sparse matrix, it can still be applied efficiently to sparse inputs, \(e_{i}\), and stored in small amounts of memory. Indeed in our experiments, for a fixed parameter budget, the fewer layers of the MLP, the better DHE performed. This indicates to us that the sketching part of DHE is still the most important part.
+
+**Tensor Train** doesn't use hashing, but like CE it splits the input in a deterministic way that can be generalized to a random hash function if so inclined. Instead of adding or concatenating chunks, Tensor Train multiplies them together as matrices, which makes it not strictly a linear operation. However, like DHE, the first step in reducing the input size is sketching.
+
+**Learning to Collide** In recent parallel work, Ghaemmaghami et al. (2022) propose an alternate method for learning a clustering based on a low dimensional embedding table. This is like a horizontal sketch, rather than a vertical, which unfortunately means the potential parameter savings is substantially smaller.
+
+Our method introduces a novel approach to dynamic compression by shifting from random sketching to _learned_ sketching. This process can be represented as \(e_{i}HM\), where \(H\) is a sparse matrix and \(M\) is a small dense matrix. The distinguishing factor is that we derive \(H\) from the data, instead of relying on a random or fixed matrix. This adaptation, both theoretically and empirically, allows learning the same model using less memory.
+
+Figure 3: **The evolution of hashing-based methods for embedding tables.** The Hashing Trick and Hash Embeddings shown at the top, side by side with an equal amount of parameters. Next we introduce the idea of splitting the space into multiple concatenated subspaces. This is a classic idea from product quantization and reminiscent of multi-head attention in transformers. Finally in CCE we combine both methods in a way that allows iterative improvement using clustering.
+
+Sparse and Dense CCE
+
+The goal of this section is to give the background of Theorem 3.1, where we prove that CCE converges to the optimal assignments we would get from training the full embedding tables without hashing and clustering those.
+
+We can't hope to prove this in a black box setting, where the recommendation model on top of the tables can be arbitrary, since there are pathological functions where only a full table will work. Instead, we pick a simple linear model, where the data is given by a matrix \(X^{n d_{1}}\) and we want to find a matrix \(T\) that minimizes the sum of squares, \(\|XT-Y\|_{F}^{2}=_{i,j}((XT)_{i,j}-Y_{i,j})^{2}\).
+
+We give two versions of the algorithm, a sparse method, which is what we build our experimental results on; and a dense method which doesn't use clustering, and replaces the Count Sketch with a dense normal distributed random matrix for which we prove optimal convergence. The dense algorithm itself is interesting since it constitutes a novel approximation algorithm for least squares regression with lower memory use.
+
+```
+0:\(X^{n d_{1}}\), \(Y^{n d_{2}}\), \(k\)
+1:\(H_{0}=0^{d_{1} 2k}\)
+2:\(M_{0}=0^{2k d_{2}}\)
+3:for\(i=0,1,\)do
+4:\(T_{i}=H_{i}M_{i}^{d_{1} k}\)
+5:\(N N(0,1)^{d_{1} k}\)
+6:\(H_{i+1}=[T_{i} N]\)
+7:\(M_{i+1}=*{arg\,min}_{M}\|XH_{i+1}M-Y\|_{F}^{2}\)
+8:endfor ```
+
+**Algorithm 1** Dense CCE for Least Squares
+
+In the Appendix we show the following theorem guaranteeing the convergence of Algorithm 1:
+
+**Theorem 3.1**.: _Assume \(d_{1}>k>d_{2}\) and let \(T^{*}^{d_{1} d_{2}}\) be the matrix that minimizes \(\|XT^{*}-Y\|_{F}^{2}\), then \(T_{i}=H_{i}M_{i}\) from Algorithm 1 exponentially approaches the optimal loss in the sense_
+
+\[E[\|XT_{i}-Y\|_{F}^{2}](1-)^{ik}\|XT^{*}\|_{F}^{2}+\|XT^{*}-Y\|_{F}^{ 2},\]
+
+_where \(=\|X\|_{-2}^{2}/\|X\|_{F}^{2} 1/d_{1}\) is the smallest singular value of \(X\) squared divided by the sum of singular values squared._
+
+We also show how to modify the algorithm to get an improved bound of \((1-1/d_{1})^{ik}\) by conditioning the random part \(H\) by the eigenspace of \(X\). This means that after \(i=O(}{k}(1/))\) iterations we have a \(1+\) approximation to the optimal solution. Note that the standard least squares problem can be solved in \(O(nd_{1}d_{2})\) time, but one iteration of our algorithm only takes \(O(nkd_{2})\) time. Repeating it for \(d_{1}/k\) iterations is thus no slower than the default algorithm for the general least squares problem, but uses less memory.
+
+Some notes about Algorithm 2: In line 4 we compute \(HM^{d_{1} d_{2}}\) which may be very large. (After all the main goal of CCE is to avoid storing this full matrix in memory.) Luckily K-means in practice works fine on just a sample of the full dataset, which is what we do in the detailed implementation in Section 4.2.
+
+```
+0:\(X^{n d_{1}}\), \(Y^{n d_{2}}\), \(k\)
+1:\(H_{0}=0^{d_{1} 2k}\)\(\) Initialize assignments
+2:\(M_{0}=0^{2k d_{2}}\)\(\) Initialize codebook
+3:for\(i=0,1,\)do
+4:\(T_{i}=H_{i}M_{i}^{d_{1} d_{2}}\)
+5:\(A=*{kmeans}(T_{i})\{0,1\}^{d_{1} k}\)
+6:\(C*{countsketch}()\{-1,0,1\}^{d_{1} k}\)
+7:\(H_{i+1}=[A C]^{d_{1} 2k}\)
+8:\(M_{i+1}=*{arg\,min}_{M}\|XH_{i+1}M-Y\|_{F}^{2}\)
+9:endfor ```
+
+**Algorithm 2** Sparse CCE for Least Squares
+
+In line 5, note that K-means normally returns both a set of cluster assignments and cluster centroids. For our algorithm we only need the assignments. We write those as the matrix \(A\) which has \(A_{id,j}=1\) if \(id\) is assigned to cluster \(j\) and 0 otherwise. In the Appendix (Figure 5) we show how \(A\) is a sparse approximation to \(T\)'s column space. Using the full, dense column space we'd recover the dense algorithm, Algorithm 1.
+
+In line 6, \(*{countsketch}()\) is the distribution of \(\{-1,0,1\}^{d_{1} k}\) matrices with one non-zero per row. A matrix \(C\) is sampled based on hash functions \(h_{i}:[d_{1}][k]\) and \(s_{i}:[d_{1}]\{-1,1\}\) such that \(C_{j,t}=s_{i}(j)\) if \(h_{i}(j)=\) and 0 otherwise. 5 We see that with \(A\) and \(C\) sparse, \(XHM\) can be computed efficiently.
+
+Figure 4: CCE also improves models even when trained for just one epoch. This shows useful information is available from clustering even when only parts of the data have been seen.
+
+## 4 Experiments and Implementation Details
+
+Our primary experimental finding, illustrated in Table 1 and Figure 3(a), indicates that CCE enables training a model with Binary Cross Entropy matching a full table baseline, using only a half the parameters required by the next best compression method. Moreover, when allocated optimal parameters and trained to convergence, CCE can yield a not insignificant \(0.66\%\) lower BCE.
+
+### Experimental Setup
+
+In our experiments, we adhered to the setup from the open-source Deep Learning Recommendation Model (DLRM) by Naumov et al. (2019), including the choice of optimizer (SGD) and learning rate. The model uses both dense and sparse features with an embedding table for each sparse feature. We modified only the embedding table portion of the DLRM code. We used two public click log datasets from Criteo: the Kaggle and Terabyte datasets. These datasets comprise 13 dense and 26 categorical features, with the Kaggle dataset consisting of around 45 million samples over 7 days, and the Terabyte dataset containing about 4 billion samples over 24 days.
+
+We ran the Kaggle dataset experiments on a single A100 GPU. For the Terabyte dataset experiments, we ran them on two A100 GPUs using model parallelism. This was done mainly for memory reasons. With this setup, training for one epoch on the Kaggle dataset takes around 4 hours, while training for one epoch on the Terabyte dataset takes around 4 days. There was not a big difference in training time between the algorithms we tested. In total we used about 11,000 GPU hours for all the experiments across 5 algorithms, 3 seeds, 10 epochs and 9 different parameter counts.
+
+### CCE Implementation Details
+
+In the previous section we gave pseudo code for "Sparse CCE for Least Squares" (Algorithm 2). In a general model, an embedding table can be seen as a data-structure with two procedures. Below we give pseudo-code for an embedding table with vocabulary \([d_{1}]\) and output dimension \(d_{2}\), using \(2kd_{2}\) parameters. The CCE algorithm is applied to each of \(c\) columns, as mentioned in Figure 2(f).
+
+The value \(c=4\) was chosen to match Shi et al. (2020), but larger values are generally better, as long as the \(h_{i}\) functions don't become too expensive to store. See Appendix E. The random hash functions \(h^{}_{i}\) are very cheap to store using universal hashing. See Appendix D. The number of calls to Cluster was determined by grid search. See Appendix F for the effect of more or less clustering.
+
+   Method & Dataset & Epochs & Embedding Compression \\  CCE (This Paper) & Criteo Kaggle & \( 10\) & \(8,\!500\) \\ CE with Concatenation & Criteo Kaggle & \( 10\) & \(3,\!800\) \\ The Hashing Trick & Criteo Kaggle & \( 10\) & \(4,\!600\) \\ Deep Hash Embeddings & Criteo Kaggle & \( 10\) & \(1,\!300\) \\  CCE (This Paper) & Criteo Kaggle & 1 & \(212\) \\ CE with Concatenation & Criteo Kaggle & 1 & \(127-155\) \\ The Hashing Trick & Criteo Kaggle & 1 & \(78-122\) \\ Deep Hash Embeddings & Criteo Kaggle & 1 & \(7-25\) \\  CCE (This Paper) & Criteo TB & 1 & \(101\) \\ CE with Concatenation & Criteo TB & 1 & \(25-48\) \\ The Hashing Trick & Criteo TB & 1 & \(23-32\) \\ Deep Hash Embeddings & Criteo TB & 1 & \(2-6\) \\   
+
+Table 1: **Memory Reduction Rates Across all Datasets.** For each algorithm, dataset and epoch limit we measured the necessary number of parameters to reach baseline BCE. The compression ratios with ranges are estimated using degree 1 and 2 polynomial extrapolation. We can compare these results with reported compression rates from Desai et al. (2022) (ROBE) which gets \(1000\) with multi epoch training; (Yin et al., 2021) (Tensor Train) which reports a \(112\) reduction at 1 epoch on Kaggle; and Yin et al. (2021) which reports a \(16\) reduction at 1 epoch with “Mixed Dimension methods” on Kaggle.
+
+```
+1:class CCE:
+2:method Initialize:
+3:for\(i=1\) to \(c\)do:
+4:\(h_{i},h_{i}^{}\) i.i.d. \(\) random functions from \([d_{1}]\) to \([k]\)\(\)\(H\) in Algorithm 2
+5:\(M_{i},M_{i}^{}\) i.i.d. \( N(0,1)^{k d_{2}/c}\)
+6:
+7:method GetEmbedding(\(id\)):
+8:return concat(\(M_{i}[h_{i}(id)]+M_{i}^{}[h_{i}^{}(id)]\) for \(i=1\) to \(c\))
+9:
+10:method Cluster(\(items\)):
+11:for\(i=1\) to \(c\)do:
+12:\(T[M_{i}[h_{i}(id)]+M_{i}^{}[h_{i}^{}(id)]id[d_{1}]]\)\(\) See discussion below
+13: centroids, assignments \(\) K-Means(\(T\))\(\) Find \(k\) clusters and assign \(T\) to them
+14:\(h_{i}\) assignments
+15:\(M_{i}\) centroids
+16:\(h_{i}^{}\) random function from \([d_{1}]\) to \([k]\)
+17:\(M_{i}^{} 0^{k d_{2}/c}\) ```
+
+**Algorithm 3** Clustered Compositional Embeddings with \(c\) columns and \(2k\) rows
+
+In line 12 we likely don't want to actually compute the embedding for every id in the vocabulary, but instead use mini batch K-Means with oracle access to the embedding table. In practice we follow the suggestion from FAISS K-means(Johnson et al., 2019) and just sample \(256k\) ids from \([d_{1}]\) and run K-means only for this subset. The assignments from \(id\) to nearest cluster center are easy to compute for the full vocabulary after running K-means. The exact number of samples per cluster didn't have a big impact on the final performance of CCE.
+
+## 5 Conclusion
+
+We have shown the feasibility of compressing embedding tables at training time using clustering. Our method, CCE, outperforms the state of the art on the largest available recommendation data sets. While there is still work to be done in expanding our theoretical understanding and testing the method in more situations, we believe this is an exciting new paradigm for dynamic sparsity in neural networks and recommender systems in particular.
+
+Previous studies have presented diverging views regarding the feasibility of compressing embedding tables. Our belief is that Figure 3(a), Figure 3(b), and Figure 3(c) shed light on these discrepancies. At standard learning rates and with one epoch of training, it's challenging to make significant improvements over the DLRM baseline, corroborating the findings of Naumov et al. (2019). However, upon training until convergence, it's possible to achieve parity with the baseline using a thousand times fewer parameters than typically employed, even with the straightforward application of the hashing trick. Nevertheless, in the realm of practical recommendation systems, training to convergence isn't a common practice. Our experiment, as illustrated in Figure 3(a), proposes a potential reason: an excessive size of embedding tables may lead to overfitting for most methods. This revelation is startling, given the prevailing belief that "bigger is always better" and that ideal scenarios should allow each concept to have its private embedding vectors. We contend that these experimental outcomes highlight the necessity for further research into overfitting within DLRM-style models.
+
+In this paper we analyzed only the plain versions of each algorithm. There are a number of practical and theoretical improvements one may add. All methods are naturally compatible with float16 and float8 reduced or mixed precision. The averaging of multiple embeddings may even help smooth out some errors. It is also natural to consider pruning the vocabularies. In particular in an offline setting we may remove very rare values, or give them a smaller weight in the clustering an averaging. However, in an online setting this kind of pruning is harder to do, and it is easier to rely on hash collisions and SGD to ignore the unimportant values. In our experiments we used 27 embedding tables, one for each categorical feature. A natural compression idea is to map all features to the same embedding table (after making sure values don't collide between features.) We didn't experiment with this, but it potentially could reduce the need for tuning embedding table sizes separately. A later paper by Coleman et al. (2023) report good results with this method. For things we tried, but didn't work, see Appendix A.

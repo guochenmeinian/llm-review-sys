@@ -1,0 +1,211 @@
+# MRConv: Reparameterized Multi-Resolution
+
+Convolutions for Long Sequence Modelling
+
+ Harry Jake Cunningham
+
+University College London
+
+&Giorgio Giannone
+
+University College London
+
+Correspondence to jake.cunningham.21@ucl.ac.uk
+
+Work done at University College London.
+
+Mingtian Zhang
+
+University College London
+
+&Marc Peter Deisenroth
+
+University College London
+
+###### Abstract
+
+Global convolutions have shown increasing promise as powerful general-purpose sequence models. However, training long convolutions is challenging, and kernel parameterizations must be able to learn long-range dependencies without overfitting. This work introduces reparameterized multi-resolution convolutions (MRConv), a novel approach to parameterizing global convolutional kernels for long-sequence modelling. By leveraging multi-resolution convolutions, incorporating structural reparameterization and introducing learnable kernel decay, MRConv learns expressive long-range kernels that perform well across various data modalities. Our experiments demonstrate state-of-the-art performance on the Long Range Arena, Sequential CIFAR, and Speech Commands tasks among convolution models and linear-time transformers. Moreover, we report improved performance on ImageNet classification by replacing 2D convolutions with 1D MRConv layers.
+
+## 1 Introduction
+
+Modelling sequences with long-range dependencies is critical for solving tasks such as time-series forecasting, speech recognition and language modelling. Numerous deep learning models have been designed to address this challenge by aggregating information across long contexts, including recurrent neural networks (RNNs) , convolutional neural networks (CNNs) , and Transformers . Despite significant progress, these models still struggle to effectively model long sequences due to training instabilities, inadequate inductive biases to prioritize important contextual information and prohibitive computational complexities.
+
+Recently, State Space Models (SSMs)  have demonstrated their ability to model extremely long sequences. SSMs corresponding to a linear time-invariant (LTI) system, can be efficiently implemented using a global depthwise convolution. The convolution kernel is parameterized according to the HiPPO framework by initializing specially constructed state matrices . However, despite their success, SSMs are complex models that rely on sophisticated mathematics and linear algebra to compute the convolution kernel, which for S4  and S4D  becomes a bottleneck for the faster downstream convolution.
+
+Inspired by their success and equivalence to global convolutions, several authors have aimed to reduce the complexity of SSMs by _parameterizing long convolution kernels directly_. In general, explicitly parameterized long convolution kernels are extremely difficult to train and areprone to overfitting, resulting in a significant performance drop compared to SSMs. To ease training, solutions to the parameterization problem have largely focused on: 1) low-rank approximations to the convolutional kernel through implicit neural representations , the composition of multi-resolution sub-kernels , or regularization  and 2) a decaying kernel structure such that weights closer to the input are larger than ones further away .
+
+In this work, we introduce reparameterized multi-resolution convolutions (MRConv), a method for parameterizing global convolutional kernels for long-sequence modelling, that simplifies, outperforms, and is more efficient than SSMs. Building on previous work, we focus our attention on **structured multi-resolution sub-kernels, low-rank kernel parameterizations** and **learnable kernel decay**. We adopt the multi-resolution approach introduced by SGConv , constructing large kernels as the sum of smaller sub-kernels of increasing length but fixed numbers of parameters. To improve performance we use ideas from computer vision, namely _structural reparameterization_. Specifically, to diversify optimization we train each sub-kernel in parallel, summing their activations after batch normalization, before merging all parameters into a single convolution at inference. We also explore several different low-rank kernel parameterizations and how these can be linearly combined during training to learn expressive long-range kernels that perform well across a wide range of data modalities.
+
+Our contributions are summarized as follows:
+
+* Inspired by SGConv , our MRConv structure constructs global kernels as the learnable combination of low-rank sub-kernels of increasing length but equal numbers of parameters, each designed to model the input at a different resolution and protect from overfitting.
+* MRConv uses a novel reparameterization scheme, allowing each sub-kernel to be trained in parallel, utilizing batch normalization and linear scaling to learn the kernel decay rate, before merging them into a single global convolution at inference.
+* We demonstrate that MRConv achieves **state of the art performance** among attention-free models and linear-time Transformers across various data modalities on Long Range Arena, sCIFAR, Speech Commands and ImageNet, whilst also improving efficiency.
+
+## 2 Background
+
+State Space ModelsWe consider discretized, linear time-invariant (LTI) state-space models (SSMs) of the form
+
+\[x_{t} =x_{t-1}+u_{t}\] (1) \[y_{t} =x_{t}+u_{t},\] (2)
+
+where \(x_{t}^{D}\) is the hidden state at time \(t=1,,L\), \(u_{t}\) is a scalar input signal, and \(y\) is an output signal. Essential to the success of SSMs is initialization of the system matrices \(^{D D}\), \(^{D 1}\), \(^{1 D}\), and \(^{1 1}\) according to the HiPPO theory that projects the input sequence onto a set of orthogonal polynomials equipped with exponential decay .
+
+Unrolling the recursion over the length of the time horizon \(L\), the output \(y^{L}\) can equivalently be computed as a 1D causal convolution, avoiding computation of the hidden states, which can become very memory intensive, as
+
+\[ =[,,,^{L-1} ]\] (3) \[y = u+u,\] (4)
+
+where \(u=[u_{1},,u_{L}]^{T}^{L}\). Computing the convolutional kernel for S4 and S4D scales as \(((L+D)^{2}(L+D))\) using fast Cauchy and Vandermonde matrix-vector products, although this bottlenecks the faster \((L L)\) convolution implemented using Fast Fourier Transforms (FFTs).
+
+Convolutional Models for Sequence ModellingInterpreting SSMs as a global convolution implicitly parameterized by the system matrices, we can also consider alternative implicit parameterizations. In general, implicit parameterizations define kernel values \([t]\) as a function of the filter locations \(t=1,,L\),
+
+\[[t]=^{-t}f_{}(t),\] (5)where \(f_{}\) is a parametric function with parameters \( L\) and \(\) is some decay constant. Several parameterizations of \(f_{}\) have been proposed including MLPs [40; 27; 38] and linear interpolation . The low-rank structure of implicit parameterizations, coupled with exponential decay has proven a successful inductive bias for long-sequence modelling, ensuring the magnitude of kernel weights is greater for near information and improving generalization by preventing overfitting on irrelevant long-range dependencies.
+
+## 3 Reparameterized Multi-Resolution Convolutions
+
+We propose MRConv, a set of depthwise separable multi-resolution convolutions designed for long-sequence modelling. Addressing the need for implicit kernel parameterizations with a decay structure, we construct global kernels as the _learnable summation_ of normalized multi-resolution sub-kernels of increasing length but with a constant number of parameters, using more parameters to aggregate local information. Further, we use _causal structural reparameterization_ to train individual sub-kernels in parallel for diverse optimization and improved model performance, before combining them into a single kernel for efficient inference. See Figure 1 for an overview of the MRConv block.
+
+In Section 3.1, we define 1D causal structural reparameterization and in Section 3.2 we introduce our reparameterization scheme for merging multi-resolution convolutions. In Section 3.3, we introduce 3 kernel parameterizations for generating low-rank kernels with fixed numbers of parameters but variable lengths.
+
+### Causal Structural Reparameterization
+
+Our multi-resolution strucutre is based on the linearity of the convolution operator, which allows us to merge multiple branches of causal convolutions into a single convolution as
+
+\[y[t]=_{n=0}^{N-1}(u*k_{n})[t]=(u*(_{n=0}^{N-1}k_{n}) )[t]=(u*k_{rep})[t],\] (6)
+
+where \(k_{n}\) is the convolution kernel of the \(n\)th branch and \(k_{rep}=_{n=0}^{N-1}k_{n}\) is the _reparameterized kernel_ computed by summing all \(n\) kernels together. In order to reparameterize causal convolution kernels of different sizes, we must ensure that the kernels are correctly aligned spatially before summing them, such that \(k_{n}[]\) for all kernels acts on the input at \(u[t-]\). To do this we pad shorter kernels of length \(l\) to the right with zeros such that the length of the kernel is the length of the longest
+
+Figure 1: **Left**: The MRConv block is composed of a MRConv layer, GELU activation, pointwise linear layer, to mix the channels, and a gated linear unit. **Middle**: During training, the MRConv layer processes the input using \(N\)_branches_ each with it’s own convolution kernel of increasing length and BatchNorm parameters. The output of the layer is given by pointwise multiplying each branch by \(_{i}\) and summing. **Right**: At inference the branches can be reparameterised into a single convolution.
+
+kernel \(L\) and then sum, such that
+
+\[k_{rep}=_{n=0}^{N-1}(k_{n},(0,L-l))=_{n=0}^{N-1}_{n},\] (7)
+
+where \(_{n}\) corresponds to the zero-padded version of \(k_{n}\). In this work, we consider two types of structural reparameterization: 1) _causal branch addition with batchnorms_ for combining causal convolutions of varying length, and 2) _causal branch addition with linear rescaling_ for combining causal convolutions of equal length.
+
+Causal Branch Addition with BatchNormWhen merging kernels of different lengths, normalization of each branch becomes crucial due to the impact of kernel size on the output statistics of convolutions with different length kernels. Hence, when constructing multi-resolution branches we use BatchNorm after each convolution to normalize the features, which can then be merged into the preceding convolution layer at inference via
+
+\[k_{rep}=_{0}(k_{0})}+_{1}(k_{1})},\] (8)
+
+where the lengths of the normalized kernels are adjusted according to equation 7.
+
+Causal Branch Addition with Linear RescalingWhen merging kernels of the same length normalization is unnecessary. In , the authors argue that the scaling factors of norm layers matter most as they diversify the optimization of different branches and instead propose replacing non-linear norm layers with linear scaling layers that can be reparameterized during training. We follow this advice for merging kernels of equal length as
+
+\[k_{rep}=_{0} k_{0}+_{1} k_{1}.\] (9)
+
+This reduces both memory and computational costs during training as all layers are now linear and hence kernels can be reparameterized during training.
+
+### Multi-Resolution Convolutions
+
+We now outline our reparameterization scheme as a means of training multi-resolution convolutions using branches that can be combined into a single convolution kernel for efficient inference. Let \(u^{D L}\) be a \(D\)-dimensional input sequence of length \(L\). We define the number of independent resolutions as \(N=_{2}(L/l_{0})+1\) where \(l_{0}\) is the size of the kernel at the first resolution. At each resolution \(i\), we define a kernel \(k_{i}\) of length \(l_{i}=l_{0}2^{i}\) for all \(i<N\). We denote the output of each convolution as \(c_{i}=(k_{i}*u)^{D L}\). Following each convolution, we pass the output through a BatchNorm, \(_{i}=_{i}(c_{i})\), where each resolution has its own set of BN parameters. We define the set of normalized multi-resolution convolution outputs \(}^{N D L}\) as,
+
+\[}=[_{0}(k_{0}*u),_{1}(k_{1}*u),, _{N-1}(k_{N-1}*u)].\] (10)
+
+Given \(}\) we wish to combine the outputs to generate an output \(y\), ensuring the most relevant parts of the input are highlighted. The output \(y[t]^{D}\) at time step \(t\) is generated by computing a linear combination of the coefficients \(}[t]\) at time step \(t\) according to
+
+\[y[t]=^{T}}[t],\] (11)
+
+where \(^{N D}\) is a learnable parameter. Applying \(\) across the sequence length we define the output \(y^{D L}\) as the summation
+
+\[y=_{0}_{0}(k_{0}*u)+_{1}_{1}(k_{1}*u)++ _{N-1}_{N-1}(k_{N-1}*u).\] (12)
+
+Further, applying our reparameterization scheme at inference, we can rewrite the above process as a single convolution by zero-padding shorter kernels and merging the BN parameters into each convolution as
+
+\[y=u*(_{0}_{0}(k_{0})}+_{1} _{1}(k_{1})}++_{N-1}_{0}(k_{N-1})})=u*k_{rep},\] (13)
+
+eliminating the extra memory and computational cost of training with extra convolutions.
+
+### Low-Rank Kernel Parameterization
+
+Our multi-resolution framework is general and agnostic to the parameterization of the kernels at each resolution. In this work, we consider 3 different parameterizations:
+
+Dilated KernelsInspired by wavelets, dilated convolutions are a variation on standard convolutional filters where \(p\) many zeros are padded between the elements of the kernel, where \(p+1\) is known as the dilation factor. Formally, dilated convolutions are defined as
+
+\[y[t]=(u*k_{dilated})[t]=_{=0}^{l-1}k[]u[t-p].\] (14)
+
+They are a parameter-efficient way of increasing the receptive field of a convolution by detaching the length of the kernel from the number of parameters.
+
+Fourier KernelsInstead of parameterizing kernels in the time domain \(k^{D L}\), we instead parameterize them as complex valued kernels \(^{D L}\) in the Fourier domain. To get \(k\) we simply take an inverse Fourier transform of \(\), \(k=^{-1}[]\). We can also generate long low-rank kernels by only parameterizing a small number \(m\) of low-frequency Fourier modes. In practice we use FFTs and zero-padding to achieve this, at a cost of \((L L)\), which is cheaper than computing the kernel in the SSM formulation,
+
+\[k_{fourier}[t]=[(,L-m)])[t].\] (15)
+
+Sparse KernelsSimilar to dilated kernels we also propose sparse kernels, where, instead of regularly spacing kernel elements at a set distance apart, we randomly sample their positions across the sequence length, which we then fix during training and inference. Given a set of kernel value locations \(\) we define sparse kernels as
+
+\[k_{sparse}[t]=_{t} k_{t},\] (16)
+
+where \(_{t}\) is the Kronecker delta, which equals 1 if \(t\) is in the set \(\) and \(0\) otherwise, and \(k_{t}\) represents the non-zero kernel value at position \(t\).
+
+### FFT Convolutions
+
+Other than dilated kernel convolutions, which can be computed in \((kL)\) using the implicit GEMM algorithm , for all kernels we compute the depthwise convolution using FFTs reducing the
+
+Figure 2: **Multi-resolution structural reparameterization.** During _training_, we parameterize each branch with a kernel of increasing length but fixed number of parameters. For the Fourier kernels, we use only a handful of low-frequency modes and for the dilated kernels we increase the dilation factor. At _inference_, we combine the kernels into a single kernel by merging the BN parameters with the kernel parameters and performing a learnt weighted summation.
+
+computation to \((L L)\) time complexity. We also make use of a number of highly optimized FFT convolution implementations, which further speeds up our work and reduces memory [17; 18].
+
+**Remark**.: _The time complexity of a multi-resolution convolution on a sequence of length \(L\) is at most \((((L/k_{0})+1)L L)\) during training and \((L L)\) during inference where each convolution is performed in the Fourier domain._
+
+## 4 Related Work
+
+Several prior works have used multi-resolution convolutions for general sequence modelling. SGConv  is most similar to our approach, using a weaker form of reparameterization, by concatenating smaller low-rank sub-kernels to construct long convolution kernels. Each sub-kernel is implicitly defined by linearly interpolating dilated kernel values and a fixed kernel decay is used. We expand considerably upon their work, exploring several new reparameterization schemes, introduce improved kernel parameterizations and add learnable kernel decay.
+
+MultiresNet  uses dilated convolutions with shared weights to parameterize a learnable wavelet transform and also learns a linear combination of outputs similar to our method. However, they don't consider reparameterizing their model into a single global convolution for efficient inference. Ding et al.  design a set of structurally parameterized kernels also using dilated kernels and parallel branches during training, however they only consider small kernel sizes and doesn't consider any kernel decay.
+
+Recently CHELA  proposed to use short and long convolutions placed sequentially in conjunction with self-attention. However, in their work, in instances where they place a non-linear activation function between the convolutions, the non-linearity restricts the ability to reparameterize both convolutions into a single kernel.
+
+## 5 Experiments
+
+We now evaluate the empirical performance of MRConv against similar baseline methods on long sequence modelling tasks. We test 3 different kernel parameterizations: 1) dilated kernels, 2) Fourier kernels and 3) Fourier + sparse kernels, which we reparameterize during training using linear rescaling (see Equation 9). We select model hyperparameters to ensure similar computational complexities to comparable models such as S4 and SGConv. Our results show that MRConv is a highly effective and efficient sequence modeller, achieving SoTA performance on LRA, scIFAR and Speech Commands, whilst being more efficient than SSMs, such as S4, and linear-time transformers.
+
+### Long Range Arena
+
+The Long Range Arena (LRA) benchmark  evaluates the performance of sequence models on long-range modelling tasks on a wide range of data modalities and sequence lengths from 1,024 to 16,000. For all LRA tasks, we use the standard S4 block (see Figure 1) and use MRConv as a drop-in replacement for the SSM layer. We train two model variants: 1) _Base_ has similar complexity and parameters to existing convolutional and SSM baselines and 2) _Large_ where we scale the model with increased width or depth to match the computational budget set by more expensive quadratic attention baselines (see Table (b)b).
+
+Table 1 compares MRConv to other baseline methods. Treating the kernel parameterization as a model hyperparameter and selecting the model with the highest validation accuracy, MRConv-_Base_ achieves the highest average score among sub-quadratic complexity models including S5, SGConv and modern linear-time transformer architectures such as MEGA-Chunk. Further, MRConv-_Large_ matches the performance of more computationally expensive quadratic transformers whilst being much faster at inference due to reparameterization (see Table (b)b). We conduct a series of ablation studies to assess the effectiveness of our kernel parameterizations, reparameterization scheme, and the importance of learnable decay. Additional implementation details can be found in Appendix D.3.
+
+Kernel ParameterizationTable 1 displays the LRA results for each proposed kernel parameterization. Dilated kernels perform exceptionally well on the Image task, outperforming all other non-input-dependent models by 1.2%. However, on information-dense tasks such as ListOps, Fourierkernels perform better, as the sparse dilated pattern is prone to skipping important tokens. Fourier kernels perform best on average and are the only model that achieves better than random guessing on Path-X, where sparse and dilated kernels struggle due to their sparsity. The combination of sparse and Fourier kernels is also effective on natural data and performs well on Pathfinder but can lead to overfitting on discrete data modalities, such as ListOps.
+
+MRConv DesignTable 2 shows that all of our structural additions improve performance over dense kernels by 13.2% and 6.4% on the ListOps and Image tasks. We found that BatchNorms are crucial for learning the linear combination of each multi-resolution convolution, resulting in an improvement in accuracy of 5.35% and 2.36% on both tasks than without them. Interestingly, parameterizing our multi-resolution architecture with dense kernels reduces overfitting, improving the test accuracy by 3.90% and 3.75%, despite having more parameters. Path-X was the only task where we found learning the combination of multi-resolution convolutions did not improve performance and we provide extra implementation details and ablations in Appendix D.3.3.
+
+Resolution AnalysisFigure 2(b) shows the normalized magnitude of the weight \(_{i}\) for each kernel \(k_{i}\) at different depths of the model after training on ListOps and CIFAR datasets. The resulting weight distribution shows that early layers learn short high-frequency kernels for local features, while deeper layers learn an even distribution across a range of longer kernels. On CIFAR, deeper layers learn low-frequency global kernels, aligning with existing observations on larger models . These non-stationary filter characteristics with depth emphasise the need for effective learnable kernel decay, which is difficult to achieve with hand-tuned initializations such as in SGConv.
+
+### Pixel-Level 1D Image Classification
+
+Next, we evaluate MRConv on the sequential CIFAR (sCIFAR) image classification task, where images are flattened to a 1D sequence of pixels. This is a challenging sequence modelling task as the model
+
+   Model & ListOps & Text & Retrieval & Image & Pathfinder & Path-X & Avg. \\ (Input length) & (2,048) & (4,096) & (4,000) & (1,024) & (1,024) & (16,384) & \\  Transformer & 36.37 & 64.27 & 57.46 & 42.44 & 71.40 & ✗ & 53.66 \\ Transformer + SPT & 59.15 & 88.81 & 90.38 & 76.00 & 88.49 & 88.05 & 81.81 \\   \\ BST & 61.49 & 87.63 & 90.51 & **91.07** & 95.75 & 95.28 & 86.96 \\ SPADE-Chunk & 60.50 & **90.69** & 91.17 & 88.22 & 96.23 & 97.60 & 87.40 \\ MEGA-Chunk & 58.76 & 90.19 & 90.97 & 85.80 & 94.41 & 93.81 & 85.66 \\   \\ S4D-LegS & 60.47 & 86.18 & 89.46 & 88.19 & 93.06 & 91.95 & 84.89 \\ S4-LegS & 59.60 & 86.82 & 90.90 & 88.65 & 94.20 & 96.35 & 86.09 \\ Liquid-S4\({}^{*}\) & **62.75** & 89.02 & 91.20 & 89.50 & 94.8 & 96.66 & 87.32 \\ S5 & 62.15 & 89.31 & 91.40 & 88.00 & 95.33 & 98.58 & 87.46 \\   \\ CCNN & 43.60 & 84.08 & - & 88.90 & 91.51 & ✗ & - \\ Long Conv & 62.2 & 89.6 & 91.3 & 87.0 & 93.2 & 96.0 & 86.6 \\ SGConv & 61.45 & 89.20 & 91.11 & 87.97 & 95.46 & 97.83 & 87.17 \\   \\ MRConv-\(B\), Dilated & 60.90 & 86.38 & 88.30 & 90.37 & 94.42 & ✗ & 78.40 \\ MRConv-\(B\), Fourier & 62.40 & 89.26 & 91.44 & 88.55 & 95.03 & 97.82 & 87.42 \\ MRConv-\(B\), Fourier+Sparse & 62.10 & 89.26 & 91.35 & 89.07 & 95.55 & ✗ & 79.56 \\ MRConv-\(L\), Dilated & 61.25 & 88.36 & 89.78 & 90.55 & 95.22 & ✗ & 79.19 \\ MRConv-\(L\), Fourier & 62.45 & 89.40 & **91.48** & 89.30 & 95.75 & **98.65** & 87.84 \\ MRConv-\(L\), Fourier+Sparse & 61.65 & 89.42 & 91.35 & 89.15 & **96.64** & ✗ & 79.70 \\   \\ MRConv-\(B\) & 62.40 & 89.26 & 91.44 & 90.37 & 95.55 & 97.82 & 87.81 \\ MRConv-\(L\) & 62.45 & 89.42 & **91.48** & 90.55 & **96.64** & **98.65** & **88.20** \\   
+
+Table 1: **Test accuracy on the Long Range Arena Benchmarks**. We follow the standard training procedures introduced in . Bold scores indicate the highest performing model on a given task and underlined the second best performing. ✗ indicates a model did not do better than random guessing and - that a result was not available. In this table we only include results from other non-input-dependent models.
+
+must be able to capture pixel-level relationships at different scales, as pixels close together in 2D space can be far apart in its flattened sequence representation.
+
+Table 2 reports the performance of MRConv compared to other baseline methods. On sCIFAR MRConv with dilated kernels significantly improves test accuracy upon the previous best model, MultiresNet, by 1.1%. Further, MRConv with dilated kernels is very parameter efficient using 10 layers and 5.7M parameters, in contrast to S4 which uses 6 layers and 7.9M parameters . We also note a significant performance gap between Fourier and dilated parameterizations. We hypothesise that dilated convolutions enhance the ability of long kernels to focus on long-range sparse patterns (i.e. relationships between pixels far apart might be more important than pixels closer together), which is well suited for flattened image data which has a high correlation between neighboring pixels.
+
+### Raw Speech Classification
+
+The Speech Commands (SC) dataset  contains 1s sound recordings, sampled at 16,000 Hz, of 35 spoken words in English. The task is to classify the spoken word from its sampled waveform. We also test zero-shot classification at a lower sampling rate of 8,000 Hz to test the continuous-time parameterization of each model.
+
+Table 2 reports the results. Both the dilated and Fourier kernel parameterizations perform well, especially MRConv equipped with Fourier kernels, which outperforms all baseline models. On the zero-shot task, MRConv with Fourier kernels also performs the best. By parameterizing the kernels in the Fourier domain with a set of low-frequency modes, we ensure that the kernels are band-limited. As a result, we can downsample each kernel whilst avoiding the effects of aliasing, improving zero-shot testing performance over alternative continuous formulations, such as SGConv, which don't have any anti-aliasing guarantees. It is important to note that dilated kernels and sparse kernels are not continuous parameterizations and are therefore not suitable models for performing zero-shot changes in input resolution.
+
+### ImageNet Classification
+
+To evaluate MRConv on a large-scale task, we employ the ImageNet classification benchmark , which consists of 1.28 million high-resolution training images of size 224\(\)224 and 1000 classes. As a base architecture, we choose ConvNeXt , a fully convolutional model that enhances the ResNet architecture by incorporating elements from Vision Transformers. To assess MRConv, we
+
+    &  &  \\  & Params & Accuracy & Change & Params & Accuracy & Change \\  Dense kernel & 2.4M & 49.25 & - & 6.3M & 82.90 & - \\ + Multiresolution & 4.5M & 53.15 & +3.90 & 9.4M & 86.65 & +3.75 \\ + Fourier kernel & 307K & 57.05 & +7.80 & 3.8M & 86.19 & +3.29 \\ + BatchNorm & 332K & 62.40 & +13.15 & 3.8M & 88.55 & +5.65 \\ + 2x Depth (MRConv, Fourier) & 661K & **62.45** & +13.20 & 7.7M & **89.30** & +6.40 \\   
+
+Table 2: **MRConv design ablations**. Effect of MRConv modifications on ListOps and Image tasks from LRA. For reference we note that _S4-LegS_ uses 815K and 3.6M parameters and _Liquid-S4_ uses 333K and 11M parmeters for each task respectively.
+
+Figure 3: **Left**: ImageNet Top-1 Acc. vs. Throughput. **Right**: Distribution of \(\) norms for each depth for MRConv trained on ListOps and CIFAR respectively. Changing composition of kernels highlights how the convolution kernels are non-stationary with respect to depth.
+
+replace the standard 7x7 2D convolutional layers in each block with 1D MRConv blocks, flattening the 2D features in each layer to 1D sequences. We denote our model MRConvNeXt and use the same hyperparameter settings for each Tiny/Small/Base model from ConvNeXt without any changes.
+
+Comparing MRConvNeXt with ConvNeXt and SGConvNeXt , another 1D convolution model, MRConvNeXt equipped with Fourier + Sparse kernels achieves SoTA performance, outperforming ConvNeXt at every model size. As highlighted by , 1D FFT convolutions use fewer FLOPs than standard convolutions, although empirically, the throughput decreases. Using optimized CUDA kernels for 1D FFT convolutions, we close the gap between theoretical and empirical throughput as shown in Figure 2(a), comfortably outperforming Swin  a powerful vision transformer, and improving the throughput-accuracy frontier when compared to standard ConvNeXt.
+
+Table 4: **Left**: Top-1 test accuracy on ImageNet classification . **Right**: Inference time speed comparison between _Base_ and _Large_ versions of MRConv and linear and quadratic attention versions of _MEGA_. We denote _Rep_ as reparameterized models. By scaling MRConv up with more parameters we match the performance of MEGA with quadratic attention, whilst also being more efficient.
+
+Table 3: **Left**: Test accuracy on sCIFAR pixel-level 1D image classification. **Right**: Test accuracy on 35-way Speech Commands classification task . Each model is trained on one-second 16kHz audio waveforms and then tested at 16kHz and 0-shot at 8kHz.
+
+## 6 Discussion & Conclusion
+
+In this work, we introduced MRConv, a simple yet effective method for parameterizing long-convolution kernels. We develop three kernel parameterizations and demonstrate through experimentation how each approach is suited to different data modalities. Further, we show the importance of having a learnable decay due to differing model characteristics with depth. Finally, we highlight MRConv's leading performance on LRA, cCIFAR, Speech Commands and ImageNet classification.
+
+However, our model is not without its limitations. Training with parallel branches requires computing many more convolutions, increasing memory usage and slowing down training. Currently, parallel training is necessary due to the presence of batch normalization, which is non-linear during training. For future work, we aim to remove batch normalization, potentially through initialization  or linear rescaling (Equation 9), allowing for reparameterization during training, significantly reducing training costs. Our model also lacks input dependency. Whilst this does not affect performance on natural data, such as images and audio, on discrete information-dense sequences, such as text, linear-time transformers still outperform MRConv (see Table 1). For future work, we propose introducing input dependency into our model, using either Hyena recurrences  or by combining with self-attention similar to MEGA . Finally, unlike SSMs, our model doesn't support fast autoregressive inference by construction. However, we note an equivalence between kernels constructed as the sum of Fourier basis functions and SSMs has already been established . We propose converting MRConv equipped with Fourier kernels into a multi-resolution SSM as future work.

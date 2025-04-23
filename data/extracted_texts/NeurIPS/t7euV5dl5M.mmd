@@ -1,0 +1,253 @@
+# Approximation-Aware Bayesian Optimization
+
+Natalie Maus
+
+University of Pennsylvania
+
+nmaus@seas.upenn.edu
+
+&Kyurae Kim
+
+University of Pennsylvania
+
+**Geoff Pleiss**
+
+University of British Columbia
+
+Vector Institute
+
+&David Eriksson
+
+Meta&John P. Cunningham
+
+Columbia University&Jacob R. Gardner
+
+University of Pennsylvania
+
+###### Abstract
+
+High-dimensional Bayesian optimization (BO) tasks such as molecular design often require >10,000 function evaluations before obtaining meaningful results. While methods like sparse variational Gaussian processes (SVGPs) reduce computational requirements in these settings, the underlying approximations result in suboptimal data acquisitions that slow the progress of optimization. In this paper we modify SVGPs to better align with the goals of BO: targeting informed data acquisition rather than global posterior fidelity. Using the framework of utility-calibrated variational inference, we unify GP approximation and data acquisition into a joint optimization problem, thereby ensuring optimal decisions under a limited computational budget. Our approach can be used with any decision-theoretic acquisition function and is readily compatible with trust region methods like TuRBO. We derive efficient joint objectives for the expected improvement and knowledge gradient acquisition functions for standard and batch BO. Our approach outperforms standard SVGPs on high-dimensional benchmark tasks in control and molecular design.
+
+## 1 Introduction
+
+Bayesian optimization (BO; Frazier, 2018; Garnett, 2023; Jones et al., 1998; Mockus, 1982; Shahriari et al., 2015) casts optimization as a sequential decision-making problem. Many recent successes of BO have involved complex and high-dimensional problems. In contrast to "classic" low-dimensional BO problems--where expensive black-box function evaluations far exceeded computational costs--these modern problems necessitate tens of thousands of function evaluations, and it is often the complexity and dimensionality of the search space that makes optimization challenging, rather than a limited evaluation budget (Eriksson et al., 2019; Griffiths and Hernandez-Lobato, 2020; Maus et al., 2022, 2023; Stanton et al., 2022). Because of these scenarios, BO is entering a regime where computational costs are becoming a primary bottleneck (Maddox et al., 2021; Maus et al., 2023; Moss et al., 2023; Vakili et al., 2021), as the Gaussian process (GP; Rasmussen and Williams, 2005) surrogate models that underpin most of Bayesian optimization scale cubically with the number of observations.
+
+In this new regime, we require scalable GP approximations, an area that has made tremendous progress over the last decade. In particular, sparse variational Gaussian processes (SVGP; Hensman et al., 2013; Quinonero-Candela and Rasmussen, 2005; Titsias, 2009) have seen an increase in use (Griffiths and Hernandez-Lobato, 2020; Maddox et al., 2021; Maus et al., 2022, 2023; Stanton et al., 2022; Tripp et al., 2020; Vakili et al., 2021), but many challenges remain to effectively deploy SVGPs for large-budget BO. In particular, the standard SVGP training objective is not aligned with the goals of black-box optimization. SVGPs construct an inducing point approximation that maximizes the standard variational evidence lower bound (ELBO; Jordan et al., 1999), yielding a posterior approximation \(q^{*}(f)\) that models all observed data (Matthews et al., 2016; Moss et al., 2023). However, the optimal posterior approximation \(q^{*}\) is suboptimal for the decision-making tasks involvedin BO (Lacoste-Julien et al., 2011). In BO, we do not care about posterior fidelity at the majority of prior observations; rather, we only care about the fidelity of downstream functions involving the posterior, such as the expected utility. To illustrate this point intuitively, consider using the common expected improvement (EI; Jones et al., 1998) acquisition function for selecting new observations. Maximizing the ELBO might result in a posterior approximation that maintains fidelity for training examples in regions of virtually zero EI, thus wasting "approximation budget."
+
+To solve this problem, we focus on the deep connections between statistical decision theory (Robert, 2001; Wasserman, 2013, SS12) and Bayesian optimization (Garnett, 2023, SS6-7), where acquisition maximization can be viewed as maximizing posterior-expected utility. Following this perspective, we leverage the utility-calibrated approximate inference framework (Jaiswal et al., 2020, 2023; Lacoste-Julien et al., 2011), and solve the aforementioned problem through a variational bound (Blei et al., 2017; Jordan et al., 1999)-the (log) **expected utility lower bound (EULBO)**--a joint function of the decision (the BO query) and the posterior approximation (the SVGP). When optimized jointly, the EULBO automatically yields the approximately optimal decision through the minorize-maximize principle (Lange, 2016). The EULBO is reminiscent of the standard variational ELBO (Jordan et al., 1999), and can indeed be viewed as a standard ELBO for a generalized Bayesian inference problem (Bissiri et al., 2016; Knoblauch et al., 2022), where we seek to approximate the _utility-weighted_ posterior. This work represents the first application of utility-calibrated approximate inference towards BO despite its inherent connection with utility maximization.
+
+The benefits of our proposed approach are visualized in Fig. 1. Furthermore, it can be applied to acquisition function that admits a decision-theoretic interpretation, which includes the popular expected improvement (EI; Jones et al., 1998) and knowledge gradient (KG; Wu et al., 2017) acquisition functions, and is trivially compatible with local optimization techniques like TuRBO (Eriksson et al., 2019) for high-dimensional problems. We demonstrate that our joint SVGP/acquisition optimization approach yields significant improvements across numerous Bayesian optimization benchmarks. As an added benefit, our approach can simplify the implementation and reduce the computational burden of complex (decision-theoretic) acquisition functions like KG. We demonstrate a novel algorithm derived from our joint optimization approach for computing and optimizing the KG that expands recent work on one-shot KG (Balandat et al., 2020) and variational GP posterior refinement (Maddox et al., 2021).
+
+Overall, our contributions are summarized as follows:
+
+* We propose utility-calibrated variational inference of SVGPs in the context of large-budget BO.
+* We study this framework in two special cases using the utility functions of two common acquisition functions: EI and KG. For each, we derive tractable EULBO expressions that can be optimized.
+* For KG, we demonstrate that the computation of the EULBO takes only negligible additional work over computing the standard ELBO by leveraging an online variational update. Thus, as a byproduct of optimizing the EULBO, optimizing KG becomes comparable to the cost of the EI.
+* We extend this framework to be capable of running in batch mode, by introducing q-EULBO analogs of q-KG and q-EI as commonly used in practice (Wilson et al., 2018).
+* We demonstrate the effectiveness of our proposed method against standard SVGPs trained with ELBO maximization on high-dimensional benchmark tasks in control and molecular design, where the dimensionality and evaluation budget go up to 256 and 80k, respectively.
+
+## 2 Background
+
+Noisy Black-Box Optimization.Noisy black-box optimization refers to problems of the form: \(_{}\,F(),\) where \(^{d}\) is some compact domain, \(F:\) is some objective function, and we assume that only zeroth-order information of \(F\) is available. More formally, for some \(i_{>0}\), we assume that observations of the objective function \((_{i},_{i}=(_{i}))\) have been corrupted by independently and identically distributed (i.i.d.) Gaussian noise \((_{i}) F(_{i})+\), where \((0,_{}^{2})\). The noise variance \(_{}^{2}\) is also unknown.
+
+Bayesian optimization.Bayesian Optimization (BO) is and iterative approach to noisy black-box optimization that iterates the following steps: \(\) At each step \(t 0\), we use a set of observations \(_{t}=\{(_{i},_{i}=(_{i}) )\}_{i=1}^{n_{t}}\) of \(\) to fit a surrogate supervised model \(f\). Typically, \(\) is taken to be the sample space of a Gaussian process such that the function-valued posterior distribution \((f)\) forms a distribution over surrogate models at step \(t\).
+
+The posterior is then used to form a decision problem where we choose which point we should evaluate next, \(_{t+1}=_{}(_{t})\), by maximizing an acquisition function \(:\) as
+
+\[_{}(_{t})*{arg\,max} _{}\;\;(;_{t}).\] (1)
+
+After selecting \(_{t+1}\), \(\) is evaluated to obtain the new datapoint \((_{t+1},y_{t+1}=(_{t+1}))\). This is then added to the dataset, forming \(_{t+1}=_{t}(_{t+1},y_{t+1})\) to be used in the next iteration.
+
+Utility-Based Acquisition Functions.Many commonly used acquisition functions, including EI and KG, can be expressed as posterior-expected utility functions
+
+\[(;) u(,f;)(f)f,\] (2)
+
+where \((,f;): \) is some utility function associated with \(\)(Garnett, 2023, SS6-7). In statistical decision theory, posterior-expected utility maximization policies such as \(_{}\) are known as _Bayes policies_. These are important because, for a given utility function, they attain certain notions of statistical optimality such as Bayes optimality and admissibility (Robert, 2001, SS2.4; Wasserman, 2013, SS12). However, this only holds true if we can exactly compute Eq. (2) over the posterior. Once approximate inference is involved, making optimal Bayes decisions becomes challenging.
+
+Sparse Variational Gaussian Processes.While the \((n^{3})\) complexity of exact Gaussian process model selection and inference is not necessarily a roadblock in the traditional regression setting with 10,000-50,000 training examples, BO amplifies the scalability challenge by requiring us to sequentially train or update _many_ large scale GPs as we iteratively acquire more data.
+
+To address this, sparse variational GPs (SVGP; Hensman et al., 2013; Titsias, 2009) have become commonly used in high-throughput Bayesian optimization. SVGPs modify the original GP prior from \(p(f)\) to \(p(f)p()\), where we assume the latent function \(f\) is "induced" by a finite set of _inducing values_\(=(_{1},...,_{m})^{m}\) located at _inducing points_\(_{l}\) for \(i=1,...,m\). Inference is done through variational inference (Blei et al., 2017; Jordan et al., 1999), where the posterior of the inducing points is approximated using \(q_{}()=(;=(,))\) and that of the latent functions with \(q(f)=p(f)\). Here, the variational parameters \(\) and \(\) are defined as the learned mean and covariance of the variational distribution \(q_{}()\). It is standard practice to define \(=(,)\) so that \(\) can be used as shorthand to represent all of the trainable variational parameters. As is typical in the BO literature, we use the subscript \(\) to denote that the distribution denoted as \(q\) contains trainable parameters in \(\).
+
+For a positive definite kernel function \(k:_{>0}\), the resulting ELBO objective, which can be computed in a closed form (Hensman et al., 2013), is then
+
+\[_{}(;_{t}) _{q_{}(f)}[_{i=1}^{n_{t}}(y_ {i} f(_{i}))]-*{D}_{} (q_{}(),p()),\] (3)
+
+where \((y_{i} f(_{i}))=(y_{i} f( _{i}),_{})\) is a Gaussian likelihood. The marginal variational approximation can be computed as
+
+\[q_{}(f)= q_{}(f,)\,= p(f )\,q_{}()\,\]
+
+Figure 1: **(Left.) Fitting an SVGP model with only \(m=4\) inducing points sacrifices modeling areas of high EI (few data points at right) because the ELBO focuses only on global data approximation (left data) and is ignorant of the downstream decision making task. (Middle.) Because of this, (normalized) EI with the SVGP model peaks in an incorrect location relative to the exact posterior. (Right.) Updating the GP fit and selecting a candidate jointly using the EULBO (our method) results in candidate selection much closer to the exact model.**
+
+such that the point-wise function evaluation on some \(\) is
+
+\[q_{}(f())=(f();_{f}() _{}_{}^{-1},_{f}^{2}( )_{}+_{}^{ }_{}^{-1}_{}^{-1}_{ }),\] (4)
+
+with \(_{} k(,)-_{ }_{}^{-1}_{}^{}\), the vector \(_{}^{m}\) is formed as \([_{}]_{i}=k(_{i},)\), and the matrix \(_{}^{m m}\) is formed as \([_{}]_{i}=k(_{i},_{j})\). Additionally, the GP likelihood and kernel contain hyperparameters, which we denote as \(\), and we collectively denote the set of inducing point locations as \(=(_{1},...,_{m})^{m}\). We therefore denote the ELBO as \(_{}(,,;_{t})\).
+
+## 3 Approximation-Aware Bayesian Optimization
+
+When SVGPs are used in conjunction with BO (Maddox et al., 2021; Moss et al., 2023) at iteration \(t 0\), acquisition functions of the form of Eq.2 are naively approximated as
+
+\[(;) u(,f;_ {t})q_{}(f)f,\]
+
+where \(q_{}(f)\) is the approximate SVGP posterior given by Eq.4. The acquisition policy implied by this approximation contains two separate optimization problems:
+
+\[_{t+1}=*{arg\,max}_{} u(,f;_{t})q_{_{}^{*}}(f )f_{}^{*}= *{arg\,max}_{}_{} (;_{t}).\] (5)
+
+Treating these optimization problems separately creates an artificial bottleneck that results in suboptimal data acquisition decisions. Intuitively, \(_{}^{*}\) is chosen to faithfully model all observed data (Matthews et al., 2016; Moss et al., 2023), without regard for how the resulting model performs at selecting the next function evaluation in the BO loop. For an illustration of this, see Figure1. Instead, we propose a modification to SVGPs that couples the posterior approximation and data acquisition through a joint problem of the form:
+
+\[(_{t+1},\,^{*}\,)=*{arg\,max}_{ {},}_{}(,;_{t}).\] (6)
+
+This results in \(_{t+1}\) directly approximating a solution to Eq.2, where the **expected utility lowerbound** (EULBO) is an ELBO-like objective function derived below.
+
+### Expected Utility Lower-Bound
+
+Consider an acquisition function of the form of Eq.2, where the utility \(\,:\,_{>0}\) is strictly positive. We can derive a similar variational formulation of the acquisition function maximization problem following Lacoste-Julien et al. (2011). That is, given any distribution \(q_{}\) indexed by \(\) and considering the SVGP prior augmentation \(p(f) p(f)p()\), the acquisition function can be lower-bounded through Jensen's inequality as
+
+\[(;_{t}) = u(,f;_{t})(f _{t})f\] \[= u(,f;_{t})(f,_{t})}(f,)}{q_{ }(f,)}f\,\] \[= u(,f;_{t})\,( _{t} f)p(f)p()}()p(f)}{q_{}()p(f)}f\, - Z\] \[(,f;_{t}) (_{t} f)p()}{q_{} ()})p(f)q_{}( {u})\,f\,- Z,\] (7)
+
+where \(Z\) is a normalizing constant. A restriction on \(u\) comes from the inequality in Eq.7, where the utility needs to be strictly positive. This means that non-strictly positive utilities need to be modified to be incorporated into this framework. (See the examples by Kusmierczyk et al., 2019.) Also, notice that the derivation is reminiscent of expectation-maximization (Dempster et al., 1977) and variational lower bounds (Jordan et al., 1999). That is, through the minorize-maximize principle (Lange, 2016), maximizing the lower bound with respect to \(\) and \(\) approximately solves the original problem of maximizing the posterior-expected utility.
+
+Expected Utility Lower-Bound.Up to a constant and rearranging terms, maximizing Eq.7 is equivalent to maximizing
+
+\[_{}(,;_{t}) _{p(f|)q_{}()} [(_{t} f)+ p()- q_{ }()+ u(,f;_{t})]\] \[=_{q_{}(f)}[_{i=1}^{n_{t}}(y_{i } f)]-_{}(q_{}(),p())+ _{q_{}(f)} u(,f;_{t})\] \[=_{}(;_{t}) +_{q_{}(f)} u(,f;_{t}),\] (8)
+
+which is the joint objective function alluded to in Eq.6. We maximize \(\) to obtain \((_{t+1},^{*})=_{, }\ \ _{}(,)\), where \(_{t+1}\) corresponds our next BO "query".
+
+From Eq.8, the connection between the \(\) and \(\) is obvious: the \(\) is now "nudging" the ELBO solution toward high utility regions. An alternative perspective is that we are approximating a _generalized posterior_ weighted by the utility (Table. 1 by Knoblauch et al., 2022; Bissiri et al., 2016). Furthermore, Jaiswal et al. (2020, 2023) prove that the resulting actions satisfy consistency guarantees under assumptions typical in such results for variational inference (Wang and Blei, 2019).
+
+Hyperparameters and Inducing Point Locations.For the hyperparameters \(\) and inducing point locations \(\), we use the marginal likelihood to perform model selection, which is common practice in BO (Shahriari et al., 2015, SSV.A). (Optimizing over \(\) was popularized by Snelson and Ghahramani, 2005.) Following suit, we also optimize the \(\) as a function of \(\) and \(\) as
+
+\[,,,}{}\ \{\ _{}(,,,; _{t})_{}(, ,;_{t})+_{q_{}(f)} u (,f;_{t})\}.\]
+
+We emphasize here that the SVGP-associated parameters \(,,\) have gradients that are determined by _both_ terms above. Thus, the expected log-utility term \(_{f q_{}(f)} u(,f;_{t})\) simultaneously results in acquisition of \(_{t+1}\) and directly influences the underlying SVGP regression model.
+
+### \(\) for Expected Improvement (EI)
+
+The EI acquisition function can be expressed as a posterior-expected utility, where the underlying "improvement" utility function is given by the difference between the objective value of the query, \(f()\), and the current best objective value \(y_{t}^{*}=_{i=1,,t}\{y_{i} y_{i}_{t}\}\):
+
+\[u_{}(,f;_{t})( f()-y_{t}^{*}),\] (9)
+
+where \((x)(x,0)\). Unfortunately, this utility is not strictly positive whenever \(f() y^{*}\). Thus, we cannot immediately plug \(u_{}\) into the \(\). While it is possible to add a small positive constant to \(u_{}\) and make it strictly positive as done by Kusmierczyk et al. (2019), this results in a looser Jensen gap in Eq.7, which could be detrimental. This also introduces the need for tuning the constant, which is not straightforward. Instead, we define the following "soft" EI utility:
+
+\[u_{}(,f;_{t}) (f()-y_{t}^{*}),\]
+
+where the ReLU in Eq.9 is replaced with \((x)(1+(x))\). \((x)\) converges to the ReLU in both extremes of \(x\). Thus, \(u_{}\) will behave closely to \(u_{}\), while being slightly more explorative due to positivity.
+
+Computing the \(\) and its derivatives now requires the computation of \(_{f q_{}(f)} u_{}(,f; _{t})\), which, unlike EI, does not have a closed-form. However, since the utility function only depends on the function values of \(f\), the expectation can be efficiently computed to high precision through one-dimensional Gauss-Hermite quadrature. Crucially, the expensive \(K_{zz}^{-1}m\) and \(K_{zz}^{-1}SK_{zz}^{-1}\) solves that dominate both the asymptotic and practical running time of both the ELBO and the \(\) are fixed across the log utility evaluations needed by quadrature. Because quadrature only depends on these precomputed moments, the additional work necessary due to lacking a closed form solution is negligible: Gauss-Hermite quadrature converges extremely quickly in the number of quadrature sites, and only requires on the order of 10 or so of these post-solve evaluations to achieve near machine precision.
+
+### \(\) for Knowledge Gradient (KG)
+
+Although non-trivial, the KG acquisition is also a posterior-expected utility, where the underlying utility function is given by the maximum predictive mean value anywhere in the input domain _after_conditioning on a new observation \((,y)\):
+
+\[u_{}(,y;_{t})_{^{ }}\,[f(^{})_{t} \{(,y)\}].\]
+
+Note that the utility function as defined above is not non-negative: the maximum predictive mean of a Gaussian process can be negative. For this reason, the utility function is commonly (and originally, _e.g._Frazier, 2009, Eq. 4.11) written in the literature as the _difference_ between the new maximum mean after conditioning on \((,y)\) and the maximum mean beforehand:
+
+\[u_{}(,y;_{t})_{^{ }}\,[f(^{})_{t }\{(,y)\}]-_{t}^{+},\]
+
+where \(_{t}^{+}_{^{}} [f(^{})_{t}]\). Note that \(_{t}^{+}\) plays the role of a simple constant as it depends on neither \(\) nor \(y\). Similarly to the EI acquisition, this utility is still not strictly positive, and we thus define its "softplus-ed" variant:
+
+\[u_{}(,y;_{t}) (u_{}(,y;_{t})-c^{+}).\]
+
+Here, \(c^{+}\) acts as \(_{t}^{+}\) by making \(u_{}\) positive as often as possible. This is particularly important when the GP predictive mean is negative as a consequence of the objective values being negative. One natural choice of constant is using \(_{t}^{+}\); however, we find that simply choosing \(c^{+}=y_{t}^{+}\) works well and is more computationally efficient. Here, \(y_{t}^{+}\) is the highest value of \(y_{t}\) (the highest objective value observed so far).
+
+One-Shot KG Eulbo.The Eulbo using \(u_{}\) results in an expensive nested optimization problem. To address this, we use an approach similar to the one-shot knowledge gradient method of Balandat et al. (2020). For clarity, we will define the parameterization function
+
+\[y_{}(;_{i})_{q_{}} ()+_{q_{}}()\,_{i},\]
+
+where, for an i.i.d. sample \(_{i}(0,1)\), computing \(y_{}(,_{i})\) is equivalent to sampling \(y_{i}(_{q_{}}(),_{q_{}}())\). This enables the use of the reparameterization gradient estimator (Kingma and Welling, 2014; Rezende et al., 2014; Titsias and Lazaro-Gredilla, 2014). Now, notice that the KG acquisition function can be approximated through Monte Carlo as
+
+\[_{}(;)_{i=1}^{S}u_{ {KG}}(,y_{}(;_{i});_{t})=_{i=1}^{S}_{^{}}[f(^{ })_{t}\{,y_{}(;_{i})\}],\]
+
+where, for \(i=1,...,S\), \(_{i}(0,1)\) are i.i.d. The one-shot KG approach absorbs the nested optimization over \(^{}\) into a simultaneous joint optimization over \(\) and a mean maximizer for each of the S samples, \(^{}_{1},...,^{}_{S}\) such that \(_{}_{}(;_{t})_{, ^{}_{1},...,^{}_{S}}_{}(; )\), where
+
+\[_{}(;_{t})_{i=1}^{S }_{}(,^{}_{i},y_{}( ;_{i});_{t})=_{i=1}^{S}[f(^{}_{i})_{t}\{,y_{}(;_{i})\}],\]
+
+Evidently, there is no longer an inner optimization problem over \(^{}\). To estimate the \(i\)th term of this sum, we draw a sample of the objective value of \(\), \(y_{}(;_{i})\), and condition the model on this sample. We then compute the new posterior predictive mean at \(^{}_{i}\). After summing, we compute gradients with respect to both the candidate \(\) and the mean maximizers \(^{}_{1},...,^{}_{S}\). Again, we use the "soft" version of one-shot KG in our Eulbo optimization problem:
+
+\[u_{}(,^{},y;_{t})=([f(^{})_{t}\{(,y)\} ]-c^{+}),\]
+
+where this utility function is crucially a function of both \(\) and a free parameter \(^{}\). As with \(_{}\), maximizing the Eulbo can be set up as a joint optimization problem:
+
+\[_{,^{}_{1},...,^{}_{S},,},}_{}(,, )+_{i=1}^{S} u_{}(,^{ }_{i},y_{}(;_{i}); _{t})\] (10)
+
+Efficient KG-Eulbo Computation.The computation time of the non-ELBO term in Eq. (10) is dominated by having to compute \([f(^{}_{i})_{t}\{(,y_{}(;_{i}))\}]\)\(S\)-timestimes. Notice that we only need to compute an updated posterior predictive mean, and can ignore predictive variances. For this, we can leverage the online updating strategy of Maddox et al. (2021). In particular, the predictive mean can be updated in \((m^{2})\) time using a simple Cholesky update. The additional \((Sm^{2})\) cost of computing the Eulbo is therefore amortized by the original \((m^{3})\) cost of computing the ELBO.
+
+### Extension to q-Eulbo for Batch Bayesian Optimization
+
+The EULBO can be extended to support batch Bayesian optimization by using the Monte Carlo batch mode analogs of utility functions as discussed _e.g._ by Balandat et al. (2020); Wilson et al. (2018). Given a set of candidates \(=(_{1},...,_{q})^{q}\), the \(q\)-EI utility function is given by:
+
+\[_{q}(,;_{t})_{j =1...q}(f(_{j})-y_{t}^{*})\]
+
+This utility can again be softened as:
+
+\[_{q}(,;_{t})_ {j=1...q}(f(_{j})-y_{t}^{*})\]
+
+Because this is now a \(q\)-dimensional integral, Gauss-Hermite quadrature is no longer applicable. However, we can apply Monte Carlo as
+
+\[_{q_{}(f)}_{q}(,; _{t})_{i=1}^{S}_{j=1...q}(\,y_{}(;_{i})-y_{t}^{*}\, ).\]
+
+As done in the BoTorch software package (Balandat et al., 2020), we observe that fixing the set of base samples \(_{1},...,_{S}\) during each BO iteration results in better optimization performance at the cost of negligible q-EULBO bias. Now, optimizing the q-EULBO is done over the full set of \(q\) candidates \((_{1},...,_{q})\) jointly, as well as the GP hyperparameters, inducing points, and variational parameters.
+
+Knowledge Gradient.The KG version of the EULBO can be similarly extended. The expected log utility term in the maximization problem Eq.10 becomes:
+
+\[_{1},...,_{q},^{}_{1},...,^{}_{ S},,,}{}\ \ _{}(,,)+_{i=1 }^{S}_{j=1..q}_{1}(_{j},^{}_{i},y_ {}(;_{i});_{t}),\]
+
+resulting in a similar analog to q-KG as described by Balandat et al. (2020).
+
+### Optimizing the Eulbo
+
+Optimizing the EULBO for SVGPs is known to be challenging (Galy-Fajou and Opper, 2021; Tereinin et al., 2024) as the optimization landscape for the inducing points is non-convex, multi-modal, and non-smooth. Naturally, these are also challenges for EULBO; we found that care must be taken when implementing and initializing the EULBO maximization problem. In this subsection, we outline some key ideas, while a detailed description with pseudocode is presented in Appendix A.
+
+Initialization and Warm-Starting.We warm-start the EULBO maximization procedure by solving the conventional two-step scheme in Eq.5: At each BO iteration, we obtain the "warm" initial values for \((,,)\) by optimizing the standard ELBO. Then, we use this to maximize the conventional acquisition function corresponding to the chosen utility function \(\) (the expectation of \(\) over \(q_{}(f)\)), which provides the warm-start initialization for \(\).
+
+Alternating Maximization Scheme.To optimize \(_{}(,,,)\), we alternate between optimizing over the query \(\) and the SVGP parameters \(,,\). We find this block-coordinate descent scheme to be more stable and robust than jointly updating all parameters, though the reason why this is more stable than jointly optimizing all parameters requires further investigation.
+
+## 4 Experiments
+
+We evaluate EULBO-based SVGPs on a number of benchmark BO tasks, described in detail in Section4.1. These tasks include standard low-dimensional BO problems, e.g., the 6D Hartmann function, as well as 7 high-dimensional and high-throughput optimization tasks.
+
+Baselines.We compare EULBO to several baselines with the main goal of achieving a high reward using as few function evaluations as possible. Our primary point of comparison is ELBO-based SVGPs. We consider two approaches for inducing point locations: 1. optimizing inducing point locations via the ELBO (denoted as **ELBO**), 2. placing the inducing points using the strategy proposed by Moss et al. (2023) at each stage of ELBO optimization (denoted as **Moss et al.**). The latter offers improved BO performance over standard ELBO-SVGP in BO settings, yet--unlike our method--it exclusivelytargets inducing point placement and does not affect variational parameters or hyperparameters of the model. In addition, we compare to BO using exact GPs using \(2,000\) function evaluations as the use of exact GP is intractable beyond this point due to the need to _repeatedly_ fit models.
+
+Acquisition Functions and BO algorithms.For EULBO, we test the versions based on both the Expected Improvement (EI) and Knowledge Gradient (KG) acquisition functions as well as the batch variant. We test the baseline methods using EI only. On high-dimensional tasks (tasks with dimensionality above \(10\)), we run EULBO and baseline methods with standard BO and with trust region Bayesian optimization (TuRB0) (Eriksson et al., 2019). For the largest tasks (Lasso, Molecules) we use acquisition batch size of \(20\) (\(q=20\)), and batch size \(1\) (\(q=1\)) for all others.
+
+Implementation Details and Hyperparameters.Code to reproduce all results in the paper is available at https://github.com/nataliemaus/aabo. We implement EULBO and baseline methods using the GPTorch (Gardner et al., 2018) and BoTorch (Balandat et al., 2020) packages. For all methods, we initialize using a set of \(100\) data points sampled uniformly at random in the search space. We use the same trust region hyperparameters as in (Eriksson et al., 2019). In Appendix B.1, we also evaluate an additional initialization strategy for the molecular design tasks. This alternative initialization matches prior work in using \(10,000\) molecules from the GuacaMol dataset Brown et al. (2019) rather than the details we used above for consistency across tasks, but does achieve higher overall performance.
+
+### Tasks
+
+Hartmann 6D.The widely used Hartmann benchmark function (Surjanovic and Bingham, 2013).
+
+Lunar Lander.The goal of this task is to find an optimal \(12\)-dimensional control policy that allows an autonomous lunar lander to consistently land without crashing. The final objective value we optimize is the reward obtained by the policy averaged over a set of \(50\) random landing terrains. For this task, we use the same controller setup used by Eriksson et al. (2019).
+
+Rover.The rover trajectory optimization task introduced by Wang et al. (2018) consists of finding a \(60\)-dimensional policy that allows a rover to move along some trajectory while avoiding a set of obstacles. We use the same obstacle set up as in Maus et al. (2023).
+
+Figure 2: **Optimization results on the 8 considered tasks.** We compare all methods for both standard BO and TuRB0-based BO (on all tasks except Hartmann). Each line/shaded region represents the mean/standard error over \(20\) runs See subsection B.1 for additional molecule results.
+
+Lasso DNA.We optimize the 180--dimensional DNA task from the LassoBench library (Sehic et al., 2022) of benchmarks based on weighted LASSO regression (Gasso et al., 2009).
+
+Molecular design tasks (x4).We select four challenging tasks from the Guacamol benchmark suite of molecular design tasks (Brown et al., 2019): Osimertinib MPO, Fexofenadine MPO, Median Molecules 1, and Median Molecules 2. We use the SELFIES-VAE introduced by Maus et al. (2022) to enable continuous 256 dimensional optimization.
+
+### Optimization Results
+
+In Figure 2, we plot the reward of the best point found by the optimizer after a given number of function evaluations. Error bars show the standard error of the mean over 20 replicate runs. EULB0 with TuRB0 outperforms the other baselines with TuRB0. Similarly, EULB0 with standard BO outperforms the other standard BO baselines. One noteworthy observation is that neither acquisition function appears to consistently outperform the other. However, EULB0-SVGP almost always dominates ELBO-SVGP and often requires a small fraction of the number of oracle calls to achieve comparable performance. These results suggest that coupling data acquisition with approximate inference/model selection results in significantly more sample-efficient optimization.
+
+### Ablation Study
+
+While the results in Fig. 2 demonstrate that EULB0-SVGP improves the BO performance it is not immediately clear to what extent joint optimization modifies the posterior approximation beyond what is obtained by standard ELBO optimization. To that end, in Fig. 3 we refine an ELBO-SVGP model with varying degrees of additional EULB0 optimization. At every BO iteration we begin by obtaining a SVGP model (where the variational parameters, inducing point locations, and GP hyperparameters are all obtained by optimizing the standard ELBO objective). We then refine some subset of parameters (either the inducing points, the variational parameters, the GP hyperparameters, or all of the above) through additional optimization with respect to the EULB0 objective. Interestingly, we find that tasks respond differently to the varying levels of EULB0 refinement. In the case of Lasso DNA, there is not much of a difference between EULB0 refinement on all parameters versus refinement on the variational parameters alone. On the other hand, the performance on Median Molecules 2 is clearly dominated by refinement on all parameters. Nevertheless, we see that EULB0 is always beneficial, whether applied to all parameters or some subset.
+
+## 5 Related Work
+
+Scaling Bayesian Optimization to the Large-Budget Regime.BO has traditionally been confined to the small-budget optimization regime with a few hundred objective evaluations at most. However, recent interest in high-dimensional optimization problems has demonstrated the need to scale BO to large data acquisition budgets. For problems with \(\)10\({}^{3}\) data acquisitions, Hernandez-Lobato et al. (2017); Snoek et al. (2015); Springenberg et al. (2016) consider Bayesian neural networks (BNN; Neal, 1996), McIntire et al. (2016) use SVGP, and Wang et al. (2018) turn to ensembles of
+
+Figure 3: **Ablation study measuring the impact of EULB0 optimization on various SVGP parameters.** At each BO iteration, we use the standard ELBO objective to optimize the SVGP hyperparameters, variational parameters, and inducing point locations. We then refine some subset of these parameters by further optimizing them with respect to the EULB0 objective.
+
+subsampled GPs. For problems with \( 10^{3}\) acquisitions, SVGP has become the _de facto_ approach to alleviate computational complexity (Griffiths and Hernandez-Lobato, 2020; Maus et al., 2022, 2023; Stanton et al., 2022; Tripp et al., 2020; Vakili et al., 2021). As in this paper, many works have proposed modifications to SVGP to improve its performance in BO applications. Moss et al. (2023) proposed an inducing point placement based on a heuristic modification of determinantal point processes (Kulesza and Taskar, 2012), which we used for initialization, while Maddox et al. (2021) proposed a method for a fast online update strategy for SVGPs, which we utilize for the KG acquisition strategy.
+
+Utility-Calibrated Approximate Inference.The utility-calibrated VI objective was first proposed by Lacoste-Julien et al. (2011), where they used a coordinate ascent algorithm to maximize it. Since then, various extensions have been proposed: Kusmierczyk et al. (2019) leverage black-box variational inference (Ranganath et al., 2014; Titsias and Lazaro-Gredilla, 2014; Morais and Pillow (2022) use expectation-propagation (EP; Minka, 2001); Abbasnejad et al. (2015) and Rainforth et al. (2020) employ importance sampling; Cobb et al. (2018) and Li and Zhang (2023) derive a specific variant for BNNs; and (Wei et al., 2021) derive a specific variant for GP classification. Closest to our work is the GP-based recommendation model learning algorithm by Abbasnejad et al. (2013), which sparsifies an EP-based GP approximation by maximizing a utility similar to those used in BO.
+
+## 6 Limitations and Discussion
+
+The main limitation of our proposed approach is increased computational cost. While EULBO-SVGP still retains the \(O(m^{3})\) computational complexity of standard SVGP, our practical implementation requires a warm-start: first fitting SVGP with the ELBO loss and then maximizing the acquisition function before jointly optimizing with the EULBO loss. Furthermore, EULBO optimization currently requires multiple tricks such as clipping and block-coordinate updates. In future work, we aim to develop a better understanding of the EULBO geometry in order to develop developing more stable, efficient, and easy-to-use EULBO optimization schemes. Nevertheless, our results in Section4 demonstrate that the additional computation of EULBO yields substantial improvements in BO data-efficiency, a desirable trade-off in many applications. Moreover, EULBO-SVGP is modular, and our experiments capture a fraction of its potential use. It can be applied to any decision-theoretic acquisition function, and it is likely compatible with non-standard Bayesian optimization problems such as cost-constrained BO (Snoek et al., 2012), causal BO (Aglietti et al., 2020), and many more.
+
+More importantly, our paper highlights a new avenue for research in BO, where surrogate modeling, approximate inference, and data selection are jointly determined from a unified objective. Extending this idea to GP approximations beyond SVGP and acquisition functions beyond EI/KG may yield further improvements, especially in the increasingly popular high-throughput BO setting.

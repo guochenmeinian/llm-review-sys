@@ -1,0 +1,181 @@
+# kGym: A Platform and Dataset to Benchmark Large Language Models on Linux Kernel Crash Resolution
+
+Alex Mathai \({}^{1}\)
+
+Chenxi Huang \({}^{2}\)
+
+Denotes equal contribution
+
+Petros Maniatis \({}^{3}\)
+
+Aleksandr Nogikh \({}^{4}\)
+
+Franjo Ivancic \({}^{4}\)
+
+Junfeng Yang \({}^{1}\) and Baishakhi Ray \({}^{1}\)
+
+\({}^{1}\)Columbia University, \({}^{2}\) University of Minnesota, \({}^{3}\) Google Deepmind, \({}^{4}\) Google {alexmathai, junfeng, rayb}@cs.columbia.edu
+
+{maniatis, nogikh, ivancic}@google.com
+
+{huan2677}@umn.edu
+
+###### Abstract
+
+Large Language Models (LLMs) are consistently improving at increasingly realistic software engineering (SE) tasks. In real-world software stacks, significant SE effort is spent developing foundational system software like the Linux kernel. Unlike application-level software, a systems codebase like Linux is multilingual (low-level C/Assembly/Bash/Rust); gigantic (>20 million lines); critical (impacting billions of devices worldwide), and highly concurrent (involving complex multi-threading). To evaluate if machine learning (ML) models are useful while developing such large-scale systems-level software, we introduce kGym (a platform) and kBenchSyz (a dataset). The kGym2 platform provides a SE environment for large-scale experiments on the Linux kernel, including compiling and running kernels in parallel across several virtual machines, detecting operations and crashes, inspecting logs, and querying and patching the code base. We use kGym to facilitate evaluation on kBenchSyz, a crash resolution benchmark drawn from real-world Linux kernel bugs. An example bug in kBenchSyz contains crashing stack traces, a bug-reproducer file, a developer-written fix, and other associated data. To understand current performance, we conduct baseline experiments by prompting LLMs to resolve Linux kernel crashes. Our initial evaluations reveal that the best performing LLM achieves 0.72% and 5.38% in the unassisted and assisted (i.e., buggy files disclosed to the model) settings, respectively. These results highlight the need for further research to enhance model performance in SE tasks. Improving performance on kBenchSyz requires models to master new learning skills, including understanding the cause of crashes and repairing faults, writing memory-safe and hardware-aware code, and understanding concurrency. As a result, this work opens up multiple avenues of research at the intersection of machine learning and systems software.
+
+## 1 Introduction
+
+In recent years, there has been significant progress in using code LLMs (like CodeWhisperer  and CoPilot ) in all stages of the software cycle, including development, debugging, and testing. Despite being trained on large and complex open-source projects, LLMs areoften benchmarked on test sets like EvalPlus (Liu et al., 2023a), HumanEval (Chen et al., 2021), and APPS (Hendrycks et al., 2021) which are about3 to get saturated (Ott et al., 2022). While useful, these benchmarks represent "green-field" SE by isolating coding to the task of solving programming puzzles. Unfortunately, such puzzles do not reflect the intricacies involved in everyday reasoning and solving of complex bugs in production-ready software.
+
+Hence, newly introduced benchmarks (like SWE-Bench (Jimenez et al., 2024)) try to bridge the gap between existing tasks and realistic SE in "brown-field" environments, where LLM assistants edit, debug, and test production-ready software. Such benchmarks capture a more realistic SE setting: given a software repository, a natural-language (NL) description of a problem or feature request, and a set of held-out executable test cases, edit the repository so that the test cases pass.
+
+Our work moves one step further along the same trajectory, by introducing a drastically more challenging SE benchmark for future assistants. Specifically, we target _crash resolution in the Linux kernel_ [Lin]: given a state of the Linux codebase, a crash report, and the crash-inducing input, the target is to repair the codebase such that the input no longer triggers a crash. To that effect, we build an execution environment, kGym, and corresponding benchmark, kBenchSyz.
+
+**Why Linux?** The Linux Kernel spans over \(20\)M lines of code spread across \(50\)k files. It has been in open-source development for decades and is deployed on billions of devices worldwide, including cloud infrastructures, desktops, and over three billion active Android devices [And]. Although the criticality of Linux itself justifies a benchmark built around it, kBenchSyz also tests LLM assistants on new and generalizable SE skills beyond what is available today:
+
+* Low level: Linux is a systems codebase written in a mixture of C, Assembly (for multiple hardware architectures, like x86, ARM, etc.), Bash, and Rust, sometimes intermingled in the same file (e.g., in Assembly embedded in C). As a result, the implementation must be hardware-aware and memory-safe, in contrast to userspace code (often hardware-agnostic) and code in managed languages such as Python (the runtime abstracts away memory and hardware details).
+* Concurrent: Linux code is highly concurrent and non-deterministic, with many kernel bugs caused by hard-to-reproduce thread interleavings, leading to deadlocks, race conditions, and atomicity violations ("Heisenbugs"). To resolve such bugs, the model must be able to learn and reason about the different interleaving schedules across concurrent threads. Moreover, a corresponding benchmark platform must work with _flaky_ test oracles--the bug is sometimes observed, but not always--unlike existing benchmarks, which rely on deterministic oracles.
+* Ambiguous Intent: Unlike application-level SE tasks that start with an NL description of a problem, the root cause in a crash report is often unknown, hard to reproduce, and must be identified before it can be resolved. This makes for a challenging task, both in terms of ambiguity and the underlying dependence on myriad behaviors of the complex kernel.
+* Decentralized Development: Linux development is highly decentralized; a recent version (v6.3) saw contributions from \( 2\)k developers, with \(513\)k lines deleted and \(644\)k lines added [RV6]. Such decentralized development is managed by splitting the kernel into subsystems, each with head maintainers. Consequently, each subsystem has unique coding conventions, including custom memory allocators, complex data structures, and specific coding templates.
+
+**kBenchSyz** consists of \(279\) Linux-kernel bug-resolution samples. Each consists of (i) a commit-id that specifies a kernel code-base exhibiting the bug crash; (ii) a crash report containing one (or more) crash stack traces; (iii) a reproducer (i.e., a crashing test input program); (iv) a developer-written and vetted patch that, when applied to the kernel code-base, fixes the root cause of the crash and results in an operational kernel; and (v) compilation and execution configuration files for the above. Additionally, it provides detailed email discussions between kernel developers leading to a bug's resolution. The samples are diverse, covering multiple critical subsystems, exhibiting various crash types, and requiring fixes from a single line to many lines across multiple functions and files.
+
+**kBenchC**. We have also curated and released a larger dataset of \(504\) Linux-kernel bugs. kBenchC and kBenchSyz differ in the artifact used to reproduce the kernel bugs. While kBenchSyz uses a _syz_ reproducer file (explained in Section 2) to reproduce the bugs, kBenchC uses a C code snippet that has been derived (translated) from the original _syz_ reproducer.
+
+For the remainder of this paper however, we describe and report results on kBenchSyz.
+
+**kGym** provides an execution platform for ML-assisted SE to address challenges in kBenchSyz. It is scalable, user-friendly, and capable of (a) compiling hundreds of Linux kernel versions, (b) applying patches to buggy kernels, and (c) executing bug reproducaters to either replicate a Linux kernel bug or confirm crash resolution after a patch. A sample end-to-end run of kGym is shown in Figure 1. As depicted, kGym facilitates a typical debug-patch-test cycle, where given a crash report an LLM is called to generate a code patch (or Top-K patches). kGym then applies the patch to the buggy kernel, runs the reproducater, and returns results: which can be another crash or a successful resolution. Key features of kGym for kBenchSyz include parallel execution across VMs and replicated test execution to manage non-determinism. Equipped with parallel execution, kGym can run hundreds to thousands of iterations of this loop within a day with limited resources, thus supporting further research in AI-assisted SE and low-level systems software.
+
+Using kGym, we first reproduced all \(279\) bugs in kBenchSyz and then used LLMs in the pipelines to fix them. In this process, we ran over \(17\)k kernel jobs using both open-source and state-of-the-art LLMs. In both RAG-based assisted (\(5.38\%\)) and unassisted (\(0.72\%\)) settings, our results show that even the best LLMs perform poorly on Linux kernel crash resolution, suggesting that kBenchSyz is poised to establish itself as the next frontier benchmark for LLM-assisted SE.
+
+In what follows we list the different kernel bug components, provide details about kGym, describe how we collected kBenchSyz, and present initial crash-resolution results using popular LLMs.
+
+## 2 Background: Continuous Testing via Syzkaller in Syzbot
+
+To enhance Linux kernel security, the security community has developed numerous fuzzing tools over the past decade (Syz, Tri, Schumilo et al., 2017; Kim et al., 2020). These tools automatically mutate and prioritize inputs to test the kernel, aiming to find bugs that developers can eventually resolve. We choose Syzkaller (Syz) to construct kBenchSyz as it is a widely-used open-source testing service for the Linux Kernel, where developers post, discuss, and fix kernel bugs. To date, more than \(5\)k Syzkaller-detected kernel bugs have been reported and fixed, far surpassing the total bugs detected in the two decades before Syzkaller's inception in \(2016\) [CVE].
+
+**Syzkaller** generates inputs resembling user-space programs by mutating a domain-specific language (DSL) called _syz_ and can optionally translate this into a C program. Thus, the input to a kernel is itself a program containing a sequence of up to \(10\) Linux kernel system calls. The specifics of the _syz_ DSL and how Syzkaller mutates the input are beyond the scope of this paper; what is relevant is that the input to each kBenchSyz sample is a user-space program produced by Syzkaller, which we also refer to as the Reproducer. For the bugs in kBenchC, the input to each sample is the C program translation of the Syzkaller user-space program. Unlike the _syz_ program which is relatively short, the C translation can be arbitrarily long as it directly depends on the output of the translation procedure.
+
+Figure 1: kGym Pipeline. Input to kGym is a kBenchSyz bug consisting of a kernel crash and a crash reproducer file. To reproduce the bug, kGym compiles the buggy kernel version and runs the reproducer file. Next, the LLM is prompted with the kernel bug (along with the crash trace) to generate potential patch(es). Each code patch is given to kGym, which then applies the patch to the buggy kernel version, compiles the entire kernel, and subsequently executes a reproducer file to check if the bug has been successfully resolved.
+
+**Syzbot** is an open-source platform that continuously runs Syzkaller on numerous kernels spanning multiple versions, architectures, and branches; testing them against various fault detectors. These detectors range from simple ones that detect kernel deadlocks or crashes (a.k.a., kernel "panic", when the kernel reaches an irrecoverable fault state) to complex ones looking for high-priority assertion violations. Many such detectors are called _sanitizers_[Stepanov and Serebryany, 2015, Con, Serebryany et al., 2012, Add], which typically look for concurrency and memory-safety issues. For instance, KASAN, the Kernel Address Sanitizer[Serebryany et al., 2012], detects memory corruption such as out-of-bounds reads and use-after-free accesses. Whenever a fault detector is triggered during a Syzkaller run, a kernel crash report is posted on a public Syzbot site (Figure 2). Kernel developers discuss the report, propose fixes, and the crash is considered resolved when the reproducer no longer triggers the crash and a maintainer accepts the fix.
+
+We collect kBenchSyz samples (as shown in Figure 2) from the reported and fixed bugs on Syzbot. More specifically, for each bug, we collect
+
+1. \(_{}\): the specific kernel commit id exhibiting the crash.
+2. Config : a file that specifies options and flags needed to correctly compile the Linux kernel.
+3. Reproducer: the bug reproducer (3 in Figure 2) that triggers the crash.
+4. \(_{}\) and Fix (gold fix): fix commit id and developer patch that resolves the bug (1).
+5. \(_{}\): the crash report and stack traces generated at the commit id \(_{}\) (4).
+6. Bisect: a cause-bisection commit identifying the first commit that exposed the bug (available for \( 20\%\) of bugs) (2).
+7. Email: email discussions of developers about the bug. This is included as auxiliary information for bug localization, explanation, and repair research.
+
+## 3 Kgym: A Scalable Platform for Kernel Bug Reproduction and Resolution
+
+kGym is a scalable, flexible, extensible, and user-friendly platform for research using LLM-assisted tools on Linux Kernel SE problems. Below, we list the inputs to kGym and the different actions that kGym provides to a user (here "user" can refer to an AI agent) to apply patches, build kernels, and run reproducers (Figure 1). We highlight two important functionalities of kGym, Kbuilder and Kreproducer. For an in-depth explanation of kGym's architecture, see Appendix 3.
+
+**Inputs:** From the features discussed in Section 2, we only need the commit id, the Config, and the Reproducer to reproduce a bug using kGym. Additionally, we provide a crash report to the LLM to help it generate a patch. Using these inputs, kGym can perform the list of actions mentioned below.
+
+**Build:** For kernel crash resolution, we must first enable the building of kernels at specified commit ids. We provide a kernel-building API supported by Kbuilder, that focuses on compiling a kernel based on user specifications. These include a _git-url_, a _commit-id_ (e.g., \(_{}\)), a _kernel-config_ (Config), a _compiler_, a _linker_, a _hardware architecture_ (currently amd64), and a _userspace image_ (options: buildroot, debian-bullseye, debian-buster, debian-stretch).
+
+Figure 2: A sample kernel bug from Syzkaller [Bug]
+
+**Reproduce-Bug:** Once the user builds a kernel, the next step is to run the Reproducer to generate the crash report. We provide a bug-reproducing API supported by Kreproducer. This API requires (i) a pre-compiled disk image (from Build) and (ii) a Reproducer file. Kreproducer launches a VM with the image, monitors the reproducer's execution, and collects kernel panic information if a crash occurs. Thus, using Reproduce-Bug, we can generate and collect the crash report for the Linux kernel bug. However, since many bugs are non-deterministic, running the reproducer once may not suffice. A Parallel-Reproduce action launches multiple VMs to run Reproduce-Bug in parallel, increasing the chances of reproducing the kernel crash.
+
+**Retrieve-File:** After obtaining the crash report, the next steps are to (i) retrieve relevant code files from the Linux codebase, (ii) inspect these files, and (iii) suggest a patch. The Retrieve-File action fetches files from the Linux codebase at a specific commit-id by checking out the correct commit and retrieving the specified files.
+
+**Patch:** The input prompt to the LLM is constructed using the crash report and retrieved files. The LLM then generates a fix, which can be applied to the codebase at the specified commit-id. To check for crash resolution, the user must first apply the fix, recompile the Linux kernel, and then re-run the Reproducer. The Patch action facilitates this by taking a _patch_ argument specified in the git diff format in addition to all the Build action arguments. The Patch action applies the patch and compiles the kernel. The user can then use this compiled kernel with the Reproduce-Bug action. If the Reproducer does not crash the kernel within \(10\) minutes, the bug is considered resolved.
+
+**Kernel-Log:** For future works that monitor the Linux kernel environment, we provide the Kernel-log action. When invoked, Kernel-log downloads the Kernel's ring buffer (dmesg4 output) for inspection after applying and running a patch. Analyzing kernel log changes is challenging due to its verbosity, often containing hundreds of thousands of lines. Although we believe this log will become crucial in kernel crash resolution, we leave this as a future research area.
+
+## 4 kBenchSyz
+
+We use the kGym system explained in Section 3 to curate kBenchSyz, a dataset of Linux kernel bugs and fixes. We then use this dataset to benchmark the efficacy of state-of-the-art LLMs in solving bugs in production-ready software. In what follows, we explain how we derive a gold standard subset of bugs from the Syzkaller dataset and then delve into the characteristics of the benchmark itself.
+
+**Notion of a Fix:** We follow Syzkaller and deem a patch as a valid bug fix if, upon application of the patch, the kernel remains functional without a crash, after executing the Reproducer.
+
+**Retrieving Kernel Versions to Apply Fixes (Commitparent):** For many bugs, there can be thousands of commits between Commitbug and Commitfix because patches for old bugs are often submitted to the current latest kernel version. Hence, to verify if a patch successfully resolves a crash, we must first compute the last commit before Commitfix where the bug is still reproducible. This is Commitparent, which is the parent commit immediately before Commitfix in the git tree.
+
+**Filtering a Gold Standard:** For each bug, we collect Commitbug, Config, Reproducer, Commitfix, Fix, and Commitparent (where we will apply the fix). We filter the bugs using three criteria: (1) The kernel crashes when running Reproducer on Commitbug, (2) The kernel crashes when running Reproducer on Commitparent, and (3) The kernel does not crash when running Reproducer on Commitfix. These checks ensure each data point is a valid reproducible bug with a demonstrable fix.
+
+**Experiment Caveat:** In Section 5, we perform all crash resolution experiments on Commitparent to allow for a qualitative comparison of the LLM's suggested patch against the actual Fix. Therefore, we provide the crash report generated at Commitparent as part of the input prompt to the LLM. Using kGym, we run every bug in kBenchSyz and collect Crashparent, the crash report observed when running the Reproducer on Commitparent. Consequently, each data point in kBenchSyz is characterized by a seven-tuple: (Commitbug, Config, Reproducer, Commitfix, Commitparent, Crashparent, Fix). It is important to note that crash resolution can still be attempted on Commitbug. But due to the thousands of commits between Commitbug and Commitparent, the correct solution for Commitbug may differ vastly from the Fix. In the following section, we perform some quantitative studies of kBenchSyz to better understand the characteristics of this benchmark.
+
+[MISSING_PAGE_FAIL:6]
+
+### Models
+
+**Closed LLMs:** We conduct experiments on state-of-the-art closed LLMs like GPT-3.5 Turbo, GPT-4 Turbo, Claude-3 Sonnet, and Gemini-1.5 Pro. For GPT-3.5 Turbo, we use a maximum context length of 16k tokens. For more powerful models like GPT-4 Turbo, Gemini-1.5 Pro, and Claude-3 Sonnet, we use a maximum context size of 50k tokens to stay within budget constraints.
+
+**Open LLMs:** We also experiment with the Llama series of open-source instruction-tuned LLMs like Code Llama-7b-Instruct, Code Llama-13b-Instruct, Code Llama-34b-Instruct, and Llama-3-8B-Instruct. To stay within resource constraints, we restrict ourselves to a maximum context length of \(16\)k tokens.
+
+### Input Prompt
+
+To generate viable kernel patches, we provide meaningful context in the LLM's input prompt. For each bug in kBenchSyz, the prompt includes \(_{}\) and relevant C files (Section A.3). Since Linux Kernel files can be thousands of lines long, prompts often exceed the maximum context lengths of LLMs. Therefore, we run experiments on smaller subsets of kBenchSyz, detailed in Section 5.3.
+
+### Evaluation Settings
+
+An important part of the input prompt is a set of C files relevant to the crash report. Given the Linux kernel's vast size, selecting the most relevant files is challenging. Following SWE-Bench [Jimenez et al., 2024], we use a retrieval-based system for this task and evaluate each LLM in two settings:(1) oracle retrieval and (2) sparse retrieval. It is important to note that in both settings, we limit the kernel crash report to a maximum of 10k tokens to keep enough space for the relevant C files.
+
+**Oracle Retrieval:** In this setting, we parse the actual developer \(\) and collect the modified files. Each modified file is included in the prompt, and the LLM is asked to generate a patch for these files. This assisted setting makes the task easier, but we are forced to skip the bug if all Oracle files do not fit into a single prompt. This reduces the number of bugs to \(117\) for models with a \(16\)k context size (e.g., GPT-3.5 Turbo and Llama models) and \(228\) for models with a \(50\)k context size (e.g., GPT-4 Turbo, Claude-3 Sonnet, and Gemini-1.5 Pro).
+
+**Sparse Retrieval:** In the unassisted setting, the bug is first localized to a set of C files before the LLM generates a patch. This localization can be done using many techniques. Dense retrieval mechanisms are ill-suited [Jimenez et al., 2024] because of the sheer scale of the Linux kernel (\(>20\)M lines and \(>50\)k files). Hence, using \(_{}\) as the key, we adopt a sparse retrieval method like BM25 to retrieve the top 3 files to modify. Once we get the top \(3\) files, we add as many files as possible to the input prompt without exceeding the context limit. However, we intentionally skip a kernel bug if we cannot fit a single file. For models with a context length of \(16\)k, the number of bugs is reduced to \(227\), and for a longer context length of \(50\)k, we get \(275\) bugs. Please refer to Table 10 in the Appendix for a tabular view of the model variants against their respective kBenchSyz subsets.
+
+**BM25 Efficacy:** To evaluate BM25, we compare its retrieval predictions against the set of Oracle files. As shown in Table 5, as we retrieve more predictions from BM25 by increasing \(K\) from \(3\) to \(20\), the number of samples for which BM25 returns a superset of the oracle files increases from \(1.76\%\) to \(9.69\%\) for a \(16\)k context length and from \(2.91\%\) to \(10.54\%\) for a \(50\)k context length. As evident from Table 5, there is a lot of scope to improve bug localization using a given kernel crash report. However, these results are unsurprising, because if we set \(K\) to \(3\) and assume a single Oracle file, the probability of correctly including the Oracle file in \(3\) random choices from the \(50\)k files in the Linux kernel is \(0.006\). Thus, in contrast to random guessing, BM25 does a reasonable job.
+
+    &  \\  & **16K** & **50K** \\ 
+**Top K** & **All / Any / None** & **All / Any / None** \\
+3 & 1.76 / 0.00 / 98.24 & 2.91 / 0.00 / 97.09 \\
+5 & 3.96 / 0.44 / 95.6 & 5.10 / 0.36 / 94.54 \\
+10 & 6.61 / 0.00 / 93.39 & 7.64 / 0.00 / 92.36 \\
+20 & 9.69 / 0.44 / 89.87 & 10.54 / 0.36 / 89.10 \\   
+
+Table 5: BM25 Recall for different values of Top-K and context lengths. All, Any and None denote complete, partial, and no overlap with oracle files respectively.
+
+### Quantitative Analysis of Patch Generation
+
+**Querying LLMs:** To stay within budget and API constraints, we query each LLM differently. For GPT-3.5 Turbo and GPT-4 Turbo APIs, we ask for the top-\(10\) likely patches. By extracting \(10\) outputs (instead of \(1\)), the total cost increases by only \(20\)-\(30\%\) as the long input context exhausts most of the budget. The Gemini-1.5 Pro API does not provide a parameter for multiple outputs, but as it is currently free to use, we query Gemini \(10\) times with the same input tokens. There is also no such parameter for the paid Claude-3 Sonnet API, so we conduct experiments with a single output to limit costs. As such, the Claude API metrics should likely improve if \(10\) outputs are considered.
+
+**Compute:** To run the crash resolution experiments using kGym at scale, we employ \(11\) VMs hosted on Google Cloud. Each VM is a c2-standard-30 Google Compute Engine (GCE) instance.
+
+**Patch Application Rate:** As part of the input prompt, we ask the LLM to generate a git diff patch for kGym to apply to the codebase. However, we observe that current state-of-the-art LLMs often struggle to generate _syntactically valid_ patches with the correct diff structure. This issue has also been noted in other works like SWE-Bench [Jimenez et al., 2024]. Table 6 shows the patch application rate (Apply \(\%\)) for each LLM in both the Oracle and BM25 settings to illustrate the prevalence of this problem. Amongst the \(50\)k context models (GPT-4 Turbo, Claude-3 Sonnet, and Gemini-1.5 Pro), GPT-4 Turbo achieves the highest application rate as it generates well-formed patches for more than half the bugs in both the Oracle (\(56.99\%\)) and BM25 settings (\(55.2\%\)). For the remaining \(16\)k context models, we notice the highest Apply \(\%\) for GPT-3.5 Turbo in both settings (\(15.41\%\) and \(40.86\%\)).
+
+**Bug Solve Rate:** In addition to the patch application rate, we also measure % of _semantically valid_ patches, i.e., the % of bugs solved when successfully applying the patch (Solve %). Amongst the \(50\)k context models, GPT-4 Turbo has the highest solve rate of \(5.38\%\), solving \(15\) bugs in the Oracle setting. However, in the BM25 setting, due to poor retrieval performance, only GPT-4 Turbo has a non-zero solve rate of \(0.72\%\) indicating that more research is needed to improve kernel bug localization and resolution. For the \(16\)k context models, GPT-3.5 Turbo has the highest solve rates of \(1.08\%\) and \(0.36\%\) in the Oracle and BM25 settings respectively. Unfortunately, the solve rates for all the Llama models are \(0\%\) in all scenarios.
+
+**Union:** Upon inspecting all the correct LLM patches, we note \(29\) unique bug ids from a total of \(36\) solved bugs. Hence, combining the patches from all the models results in a solve rate of \(10.39\%\).
+
+Overall, we observe that state-of-the-art LLMs struggle to effectively resolve Linux kernel bugs due to the sheer complexity and scale of the problem. As a result, we believe that there is a lot of scope for research to make LLMs effective in this domain. In the following section, we will qualitatively analyze an example patch from GPT-4 Turbo and compare this to the actual Fix.
+
+### Qualitative Analysis of Patch Generation
+
+Figure 4 shows an example of a memory leak bug in kBenchSyz. The crash report (left) includes a stack trace with cinergyt2_frontend_attach highlighted in red, which is the buggy function that is modified in the Fix. On the right, we compare the actual Fix by a developer with a successful patch suggested by GPT-4 Turbo. The model's patch correctly localizes the bug but is less nuanced and safe than the developer's solution. The developer's fix ensures memory safety and follows coding conventions, while the model's patch uses kfree, which can cause issues if the memory was not
+
+    & **Patch** & **GPT-3.5** & **CL** & **CL** & **CL** & **L3** & **GPT-4** & **Claude** & **Sonnet** 5 & **L5 Pro** \\  & **Results** & **Turbo** & **7b** & **13b** & **34b** & **8B** & **Turbo** & **3** & **Sonnet** 5 & **L5 Pro** \\  & & (1, 10) & (1) & (1) & (1) & (1) & (1, 10) & (1) & (1) & (1, 10) \\   & **Apply \%** & (1,43, **15.41**) & 9.68 & 0.72 & 15.41 & 0.36 & (20.07, **56.99**) & 27.60 & (22.22, 45.52) \\  & **Solve \%** & (0, **1.08**) & 0 & 0 & 0 & (1.08, **5.38**) & 1.79 & (0.72, 3.58) \\   & **Apply \%** & (13.26, **40.86**) & 20.79 & 0.72 & 40.14 & 1.08 & (15.77, **55.20**) & 28.67 & (12.19, 24.37) \\  & **Solve \%** & (0.36, **0.36**) & 0 & 0 & 0 & 0 & (0, **0.72**) & 0 & (0, 0) \\   
+
+Table 6: Patch Application and Bug Solve Rates using state-of-the-art LLMs. CL stands for CodeLlama and L3 stands for LLama-3. All % numbers are calculated for the entire \(279\) bugs in kBenchSyz. We ran over \(17,000\) kernel jobs using kGym to quantify these results.
+
+allocated with kmalloc. Despite its shortcomings, the model's patch can expedite debugging by highlighting the root cause, guiding the developer in composing a more accurate fix, thereby speeding up kernel crash resolution.
+
+## 6 Related Work
+
+**Code Modeling and ML for SE.** Recent advancements in code LMs have made program synthesis a reality (Guo et al., 2022; Ahmad et al., 2021; Wang et al., 2021; Feng et al., 2020). Many efforts have also scaled these advancements to build models that show amazing code comprehension and completion capabilities (Ila, Roziere et al., 2024; Nijkamp et al., 2023;a,b; Fried et al., 2023; Chen et al., 2021). Subsequently, many works have adapted code LMs to assist in various SE tasks like testing (Xia et al., 2024; Wang et al., 2024; Kang et al., 2023), program repair (Dinh et al., 2023; Gao et al., 2022), commit generation (Liu et al., 2023b), and pull request reviews (Li et al., 2022). Program repair is the closest research area to this work. However, previous works have not explored program repair in the context of massive systems-level repositories. We believe this is partly because performing large-scale experiments on these codebases is very challenging. Hence, we hope that kGym will spur research at the intersection of ML and systems-level code.
+
+**Benchmarking.** The most commonly evaluated application of Code LLMs is code generation. As a result, there are a plethora of code completion benchmarks. Most benchmarks including HumanEval (Chen et al., 2021) and others (CodeGeeX, 2022; Austin et al., 2021; Athiwaratkun et al., 2023; Cassano et al., 2023; Hendrycks et al., 2021; Lu et al., 2021; Puri et al., 2021; Clement et al., 2021; Ding et al., 2023; Wang et al., 2023; Lu et al., 2022) mainly assess code completion by providing in-file context, i.e., the LLM prompts only contain code from a single file. More recent works have introduced tougher repository-level benchmarks (Shrivastava et al., 2023; Ding et al., 2022; Pei et al., 2023; Zhang et al., 2023; Ding et al., 2023; Jimenez et al., 2024). Among these, SWE-bench (Jimenez et al. ) is the closest related work as it concentrates on repository-level program repair.
+
+Figure 4: A sample bug patch using GPT-4 Turbo. The left figure shows a stack trace with the buggy function highlighted in red. The right compares a successfully generated patch by GPT-4 Turbo vs a human developer. The developer solution first confirms that adap->fe_adap.fe is not null and then uses the function pointer field ops.release to deallocate the structure safely using a custom memory deallocator. In contrast, the model uses kfree in the generated patch to deallocate the object which implicitly assumes that the object was allocated memory using kmalloc.
+
+However, unlike SWE-bench, kBenchSyz focuses on low-level systems code, not generic userspace code like Python libraries. Additionally, a sample kBenchSyz problem has a code context scale that is \(50\) times the size of the largest SWE-bench instance. Hence, we believe that progress made on kBenchSyz would reflect advancements in the real-world crash resolution capabilities of ML models.
+
+## 7 Limitations
+
+**Time Intensive Experiments**. Due to the large size of the Linux kernel, compilation and linking of \( 50\)k files takes a significant amount of time. Using a c2-standard-30 machine, the compilation process takes \(15\) to \(20\) minutes. After this, if a patch is correct, the reproducuer runs for \(10\) minutes, and if incorrect, the kernel crashes within a couple of minutes. Thus, the total feedback time, after patch application, ranges from \(17\) to \(30\) minutes. As such, running kernel experiments is time intensive.
+
+**Single Test Reproducer**. As kGym builds upon Syzkaller, it uses a single Reproducer to check if the crash goes away. As a result, it is possible for an LLM to generate a patch that may work for crash resolution but may significantly alter code functionality. Thus after the reproducuer check, extensive testing maybe required to ensure that the kernel functions correctly. This can be done by using tools like Linux Testing Project6 or Linux Kernel Selftests7.
+
+## 8 Conclusion
+
+In this work, we introduce kBenchSyz (and kBenchC), a new challenging SE benchmark aimed at Linux kernel crash resolution. To effectively experiment on kBenchSyz, we also introduce kGym, a platform to execute large-scale kernel experiments. To interact with kGym, we also provide few simple APIs. Using kGym, we run over \(17\)k kernel jobs to report our initial baseline results that indicate poor performance even when using state-of-the-art LLMs. Thus, we conclude that there is adequate scope for research to improve crash resolution performance in massive production-ready systems-level codebases. We hope that by introducing kBenchSyz and kGym, we spur more efforts that lower the barrier of entry to research at the intersection of machine learning and system software.
+
+## 9 Acknowledgements
+
+This work was partly supported by multiple Google Cyber NYC awards, a Columbia SEAS/EVPR Stimulus award and the following NSF awards - IIS 2221943, CCF 2313055, CCF 1845893, CCF 2107405.

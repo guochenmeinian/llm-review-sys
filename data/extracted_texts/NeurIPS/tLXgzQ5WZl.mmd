@@ -1,0 +1,179 @@
+# SCube: Instant Large-Scale Scene Reconstruction
+
+using VoxSplats
+
+ Xuanchi Ren\({}^{1,2,3}\), Yifan Lu\({}^{1,4}\), Hanxue Liang\({}^{1,5}\), Zhangjie Wu\({}^{1,6}\),
+
+**Huan Ling\({}^{1,2,3}\), Mike Chen\({}^{1}\), Sanja Fidler\({}^{1,2,3}\), Francis Williams\({}^{1}\), Jiahui Huang\({}^{1}\)**
+
+\({}^{1}\)NVIDIA, \({}^{2}\)University of Toronto, \({}^{3}\)Vector Institute, \({}^{4}\)Shanghai Jiao Tong University
+
+\({}^{5}\)University of Cambridge, \({}^{6}\)National University of Singapore
+
+https://research.nvidia.com/labs/toronto-ai/scube/
+
+Equal contribution.
+
+###### Abstract
+
+We present SCube, a novel method for reconstructing large-scale 3D scenes (geometry, appearance, and semantics) from a sparse set of posed images. Our method encodes reconstructed scenes using a novel representation VoxSplat, which is a set of 3D Gaussians supported on a high-resolution sparse-voxel scaffold. To reconstruct a VoxSplat from images, we employ a hierarchical voxel latent diffusion model conditioned on the input images followed by a feedforward appearance prediction model. The diffusion model generates high-resolution grids progressively in a coarse-to-fine manner, and the appearance network predicts a set of Gaussians within each voxel. From as few as _3 non-overlapping input images_, SCube can generate millions of Gaussians with a \(1024^{3}\) voxel grid spanning _hundreds of meters_ in _20 seconds_. Past works tackling scene reconstruction from images either rely on per-scene optimization and fail to reconstruct the scene away from input views (thus requiring dense view coverage as input) or leverage geometric priors based on low-resolution models, which produce blurry results. In contrast, SCube leverages high-resolution sparse networks and produces sharp outputs from few views. We show the superiority of SCube compared to prior art using the Waymo self-driving dataset on 3D reconstruction and demonstrate its applications, such as LiDAR simulation and text-to-scene generation.
+
+## 1 Introduction
+
+Recovering 3D geometry and appearance from images is a fundamental problem in computer vision and graphics which has been studied for decades. This task lies at the core of many practical applications spanning robotics, autonomous driving, and augmented reality; just to name a few. Early algorithms tackling this problem use stereo matching and structure from motion (SfM) to recover 3D signals from image data (_e.g._). More recently, a line of work starting from Neural Radiance Fields  (NeRFs) has augmented traditional SfM pipelines by fitting a volumetric field to a set of images, which can be rendered from novel views. NeRFs augment traditional reconstruction pipelines by encoding dense geometry, and view-dependent lighting effects. While radiance-field methods present a drastic step forward in our ability to recover 3D information from images, they require a time-consuming per-scene optimization scheme. Furthermore, since each scene is recovered in isolation, radiance fields do not make use of data priors, and cannot extrapolate reconstructions away from the input views. Thus, radiance-field methods require dense view coverage in order to produce high-quality 3D reconstructions.
+
+Another recent line of work applies deep learning to predict 3D from images. These methods either meta-learn an initialization to the radiance-field optimization problem [7; 30; 49], or directly predict 3D from images using a feed-forward network [17; 57; 73]. While learning-based approaches can produce reconstructions from sparse views, they have only been used successfully for the case of single objects at low resolutions. Furthermore, these methods often suffer from 3D inconsistencies (_e.g._ the multi-layer surface or the Janus problem). In order to solve the general 3D reconstruction from images problem, we need methods that can _(1)_ generalize reconstruction to general scenes over the pure object case, _(2)_ produce accurate and high-quality reconstructions in the presence of dense views, leveraging data priors to produce plausible reconstructions in the sparse-view regime, and _(3)_ run quickly and efficiently (in terms of runtime and memory) on large-scale and high-resolution inputs. These demands are difficult to satisfy in practice since high-quality ground-truth 3D data is not widely available for scenes, 3D representations for deep learning that scale to large and diverse inputs are under-explored in the literature, and corresponding scalable and easy-to-train model designs need to be developed alongside any new 3D representation.
+
+Nevertheless, we remark that some of these issues have been resolved in isolation: Gaussian Splatting  enables fast, differentiable rendering and high reconstruction quality (but is not being used with data priors), and sparse voxel hierarchies  have been successfully used to build generative models of large-scale 3D scenes with attributes such as semantics and colors, and have been trained on partial data such as LiDAR scans from autonomous vehicle captures.
+
+In light of the above observations, we introduce SCube, a feed-forward method for large 3D scene reconstruction from images. Our method encodes 3D scenes as a hybrid of Gaussian splats (which enable fast rendering), supported on a sparse-voxel-hierarchy (which enables efficient generative modeling of large 3D scenes with semantics). We call this hybrid representation VoxSplats and predict a VoxSplat from images using a feed-forward process consisting of two steps: _(1)_ A generative geometry network that predicts a sparse voxel hierarchy conditioned on input images, and _(2)_ an appearance network that predicts the Gaussian attributes within the voxels as well as a skybox texture to represent the background. The networks are implemented using highly efficient sparse convolution [14; 40] designed for 3D data which enables us to reconstruct a full scene from images in under 20 seconds. We evaluate our performance on the Waymo Open Dataset  on the challenging task of reconstructing a scene from sparse images with low overlap. We show that SCube significantly outperforms existing methods on this task. Furthermore, we demonstrate that SCube enables downstream applications such as LiDAR simulation and text-to-scene generation.
+
+## 2 Related Work
+
+**3D Scene Representation.** Scenes in the wild are often large in scale and contain complicated internal structures which cause representations such as tri-planes , dense voxel grids , or meshes [19; 46] to fail due to capacity or memory limitations. Optimization-based reconstruction methods [15; 32] use high-resolution hash grids [1; 33], but these are non-trivial to infer using a neural
+
+Figure 1: **SCube.** Given sparse input images with little or no overlap, our model reconstructs a high-resolution and large-scale scene in 3D represented with VoxSplats, ready to be used for novel view synthesis or LiDAR simulation.
+
+network . In contrast, sparse voxel grids are effective for learning scene-reconstruction [40; 75] thanks to efficient sparse neural operators [8; 54]. Recently, Gaussian splatting  has enabled real-time neural rendering and has been applied to overfitting large scenes [66; 76]. [31; 39] use a hybrid of the above two representations, but the voxel grid or octree is only used to regularize the Gaussian positions without any data priors learned. This is in contrast to our VoxSplat that allows reconstruction in a direct inference pass thanks to the efficiency of sparse grids and the high representation power of Gaussian splats. We support operating only on sparse-view images, significantly lifting the input requirements by learning from large datasets.
+
+Sparse-view 3D ReconstructionSparse-view images often contain insufficient correspondences required by traditional reconstruction methods . One line of work uses learned image-space priors such as depth , normal maps , and appearance from GANs  or diffusion models  to augment an optimization process such as NeRF. To speed up inference, another line of work uses a feed-forward model to predict renderable features [4; 6; 22; 29; 57; 73]. Alternatively, some papers perform learning directly in 3D space, which yields better consistency and less distortion [5; 13; 17; 68]. Our setting is similar to  where input images come from the same rig, but ours is more challenging since we do not use temporally-sequenced inputs with high overlap. We remark that semantic scene completion works [21; 26; 51; 61] also reconstruct voxels but at much lower resolutions and without appearance.
+
+Generative Models for 3D.3D reconstruction can also be formulated as a conditional generative problem (i.e.modeling the distribution of scenes given partial observations). Text and single-image to-3D generation has been explored for objects [17; 28; 38; 47; 55; 56; 60; 69]. Extending this task to large-scenes is comparatively unexplored, and object-based methods often fail due to scaling limitations or assumptions on the data. [48; 72] recursively apply an image generative model to inpaint missing regions in 3D, but produces blurry reconstructions at a limited scale. XCube  is among the first to directly learn high-resolution 3D scene priors. Here, we extend this model with multiview image conditioning and enable it to predict appearance on top of geometry.
+
+## 3 Method
+
+Our method reconstructs a high-resolution 3D scene from \(N\) sparse images \(=\{^{i}\}_{i=1}^{N}\) in two stages: _(1)_ We reconstruct the scene geometry represented as a sparse voxel grid \(\) with semantic
+
+Figure 2: **Framework.** SCube consists of two stages: **(1)** We reconstruct a sparse voxel grid with semantic logit conditioned on the input images using a conditional latent diffusion model based on XCube . **(2)** We predict the appearance of the scene represented as VoxSplats and a sky panorama using a feedforward network. Our method allows us to synthesize novel views in a fast and accurate manner, along with many other applications.
+
+features (SS 3.1). _(2)_ We predict the appearance \(\) of the scene that allows for high-quality novel view synthesis (SS 3.2) using VoxSplats and a sky panorama. We can express our pipeline as taking samples from the distribution \(p(,|)=p(|,)p( |)\). In order to improve the final view quality of the output, we apply an optional post-processing step discussed in SS 3.3.
+
+### Voxel Grid Reconstruction
+
+Background: 3D Generation with XCube.XCube  is a 3D generative model that produces high-quality samples for both objects and large outdoor scenes. XCube uses a hierarchical latent diffusion model to generate _sparse voxel hierarchies_, i.e., a hierarchy of sparse voxel grids where each fine voxel is contained within a coarse voxel. XCube learns a distribution over latent \(\) encoded by a sparse structure Variational Autoencoder (VAE). Both the VAE and the diffusion model are instantiated with sparse convolutional neural networks , and can generate geometry at up to \(1024^{3}\) resolution. We use XCube as the backbone for our geometry reconstruction module. We remark that while the original paper only focused on unconditional or text-conditioned generation, we introduce a novel image-based conditioning \(\).
+
+Image Conditioned Geometry Generation.To condition XCube on posed input images, we lift DINO-v2  features computed on the input images to 3D space as follows. First, we use the pre-trained DINOv2 model to extract robust visual features for input images, and process the DINO feature using several trainable 2D conv layers to reduce the feature channel to \(+D\). We then split the channel \(C+D\) into two parts for each pixel \(j\) and input image index \(i\): one part is a regular \(C\)-dimensional feature \(_{j}^{i}\) and the other will be a \(D\)-dimensional Softmax-normalized vector \(_{j}^{i}^{D}\). Here \(_{j}^{i}\) can be viewed as a distribution over the depth of the corresponding pixel, and we follow a strategy similar to LSS  to unproject the images into a dense 3D voxel grid \(\) where \(v\) denotes the index of a voxel and \(d[1,D]\) indexes the depth buckets:
+
+\[_{jd}^{i}=_{jd}^{i}_{j}^{i},_{v }=_{(i,j,d)}_{jd}^{i}^{C}.\] (1)
+
+Note that we quantize the depth into \(D\) bins dividing the range from a predefined \(z_{}\) to \(z_{}\). Unlike image-conditioning techniques used in object-level or indoor-level datasets where the camera frusta have significant overlap, our large-scale outdoor setting only takes sparse low-overlapping views captured from an ego-centric camera. Hence previous methods [28; 50; 52] that broadcast the same features to all the voxels along the rays corresponding to the pixel are not suitable here to precisely locate the geometries such as vehicles. The use of the weight \(\) allows us to handle occlusions effectively and produce a more accurate conditioning signal. After building \(\), we directly concatenate it with the latent \(\) and feed it into the XCube diffusion network as conditioning.
+
+Training and Inference.Our training pipeline is similar to , where we first train a VAE to learn a latent space over sparse voxel hierarchies. We add semantic logit prediction as in  to the grid and empirically find that it helps the model to learn better geometry. Then we train the diffusion model conditioned on \(\) using the following loss:
+
+\[=_{}+_{},_{}=_{,i,j}( _{j}^{i},[_{j}^{i}]),\] (2)
+
+where \(_{}\) is the loss for diffusion model training (see Appendix A for details). \(()\) is the multi-class focal loss . This additional depth loss is an explicit supervision to properly weigh the image features and encourage correct placement into the corresponding voxels. Due to the generative nature of XCube, we could learn the data prior to generate complete geometry even if some of the ground-truth 3D data is incomplete.
+
+### Appearance Reconstruction
+
+The VoxSplat Representation.In the second stage, we fix the voxel grid \(\) generated from the geometry stage and predict a set of Gaussian splats in each voxel to model the scene appearance. Gaussian splatting  is a powerful 3D representation technique that models a scene's appearance volumetrically as sum of Gaussians:
+
+\[G()=^{-(- )^{}^{-1}(-)},\] (3)where \(\) is the opacity, \(^{3}\) is the center of each Gaussian, and \(=^{}^{}^{3 3}\) is its covariance. The covariance matrix is factorized into a rotation matrix \(\) parameterized by a quaternion \(\) and a scale diagonal matrix \(=()\). Each Gaussian additionally stores a color value RGB. Note that the original paper uses a set of SH coefficients for view-dependent colors, but we only use the \(0^{}\)-order SH in our model (i.e., without view-dependency) which we found to be sufficient for sparse-view reconstruction.
+
+While the original Gaussian Splatting paper and its follow-ups  propose many heuristics to optimize the positions of Gaussians for a given scene, we instead choose to predict \(M\) Gaussians per-voxel using a feed-forward model. We limit the positions of the Gaussians within a neighborhood of their supporting voxels, thus preserving the geometric structure of the supporting grid. By grounding the splats on a voxel _scaffold_, our reconstructions achieve better geometric quality without resorting to heuristics. Fittingly, we dub our voxel-supported Gaussian splats _VoxSplats_.
+
+The output of our network is \(\{[}_{v},_{v},}_{v},}_{v}, _{v}]^{14}\}_{M}\) for each voxel \(v\). To compute the per-Gaussian parameters used for rendering we apply the following activations:
+
+\[_{v}=r}_{v}+_{v},\ \ _{v}=(_{v}),\ \ _{v}=}_{v},\ \ _{v}=(}_{v}),\] (4)
+
+where \(_{v}\) is the centroid of the voxel \(v\), and \(r\) is a hyperparameter that controls the range of a Gaussian within its supporting voxel. Here, we set \(r\) to three times the voxel size. We can efficiently render the Gaussians predicted by our model using rasterization  or raytracing .
+
+Sky Panorama for Background.To capture appearance away from the predicted geometry, our model builds a sky feature panorama \(^{H_{p} W_{p} C_{p}}\) from all input images, which can be considered as an expanded unit sphere with an inverse equirectangular projection. For each pixel in the panorama \(\), we get its cartesian coordinate \(=(x,y,z)\) on the unit sphere and project \(\) to the image plane to retrieve the image feature; since only the view direction decides the sky color, we zero the translation part of the camera pose in the projection step. We also apply a sky mask to ensure the panorama only focuses on the sky region.
+
+To render a novel viewpoint with its extrinsics and intrinsics, we recover the background appearance by sampling the sky panorama and decoding it into RGB values. For each camera ray from the novel view, we calculate its pixel coordinate on the 2D sky panorama \(\) with equirectangular projection and get the sky features via trilinear interpolation, resulting in a 2D feature map for the novel view. We finally decode the 2D feature map with a CNN network to get the background image \(_{}\), which will be alpha-composited with the foreground image from Gaussian rasterization:
+
+\[_{}(u,v)=_{}(u,v)+(1-(u,v)) _{}(u,v)\] (5)
+
+where \(_{}(u,v)\) is the rendered image of Gaussians, \((u,v)\) indicates the pixel coordinate, and \((u,v)\) is the accumulated transmittance map of the Gaussians (see  for details).
+
+Architecture Details.We predict the \((M 14)\)-dimensional vector \(\{[}_{v},_{v},}_{v},_{v}]\}_{M}\) for each voxel via a 3D sparse convolutional U-Net which takes as input the sparse voxel grid \(\) outputted by the geometry stage, where each voxel contains a feature sampled from the input images as follows: We process each input image \(^{i}\) using a CNN to get the image feature, and then cast a ray from each image pixel into \(\), accumulating the feature in the first voxel intersected by that ray. Voxels that are not intersected by any rays receive a zero feature vector.
+
+For the sky panorama model, we use the same image feature as above. In the training stage, we set smaller \(H_{p}\) and \(W_{p}\) for faster training and lower memory usage; in the inference stage, we increase \(H_{p}\) and \(W_{p}\) to get a sharper and more detailed sky appearance.
+
+Given a set of training images \(\{^{i}_{}\}_{i}\) and sky masks \(\{^{i}\}_{i}\) distinct from the inputs, we supervise the appearance model using the loss:
+
+\[=_{1}_{1}(^{i}_{},^{i}_{})+_{2}_{1}(^{i},^{i}) +_{}_{}(^{i}_{}, ^{i}_{})+_{}_{}( ^{i}_{},^{i}_{}),\] (6)
+
+where the training views \(^{i}_{}\) are sampled from nearby 10 views of the input images; the predicted views \(^{i}_{}\) and transmittance masks \(^{i}\) are rendered using Eq (5); and \(_{}\)/\(_{}\) are perceptual and structural metrics defined in  and .
+
+### Postprocessing and Applications
+
+**Optional GAN Postprocessing.** The novel views directly rendered from our appearance model sometimes suffer from voxelization artifacts or noise. We resolve this with an optional lightweight conditional Generative Adversarial Network (GAN) that takes the rendered images as input and outputs a refined version. The discriminator of this GAN takes \(256 256\) image patches sampled from the input sparse view images, as well as the generated images conditioned on the rendered images. Drawing inspiration from , we fit the GAN independently for each scene at inference time, which takes \(\)20min to train. Due to the excessive time cost, we apply this step optionally only when higher-quality images are needed (which we call **SCube+**). Fig. 8 shows the results with and without this step, and we further present a **general postprocessing without per-scene optimization** in Appendix C.
+
+**Application: Consistent LiDAR Simulation.** LiDAR simulation  aims at reproducing the point cloud output given novel locations of the sensor and is an important application for training and verification of autonomous driving systems. The generated LiDAR point clouds should accurately reflect the underlying 3D geometry and a sequence of LiDAR scans should be temporally consistent. Our method enables converting sparse-view images directly into LiDAR point clouds, i.e., a _sensor-to-sensor conversion_ scheme. To achieve this, we leverage the output high-resolution Gaussians from our model and ray-trace the LiDAR rays to obtain the corresponding distances. Thanks to our clean voxel scaffold, the reconstructed scene is free of floaters and we set the opacity \(\) to 1 for all the Gaussians to ensure a _hard_ intersection that aligns better with the geometry.
+
+**Application: Text-to-Scene Generation.** Our method can be easily extended to generate 3D scenes from text prompts. Similar to MVDream , we train a multi-view diffusion model with the architecture of VideoLDM  that generates images from text prompts. The original spatial self-attention layer is inflated along the view dimension to achieve content consistency . For training, we use CogVLM  to annotate the images automatically on a large scale. After the model is trained, we directly feed the output of the multi-view model to SCube to lift the observations into 3D space for novel view synthesis.
+
+## 4 Experiments
+
+In this section, we validate the effectiveness of SCube. First, we present our new data curation pipeline that produces ground-truth voxel grids (SS 4.1). Next, we demonstrate SCube's capabilities in scene reconstruction (SS 4.2), and further highlight its usefulness in assisting the state-of-the-art Gaussian splatting pipeline (SS 4.3). Finally, we showcase other applications of our method (SS 4.4) and perform ablation studies to justify our design choices (SS 4.5).
+
+### Dataset Processing
+
+Accurate 3D data is essential for our method to learn useful geometry and appearance priors. Fortunately, many autonomous driving datasets  are equipped with 3D LiDAR data, and one can simply accumulate the point clouds to obtain the 3D scene geometry . However, the LiDAR
+
+Figure 3: **Data Processing Pipeline. We add COLMAP  dense reconstruction points to the accumulated LiDAR points and compensate for dynamic objects using their bounding boxes. This provides us with a more complete geometry for training.**points usually do not cover high-up regions such as tall buildings and contain dynamic (non-rigid) objects that are non-trivial to accumulate.
+
+We hence build a data processing pipeline based on Waymo Open Dataset  as shown in Fig. 3, consisting of three steps: **Step 1**, we accumulate the LiDAR points in the world space, removing the points within the bounding boxes of dynamic objects such as cars and pedestrians. We additionally obtain the semantics of each accumulated LiDAR point, where non-annotated points are assigned the semantics of their nearest annotated neighbors. **Step 2**, we use the multi-view stereo (MVS) algorithm available in COLMAP  to reconstruct the dense 3D point cloud from the images, and the semantic labels of the points are obtained by Segformer . **Step 3**, we add point samples for the dynamic objects according to their bounding boxes at a given target frame. This gives us static _and_ accumulated ground truths available for training. For each data sample, we crop the point cloud into a local chunk of \(102.4\)m \(\)\(102.4\)m centered around a randomly sampled ego-vehicle pose. Since there are no rear-view cameras in the Waymo dataset, we allocate more space for the chunk in the forward direction, as shown in the inset figure. See Appendix A for additional details.
+
+### Large-scale Scene Reconstruction
+
+**Evaluation and Baselines.** To assess our method's power for 3D scene reconstruction, we follow the common protocol to evaluate the task of novel view synthesis . Given input multi-view images (details about choosing views are in Appendix A) at frame \(T\), we render novel views at future timestamps \(T+5\) and \(T+10\), and compare them to the corresponding ground-truth frames by calculating Peak Signal-to-Noise Ratio (PSNR), Structural Similarity Index Measure (SSIM), and Learned Perceptual Image Patch Similarity (LPIPS) . We exclude the regions of moving objects for \(T+5\) and \(T+10\) evaluation, and only use three front views when computing the metrics.
+
+We use PixelNeRF , PixelSplat , DUST3R , MVSplat , and MVSGaussian  as our baselines for comparison.  take images and their corresponding camera parameters as input and reconstruct NeRFs or 3D Gaussian representations. DUS3R  directly estimates per-pixel point clouds from the images. We append additional heads to the its decoder which predicts other 3D Gaussian attributes along with the mean positions and finetune it with a rendering loss. For all other baselines, we take the official code and re-train them on our dataset. We tried to add the
+
+Figure 4: **Novel View Synthesis. We show the synthesized novel views of SCube+ compared to baselines approaches. The inset of each subfigure shows a top-down visualization (an extreme novel view) of the reconstructed scene geometry.**
+
+state-of-the-art depth estimator Metric3Dv2  for depth supervision but empirically found that the performance degraded.
+
+**Results and Analysis.** We show our results quantitatively in Tab. 1 and visually in Fig. 4. Our method outperforms all the baselines for both the current frame (reconstruction) and future frames (prediction) by a considerable margin on all metrics. PixelNeRF is limited by the representation power of the network, and simply fails to capture high-frequency details in the scene. PixelSplat highly relies on overlapping regions in the input views and cannot adapt well to our sparse view setting. It fails to model the true 3D geometry as shown in the top-down view, and simply collapses the images into constant depths. The multi-view-stereo-based methods [6; 29] cannot enable extreme novel view synthesis such as the bird-eye view, and could not recover highly-occluded regions. Thanks to the effective pre-training of DUSt3R, it is able to learn plausible displacements in the image domain, but the method still suffers from missing regions, misalignments, or inaccurate depth boundaries. In contrast, our method can reconstruct complete scene geometry even for far-away regions. It is both accurate and consistent while producing high-quality novel view renderings.
+
+To better demonstrate the power of learning priors in 3D, we build another baseline using the state-of-the-art metric depth estimator Metric3Dv2  to unproject the images into point clouds using 2D learned priors. As shown in Fig. 5, our method can reconstruct more complete, uniform, and accurate scenes, justifying the power of representing and learning geometry directly in the true 3D space.
+
+### Assisting Gaussian Splatting Initialization
+
+Our method creates scene-level 3D Gaussians with accurate geometry and appearance, which can be used to initialize large-scale 3D Gaussian splatting  training. This is particularly useful in outdoor driving scenarios where structure-from-motion (SfM) may fail due to the sparsity of viewpoints.
+
+To demonstrate this, we consider and compare three initialization methods: **Random** initialization is where points are uniformly sampled within the range of \((-20,20)^{3}\) around each camera. **Metric3Dv2** initialization is where we use the unprojected cloud from Metric3Dv2 's monocular
+
+    &  &  &  \\   & PSNR\(\) & SSIM\(\) & LPIPS\(\) & PSNR\(\) & SSIM\(\) & LPIPS\(\) & PSNR\(\) & SSIM\(\) & LPIPS\(\) \\  PixelNeRF  & 15.26 & 0.51 & 0.66 & 15.21 & 0.52 & 0.64 & 14.61 & 0.49 & 0.66 \\ PixelSplat  & 22.15 & 0.71 & 0.61 & 20.11 & 0.70 & 0.60 & 18.77 & 0.66 & 0.62 \\ DUSt3R  & 17.17 & 0.60 & 0.58 & 17.08 & 0.62 & 0.56 & 16.08 & 0.58 & 0.60 \\ MVSplit  & 21.84 & 0.71 & 0.46 & 20.14 & 0.71 & 0.48 & 18.78 & 0.69 & 0.52 \\ MVSGaussian  & 21.25 & 0.80 & 0.51 & 16.49 & 0.70 & 0.60 & 16.42 & 0.60 & 0.59 \\  SCube **(Ours)** & 25.90 & 0.77 & 0.45 & 19.90 & 0.72 & 0.47 & 18.78 & 0.70 & 0.49 \\ SCube+ **(Ours)** & **28.01** & **0.81** & **0.25** & **22.32** & **0.74** & **0.34** & **21.09** & **0.72** & **0.38** \\   
+
+Table 1: **Quantitative Comparisons on 3D Reconstruction.** The metrics are computed both at the input frame \(T\) and future frames. \(\): higher is better, \(\): lower is better.
+
+Figure 5: **Geometry Reconstruction from Sparse Views.** We show the comparison between our method and Metric3Dv2 . The semantics of Metric3Dv2 are obtained from Segformer .
+
+depth and align its scale to metric-scale LiDAR. **SCube (ours)** initialization directly adopts the positions and colors of the Gaussians from our pipeline. For input to these methods, we choose the views from the first frame \(T\) and control the number of initial points to 200k. We then incorporate \(R\) subsequent frames into the full training, with every 3 frames skipped to be used in the test set. The number of training iterations is fixed to 30k and the initial positional learning rate is set to \(1.6\)e\(-5\). We select 15 static scenes for experiments and report their average metrics, which are shown in Tab. 2. The results consistently demonstrate SCube's effectiveness as an initialization strategy that provides accurate 3D grounding and alleviates overfitting on the training views.
+
+### Other Applications
+
+We demonstrate the applications of our method as described in SS 3.3. Fig. 6 shows the consistent LiDAR simulation results, where the simulated sequences could effectively cover a long range away from the input camera positions, while resolving intricate geometric structures such as buildings, trees, or poles. Fig. 7 exemplifies the text-to-scene generation capability enabled by our method. The 3D geometry and appearance respect the input text prompt and the corresponding images. Readers are referred to Appendix D.3 for more generative results.
+
+### Ablation Study
+
+**Image-Conditioning Strategy.** We replace the image conditioning strategy described in Eq (1) in the voxel grid reconstruction stage with a vanilla scheme that broadcasts the same feature to all the voxels along the pixel's ray. The final IoU of the fine-level voxel grid drops from \(34.31\%\) to \(30.33\%\), and the mIoU that considers the accuracy of the voxel's semantic prediction drops from \(20.00\%\) to \(16.61\%\). This shows the effectiveness of our conditioning strategy being able to disambiguate voxels at different depths.
+
+**Two-stage Reconstruction.** We disentangle the voxel grid and appearance reconstruction stages to make the best use of different types of models. Using a single-stage model2 that simultaneously
+
+    &  &  &  \\   & PSNR\(\) & SSIM\(\) & LPIPS\(\) & PSNR\(\) & SSIM\(\) & LPIPS\(\) & PSNR\(\) & SSIM\(\) & LPIPS\(\) \\  Random & 21.66 & 0.72 & 0.38 & 24.27 & 0.78 & 0.34 & 24.93 & 0.80 & 0.35 \\ Metric3Dv2  & 23.30 & 0.75 & 0.33 & 25.21 & 0.80 & 0.32 & 25.58 & 0.80 & 0.34 \\ SCube (**Ours**) & **24.10** & **0.77** & **0.32** & **25.94** & **0.81** & **0.30** & **26.07** & **0.82** & **0.32** \\   
+
+Table 2: **Initializations for Gaussian Splatting training. We train 3D Gaussians with different initialization for \(R\) frames. We report the test-set metrics. \(\): higher is better, \(\): lower is better.**
+
+Figure 6: **LiDAR Simulation. We demonstrate qualitative results of image-to-consistent-LiDAR transfer. The LiDAR sequences are simulated by moving the camera forward by 60 meters.**
+
+predicts the sparse voxels and the appearance from images, we can only achieve a PSNR/LPIPS of \(17.88\)/\(0.57\), in comparison to \(19.34\)/\(0.48\) when using the two-stage model. Here the values are the average of \(T+5\) and \(T+10\) frames. In terms of geometry quality, the single-stage model is also significantly worse (up to 100\(\)) in Chamfer distance than the two-stage model. Please refer to more details about the analysis of geometry quality in Appendix D.1.
+
+**Appearance Reconstruction.** We validate the effect of voxel grid resolution and the number of Gaussians per voxel \(M\) in the appearance reconstruction stage. Results are shown in Tab. 3. We find that higher-resolution voxel grids are crucial for capturing detailed geometry, and using a larger number of Gaussians only slightly increases the performance. Thus, we set \(M=4\) as a moderate value for the final results. Compared in Fig. 8, the GAN-based postprocessing, despite the time cost, is beneficial for producing high-quality images by sharpening the renderings. See Appendix D.2 for more visual comparisons.
+
+## 5 Discussion
+
+**Conclusion.** In this work, we have introduced SCube, a feed-forward method for large 3D scene reconstruction from images. Given sparse view non-overlapping images, our method is able to predict a high-resolution 3D scene representation consisting of voxel-supported Gaussian splats (VoxSplat) and a light-weight sky panorama in a single forward pass within tens of seconds. We have demonstrated the effectiveness of our method on the Waymo Open Dataset, and have shown that our method outperforms the state-of-the-art methods in terms of reconstruction quality.
+
+**Limitations.** Our method does suffer from some limitations. First, the current method is not able to handle complicated scenarios such as dynamic scenes under extreme lighting or weather conditions. Second, the quality of appearance in occluded regions still carries uncertainty. Third, the method itself still requires ground-truth 3D training data which is not always available for generic outdoor scenes. In future work, we plan to address these limitations by incorporating more advanced neural rendering techniques and by exploring more effective ways to generate training data.
+
+Figure 8: **Effects of GAN Postprocessing. Left: SCube+, Right: SCube. Left: Table 3: **Ablation Study for Appearance Reconstruction.**
+
+   Resolution & \(M\) & PSNR\(\) & LPIPS\(\) \\  \(256^{3}\) & 4 & 18.58 & 0.62 \\ \(1024^{3}\) & 1 & 19.34 & 0.52 \\ \(1024^{3}\) & 4 & 19.34 & 0.48 \\   
+
+Table 3: **Ablation Study for Appearance Reconstruction.**
+
+Figure 7: **Text-2-Scene Generation. Given a text prompt, we could generate various multi-view images and lift them to 3D scenes with SCube. See Appendix D.3 for more text-2-scene results.**

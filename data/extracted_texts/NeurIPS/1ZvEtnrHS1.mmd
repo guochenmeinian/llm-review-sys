@@ -1,0 +1,188 @@
+# Convolutional State Space Models for
+
+Long-Range Spatiotemporal Modeling
+
+ Jimmy T.H. Smith\({}^{*,2,4}\), Shalini De Mello\({}^{1}\), Jan Kautz\({}^{1}\), Scott W. Linderman\({}^{3,4}\), Wonmin Byeon\({}^{1}\)
+
+\({}^{1}\)NVIDIA, \({}^{*}\)Work performed during internship at NVIDIA
+
+\({}^{2}\)Institute for Computational and Mathematical Engineering, Stanford University.
+
+\({}^{3}\)Department of Statistics, Stanford University.
+
+\({}^{4}\)Wu Tsai Neurosciences Institute, Stanford University.
+
+{jsmith14,scott.linderman}@stanford.edu
+
+{shalinig,jkautz,wbyeon}@nvidia.com.
+
+###### Abstract
+
+Effectively modeling long spatiotemporal sequences is challenging due to the need to model complex spatial correlations and long-range temporal dependencies simultaneously. ConvLSTMs attempt to address this by updating tensor-valued states with recurrent neural networks, but their sequential computation makes them slow to train. In contrast, Transformers can process an entire spatiotemporal sequence, compressed into tokens, in parallel. However, the cost of attention scales quadratically in length, limiting their scalability to longer sequences. Here, we address the challenges of prior methods and introduce convolutional state space models (ConvSSM)1 that combine the tensor modeling ideas of ConvLSTM with the long sequence modeling approaches of state space methods such as S4 and S5. First, we demonstrate how parallel scans can be applied to convolutional recurrences to achieve subquadratic parallelization and fast autoregressive generation. We then establish an equivalence between the dynamics of ConvSSMs and SSMs, which motivates parameterization and initialization strategies for modeling long-range dependencies. The result is ConvSS, an efficient ConvSSM variant for long-range spatiotemporal modeling. ConvS5 significantly outperforms Transformers and ConvLSTM on a long horizon Moving-MNIST experiment while training \(3\) faster than ConvLSTM and generating samples \(400\) faster than Transformers. In addition, ConvS5 matches or exceeds the performance of state-of-the-art methods on challenging DMLab, Minecraft and Habitat prediction benchmarks and enables new directions for modeling long spatiotemporal sequences.
+
+## 1 Introduction
+
+Developing methods that efficiently and effectively model long-range spatiotemporal dependencies is a challenging problem in machine learning. Whether predicting future video frames [1; 2], modeling traffic patterns [3; 4], or forecasting weather [5; 6], deep spatiotemporal modeling requires simultaneously capturing local spatial structure and long-range temporal dependencies. Although there has been progress in deep generative modeling of complex spatiotemporal data [7; 8; 9; 10; 11; 12], most prior work has only considered short sequences of 20-50 timesteps due to the costs of processing long spatiotemporal sequences. Recent work has begun considering sequences of hundreds to thousands of timesteps [13; 14; 15; 16]. As hardware and data collection of long spatiotemporal sequences continue to improve, new modeling approaches are required that scale efficiently with sequence length and effectively capture long-range dependencies.
+
+Convolutional recurrent networks (ConvRNNs) such as ConvLSTM  and ConvGRU  are common approaches for spatiotemporal modeling. These methods encode the spatial information using tensor-structured states. The states are updated with recurrent neural network (RNN) equations that use convolutions instead of the matrix-vector multiplications in standard RNNs (e.g., LSTM/GRUs ). This approach allows the RNN states to reflect the spatial structure of the data while simultaneously capturing temporal dynamics. ConvRNNs inherit both the benefits and the weaknesses of RNNs: they allow fast, stateful autoregressive generation and an unbounded context window, but they are slow to train due to their inherently sequential structure and can suffer from the vanishing/exploding gradient problem .
+
+Transformer-based methods  operate on an entire sequence in parallel, avoiding these training challenges. Transformers typically require sophisticated compression schemes  to reduce the spatiotemporal sequence into tokens. Moreover, Transformers use an attention mechanism that has a bounded context window and whose computational complexity scales quadratically in sequence length for training and inference . More efficient Transformer methods improve on the complexity of attention , but these methods can fail on sequences with long-range dependencies . Some approaches combine Transformers with specialized training frameworks to address the attention costs . However, recent work in deep state space models (SSMs) , like S4  and S5 , has sought to overcome attention's quadratic complexity while maintaining the parallelizability and performance of attention and the statefulness of RNNs. These SSM layers have proven to be effective in various domains such as speech , images  and video classification ; reinforcement learning ; forecasting  and language modeling .
+
+Inspired by modeling ideas from ConvRNNs and SSMs, we introduce _convolutional state space models_ (ConvSSMs), which have a tensor-structured state like ConvRNNs but a continuous-time parameterization and linear state updates like SSM layers. See Figure 1. However, there are challenges to make this approach scalable and effective for modeling long-range spatiotemporal data. In this paper, we address these challenges and provide a rigorous framework that ensures both computational efficiency and modeling performance for spatiotemporal sequence modeling. First, we discuss computational efficiency and parallelization of ConvSSMs across the sequence for scalable training and fast inference. We show how to parallelize linear convolutional recurrences using a binary associative operator and demonstrate how this can be exploited to use parallel scans for subquadratic parallelization across the spatiotemporal sequence. We discuss both theoretical and practical considerations (Section 3.2) required to make this feasible and efficient. Next, we address how to capture long-range spatiotemporal dependencies. We develop a connection between
+
+Figure 1: ConvRNNs  (left) model spatiotemporal sequences using tensor-valued states, \(}_{k}\), and a nonlinear RNN update, \(()\), that uses convolutions instead of matrix-vector multiplications. A position-wise nonlinear function, \(()\), transforms the states into the output sequence. Deep SSMs  (center) model vector-valued input sequences using a discretized linear SSM. The linear dynamics can be exploited to parallelize computations across the sequence and capture long-range dependencies. We introduce ConvSSMs (right) that model spatiotemporal data using tensor states, like ConvRNNs, and linear dynamics, like SSMs. We also introduce an efficient ConvSSM variant, ConvS5, that can be parallelized across the sequence with parallel scans, has fast autoregressive generation, and captures long-range dependencies.
+
+the dynamics of SSMs and ConvSSMs (Section 3.3) and leverage this, in Section 3.4, to introduce a parameterization and initialization design that can capture long-range spatiotemporal dependencies.
+
+As a result, we introduce _ConvS5_, a new spatiotemporal layer that is an efficient ConvSSM variant. It is parallelizable and overcomes difficulties during training (e.g., vanishing/exploding gradient problems) that traditional ConvRNN approaches experience. ConvS5 does not require compressing frames into tokens and provides an unbounded context. It also provides fast (constant time and memory per step) autoregressive generation compared to Transformers. ConvS5 significantly outperforms Transformers and ConvLSTM on a challenging long horizon Moving-MNIST  experiment requiring methods to train on 600 frames and generate up to 1,200 frames. In addition, ConvS5 trains \(3\) faster than ConvLSTM on this task and generates samples \(400\) faster than the Transformer. Finally, we show that ConvS5 matches or exceeds the performance of various state-of-the-art methods on challenging DMLab, Minecraft, and Habitat long-range video prediction benchmarks .
+
+## 2 Background
+
+This section provides the background necessary for ConvSSMs and ConvS5, introduced in Section 3.
+
+### Convolutional Recurrent Networks
+
+Given a sequence of inputs \(_{1:L}^{L U}\), an RNN updates its state, \(_{k}^{P}\), using the state update equation \(_{k}=(_{k-1},_{})\), where \(()\) is a nonlinear function. For example, a vanilla RNN can be represented (ignoring the bias term) as
+
+\[_{k}=(_{k-1}+_{})\] (1)
+
+with state matrix \(^{P P}\), input matrix \(^{P U}\) and \(()\) applied elementwise. Other RNNs such as LSTM  and GRU  utilize more intricate formulations of \(()\).
+
+_Convolutional recurrent neural networks_[17; 18] (ConvRNNs) are designed to model spatiotemporal sequences by replacing the vector-valued states and inputs of traditional RNNs with tensors and substituting matrix-vector multiplications with convolutions. Given a length \(L\) sequence of frames, \(_{1:L}^{L H^{} W^{} U}\), with height \(H^{}\), width \(W^{}\) and \(U\) features, a ConvRNN updates its state, \(_{k}^{H W P}\), with a state update equation \(_{k}=(_{k-1},_{k})\), where \(()\) is a nonlinear function. Analogous to (1), we can express the state update equation for a vanilla ConvRNN as
+
+\[_{k}=(*_{k-1}+*_{ k}),\] (2)
+
+where \(*\) is a spatial convolution operator with state kernel \(^{P P k_{A} k_{A}}\) (using an [output features, input features, kernel height, kernel width] convention), input kernel \(^{P U k_{B} k_{B}}\) and \(()\) is applied elementwise. More complex updates such as ConvLSTM  and ConvGRU  are commonly used by making similar changes to the LSTM and GRU equations, respectively.
+
+### Deep State Space Models
+
+This section briefly introduces deep SSMs such as S4  and S5  designed for modeling long sequences. The ConvS5 approach we introduce in Section 3 extends these ideas to the spatiotemporal domain.
+
+Linear State Space ModelsGiven a continuous input signal \((t)^{U}\), a latent state \((t)^{P}\) and an output signal \((t)^{M}\), a continuous-time, linear SSM is defined using a differential equation:
+
+\[^{}(t)=(t)+(t), (t)=(t)+(t),\] (3)
+
+and is parameterized by a state matrix \(^{P P}\), an input matrix \(^{P U}\), an output matrix \(^{M P}\) and a feedthrough matrix \(^{M U}\). Given a sequence, \(_{1:L}^{L U}\), the SSM can be discretized to define a discrete-time SSM
+
+\[_{k}=}_{k-1}+} _{k},_{k}=_{k}+ _{k},\] (4)
+
+where the discrete-time parameters are a function of the continuous-time parameters and a timescale parameter, \(\). We define \(}=_{}(,)\) and \(}=_{}(,,)\) where \(()\) is a discretization method such as Euler, bilinear or zero-order hold .
+
+S4 and S5Gu et al.  introduced the _structured state space sequence_ (S4) layer to efficiently model long sequences. An S4 layer uses many continuous-time linear SSMs, an explicit discretization step with learnable timescale parameters, and position-wise nonlinear activation functions applied to the SSM outputs. Smith et al.  showed that with several architecture changes, the approach could be simplified and made more flexible by just using one SSM as in (3) and utilizing parallel scans. SSM layers, such as S4 and S5, take advantage of the fact that linear dynamics can be parallelized with subquadratic complexity in the sequence length. They can also be run sequentially as stateful RNNs for fast autoregressive generation. While a single SSM layer such as S4 or S5 has only linear dynamics, the nonlinear activations applied to the SSM outputs allow representing nonlinear systems by stacking multiple SSM layers [56; 57; 58].
+
+SSM Parameterization and InitializationParameterization and initialization are crucial aspects that allow deep SSMs to capture long-range dependencies more effectively than prior attempts at linear RNNs [59; 60; 61]. The general setup includes continuous-time SSM parameters, explicit discretization with learnable timescale parameters, and state matrix initialization using structured matrices inspired by the HiPPO framework . Prior research emphasizes the significance of these choices in achieving high performance on challenging long-range tasks [19; 20; 56; 57]. Recent work  has studied these parameterizations/initializations in more detail and provides insight into this setup's favorable initial eigenvalue distributions and normalization effects.
+
+### Parallel Scans
+
+We briefly introduce parallel scans, as used by S5, since they are important for parallelizing the ConvS5 method we introduce in Section 3. See Blelloch  for a more detailed review. A scan operation, given a binary associative operator \(\) (i.e. \((a b) c=a(b c)\)) and a sequence of \(L\) elements \([a_{1},a_{2},...,a_{L}]\), yields the sequence: \([a_{1},\ (a_{1} a_{2}),\...,\ (a_{1} a_{2}... a _{L})]\).
+
+Parallel scans use the fact that associative operators can be computed in any order. A parallel scan can be defined for the linear recurrence of the state update in (4) by forming the initial scan tuples \(c_{k}=(c_{k,a},c_{k,b}):=(},\ \ } _{k})\) and utilizing a binary associative operator that takes two tuples \(q_{i},q_{j}\) (either the initial tuples \(c_{i},c_{j}\) or intermediate tuples) and produces a new tuple of the same type, \(q_{i} q_{j}:=(q_{j,a} q_{i,a},\ q_{j,a} q_{i,b}+q_{j,b})\), where \(\) is matrix-matrix multiplication and \(\) is matrix-vector multiplication. Given sufficient processors, the parallel scan computes the linear recurrence of (4) in \(O( L)\) sequential steps (i.e., depth or span) .
+
+## 3 Method
+
+This section introduces convolutional state space models (ConvSSMs). We show how ConvSSMs can be parallelized with parallel scans. We then connect the dynamics of ConvSSMs to SSMs to motivate parameterization. Finally, we use these insights to introduce an efficient ConvSSM variant, ConvS5.
+
+### Convolutional State Space Models
+
+Consider a continuous tensor-valued input \(}(t)^{H^{} W^{} U}\) with height \(H^{}\), width \(W^{}\), and number of input features \(U\). We will define a continuous-time, linear convolutional state space model (_ConvSSM_) with state \(}(t)^{H W P}\), derivative \(}^{}(t)^{H W P}\) and output \(}(t)^{H W U}\), using a differential equation:
+
+\[}^{}(t) =}*}(t)+ {}*}(t)\] (5) \[}(t) =}*}(t)+ {}*}(t)\] (6)
+
+where \(*\) denotes the convolution operator, \(}^{P P k_{A} k_{A}}\) is the state kernel, \(}^{P U k_{B} k_{B}}\) is the input kernel, \(}^{U P k_{C} k_{C}}\) is the output kernel, and \(}^{U U k_{D} k_{D}}\) is the feedthrough kernel. For simplicity, we pad the convolution to ensure the same spatial resolution, \(H W\), is maintained in the states and outputs. Similarly, given a sequence of \(L\) inputs, \(}_{1:L}^{L H^{} W^{ } U}\), we define a discrete-time convolutional state space model as
+
+\[}_{k} =}}*}_{k -1}+}}*}_{k}\] (7) \[}_{k} =}*}_{k}+ {}*}_{k}\] (8)
+
+where \(}}^{P P k_{A} k _{A}}\) and \(}}^{P U k_{B} k _{B}}\) denote that these kernels are in discrete-time.
+
+### Parallelizing Convolutional Recurrences
+
+ConvS5 leverages parallel scans to efficiently parallelize the recurrence in (7). As discussed in Section 2.3, this requires a binary associative operator. Given that convolutions are associative, we show:
+
+**Proposition 1**.: _Consider a convolutional recurrence as in (7) and define initial parallel scan elements \(c_{k}=(c_{k,a},c_{k,b}):=(}}, }}*}_{k})\). The binary operator, defined below, is associative._
+
+\[q_{i} q_{j}:=(q_{j,a} q_{i,a},\ q_{j,a}*q_{i,b}\ +\ q_{j,b}),\] (9)
+
+_where \(\) denotes convolution of two kernels, \(*\) denotes convolution and \(+\) is elementwise addition._
+
+Proof.: See Appendix A.1. 
+
+Therefore, in theory, we can use this binary operator with a parallel scan to compute the recurrence in (7). However, the binary operator,, requires convolving two \(k_{A} k_{A}\) resolution state kernels together. To maintain equivalence with the sequential scan, the resulting kernel will have resolution \(2k_{a}-1 2k_{a}-1\). This implies that the state kernel will grow during the parallel scan computations for general kernels with a resolution greater than \(1 1\). This allows the receptive field to grow in the time direction, a useful feature for capturing spatiotemporal context. However, this kernel growth is computationally infeasible for long sequences.
+
+We address this challenge by taking further inspiration from deep SSMs. These methods opt for simple but computationally advantageous operations in the time direction (linear dynamics) and utilize more complex operations (nonlinear activations) in the depth direction of the model. These nonlinear activations allow a stack of SSM layers with linear dynamics to represent nonlinear systems. Analogously, we choose to use \(1 1\) state kernels and perform pointwise state convolutions for the convolutional recurrence of (7). When we stack multiple layers of these ConvSSMs, the receptive field grows in the depth direction of the network and allows the stack of layers to capture the spatiotemporal context . Computationally, we now have a construction that can be parallelized with subquadratic complexity with respect to the sequence length.
+
+**Proposition 2**.: _Given the effective inputs \(}}*}_{1:L}^{L H  W P}\) and a pointwise state kernel \(}^{P P 1 1}\), the computational cost of computing the convolutional recurrence in Equation 7 with a parallel scan is \(L(P^{3}+P^{2}HW)\)._
+
+Proof.: See Appendix A.2. 
+
+Further, the ConvS5 implementation introduced below admits a diagonalized parameterization that reduces this cost to \((LPHW)\). See Section 3.4 and Appendix B for more details.
+
+Figure 2: The dynamics of a ConvSSM with pointwise state kernel (top) can be equivalently viewed as the dynamics of an SSM (bottom). See Proposition 3. Each ConvSSM state pixel evolves according to an SSM state update with shared state matrix, \(_{}\), and input matrix, \(}_{}\), that can be formed by reshaping the ConvSSM’s state kernel and input kernel. This allows leveraging parameterization insights from deep SSMs  to equip ConvS5 to model long-range dependencies.
+
+### Connection to State Space Models
+
+Since the convolutions in (5-6) and (7-8) are linear operations, they can be described equivalently as matrix-vector multiplications by flattening the input and state tensors into vectors and using large, circulant matrices consisting of the kernel elements . Thus, any ConvSSM can be described as a large SSM with a circulant dynamics matrix. However, we show here that the use of pointwise state kernels, as described in the previous section, provides an alternative SSM equivalence, which lends a special structure that can leverage the deep SSM parameterization/initialization ideas discussed in Section 2.2 for modeling long-range dependencies. We show that each pixel of the state, \(}(t)_{i,j}^{P}\), can be equivalently described as evolving according to a differential equation with a shared state matrix, \(_{}\), and input matrix, \(_{}\). See Figure 2.
+
+**Proposition 3**.: _Consider a ConvSSM state update as in (5) with pointwise state kernel \(}^{P P 1 1}\), input kernel \(}^{P U k_{B} k_{B}}\), and input \(}(t)^{H^{} W^{} U}\). Let \(}_{}(t)^{H W Uk_{B}^{2}}\) be the reshaped result of applying the Image to Column (im2col)  operation on the input \(}(t)\). Then the dynamics of each state pixel of (5), \(}(t)_{i,j}^{P}\), evolve according to the following differential equation_
+
+\[}^{}(t)_{i,j}=_{}}( t)_{i,j}+_{}}_{im2col}(t)_{i,j}\] (10)
+
+_where the state matrix, \(_{}^{P P}\), and input matrix, \(_{}^{P(Uk_{B}^{2})}\), can be formed by reshaping the state kernel, \(}\), and input kernel, \(}\), respectively._
+
+Proof.: See Appendix A.3. 
+
+Thus, to endow these SSMs with the same favorable long-range dynamical properties as S4/S5 methods, we initialize \(_{}\) with a HiPPO  inspired matrix and discretize with a learnable timescale parameter to obtain \(}_{}\) and \(}_{}\). Due to the equivalence of Proposition 3, we then reshape these matrices into the discrete ConvSSM state and input kernels of (7) to give the convolutional recurrence the same advantageous dynamical properties. We note that if the input, output and dynamics kernel widths are set to \(1 1\), then the ConvSSM formulation is equivalent to "convolving" an SSM across each individual sequence of pixels in the spatiotemporal sequence (this also has connections to the temporal component of S4ND  when applied to videos). However, inspired by ConvRNNs, we observed improved performance when leveraging the more general convolutional structure the ConvSSM allows and increasing the input/output kernel sizes to allow local spatial features to be mixed in the dynamical system. See ablations discussed in Section 5.3.
+
+### Efficient ConvSSM for Long-Range Dependencies: ConvS5
+
+Here, we introduce _ConvS5_, which combines ideas of parallelization of convolutional recurrences (Section 3.2) and the SSM connection (Section 3.3). ConvS5 is a ConvSSM that leverages parallel scans and deep SSM parameterization/initialization schemes. Given Proposition 3, we implicitly parameterize a pointwise state kernel, \(}^{P P 1 1}\) and input kernel \(}^{P U k_{B} k_{B}}\) in (5) using SSM parameters as used by S5 , \(_{}^{P P}\) and \(_{}^{P(Uk_{B}^{2})}\). We discretize these S5 SSM parameters as discussed in Section 2.2 to give
+
+\[}_{}=_{}( _{},}),}_ {}=_{}(_{}, _{},}),\] (11)
+
+and then reshape to give the ConvS5 state update kernels:
+
+\[}_{}^{P P}}}}_{}^{P  P 1 1}\] (12)
+
+\[}_{}^{P(Uk_{B}^{2})} }}}_{} ^{P U k_{B} k_{B}}.\] (13)
+
+We then run the discretized ConvSSM system of (7- 8), using parallel scans to compute the recurrence. In practice, this setup allows us to parameterize ConvS5 using a diagonalized parameterization  which reduces the cost of applying the parallel scan in Proposition 2 to \((LPHW)\). See Appendix B for a more detailed discussion of parameterization, initialization and discretization.
+
+We define a ConvS5 layer as the combination of ConvS5 with a nonlinear function applied to the ConvS5 outputs. For example, for the experiments in this paper, we use ResNet blocks for the nonlinear activations between layers. However, this is modular, and other choices such as ConvNext  or S4ND  blocks could easily be used as well. Finally, many ConvS5 layers can be stacked to form a deep spatiotemporal sequence model.
+
+[MISSING_PAGE_FAIL:7]
+
+environment benchmarks proposed in Yan et al. . Finally, in Section 5.3, we discuss ablations that highlight the importance of ConvSS's parameterization.
+
+### Long Horizon Moving-MNIST Generation
+
+There are few existing benchmarks for training on and generating long spatiotemporal sequences. We develop a long-horizon Moving-MNIST  prediction task that requires training on 300-600 frames and accurately generating up to 1200 frames. This allows for a direct comparison of ConvS5, ConvRNNs and Transformers as well as an efficient attention alternative (Performer ) and CW-VAE , a temporally hierarchical RNN based method. We first train all models on 300 frames and then evaluate by conditioning on 100 frames before generating 1200. We repeat the evaluation after training on 600 frames. See Appendix D for more experiment details. We present the results after generating 800 and 1200 frames in Table 2. See Appendix C for randomly selected sample trajectories. ConvS5 achieves the best overall performance. When only trained on 300 frames, ConvLSTM and ConvS5 perform similarly when generating 1200 frames, and both outperform the Transformer. All methods benefit from training on the longer 600-frame sequence. However, the longer training length allows ConvS5 to significantly outperform the other methods across the metrics when generating 1200 frames.
+
+In Table 2-bottom we revisit the theoretical properties of Table 1 and compare the empirical computational costs of the Transformer, ConvLSTM and ConvS5 on the 600 frame Moving-MNIST task. Although this specific ConvS5 configuration requires a few more FLOPs due to the convolution computations, ConvS5 is parallelizable during training (unlike ConvLSTM) and has fast autoregressive generation (unlike Transformer) -- training 3x faster than ConvLSTM and generating samples 400x faster than Transformers.
+
+### Long-range 3D Environment Benchmarks
+
+Yan et al.  introduced a challenging video prediction benchmark specifically designed to contain long-range dependencies. This is one of the first comprehensive benchmarks for long-range spatiotemporal modeling and consists of 300 frame videos of agents randomly traversing 3D environ
+
+  
+**Trained on 300 frames** &  &  \\ Method & FVD \(\) & PSNR \(\) & SSIM \(\) & LPIPS \(\) & FVD \(\) & PSNR \(\) & SSIM \(\) & LPIPS \(\) \\  Transformer  & \(159\) & \(12.6\) & \(0.609\) & \(0.287\) & \(265\) & \(12.4\) & \(0.591\) & \(0.321\) \\ Performer  & \(234\) & \(13.4\) & \(0.652\) & \(0.379\) & \(275\) & \(13.2\) & \(0.592\) & \(0.393\) \\ CW-VAE  & \(\) & \(12.4\) & \(0.592\) & \(0.277\) & \(\) & \(12.3\) & \(0.585\) & \(0.286\) \\ ConvLSTM  & \(\) & \(\) & \(\) & \(0.169\) & \(\) & \(\) & \(\) & \(\) \\ ConvS5 & \(\) & \(\) & \(\) & \(\) & \(\) & \(\) & \(0.678\) & \(0.230\) \\    \\  Transformer & \(\) & \(13.7\) & \(0.672\) & \(0.207\) & \(\) & \(13.1\) & \(0.631\) & \(0.252\) \\ Performer & \(93\) & \(12.4\) & \(0.616\) & \(0.274\) & \(243\) & \(12.2\) & \(0.608\) & \(0.312\) \\ CW-VAE & \(94\) & \(12.5\) & \(0.598\) & \(0.269\) & \(107\) & \(12.3\) & \(0.590\) & \(0.280\) \\ ConvLSTM & \(91\) & \(\) & \(\) & \(0.149\) & \(137\) & \(\) & \(0.727\) & \(0.180\) \\ ConvS5 & \(\) & \(\) & \(\) & \(\) & \(\) & \(\) & \(\) & \(\) \\    & Train Step Time (s) \(\) & Train Cost (V100 days) \(\) & Sample Throughput (frames/s) \(\) \\  Transformer & \(\) & \(()\) & \(\) & \(\) (\(1.0\)x) & \\ ConvLSTM & \(\) & \(3.0(3.9)\) & \(150\) & & \(\) (\(\)) & \\ ConvS5 & \(97\) & \(0.93(1.2)\) & \(\) & & \(90\) (\(429\)) & \\   
+
+Table 2: Quantitative evaluation on the Moving-MNIST dataset . **Top**: To evaluate, we condition on 100 frames, and then show results after generating 800 and 1200 frames. An expanded Table 6 is included in Appendix C with more results, error bars and ablations. Bold scores indicate the best performance and underlined scores indicate the second best performance. **Bottom**: Computational cost comparison for the 600 frame task. Compare to Table 1.
+
+ments in DMLab , Minecraft , and Habitat  environments. See Appendix C for more experimental details and Appendix E for more details on each dataset.
+
+We train models using the same \(16 16\) vector-quantized (VQ) codes from the pretrained VQ-GANs  used for TECO and the other baselines in Yan et al. . In addition to ConvS5 and the existing baselines, we also train a Transformer (without the TECO framework), Performer and S5. The S5 baseline serves as an ablation on ConvS5's convolutional tensor-structured approach. Finally, since TECO is essentially a training framework (specialized for Transformers), we also use ConvS5 and S5 layers as a drop-in replacement for the Transformer in TECO. Therefore, we refer to the original version of TECO as _TECO-Transformer_, the ConvS5 version as _TECO-ConvS5_ and the S5 version as _TECO-S5_. See Appendix D for detailed information on training procedures, architectures, and hyperparameters.
+
+DMLabThe results for DMLab are presented in Table 3. Of the methods trained without the TECO framework in the top section of Table 3, ConvS5 outperforms all baselines, including RNN [90; 16], efficient attention [39; 33] and diffusion  approaches. ConvS5 also has much faster autoregressive generation than the Transformer. ConvS5 significantly outperforms S5 on all metrics, pointing to the value of the convolutional structure of ConvS5.
+
+For the models trained with the TECO framework, we see that TECO-ConvS5 achieves essentially the same FVD and LPIPS as TECO-Transformer, while significantly improving PSNR and SSIM. Note the sample speed comparisons are less dramatic in this setting since the MaskGit  sampling procedure is relatively slow. Still, the sample throughput of TECO-ConvS5 and TECO-S5 remains constant, while TECO-Transformer's throughput decreases with sequence length.
+
+Minecraft and HabitatTable 4 presents the results on the Minecraft and Habitat benchmarks. On Minecraft, TECO-ConvS5 achieves the best FVD and performs comparably to TECO-Transformer on the other metrics, outperfoTarming all other baselines. On Habitat, TECO-ConvS5 is the only method to achieve a comparable FVD to TECO-Transformer, while outperforming it on PSNR and SSIM.
+
+### ConvS5 ablations
+
+In Table 5 we present ablations on the convolutional structure of ConvS5. We compare different input and output kernel sizes for the ConvSSM and also compare the default ResNet activations to a channel mixing GLU  activation. Where possible, when reducing the sizes of the ConvSSM kernels, we redistribute parameters to the ResNet kernels or the GLU sizes to compare similar parameter counts. The results suggest more convolutional structure improves performance.
+
+    &  \\ Method & FVD \(\) & PSNR \(\) & SSIM \(\) & LPIPS \(\) & Sample Throughput (frames/s) \(\) \\  FitVid*  & \(176\) & \(12.0\) & \(0.356\) & \(0.491\) & - \\ CW-VAE*  & \(125\) & \(12.6\) & \(0.372\) & \(0.465\) & - \\ Perceiver AR*  & \(96\) & \(11.2\) & \(0.304\) & \(0.487\) & - \\ Latent FDM*  & \(181\) & \(17.8\) & \(0.588\) & \(0.222\) & - \\ Transformer  & \(97\) & \(19.9\) & \(0.619\) & \(0.123\) & \(9\) (\(1.0\)) \\ Performer  & \(80\) & \(17.3\) & \(0.513\) & \(0.205\) & \(7\) (\(0.8\)) \\ S5  & \(221\) & \(19.3\) & \(0.641\) & \(0.162\) & \(28\) (\(3.1\)) \\ ConvS5 & \(\) & \(\) & \(\) & \(\) & \(\) (\(\)) \\  TECO-Transformer*  & \(\) & \(22.4\) & \(0.709\) & \(0.155\) & \(16\) (\(1.8\)) \\ TECO-Transformer (our run) & \(\) & \(21.6\) & \(0.696\) & \(\) & \(16\) (\(1.8\)) \\ TECO-S5 & \(35\) & \(20.1\) & \(0.687\) & \(0.143\) & \(\) (\(\)) \\ TECO-ConvS5 & \(31\) & \(\) & \(\) & \(0.085\) & \(18\) (\(2.0\)) \\   
+
+Table 3: Quantitative evaluation on the DMLab long-range benchmark . Results from Yan et al.  are indicated with \(*\). Methods trained using the TECO  training framework are at the bottom of the table. TECO methods are slower to sample due to the MaskGit  procedure. The expanded Table 8 in Appendix C includes error bars and ablations.
+
+[MISSING_PAGE_FAIL:10]

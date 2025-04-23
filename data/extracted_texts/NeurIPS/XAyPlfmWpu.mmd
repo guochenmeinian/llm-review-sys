@@ -1,0 +1,221 @@
+# Binarized Neural Machine Translation
+
+Yichi Zhang
+
+Cornell University
+
+yz2499@cornell.edu
+
+&Ankush Garg
+
+Google DeepMind
+
+ankugarg@google.com
+
+&Yuan Cao
+
+Google DeepMind
+
+yuancao@google.com
+
+&Lukasz Lew
+
+Google Research
+
+lew@google.com
+
+&Behrooz Ghorbani
+
+OpenAI
+
+ghorbani@openai.com
+
+&Zhiru Zhang
+
+Cornell University
+
+zhiruz@cornell.edu
+
+&Orhan Firat
+
+Google DeepMind
+
+orhant@google.com
+
+Equal contribution.Work done while at Google.
+
+###### Abstract
+
+The rapid scaling of language models is motivating research using low-bitwidth quantization. In this work, we propose a novel binarization technique for Transformers applied to machine translation (BMT), the first of its kind. We identify and address the problem of inflated dot-product variance when using one-bit weights and activations. Specifically, BMT leverages additional LayerNorms and residual connections to improve binarization quality. Experiments on the WMT dataset show that a one-bit weight-only Transformer can achieve the same quality as a float one, while being \(16\) smaller in size. One-bit activations incur varying degrees of quality drop, but mitigated by the proposed architectural changes. We further conduct a scaling law study using production-scale translation datasets, which shows that one-bit weight Transformers scale and generalize well in both in-domain and out-of-domain settings3.
+
+## 1 Introduction
+
+Neural language models are scaling, with the parameter count of recent models, such as the GPT family, roughly increased by \(10\) per year . A scaling law study by Kaplan et al.  suggests that the continuous increase in model parameters is strongly correlated with performance improvement. This trend has been validated by recent successes in large-scale models, such as the 540-billion parameter Pathways Language Model (PaLM), which achieves breakthrough performance on language understanding and generation . The 540-billion parameter Minerva  also exceeded the national average on the National Math Exam in Poland in 2021, where language models were previously far from human-level. Similarly, in the field of neural machine translation (MT), the scaling law holds, as reported by Ghorbani et al. , with the translation quality improving as the model size increases.
+
+The aggressive scaling trend resulted in unprecedented challenges in model serving. In particular:
+
+**The inference cost grows exponentially.** The size and computational complexity of language models are increasing rapidly, with roughly a \(10\) increase in model size and a \(100\) increase in operationcount per year . However, the energy efficiency of hardware used to run these models is not keeping pace. Specifically, the energy required for FP32 operations has improved by only 2.5\(\) over the past 11 years (2007-2018), from 45nm to 7nm process nodes. Over the same period, DRAM access energy has only improved by 6.3\(\). The ever-growing gap between model size inflation and inefficiency in hardware energy utility is causing inference energy to grow exponentially, which is becoming a major cost of running language models in datacenters.
+
+**The inter-chip communication overhead becomes non-negligible.** Data parallelism alone is no longer sufficient for models at such a large scale since one matrix multiplication cannot fit on a single accelerator chip. Each weight tensor in PaLM , for example, is partitioned across 3072 TPUv4 chips in a pod. This leads to a huge overhead on transferring the weights and intermediate activations across the datacenter networks.
+
+**Latency-critical applications can now hardly benefit from parameter caching.** Loading model parameters from DRAM to on-chip accelerator memory often takes a lot of time during inference. In the past, parameter caching was an effective optimization for latency because it reused model weights and avoided off-chip memory transfers. However, evaluations on edge TPUs reported that this method works best for models with fewer than 30 million parameters . For larger models, parameter caching even becomes harmful. Benefits from compiler optimizations are diminishing, and the serving latency becomes almost proportional to the model parameter count. In our case, the smallest translation model has about 50 million parameters. Improving latency thus boils down to increasing memory bandwidth alone.
+
+Quantization can significantly reduce inference cost. Binarization is an extreme case where both the weights and activations of a matrix multiplication (matmul) are quantized to a single bit. Compared to the Brain floating-point format (bfloat16) 4, binarization reduces the weight size by 16\(\), thus significantly lowering the memory and communication overhead. Moreover, a binarized matmul can be carried out by XNOR operations followed by a population count, which is estimated to be 256\(\) more energy-efficient than the bfloat16 counterpart .
+
+Prior work shows that BERT can be binarized for pretraining [5; 33; 28]; however, it is important to note that the BERT and MT models, which both use Transformer as their core , are very different. One key difference is the architecture: while an MT model has both an encoder and a decoder, BERT only has an encoder. This difference can impact the quality of encoder quantization because every cross attention layer in the decoder requires outputs from the encoder. Another difference is that MT model inference produces a sequence of text, while BERT performs a single text classification. This is critical because each word in the output translation sequence affects the generation of the next word. The sampling distribution of a word is therefore crucial and should be preserved after binarization, but for BERT, only the peak of the logits needs to be preserved. Due to these differences, directly applying BERT binarization techniques to MT can easily result in a lower quality model.
+
+In this work, we investigate binarized Transformer for neural machine translation, which, to our knowledge, is the first study on this topic. Each Transformer block contains an attention layer and a feed-forward network (FFN). We binarize the weights and activations separately so we can study how each one affects the quality of the model. We found that binarizing weights did not significantly affect accuracy, but that traditional methods for binarizing activations led to poor performance due to activation magnitude explosion. Then, we propose a new method for activation binarization that uses a simple scaling factor and additional residual connections.
+
+To understand the scaling behavior of the proposed 1-bit Transformer in practice, we further evaluate it on our in-house production-scale translation dataset that contains three billion sentence pairs. We for the first time demonstrate that the 1-bit weight Transformer scales and generalizes similarly well as the float one, even on the out-of-domain data. We also analyze sentences sampled from both models' outputs and find that the 1-bit Transformer generates a similar translation quality as its float counterpart. Binarization can therefore be a potential candidate for future MT model serving.
+
+## 2 Related Work
+
+The success of Transformer has spurred an active body of work to quantize it to lower precision. In this section, we review a subset of these efforts that inspired our approach.
+
+**Transformer quantization.** Much of the prior effort focused on 8-bit Transformer. Bhandare et al.  reported a less than 0.5 BLEU drop on the WMT14 En-De translation task with 8 bits. Prato et al.  showed an 8-bit Transformer preserved the translation quality. For non-generative tasks, Zafrir et al.  quantized BERT to 8-bit with marginal quality loss. When pushed down to 4 bits, though Prato et al.  reported an 8 BLEU degradation for MT, Aji and Heafield  reported almost no BLEU loss by using a logarithmic quantization scheme.
+
+The exploration on 1-bit Transformers centered around BERT. Usually binarization is directly applied and the focus is on improving the training recipe. Bai et al.  initiated the attempt by splitting a ternary BERT into a binary one, then fine-tuning. It achieved 41% average accuracy on the GLUE benchmarks. Qin et al.  proposed to distill each intermediate layer outputs from a floating-point model. Recently, Liu et al.  proposed to incrementally quantize the model, e.g., from 32-bit to 4-bit to 2-bit, finally to 1-bit, and it improved the GLUE accuracy to 73.5%.
+
+**Binarized vision models.** Courbariaux et al.  pioneered the investigation on binarized deep neural nets. Recently, PokeBNN  established a pareto SOTA on the ImageNet recognition task. We inherit the binarization functions and training recipes from PokeBNN.
+
+**Generalizability.** Hooker et al.  show that compressed models do not generalize well on out-of-domain (OOD) data. We are particularly interested in evaluating BMT under OOD settings and analyze its generalizability.
+
+## 3 Algorithm and Model Architecture
+
+In this section, we introduce the methodology of binarizing a Transformer-based MT model. We first define the binarization equations, then show that directly applying the equations to Transformer will produce an inferior model quality because of the dot-product variance inflation. A scaling factor is then proposed as a solution to this problem, and we discuss using LayerNorm  to replace fixed scaling factors. Finally, we combine and present the architectural changes that are necessary to improve the binarized model quality.
+
+### Binarization Equations
+
+We follow the approach defined in PokeBNN  and AQT , which includes an important hyperparameter "\(B\)". The function of casting floating-point values into binary values is
+
+\[(x,x_{min},x_{max}):=(x_{max}, (x_{min},x))\] \[x_{b}:=(((,-1+,1-))+0.5) B\]
+
+where \(x\) is the input tensor, \(\) is a small floating-point number that prevents overflow when taking the floor, and \(B\) is the binarization bound. In the backward propagation, the floor function is ignored, i.e., \((x)}{ x}:=1\), known as the straight-through estimator . The gradient of the entire binarization function is then \(}{x}=1_{x[-B,B]}\), otherwise zero. The bound \(B\) therefore serves as a hyperparameter that controls the range of the input values that will have non-zero gradients. Note that \(B\) also serves as a scaling factor for the outputs since the binarization function maps \(x\{-,+\}\). The bound \(B\) can also generalize to a vector, depending on the granularity of binarization. The finest granularity, however, is one bound value for each dot product, i.e., per contraction dimension, so that the binarized matrix multiplication can be accelerated.
+
+For a dense layer in Transformer of the form \(A W\), where \(A^{N d_{}}\) is the input activations and \(W^{d_{} d_{k}}\) is the model weights, we instead compute a binarized matmul \(A_{b} W_{b}\). Throughout the experiments we apply binarization bound \(B_{W}\) and \(B_{A}\) for weights and activations, respectively.
+
+\[B_{W}=((W),=d_{}),B_{A}=( (A),=d_{})\]
+
+where \(\) is the dimension along which \(\) is taken. Using one axis means the bound is per channel and per example . Both \(B_{A}^{N 1}\) and \(B_{W}^{1 d_{k}}\) are vectors that contain maximum absolute values along the contraction dimension. Note that the weight binarization bound \(B_{W}\) is static in inference though it is updated in every training iteration. The activation bound \(B_{A}\) is dynamic.
+
+### Variance Inflation in Binarization
+
+We start by applying the binarization function to feed-forward networks (FFNs), leaving other modules as float. We observe that directly binarizing the weights preserves the model quality, but binarizing the input activations causes the training to _not_ converge in the context of machine translation. To understand the reason of this behavior, we analyze the variance of the dot product magnitude with and without binarization. Our analysis reveals that binarizing both weights and activations will statistically inflate the magnitude, leading to abnormal signal propagation within the neural network . We present the details of this analysis as follows.
+
+Let each weight of a dense layer be randomly initialized and sampled from a zero-mean normal distribution, \(w(0,\,_{w}^{2})\). Assume each input activation is independent of the weights and identically distributed as \(a(0,\,_{a}^{2})\). After applying the binarization function, both \(w_{b}\) and \(a_{b}\) are still centered at zero and have an equal probability of being either \(-\) or \(+\), namely, they follow the probability mass function defined as \((x_{b})=&x_{b}=-\\ &x_{b}=+.\) Hence the variance of a binarized multiplication is
+
+\[(a_{b} w_{b})=[a_{b}^{2}] [w_{b}^{2}]-^{2}[a_{b}] ^{2}[w_{b}]=_{a_{b}}a_{b}^{2}(a_{b} )_{w_{b}}w_{b}^{2}(w_{b})-0=}{16}\]
+
+The variance of a binarized dot product is then \((A_{b} W_{b})=_{n=0}^{D-1}_{n}(a_{b} w_{ b})=}{16} D\), where \(D\) is the dimensionality of the dot product, i.e., the hidden projection dimension in an FFN, and \(n\) is the index of each entry in the vector.
+
+Following the same analysis, the variance of a floating-point dot-product is \((A W)=_{a}^{2}_{w}^{2} D\). Note that the commonly used Xavier initializer  equalizes the variance of the activations across layers. \(_{w}^{2}\) will therefore be initialized as \(\), so \((A W)=_{a}^{2}\), which is usually at the scale of 1.
+
+Meanwhile, the common binarization bound is \(B\)[12; 39; 7]. Our Transformer FFN employs a hidden projection dimension \(D=4096\) throughout the experiments. Therefore, \((A_{b} W_{b})(A W)\). Binarization heavily inflates the dot product variance by at least \(256\), which will be reflected in the magnitude of the dense layer outputs. Also note that \((A_{b} W_{b}) D\), indicating that Transformer with a larger width will potentially suffer more from the convergence issue.
+
+### A Scaling Factor as the Solution
+
+Inspired by the scaling factor \(}\) in the scaled dot-product attention \((Q,K,V)=(}{}})V\) in the original Transformer , we propose a scaling factor for each binarized dense layer, i.e.,
+
+\[(A_{b})= W_{b}}{s}\]
+
+The scaling factor \(s\) is a hyperparameter that suppresses dot-product variance inflation, while in the attention layer \(}\) prevents the dot products from entering small-gradient regions of the softmax function. According to the analysis in Section 3.2, its value is estimated to be \(s\) in order to cancel the multiplicative effect from \(D\) on the variance.
+
+To verify how the magnitude of the scaling factor affects the training loss, we sweep \(s\) in Section 5. In practice, \(s 64\) can make the training converge.
+
+### Replacement of Scaling Factor with LayerNorm
+
+While the scaling factor \(s\) enables the binarization of FFNs, it requires hyperparameter tuning, which can be challenging for billion-parameter translation models. To address this deficiency, we propose using layer normalization
+
+Figure 1: BMT Multi-Head Attention — Differences from the original Transformer are highlighted (in yellow). All linear projections and einsums can be binarized.
+
+(LayerNorm)  as a drop-in replacement for the scaling factor, which has the form of \((x)=[x]}{(x) +}}+\), where \(\) and \(\) are learnable parameters. Besides the fact that \(\) can incorporate the scaling factor \(s\), LayerNorm also has the following advantages.
+
+_The scaling factor is now dynamic and adaptive during training._ The binarization function employs a dynamic bound \(B\), so \((A_{b} W_{b})\) varies. The learnable parameter \(\) in LayerNorm can better capture the changes in the dot product variance and hence properly normalize it.
+
+_LayerNorm also redistributes the input activations._ It enables the binarization of a tensor with all positive values. A directly binarized FFN is \((A)=(0,A_{b}W_{1b}+b_{1})_{b}W_{2 b}+b_{2}\), where \(W_{1}\), \(b_{1}\) and \(W_{2}\), \(b_{2}\) are the weights and biases for the first and second dense layer, respectively. One may note that the activations \((0,A_{b}W_{1b}+b_{1})\) are all positive. The binarization function will then map the entire tensor to a constant \(+\), which undermines the model training. With the help LayerNorm, however, the activations are redistributed and more balanced in terms of the number of positive and negative values. This enables the normal \(\{-1,+1\}\) (bipolar) binarization of the second dense layer. Qin et al. , Liu et al.  used \(\{0,1\}\) binarization instead in binarized BERT to overcome the issue of constant positive values. It yields a ternary matrix multiplication since \(A\{0,1\}^{N D}\) and \(W\{-1,+1\}^{D K}\), which incurs nontrivial additional overhead if computed on binary hardware accelerator. The complete proposed 1-bit FFN has the structure of
+
+\[(A)=( ((0,A_{b}W_{1b}+b_{1}))_{b} W_{2b}+b_{2})\]
+
+When proceeding to the attention binarization, we add a LayerNorm to the output of each linear projection layer for the same reasons. We verified in Section 5 that a dynamic and adaptive scaling factor in LayerNorm indeed outperformed a fixed one.
+
+### Residual Connection in Attention Layers
+
+In attention layers, we also add a shortcut connection to the output linear projection layer. Combined with the additional LayerNorm, the output projection then becomes \((A)=(A W)+A\). In BNNs, gradients of a binarized layer are approximated due to the straight-through estimator. This will eventually lead the optimization into a different direction as we stack more binarized layers. Liu et al.  proposed adding additional residual connections in BNNs, which became a useful method for partially addressing this issue. We therefore adopt it in our model. Note that this modification is unnecessary for QKV (query, key, value) linear projections. The shortcut around the entire attention layer in the original Transform serves the same purpose. We will also demonstrate the effectiveness of the shortcut connection in the ablation study in Section 5.
+
+The complete modified attention architecture is shown in Figure 1, where we highlight the differences from the original one. The extra layer normalization and shortcut connection are both elementwise. Their overhead is small, especially comparing to the benefits of binarization.
+
+## 4 Experiments
+
+In this section, we empirically evaluate our proposed binarized Transformer on MT tasks at difference scales. To investigate the impact of binarizing different layers, we first train a standard 6-layer encoder-decoder (6L6L) Transformer on the WMT2017 De-En translation dataset  and evaluate it on the WMT2014 De-En dataset. We then choose the 1-bit weight model variant and study its practical scaling law on in-house translation datasets. We also compare the translation qualities of both 1-bit and float models. Throughout the experiments, the embedding table and the prediction head layer are not binarized.
+
+### WMT Results
+
+We binarize five different matmuls in a Transformer. In an attention layer there are (1) QKV linear projections; (2) activation-activation matmul between queries and keys (QK Einsum); (3) activation-activation matmul between attention scores and values (Score-V Einsum); (4) output linear projection. In an FFN there are two dense layers of the same type. To study their individual impact, we binarize their weights and activations separately. In our experiments we use the following training details.
+
+**Model.** We use a 6L6L Transformer as the base model. Embedding dimension is 1024. Each multi-head attention layer has 16 heads, with a dimension of 1024 for QKV if combining all the heads. The hidden projection dimension in FFNs is 4096. Dropout layers has a dropout rate of 0.1.
+
+**Scheduler.** We adopt a three-stage training scheme, where the learning rate (LR) of each stage decreases from base to zero following a cosine decay. A quantization event starts at the beginning of each stage. We first train the model in float. In the second stage, all weights will be binarized. In the last stage, both weights and activations will be binarized.
+
+**Training.** We apply knowledge distillation (KD) during training. KD replaces the ground truth label in the cross-entropy loss function with the softmaxed logits from the teacher model, so it is optional for users. Adam optimizer  is used with \(_{1}=0.9\) and \(_{2}=0.98\). No weight decay is applied. Batch size is 1024. Base learning rate is \(0.001\). The first LR cycle has \(50000\) steps, others have \(88339\) steps. We train the model with a 4\(\)8 TPU topology.
+
+**Observations.** The evaluation results on WMT2014 De-En translation dataset is shown in Table 1. We mainly rely on the validation loss for comparing the model quality since BLEU score has a higher variation . From the table we have the following key observations.
+
+**Weight-only binarization preserves the model loss.** The float 6L6L Transformer baseline has a \(1.39\) validation loss. In contrast, binarizing all dense layer weights (in both attention layers and FFNs) produces an even lower loss (\(1.38\), BMT-1), though the BLEU score slightly drops by about \(0.4\). Both metrics indicate that the 1-bit weight model has a similar translation quality to the float baseline. Binarization has the potential to compress the model storage size by 16\(\) while preserving the quality.
+
+**FFN binarization produces promising results.** Binarizing the entire FFN, i.e., both activations and weights, while leaving other layers float, again yields a similar validation loss (\(1.4\), BMT-2) compared with the float baseline. With our proposed BMT, it is the first time on machine translation tasks that binarizing FFN activations can preserve the loss. This intriguing 1-bit FFN variant can be potentially useful for large language models. Combing with 1-bit all dense layer weights further downgrades the loss to \(1.51\) (BMT-3) and a \(2.2\) lower BLEU score in contrast to the float model. Overall, FFN binarization demonstrates a promising potential.
+
+**Attention activations are the key bottleneck to high binary model quality.** On top of the 1-bit weights and 1-bit FFN activation model variant, further binarizing input activations in all dense layers in the attention layer (BMT-6; this includes keys, queries, values and input activations to the output projection dense layer) leads to a \(1.89\) loss. This is by far the largest drop in model quality. Binarizing each individual activation tensor therein leads to at least \(0.3\) degradation in loss (BMT-4 and 5). In addition, binarizing the two activation-activation matmuls (query-key einsum operation and
+
+    &  &  & Metrics \\   & \(A_{}\) & \(W_{}\) & \(A_{}\) & \(W_{}\) & QK & Score-V & \(A_{}\) & \(W_{}\) & Val Loss & BLEU \\  FLOAT &  &  &  &  &  \\  BMT-1 & & ✓ & ✓ & ✓ & & & ✓ & 1.38 & 25.93 \\  BMT-2 & & & & & ✓ & ✓ & ✓ & 1.40 & 25.44 \\  BMT-3 & & ✓ & ✓ & & ✓ & ✓ & 1.51 & 24.11 \\  BMT-4 & ✓ & ✓ & ✓ & & ✓ & ✓ & 1.72 & 21.55 \\  BMT-5 & & ✓ & ✓ & ✓ & & ✓ & ✓ & 1.60 & 21.06 \\  BMT-6 & ✓ & ✓ & ✓ & ✓ & & ✓ & ✓ & 1.89 & 17.87 \\  BMT-7 & & ✓ & ✓ & ✓ & & ✓ & 1.76 & 18.27 \\  BMT-8 & & ✓ & ✓ & ✓ & ✓ & ✓ & ✓ & 2.81 & 9.42 \\  base & & & & & & ✓ & ✓ & 8.07 & 0.21 \\   
+
+Table 1: BMT results on the WMT dataset. Training uses WMT2017 De-En and evaluation uses WMT2014 De-En. Binarized activations or weights are labeled by checkmarks. Unlabeled tensors remains bfloat16. 1-bit weights models have 25MB of weight storage size while the float one has 399MB, \( 16\) compression. As a comparison, the baseline model (last row) directly applies XNOR-Net style  binarization used in previous works , sign function followed by a normalization. BLEU evaluation employs a beam size of 4.
+
+attention score-value einsum operation) are particularly challenging. The 1-bit weights model with both activation-activation matmuls binarized additionally produces only \(9.4\) BLEU score (BMT-8). Attention layer activations are the current bottleneck to a fully binarized translation model.
+
+### Scaling Law Study
+
+Though Section 4.1 shows promising results, an unanswered question is whether the performance degrades when binarized Transformers are scaled up. Neural language model loss is known to follow a power law as its model size scales up , known as the "scaling law". It is widely adopted for predicting the performance of models at scale. Prior work shows 8-bit and 4-bit language models are subject to a certain scaling law, but this has not yet been established for models with 3-bits or lower . We therefore conduct a scaling law study on both float and the proposed binarized models on our in-house translation dataset and compare their difference. Similar to Ghorbani et al. , we train a set of translation models and fit the losses using the following equation: \(L(N_{e},N_{d})=(}{N_{e}})^{p_{e}}( }{N_{d}})^{p_{d}}+L_{}\), where \(L\) is the per token loss, \(N_{e}\), \(N_{d}\) are the number of encoder and decoder parameters respectively. \(L_{}\) is the irreducible loss that the model attains if it has infinite capacity. \(N_{e}\) (\(N_{d}\)) is the number of parameters in the baseline 6L6L Transformer, which act as normalization constants for numerical stability in the curve fitting process. For tractability purposes, we examine scaling laws for only weight-binarized models. Weight-only model compression can also be leveraged for linear improvements in latency  and 16\(\) improvements in memory consumption (compared to blfoat16).
+
+**Dataset.** To investigate the scaling behavior of the binary models in a capacity limited regime, i.e., performance is not bound by training data, we use our large in-house parallel corpora for English to German (\(\)) direction. The training set contains 3 billion web-crawled sentence pairs. We are also particularly interested in evaluating BMT with the out-of-domain (OOD) setting and assessing its generalizability, as previous research in the image domain demonstrated that compressed models (weight pruned or quantized) have a much larger quality drop on OOD data than their uncompressed counterparts, i.e., model compression amplifies britteness . As such, to have a robust evaluation of BMT, we use eleven evaluation sets, one of which is in-domain (ID) and is similarly distributed as the training set, and the rest are OOD. For ID, we sample 2000 training examples and remove them from the training data. The ten OOD evaluation sets are divided into four categories (i) Web Domain (ii) News Domain (iii) Wikipedia (iv) Patents. Furthermore, they are either "source-original" or "target-original". The source-original datasets have a natural source side (English) while the target side (German) is human or machine translated. The target-original datasets have the natural target side (German), then back translated into source English sentences. We do this differentiation to investigate the impact of binarization on "style" of sentences since natural language exhibits rich
+
+Figure 2: Scaling law study on both in-domain and out-of-domain data — On in-domain data, scaling law fits achieve \(R^{2}\) values of 99.5 and 99.7 on float and binary models respectively. On out-of-domain data (Wikipedia), \(R^{2}\) values are 99.6 and 99.8 respectively. Scaling law fit on all the evaluation datasets, along with slopes (\(p_{e}\) and \(p_{d}\)) is presented in Figure 7 and Figure 8 (Appendix A).
+
+diversity as opposed to simple and literal (_translationese_) sentences  (More details are provided in Appendex A.1).
+
+**Models & Training.** We train two sets of Transformers, namely, encoder-scaling and decoder-scaling models. The encoder-scaling models have a fixed depth of 6 layers in the decoder while scaling up the encoder depth in sizes of \(\{6,8,10,12,14,18,22,26,30,36,42,48\}\) layers, for a total of 12 models. Same for the decoder-scaling ones, whereby the decoder depth is scaled up in similar ways. Due to the sufficiency in training data, we did not use label smoothing during training. The binary models are trained without KD. (Appendix A.2 has more details on hyper-parameters and training).
+
+**Observations.** Figure 2 compares the scaling curves of the binary and float models on both ID and OOD datasets, more in Appendix A.3. Figure 3 compares their training vs. In-domain test loss. We make the following observations:
+
+**Binary models demonstrated similar scaling behaviors as their float counterpart for both encoder and decoder scaling.** The exponent of the fitted power law for binary models in Figure 1(a) (\(p_{e}=0.16\), \(p_{d}=0.28\)) is only slightly below float ones (\(p_{e}=0.18\), \(p_{d}=0.31\)), indicating the binary model loss improves fast as the parameter count increases. This trend also holds for OOD Wikipedia dataset in Figure 1(b). Binary models generalize just as well on OOD data as float models (scaling law fits on all the OOD evaluation datasets is in Appendix A.3). We also note a gap between binary and float model losses, a phenomenon not observed from WMT experiments. We hypothesize that this is because the in-house production-scale datasets are more challenging.
+
+**For the same training loss, binary and float models achieve the same generalization performance.** As shown in Figure 3, binary and float model losses align well on a straight line, and almost overlap in the \(0.95 1.0\) region. There are no measurable differences detected in the inductive biases of the two model classes. Also, binary models require fewer parameter bits to achieve a certain performance level. For example, a 6L42L binary Transformer with 195M parameters (195M bits) has a 4.3\(\) smaller size than a 6L8L float one with 52M parameters (832M bits) while having the same loss. Such memory savings are especially advantageous when the models are deployed in a resource-constrained environments .
+
+### Generation Quality
+
+We examine the MT model generation quality in Figure 4 using two decoding strategies: a) Beam Search Decoding; b) Minimum Bayes Risk (MBR) decoding .
+
+**Beam search.** Sample quality from Beam search decoding is evaluated with standard de-tokenized BLEU scores  using sacreBLEU library 5.
+
+**MBR.** Freitag et al.  show that beam search decoding selects samples with high probability rather than high quality, especially for large models, as measured by human evaluations. They propose MBR-based decoding strategy defined as \(h^{}=}{}_{ }|}_{y_{}}u(h,y)\), where \(h^{}\) is the decoding from the model given source sentence \(x\), \(_{}\) is the set of hypotheses sampled from the model \(p(.|x)\) and \(u\) is a utility function that evaluates quality of a hypothesis \(h\) against reference \(y\). Freitag et al.  demonstrate effectiveness of the BLEURT model  for the utility function. BLEURT is a regression model that relies on the concatenation of hypothesis \(h\) and reference \(y\) and generates a scalar score between , measuring the hypothesis quality irrespective of the sentence structure, length or word overlap with the reference. In the same way, we use MBR decoding with BLEURT as the utility function to decode a sequence given the source sentence. To measure the sample quality, BLEURT(\(h,r\)) is calculated between the decoded hypothesis (\(h_{}\)) and the reference (\(r\)) for a given source sentence (\(x\)), then averaged across the evaluation set.
+
+Figure 3: Training vs. ID Test loss. We observe similar linear relationship between training and test losses of all evaluation datasets.
+
+**Observations.** Figure 3(a) shows BLEU scores of encoder-scaling models (i.e., decoder depth=6, varying encoder depth). Figure 3(b) plots BLEURT scores for encoder-scaling models, where the baseline is float models using MBR decoding with 16 samples. We observe the following:
+
+**Binary models can achieve the same BLEU score as float models with a smaller size.** Figure 3(a) shows that the BLEU score of binary models will consistently improve as the model size increases. Although binary models are 2-3 BLEU worse than float ones at the same model depth, the 30L6L binary model achieves the same BLEU as the 8L6L float model, while being 6.7\(\) smaller in size.
+
+**Increasing the sample size can match the generation quality of binary models with float models.** In Figure 3(b), a larger sample size consistently produces a higher generation quality for the binary models. At 4\(\) the sample size, i.e., 64 samples, the binary model quality approximately matches float models. Besides, the BLEURT score of binary models also improves as the model size increases.
+
+## 5 Ablation Study
+
+**Scaling factor ablation.** We binarize the FFN only and sweep the scaling factor \(s\) as a power of two from \(1\) (equivalent to no scaling factor applied) to \(4096\). We plot the final training and validation losses in Figure 4(a). The model losses drop steeply when increasing \(s\) to \(64\). Models with \(s 8\) produce almost random translation quality. Large scaling factors indeed address the convergence issue. The loss begins saturated at \(s=64\) and is only slightly worse than the float baseline (1.39). This exactly matches our expectation that \(s\). When \(s>64\), the model loss keeps improving slightly. We hypothesize that this is because the bound \(B\) is dynamic. Even a small variation on \(B\) will change the theoretical optimal \(s\) by a large margin since \((A_{b} W_{b}) B^{4}\).
+
+Figure 4: Comparison on translation qualities between binarized and float models for encoder-scaling. (a) Beam Search Decoding: BLEU scores on In-Domain Test set (b) MBR Decoding: BLEURT scores on In-Domain Test set
+
+**BMT attention layer ablation.** We only binarize the attention output projection linear layer. We train the model for \(88339\) steps, with binarization events started at step \(50000\). We plot the loss curves from step \(40000\) in Figure 4(b). Applying a fixed scaling factor achieves an almost \(0.2\) loss improvement. This is consistent with previous observations where a scaling factor helps with convergence. The LayerNorm, as a drop-in replacement for the scaling factor, not only makes the model converge to a better loss, but also recovers the loss much faster after binarization. This is expected because \(\) in the LayerNorm is learnable and can better adapt to the dynamic bound \(B\) as analyzed in Section 3.4. The loss almost saturates after binarization. Adding a shortcut around the output projection removes the information bottleneck. It helps the model converge to approximately the same quality as the float baseline.
+
+## 6 Conclusion
+
+The proposed method enables binarization for machine translation. The simple yet effective scaling factor is the key. Binary Transformers have a similar scaling behavior of translation quality as float models. Binarization can thus be a potential candidate for future model serving.
+
+Unanswered questions: How to better binarize attention einsums? Which is better for scaling up a binary Transformer, depth or width? What will be a good mixed-precision scheme?

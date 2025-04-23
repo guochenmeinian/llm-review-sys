@@ -1,0 +1,195 @@
+# SLTrain: a sparse plus low-rank approach
+
+for parameter and memory efficient pretraining
+
+ Andi Han\({}^{1}\)   Jiaxiang Li\({}^{2}\)   Wei Huang\({}^{1}\)   Mingyi Hong\({}^{2}\)   Akiko Takeda\({}^{1,3}\)
+
+**Pratik Jawanpuria\({}^{4}\)   Bamdev Mishra\({}^{4}\)**
+
+\({}^{1}\)RIKEN AIP (andi.han@riken.jp, wei.huang.vr@riken.jp)
+
+\({}^{2}\)University of Minnesota, Twin Cities (li003755@umn.edu, mhong@umn.edu)
+
+\({}^{3}\)University of Tokyo (akeda@mist.i.u-tokyo.ac.jp)
+
+\({}^{4}\)Microsoft, India (pratik.jawanpuria@microsoft.com, bamdevm@microsoft.com)
+
+###### Abstract
+
+Large language models (LLMs) have shown impressive capabilities across various tasks. However, training LLMs from scratch requires significant computational power and extensive memory capacity. Recent studies have explored low-rank structures on weights for efficient fine-tuning in terms of parameters and memory, either through low-rank adaptation or factorization. While effective for fine-tuning, low-rank structures are generally less suitable for pretraining because they restrict parameters to a low-dimensional subspace. In this work, we propose to parameterize the weights as a sum of low-rank and sparse matrices for pretraining, which we call SLTrain. The low-rank component is learned via matrix factorization, while for the sparse component, we employ a simple strategy of uniformly selecting the sparsity support at random and learning only the non-zero entries with the fixed support. While being simple, the random fixed-support sparse learning strategy significantly enhances pretraining when combined with low-rank learning. Our results show that SLTrain adds minimal extra parameters and memory costs compared to pretraining with low-rank parameterization, yet achieves substantially better performance, which is comparable to full-rank training. Remarkably, when combined with quantization and per-layer updates, SLTrain can reduce memory requirements by up to 73% when pretraining the LLaMA 7B model.
+
+## 1 Introduction
+
+Large foundation models have achieved tremendous success in various domains, including linguistics, computer vision and biology. In particular, large language models (LLMs), such as the GPT series  and the LLaMA family  have reshaped the perception of how machine understands human languages. The predominant success of these models is primarily due to the model size, usually scaling to hundreds of billions of parameters. The scaling laws seem to suggest the capacity of LLMs grows with the model size , but nonetheless requiring massive amount of resources for pre-training, storing, and fine-tuning. Particularly, memory requirement for training an LLM imposes a hard barrier for model deployment on commercial GPUs. For example, the LLaMA 7B model requires a minimum memory cost of approximately 42G under 16-bit floating point, including 14G of parameter state and 28G of optimizer state for momentum-based optimizers, like Adam .
+
+Building an LLM (from scratch) for downstream tasks typically involves two phases, i.e., pre-training and fine-tuning. The goal of pretraining is to capture general language patterns and semantics, enabling the model to acquire useful representations of words and sentences. Common pretraining objectives include masked language modeling , next token prediction , etc.
+
+Fine-tuning then tailors the learned model representations from pretraining to downstream tasks, adjusting its weights to enhance performance on specific objectives. Pioneered by LoRA , recent works have popularized low-rank finetuning of a given pretrained model (\(W_{0}\)), where \(W_{0}\) is generally full-rank (i.e., pretrained without any constraints). The premise is that LLMs usually adapt to downstream tasks in a low-dimensional subspace, which allows to parameterize the update by low-rank factors. Low-rank finetuning requires minimal trainable parameters and significant reduction of memory and computation resources [10; 12]. A number of works [14; 53; 18; 29; 30; 34; 3] have emerged to further improve the efficiency and adaptation capacity of LoRA.
+
+While most of the works have focused on exploiting low-rank structure for fine-tuning, only a few [27; 24; 43; 47] have considered pretraining with low-rank weights. It has been observed that the performance of low-rank training often lags behind full-rank training despite the great potential for improving training and memory efficiency [47; 59]. This is because neural networks often exhibit full-rank structure in the weights and imposing low-rank restrictions could significantly limit their representation power. Hence, recent works have explored full-rank training with low-rank updates. For instance, ReLoRA  periodically restarts LoRA, where the low-rank updates are merged with the weights from the last period. However, ReLoRA also requires a warm-start full-rank training to achieve competitive performance . GaLore  takes a different route by enforcing a low-rank structure not on the weights but on the gradients. This allows the Adam optimizer states to be stored in a low-dimensional space. While being memory efficient, GaLore is not parameter efficient because it still performs full parameter update with "projected-back" low-rank gradients.
+
+_Parameter efficiency_ is a desirable property post-pretraining for model deployment, fine-tuning, and model storage. On the other hand, _memory efficiency_ is necessary for training models with lower hardware requirements. Despite the importance of both parameter and memory efficiency, these two goals are often pursued independently. While low-rank models achieve both parameter and memory efficiency, as discussed earlier, they do not perform well in general [47; 59]. Therefore, a natural question is:
+
+_how can we adapt low-rank training to achieve comparable performance as full-rank training while maintaining both parameter and memory efficiency?_
+
+**Contributions.** In this work, we answer the above question by directly parameterizing the weights as low-rank plus sparse factors for pretraining. It should be noted that both low-rank and sparse factors individually facilitate parameter efficiency. Furthermore, their combination (usually) ensures that the final pretrained model is of high rank. Existing strategies for sparse learning usually involve prune-and-growth [13; 2; 58; 49] that iteratively train, prune, and grow neurons. Such a strategy is usually not memory efficient due to the need of storing (and learning) a support and a dense weight matrix. In contrast, we motivate and adopt a simpler strategy of fixing a uniformly random support (for the sparse factor). This allows to only store indices and values for memory efficient training, which scales with the number of nonzero entries. We show such a simple approach allows to further reduce the memory consumption during pretraining compared to ReLoRA  and GaLore  without sacrificing performance. We show this through an extensive set of experiments on the LLaMA language models with varying model size from 60M up to 7B parameters. We call our proposed sparse plus low-rank **pretraining** algorithm as **SLTrain**. In Figure 1, we observe that SLTrain obtains perplexity score comparable to full-rank model with considerable memory and parameter efficiency.
+
+We end this section by noting that the idea of marrying low-rank and sparse factors has been explored for robust matrix recovery [6; 57; 4], attention matrix approximation , and neural network compression . However, it is introduced for pretraining LLMs for the _first_ time in our work.
+
+Figure 1: Shown are perplexity, memory, and parameter size for pretraining LLaMA 1B on the C4 dataset with different methods. The radius and color of each circle scale with parameter size. Overall, the methods which have smaller, lighter circles on the left bottom corner are desirable for pretraining. The details are in Section 5.1.
+
+Background on low-rank pretraining
+
+Existing pretraining works [24; 43] have explored low-rank parameterization of the layer weights directly as \(W=BA\). However, it has been empirically observed that vanilla low-rank parameterization suffers from large performance degradation because of the limited representation capacity [47; 32; 59]. Hence, motivated from low-rank adaptation (LoRA)  for fine-tuning, for pretraining, ReLoRA  suggests to parameterize the layer weights as
+
+\[W=W_{0}+_{s=1}^{m}B_{s}A_{s},\] (1)
+
+where \(m\) represents the number of low-rank factors. This parameterization results in an overall high-rank update compared to LoRA because the sum of low-rank matrices is generally a higher rank matrix. The optimization is performed by training \(B_{s}\), \(A_{s}\) iteratively, merging \(W_{s} W_{s-1}+B_{s}A_{s}\), and then restarting the optimization for \(B_{s+1},A_{s+1}\). A key drawback of ReLoRA is that it stores the full-rank matrix \(W_{s}\) throughout the training and inference stages. Hence, it is memory intensive and not parameter efficient. While ReLoRA performs sequential low-rank updates in (1), a recent work  has explored parallel low-rank updates and merging them for pretraining.
+
+A more recent work, GaLore , imposes low-rank structure on the gradient. Specifically, GaLore still optimizes full-rank weights and computes full-rank gradients \(G_{t}\) at iteration \(t\), but updates Adam moments \(M_{t},V_{t}\) in a low-dimensional space, i.e.,
+
+\[M_{t}_{1}M_{t-1}+(1-_{1})P_{t}^{}G_{t}, \ \ V_{t}_{2}V_{t-1}+(1-_{2})(P_{t}^{ }G_{t})^{2}\] \[W_{t+1} W_{t}-\,P_{t}M_{t}/(}+),\]
+
+where \(P_{t}\) is a projection matrix constructed by taking the largest left singular vectors of \(G_{t}\). To reduce computational cost, \(P_{t}\) is computed every several iterations and is stored in the middle. Although being memory efficient (as \(M_{t}\) and \(V_{t}\) are computed in the smaller dimension), GaLore is not parameter efficient due to computation of \(P_{t}M_{t}\) for updating \(W_{t}\).
+
+## 3 SLTrain: proposed sparse plus low-rank pretraining
+
+In order to achieve both parameter and memory efficiency, we propose to adapt low-rank parameterization by introducing a sparse factor. We model the weight matrices as a sum of sparse and low-rank matrices. Our proposed modeling is referred to as SLTrain. Below, we discuss the motivation, modeling details, and practical considerations for implementing SLTrain.
+
+### Motivation for sparse plus low-rank parameterization
+
+Both low-rank and sparsity are parsimonious modeling strategies for exploring low-dimensional weight matrices. The low-rank component aims to learn the low-dimensional bases or eigenspaces of the weights. The sparse component, on the other hand, identifies effective neuron-wise interactions and disregards non-expressive ones. In linear algebra terms, the low-rank component enforces sparsity of singular values, whereas the sparse component enforces sparsity of individual entries. In general, low-rank matrices are not sparse, and sparse matrices are not necessarily low-rank . These concepts provide complementary information that should be explored simultaneously.
+
+Despite that low-rank modeling alone can have limited expressivity due to the low-rank structure it imposes, we show in the below proposition that low-rank plus a uniform sparse matrix with only \(( n/n)\) number of entries is full-rank with high probability.
+
+**Proposition 1**.: _Consider a matrix \(S^{n n}\) with support \(\) sampled uniformly at random with probability \((0,1)\), i.e., \([(i,j)]=\), for all \(i,j[n]\). Suppose \(=( n/n)\), then with probability at least \(1-O(1/n)\), \(BA+S\) is full rank for arbitrary randomly generated \(B,A\)._
+
+To further motivate the sparse plus low-rank modeling, in Figure 2, we illustrate different statistics from weight matrices of a pretrained LLaMA 60M model on C4 dataset (introduced later in Section 5). In Figure 2(a), we plot the singular values of weight matrices of different layers. The plot exhibits a fast decay of the singular values followed by a more stable decay of (smaller) singular values. This suggests that the top subspaces can be effective in model compression, and therefore, builds a case for low-rank modeling. However, the tail singular value distribution shows that low-rank modeling purely may not be sufficient. In order to better understand the tail part, in Figure 2(b), we visualize the magnitude of the attention output weight matrix before and after we extract the top \(r\)-dimensional subspaces (\(r=128\)) for the last attention layer. It is apparent that, after removing the top subspaces, both the magnitudes and the variation of the entries present in the residual matrix become smaller. Plotting the magnitudes of the entries in Figure 2(c) we see that 97% of the entries have a magnitude below 0.04. In Appendix B and C, we provide such visualizations for other layers of LLaMA 60M and Pythia 70M to further corroborate the findings. Overall, the figures suggest that a sparse matrix with random support can approximate the residual well given the magnitudes do not vary too much across the entries.
+
+In Table 1, we perform an ablation study that verifies the feasibility of using a random sparse support for approximating the residual matrix. Specifically, we take \(L_{0}\) as the best rank-\(r\) approximation (\(r=128\)) for the pretrained weight matrix \(W_{0}\) and evaluate the perplexity score (PPL) on the validation set. We see that compared to the full-rank pre-trained model, low-rank approximation \(L_{0}\) suffers from a drastic performance drop. We also augment the low-rank approximation \(L_{0}\) with either top 3% or random 3% of entries of the residual matrix, which we label as top sparse or random sparse pruning, respectively. We observe that \(L_{0}\) plus top sparse pruning performs better compared to \(L_{0}\) plus random sparse pruning. Nonetheless, both the performance is poor. We further evaluate fixing the low-rank approximation (to \(L_{0}\)) and only optimizing the sparse components with either top support or random support (both run for five times). Averaged PPL (over the five runs) for both the approaches improve and are comparable. This shows that fixing a random support for the sparse factor is a promising strategy from both efficiency and performance point of view. We explore learning both the sparse and low-rank factors in the next section.
+
+### Our proposed modeling
+
+Building on Section 3.1, we propose to parameterize weight matrices \(W^{d p}\) as
+
+\[W=BA+S,\]
+
+   & PPL (\(\)) \\  Full-rank & 34.06 \\ Low-rank (\(L_{0}\)) & 36633.04 \\ \(L_{0}\) + top sparse pruning & 5293.93 \\ \(L_{0}\) + random sparse pruning & 29121.38 \\  \(L_{0}\) + sparse training with top support & 53.75 \\ \(L_{0}\) + sparse training with random support & 51.98 \\  
+
+Table 1: Perplexity (PPL) of training and pruning with random versus top sparsity for LLaMA 60M on 1.1B tokens.
+
+Figure 2: Illustration of the last attention layer of pretrained full-rank LLaMA 60M model on 1.1B tokens. (a): singular value magnitudes of weight matrices where we observe a rapid decay of singular values. (b): Visualization of full-rank pretrained attention output matrix \(W_{0}\) in magnitude and the residual matrix after removing the best rank-\(r\) (\(r=128\)) approximation of the \(W_{0}\) by SVD. We observe the magnitudes of the residual vary smoothly across different neuron-neuron interactions. (c): Cumulative density of the residual matrix in magnitude where we include a cut-off fraction at \(0.97\). We observe 97% entries in the residual matrix have magnitude less than 0.04.
+
+where \(B^{d r},A^{r p}\) are low-rank factors with \(r<\{d,p\}\) being the rank parameter and \(S^{m n}\) is a sparse matrix. The number of non-zero entries \(()\) in \(S\) is determined by the sparsity level parameter \((0,1)\), i.e., \((S)= dp\). So, the total number of parameters for the proposed parameterization is \((d+p)r+ dp\), which is much smaller than the full-rank layer parameters \(dp\) when we choose \( 1\). In addition to being parameter efficient, the optimization states also cost less memory and scales with the number of trainable parameters. Finally, we note that the overall rank of \(W\) will generally be high due to the presence of the sparse factor \(S\), based on Proposition 1.
+
+The performance of such a parameterization highly depends on whether there exists an implementation that is both computation and memory efficient. Nevertheless, modern GPU hardware is not suited for sparse tensor multiplication \(Sx\) for given input \(x\), as well as its gradient, especially when \(S\) presents an unstructured sparsity pattern . This causes increased computational bottleneck despite showing memory advantage. Thus, existing works on sparse network and training mostly rely on learning and storing a parameter mask (i.e., support) [48; 15; 33] by letting \(S=M U\), where \(M\{0,1\}^{d p}\) is a binary mask and \(U^{d p}\) is a dense parameter. This allows to exploit GPU accelerator for dense matrix computation. However, masking requires to store both the support and a dense parameter for training, which significantly increases the memory cost.
+
+In this work, we achieve memory efficiency by representing \(S\) in terms of its indices and values, i.e., \((,)^{2(S)}\). This is possible because we randomly (and uniformly) fix the support a priori. The motivation for using a random (but fixed) support comes from the usefulness of random support in Table 1. This ensures the memory scales with only the sparsity in \(S\) (i.e., the support size) rather than the full size of \(S\). Further, the forward pass involves computing
+
+\[BAx+Sx=(BA_{})x,\]
+
+where we denote \(W_{}\) as scatter-adding \(\) to \(W\) at the indices specified in \(\). Because this operation results in a dense matrix, sparse matrix multiplication is avoided. Hence, this is GPU friendly without requiring to store a binary mask.
+
+We remark that despite we require to compute a dense matrix, which has the same size as the full-rank matrix, we _never_ store it for backpropagation. In particular, we can compute the gradient with respect to \(B,A\), \(\), and input \(x\) as
+
+\[_{B}L=_{z}L\,x^{}A^{},\,_{A}L=B^{}_{z}L\, x^{},\,\,_{}L=(_{z}L\,x^{})_{},\,\, _{x}L=(BA_{})^{}_{z}L,\] (2)
+
+where we let \(z=(BA_{})x\) and \(L\) denotes the loss function. We also denote \(W_{}\) as gathering the values of \(W\) at indices \(\). In other words, we only need to store \(B,A,,\) for backpropagation. This is illustrated in Algorithm 1 where we define a customized linear layer in SLTrain. We highlight that such a parameterization is agnostic to the chosen optimizers and can easily be integrated with any optimizer including Adam.
+
+In comparison with the recent pretraining works based on low-rank factors/gradients, SLTrain is more parameter and memory efficient than ReLoRA  and GaLore  as it only optimizes the low-rank and sparse factors without the need for storing full-rank matrices.
+
+```
+1:Input:\(x\), \(B_{t},A_{t},(,_{t})\).
+2:def forward(\(x,B_{t},A_{t},,_{t}\)):
+3:save_for_backward(\(B_{t},A_{t},,_{t}\))
+4:return\((BA_{})x\)
+5:
+6:def backward(\(_{z}L\)):
+7:\(x,B_{t},A_{t},,_{t}\) saved_tensor
+8: Compute gradient as in (2).
+9:return\(_{x}L,_{B_{t}}L,_{A_{t}}L,,_{_{t}}L\) ```
+
+**Algorithm 1** SLTrain for linear layer 
+
+**Regularization and preconditioning.** It is expected that the optimization of low-rank factors can cause instability when using larger stepsize or larger balancing parameter \(\), an issue already present in low-rank training . This is primarily due to the multiplicative updates of \(B,A\) simultaneously. Existing solutions, such as orthogonal constraints or regularization , preconditioning [50; 23; 56], can be easily combined with the proposed modelling for more stable convergence.
+
+**Integration with other techniques.** Since the proposed sparse plus low-rank approach pursues memory saving from the perspective of reparameterization, SLTrain can be easily integrated with optimizer-based techniques for further improving memory efficiency, including quantization  (that uses lower-bits for storing moment states without sacrificing the performance), per-layer weight updates  (that updates the parameters along with backpropagation), and activation checkpointing (that recomputes the activation states instead of storing them). In addition, SLTrain can be even combined with low-rank gradients in GaLore  for low-rank factors. This can further reduce the memory footprint, especially for larger models where the rank \(r\) is set to be high. On the other hand, because we use a simple strategy of fixed-support sparse learning, it may be beneficial to combine with different techniques for dynamic support learning [2; 20].
+
+## 4 Related works
+
+**Low-rank fine-tuning and training.** Building on the idea of LoRA  that parameterizes the update as low-rank factors, i.e., \( W=BA\), ROSA  dynamically adapts subspaces for training, where the subspaces are selected by taking SVD of the current weight matrices. Chain of Lora  decomposes the low-rank update into a sequence of small-size matrix product, \( W=_{j=1}^{k}B_{j}A_{j}\). NOLA  parameterizes the two small matrices as linear combination of two sets of random basis respectively, \(B=_{i=1}^{m}_{i}B_{i},A=_{j=1}^{n}_{j}A_{j}\) where \(A_{i},B_{j}\) are fixed random matrices. NOLA optimizes over the coefficients, thus further improving parameter efficiency. VeRA  considers a similar parameterization as NOLA where \(B=(b),A=(a)\) for fixed random matrices \(,\). DoRA  decomposes pre-trained weights into magnitude and directional components and separately fine-tune with LoRA adopted for directional update. SoRA  introduces a dynamic rank adaptation strategy for tuning LoRA rank. ResLoRA  adds a residual path for LoRA adaptors. For _pretraining_, in addition to ReLoRA  and GaLore , Flora  demonstrates LoRA updates approximate random projection of gradient, and by resampling the random projection, high-rank training can be achieved. LTE  adopts the similar idea of parameterizing a high-rank matrix through summation of low-rank matrices and adopts the parallel train-and-merge strategy as opposed to sequential in ReLoRA .
+
+**Sparse fine-tuning, training and sparse networks.** Sparse fine-tuning/training aims to selectively update the weights with others fixed [48; 1; 2; 49; 15; 33]. This usually entails choosing a proper subset of parameters either randomly , or based on approximate Fisher information , magnitude of the change , gradients and momenta , as well as by learning a parameter mask (for storing support) with sparsity regularization . On the other hand, sparse networks, also known as model pruning, directly search for a minimal architecture [16; 35] by removing redundant weights. We refer to the survey  for complete discussions of sparse network pruning.
+
+**Sparse plus low-rank.** Decomposing a matrix into the sum of low-rank and sparse matrix is a classic optimization problem for matrix recovery [6; 54; 4]. Recently, some works also consider harnessing both low-rank structure and sparsity for neural network compression. Scatterbrain  considers approximating the attention matrix for faster inference with sparse plus low-rank factors. More specifically, given \(Q,K,V^{n d}\) The main aim is to efficiently approximate \((QK^{})V\), which suffers from quadratic complexity in sequence length \(n\). Hence,  proposes to leverage a random feature map \(:^{d}^{m}\), defined as \((x)=}(Wx-\|x\|^{2}/2)\) with entries of \(W\) sampled from Gaussian distribution \((0,1)\), which defines a low-rank approximation \((Q)(K)^{}(QK^{})\). Then a sparse matrix is constructed based on locality sensitivity hashing with the non-zero entries \(S_{i,j}=(QK^{})_{i,j}-(Q)_{i}^{}(K)_{j}\). However, the aim of  is to approximate the attention matrix to reduce the computational cost while we aim to achieve memory efficiency by directly parameterizing the weight matrix. More specifically, in the context of self-attention where \(Q=XW_{Q},K=XW_{K},V=XW_{V}\), we directly parameterize each projection matrix \(W_{Q},W_{K},W_{V}\) as low-rank plus sparse factors, e.g., \(W_{Q}=BA+S\). In addition, LoSparse  proposes to decompose the pretrained weights into low-rank plus sparse factors for structuredcompression. Nevertheless, they consider optimizing the sparse matrix via iterative thresholding, which requires to store the full-size sparse matrix. We instead consider directly optimizing the sparse matrix on its non-zero entries for memory-efficient pretraining.
+
+**Memory efficient training.** To overcome the memory limitation of LLMs, many techniques have been proposed, such as reduced-precision, quantization [9; 10], gradient checkpointing  and gradient accumulation , and row-sum/column-sum of second-order statistics in Adafactor , among many others. As has already been discussed, the proposed sparse plus low-rank parameterization is orthogonal to these developments where the techniques can be easily integrated for further memory reduction.
+
+## 5 Experiments
+
+This section validates the effectiveness of low-rank plus sparse structure for pretraining and fine-tuning large language models. All the experiments are run on NVIDIA A100 GPUs. The code is available on https://github.com/andyjm3/SLTrain.
+
+### Pretraining LLMs
+
+Following [32; 59], we consider pretraining the LLaMA language models  with pre-normalization, RMSnorm , and SwiGLU activation . We train LLaMA LLMs on C4 (Colossal Clean Crawled Corpus) dataset , which is specially designed for pretraining. The training is performed without data repetition and we consider LLaMA with varying model sizes from 60M up to 7B parameters.
+
+**Baselines.** We compare our SLTrain with the baselines which exploit low-rank structures.
+
+* **Full-Rank**: This is the vanilla baseline that pretrains with full-rank weights using the Adam optimizer.
+* **Low-Rank**: This is the low-rank parameterization of weights by factorizing \(W=BA\) where optimization is on \(B,A\).
+* **ReLoRA**: ReLoRA periodically restarts LoRA  by merging the learned low-rank adaptors with layer weights and reinitializing the optimizer state and learning rate.
+* **GaLore**: GaLore explores low-rank structure for the gradients rather than for the parameters.
+
+We implement SLTrain with Adam by reparameterizing the weights from all linear layers, including fully-connected layers as well as query, key, value projection layers. The remaining parameters are updated with full-rank parameterization. This is consistent with the setup used in [21; 32; 59].
+
+**Hyperparameters.** For SLTrain, we fix the rank \(r\) to be the same as the baselines and fix sparsity ratio \(=0.03\) across all the model sizes except for LLaMA 7B where we choose \(=0.05\), which achieves a good balance between efficiency and performance. We tune and fix the stepsize to be
+
+    &  &  &  &  \\  \(r\) / \(d\) &  &  &  &  \\ Tokens &  &  &  &  \\   & PPL & Param & Mem & PPL & Param & Mem & PPL & Param & Mem & PPL & Param & Mem \\  Full-Rank & 34.06 & 58 & 0.35 & 24.36 & 134 & 0.81 & 18.80 & 368 & 2.21 & 15.56 & 1339 & 8.04 \\ Low-Rank  & 78.18 & 43 & 0.24 & 45.51 & 94 & 0.57 & 37.41 & 185 & 1.11 & 142.5 & 609 & 3.66 \\ ReLoRA  & 37.04 & 58 & 0.36 & 29.37 & 134 & 0.84 & 29.08 & 368 & 1.85 & 18.33 & 1339 & 6.34 \\ GaLore  & 34.88 & 58 & 0.28 & 25.36 & 134 & 0.61 & 18.95 & 368 & 1.59 & 15.64 & 1339 & 4.76 \\ SLTrain & 34.15 & 44 & 0.26 & 26.04 & 97 & 0.60 & 19.42 & 194 & 1.24 & 16.14 & 646 & 4.16 \\   
+
+Table 2: Validation perplexity (PPL(\(\))), number of parameters in millions (Param), and estimated total memory cost in G (Mem). The perplexity results for all the baselines are taken from . For SLTrain, we use the same rank as other baselines and fix \(=0.03\).
+
+\(0.003\) and tune \(\) in the range of \(\) for the LLaMA 60M, 130M, 250M, 1B models. We fix the other parameters to their default settings. In particular, we choose \(=32\) for the LLaMA 60M model and \(=16\) for the 130M and 350M models and \(=8\) for 1B. For the LLaMA 7B model, we choose stepsize to be \(0.0005\) and \(=8\). Except for the 7B model, we directly inherit the perplexity results from  and thus do not need to tune the hyperparameters from the baselines. We ensure the comparison is fair based on the training token number.
+
+**Memory cost estimation.** We compare the proposed SLTrain with the low-rank baseline models in terms of estimated memory consumption. Following , we compute memory estimates with bfloat16 format, where each floating point number occupies 2 bytes. We remark that SLTrain stores the indices with int64 format, which occupies 8 bytes per digit. The memory cost for a training algorithm consists of the parameter memory and optimizer state memory. The parameter memory refers to the memory occupied by storing parameters, and the optimizer state memory refers to the memory required to store the first and second-order moment statistics, e.g., in Adam. Table 2 reports the total estimated memory cost for each method. The detailed breakdown of memory estimation can be found in Appendix F.
+
+**Perplexity vs efficiency.** In Table 2, we compare the performance of different methods in three aspects: perplexity score, parameter size, and memory cost. We observe that SLTrain performs comparatively as the full-rank training and GaLore  while achieving further reduction in parameter size and memory cost. In addition, SLTrain only adds a small parameter and memory overhead to the low-rank parameterization, yet significantly improves the perplexity score. Hence, learning the additional sparse factor indeed helps in strengthening the representation capacity of SLTrain. This intuition is also validated in Figure 10 (Appendix D), where we plot the singular value distribution for different weight matrices. Due to the presence of the sparse factor, we observe that the spectrum of the SLTrain weight matrices gets enhanced beyond \(r=128\).
+
+**Measuring actual memory footprint.** In Figure 3, we record the actual memory footprint of different methods across various model sizes, on a single A100 80G GPU. We measure the memory of 8-bit SLTrain with per-layer weight update using a single batch size and bfloat16 data type. Gradient checkpointing is not used for any method. The baselines include Adam trained on full-rank weights, 8-bit Adam, and 8-bit GaLore with per-layer weight. From the figure, we see that SLTrain achieves memory reduction by 51%, 58%, 73% for 350M, 1B, 7B models, respectively. Notably, compared to state-of-the-art memory-efficient method GaLore , SLTrain reduces the memory requirement by 29%, 34%, 17% when pretraining 350M, 1B, 7B models, respectively.
+
+**Measuring throughput.** We measure the throughput of SLTrain for pretraining on the LLaMA 350M and LLaMA 1B models with a token batch size of 256 on 1\(\)80G A100 GPU and 4\(\)80G A100 GPUs, respectively. The throughput is averaged over 5000 training steps. We observe in Table 3 that the throughput token of SLTrain is slightly lower than the full-rank and GaLore baselines. This is mainly due to the retrieving and setting for the sparse entries. We believe more efficient implementation can be developed in this regard.
+
+**Scaling to LLaMA 7B model.** For pretraining the LlaMA 7B model, due to the resource constraints, we only compare SLTrain with GaLore, implemented with 8-bit Adam  on 4\(\)80G A100 GPUs, without per-layer weight updates nor gradient checkpointing.1. We directly use the training scripts of GaLore.2 In Table 4, we observe that SLTrain performs comparably to GaLore in terms of perplexity and throughput while achieving significant memory reduction of 26% per GPU device.
+
+**Inference memory and throughput.** In Table 5, we compare the inference memory usage and throughput between SLTrain and the full-rank model across various model sizes, ranging from LLaMA 130M to 7B. A clear trade-off between memory and computational cost is observed. Specifically, as the model size increases, the percentage of memory savings becomes more pronounced, while
+
+Figure 3: Actual memory consumption across different model size and algorithms on a single A100 80G GPU.
+
+the corresponding increase in computational cost is less significant. This underscores the growing advantage of SLTrain when employing larger models.
+
+**Varying random sparse support.** In contrast to common pruning strategies that require careful learning of sparse support, we show that SLTrain works with randomly selected support. In this regard, we perform pretraining on Llama 60M and 130M with five different randomly selected support for the sparse factor \(S\). The convergence plots are shown in Figure 4, where we see that changing the random support for the sparse factor does not materially affect the performance.
+
+**How do rank \(r\) and sparsity \(\) affect performance?** In Table 6, we validate the performance of training the Llama 60M and 130M models by varying the hyperparameters \(r\) and \(\). We notice that, in general, when more parameters are added (corresponding to higher \(r\) and \(\)), the performance is better. However, this performance gain is also accompanied by an increase in memory footprint. In our initial experiments, we also tried the extreme setting with \(r=0\), i.e., only the \(S\) component was learned but with a higher \(\) value. This setting demonstrated a reasonably good performance. Further investigations in this direction are left for future work.
+
+Further comparisons to full-rank performance.In this section, we evaluate the potential of SLTrain to achieve performance comparable to full-rank models by adjusting the sparsity ratio, \(\). As shown in Table 7, we increase \(\) from 0.03 to 0.1 for the LLaMA 350M and 1B models. Our results indicate that setting \(=0.1\) enables SLTrain to attain perplexity scores similar to those of full-rank models, while maintaining memory and parameter efficiency. Notably, at \(=0.1\), SLTrain reduces the parameter size by 42% for the 350M model and 45% for the 1B model. These results highlight the effectiveness of SLTrain in significantly reducing model size without sacrificing performance.
+
+## 6 Concluding Remarks
+
+In this paper, we propose SLTrain for achieving _both memory and parameter efficient_ pretraining of LLMs. SLTrain combines two complementary parsimonious structures, low-rank and sparsity, for
+
+    & PPL & Mem & Tokens/sec \\ 
+8-bit GaLore & 26.87 & 62G & 5924 \\
+8-bit SLTrain & 27.59 & 46G & 5877 \\   
+
+Table 4: Validation perplexity, _actual_ memory footprint per GPU, and throughput tokens/seconds (Tokens/sec) for LLaMA 7B on 1.4B tokens.
+
+    &  &  \\  & Mem & Tokens/s & Mem & Tokens/s \\  Full-Rank & 8.09G & 151360 & 11.06G & 71324 \\ SLTrain & 7.95G & 137058 & 10.44G & 66616 \\  & (-1.73\%) & (-9.45\%) & (-5.61\%) & (-6.60\%) \\   &  &  \\  & Mem & Tokens/s & Mem & Tokens/s \\  Full-Rank & 8.64G & 18964 & 32.93G & 9500 \\ SLTrain & 6.12G & 17482 & 21.19G & 8481 \\  & (-29.17\%) & (-7.81\%) & (-35.65\%) & (-10.73\%) \\   
+
+Table 5: Inference memory and throughput comparison on a single 40G A100 GPU on a batch size of 128 for 130M, 350M, and a batch size of 32 for 1B, 7B. Compared to 1B model, higher memory for 350M model is due to the larger batch size.
+
+Figure 4: Convergence of SLTrain in perplexity with different random support.
+
+learning models with high representation capacity. While low rank is modeled via the product \(BA\) of \(r\)-dimensional matrices, the support of the sparse factor \(S\) is obtained by uniformly random sampling over indices. The matrices \(B,A,S\) are learned for different layers via backpropagation. Empirically, we achieve state-of-the-art memory reduction during pretraining while maintaining competitive performance. Although we show results on the LLaMA language models (with varying size from 60M to 7B parameters), we believe SLTrain could also help to improve memory efficiency for vision foundation models and multi-modal foundation models, such as diffusion models  and CLIP . The significant improvements shown by SLTrain also motivates future works to understand the theoretical guarantees of training with both low-rank and sparse factors, such as convergence and loss landscape. We hope this work initiates exploration on combination of other parsimonious structures for pretraining such as Kronecker product or structured sparsity (e.g., block-diagonal, group-lasso).
+
+#### Acknowledgments
+
+M. Hong and J. Li are supported partially by NSF under the grants EPCN-2311007 and CCF-1910385, and an Amazon Research Award.

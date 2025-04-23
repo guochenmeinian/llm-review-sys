@@ -1,0 +1,178 @@
+# Efficient LLM Scheduling by Learning to Rank
+
+Yichao Fu\({}^{1}\)  Siqi Zhu\({}^{2}\)  Runlong Su\({}^{1}\)  Aurick Qiao\({}^{3}\)  Ion Stoica\({}^{4}\)  Hao Zhang\({}^{1}\)
+
+\({}^{1}\)UCSD \({}^{2}\)Tsinghua University \({}^{3}\)Snowflake \({}^{4}\) UC Berkeley
+
+Hao Zhang is the corresponding author
+
+###### Abstract
+
+In Large Language Model (LLM) inference, the output length of an LLM request is typically regarded as _not known a priori_. Consequently, most LLM serving systems employ a simple First-come-first-serve (FCFS) scheduling strategy, leading to Head-Of-Line (HOL) blocking and reduced throughput and service quality. In this paper, we reexamine this assumption - we show that, although predicting the exact generation length of each request is infeasible, it is possible to predict the relative ranks of output lengths in a batch of requests, using _learning to rank_. The ranking information offers valuable guidance for scheduling requests. Building on this insight, we develop a novel scheduler for LLM inference and serving that can approximate the shortest-job-first (SJF) schedule better than existing approaches. We integrate this scheduler with the state-of-the-art LLM serving system and show significant performance improvement in several important applications: 2.8x lower latency in chatbot serving and 6.5x higher throughput in synthetic data generation. Our code is available at https://github.com/hao-ai-lab/vllm-ltr.git.
+
+## 1 Introduction
+
+Large language models (LLMs) are increasingly becoming the backbone of many today's Internet services and applications that serve millions of users . Due to the surge in demand, efficient scheduling for LLM serving is crucial to ensure high-quality service amidst numerous concurrent users competing for computing resources. For popular interactive applications such as chatbots, this means minimizing the latency that each user perceives while maximizing the overall system throughput to accommodate as many users as possible.
+
+Under high load, LLM services that implement a first-come-first-serve (FCFS) scheduling strategy inevitably face significant Head-Of-Line (HOL) blocking, as many requests must wait for others to execute. Figure 1 illustrates a typical example of how a long request can block shorter ones in FCFS scheduling, leading to significant HOL blocking. In such scenarios, it is well-established that the shortest-job-first (SJF) and shortest-remaining-time-first (SRTF) scheduling algorithms minimize the average latency experienced across all requests. However, SJF/SRTF are seldom implemented in LLM services because they require requests to be ordered by their remaining generation lengths, which is traditionally assumed to be difficult or impossible to know ahead of time in existing systems [2; 3].
+
+In this paper, we contend that, although accurately knowing the generation length of requests may be difficult, it is actually not needed. Rather, just knowing the _relative ordering_ between request lengths is sufficient for SJF/SRTF scheduling. To this end, we propose to use the Kendall rank correlation coefficient (_Kendall's Tau_)  to measure the similarity between a predicted schedule and the SJF/SRTF schedule based on groundtruth generation lengths (i.e. oracle). We demonstrate that schedules with higher similarities (measured by Kendal's Tau) to the oracle generally translate to lower latencies in real-world performance (Figure. 2).
+
+Based on this insight, we propose to optimize the request scheduling in LLM serving via learning to rank. We show that a small auxiliary model (e.g., OPT-125M ) can be trained to accurately rankLLM requests by their generation lengths, prior to execution, at virtually no cost. For both offline batch generation and online latency-sensitive tasks, by scheduling requests _on-the-fly_ based on the predicted rankings, we can approximate the SRTF/SJF schedule, hence reduce average latency and improve throughput, respectively.
+
+Compared to existing work which attempts to directly predict the generation lengths of LLM responses [6; 7], we show that our learning-to-rank approach is both more robust in approximating SRTF/SJF, hence translating to lower latency and higher throughput, but also simpler, which can be easily integrated into production serving systems (i.e., 500 LoC in vLLM).
+
+Our contributions are summarized as follows:
+
+* We show that knowing the relative orderings of generation lengths provides valuable guidance for optimizing the scheduling of LLM serving.
+* We apply Kendall's Tau as an effective measure of the similarity between an LLM schedule and the ideal SJF/SRTF schedule, and show a higher similiary indicated by Kendall's Tau usually translates to lower latency and high throughput in practice.
+* We employ _learning-to-rank_ to optimize the schedule and show that our method is simple and enables on-the-fly scheduling at a per-iteration basis with negligible overhead.
+* Our method, when integrated with state-of-the-art serving system, significantly improves the performance on important LLM serving tasks, reducing the p90 latency of chatbot serving by \(2.8\) and increasing the throughput of batch synthetic data generation by \(6.5\).
+
+## 2 Related Work
+
+LLM Serving Systems.Orca  introduces iteration-level scheduling and vLLM  applies PagedAttention, which are two key techniques for LLM serving. However, they both apply the FCFS schedule and are prone to severe HOL blocking. Scheduling for LLM serving is a relatively less explored topic. Although many LLM serving optimizations [9; 10; 11; 12; 13] have been developed recently, all these works typically assume the output length of an LLM request cannot be known before execution. FastServe  applies skip-join MLFQ in LLM serving. It sets up the priority of requests according to their generated length so far. Andes  introduces a novel quality of experience (QoE) metric for online text services, which measures human satisfaction during the whole token delivery. It employs an online preemptive scheduling method that determines which requests to execute based on scheduling objectives (e.g., average QoE) for the upcoming timeframe. Our method differs from these by predicting generation length rankings to achieve lower latency.
+
+Scheduling in General.Scheduling is critical in computer systems. First-come-first-serve (FCFS) schedules requests according to their arrival time. Shortest-job-first (SJF) and its preemptive variant, shortest-remaining-time-first (SRTF), prioritize jobs with the shortest time to finish, which provably yield the lowest average latency, but may suffer from starvation problems. We discuss how to prevent starvation in SS4.3. Multi-level-feedback-queue (MLFQ) maintains multiple priority queues to balance fairness and latency, but introduces substantial complexity in batch and interactive LLM workloads. Our work addresses this complexity by leveraging a simpler, prediction-based scheduling strategy.
+
+Figure 1: A long request can block short requests and introduce severe HOL blocking and high latency. We assume there is no prefill time, and the system takes 1 second to generate 1 token. With a First-come-first-serve (FCFS) schedule, the long request _R0_, which arrives first and takes 10 seconds to generate 10 tokens, will block subsequent shorter requests _R1_ and _R2_ for 10 seconds. Hence the latencies of _R0_, _R1_, and _R2_ are \(10/10=1,(10+2)/2=6,(10+2+1)/1=13\) s / token, respectively, perceived by users, with an average latency of \((1+6+13)/3=6.67\) s / token. By contrast, prioritizing shortest requests yields an average latency of \((1.3+1.5+1)/3=1.27\) s / token – a \(5.3\) reduction in average latency.
+
+**LLM Generation Length Prediction.** Closest to our work are several recent works that predict the (exact) generation length of LLMs in order to enhance resource utilization (e.g., memory). Perception Only (PO)  methods let LLMs output the generation length via prompting. S3 , TetriServe  and DynamoLLM  use a predictor model (i.e, DistilBert  and OPT ) to predict generation length. These methods formulate the length prediction as a classification problem, whose success hinges on high predictive accuracy. Magnus  utilizes a language-agnostic BERT sentence embedding, a compression component, and a random forest regressor to predict generation length. Other concurrent works [19; 20] both propose a regression-based method for length prediction, fine-tuning a BERT model on the Lmsys-Chat-1M dataset with an L1 regression loss to predict the exact generation length. They tested models ranging from 300M to 3B and applied various batching policies, including no batching, dynamic batching, and continuous batching, significantly improving latency and throughput under these settings. Additionally, it supports multi-round LLM conversations. In contrast, our proposed method is built on vLLM with paged attention and uses ranking loss to optimize the predictor model. We designed a preemptive scheduling method with starvation prevention to optimize the end-to-end performance of real-world LLM serving systems.
+
+## 3 Background
+
+In this section, we introduce several background concepts in learning to rank, which are essential for understanding our methodology.
+
+**Kendall Rank Correlation Coefficient.** Kendall's Tau coefficient , specifically the Tau-b variant we use, measures the correlation between two rankings. Its value ranges from \(-1\) to \(1\), where \(1\) indicates perfect agreement between two rankings, \(-1\) indicates complete disagreement (reversed rankings), and \(0\) indicates no correlation. The formulation of Kendall's Tau is given as follows:
+
+\[=-N_{d}}{-N_{1})(N_{0}-N_{2})}},\] (1)
+
+where \(N_{c}\) and \(N_{d}\) are the number of concordant and discordant pairs, respectively, in the two rankings. \(N_{0}=n(n-1)/2\), where \(n\) is the total number of items. \(N_{1}\) and \(N_{2}\) consider tied values in each ranking: \(N_{1}=_{i}t_{i}(t_{i}-1)/2\) and \(N_{2}=_{j}u_{j}(u_{j}-1)/2\), where \(t_{i}\) is the number of tied values in the \(i^{th}\) group of ties for the first ranking and \(u_{j}\) is the number of tied values in the \(j^{th}\) group of ties for the second ranking . It's important to note that tied pairs are considered neither concordant nor discordant in this calculation.
+
+**Learning to Rank.** Learning to rank  is a machine learning approach applied to supervised ranking data. It is widely used in recommendation systems , search engine  and other research areas [22; 23]. Learning to rank typically takes one of three forms: pointwise, pairwise, and listwise. Pointwise turns the ranking problem into regression , classification [25; 26] or ordinal regression . Pairwise [28; 29; 30; 31; 32; 33] method learns the relative ranking for each pair of items. Listwise [34; 35; 36; 37; 38] learns the ranking of lists of samples in a dataset.
+
+Figure 2: **(a)**: HOL blocking was evaluated by comparing FCFS and SRTF scheduling policies across 1K requests. **(b)**: Analysis revealed that higher Kendall’s Tau correlation coefficients were associated with reduced latency. This finding was validated using the ShareGPT dataset with the Llama-3-8B model.
+
+**ListMLE.** ListMLE  is a listwise ranking loss used in this paper. It minimizes the likelihood function defined \((g(x),y)=- P(y\,|\,x;g)\), where
+
+\[P(y\,|\,x;g)=_{i=1}^{n}gx_{y(i)}} {_{k=i}^{n}gx_{y(k)}}\] (2)
+
+Here, \(P(y\,|\,x;g)\) represents the probability of the permutation \(y\) given the input \(x\) and the scoring function \(g\). \(x_{y(i)}\) denotes the element in \(x\) that corresponds to the \(i\)-th position in the permutation \(y\). The idea is to maximize the likelihood of the correct ranking \(y\) by using the scoring function \(g\) to predict the ranking of the input \(x\). The loss function \((g(x),y)\) minimizes the negative log-likelihood of this probability, encouraging the model to predict a ranking close to the true ranking. ListMLE's focus on list ranking aligns with Kendall's Tau, which measures the correlation between two rankings. This ensures that minimizing the loss can help improve Kendall's Tau.
+
+In the following section, we will introduce how we apply these learning to rank concepts to LLM scheduling, building upon the foundation laid here.
+
+## 4 Method
+
+### Problem Formulation
+
+For a given batch of requests, we define the ground truth generation length as \(\), where \(}\) is the generation length of the \(i\)-th request in the batch. From this length list, we can obtain a ranking list \(\), where \(}\) is the rank of \(l_{i}\) within the whole batch \(\).
+
+Our goal is to approximate true SJF/SRTF scheduling using these rankings to alleviate HOL blocking (Fig. 2**a**) and obtain a relatively low latency in LLM serving. Different from the previous methods which target to predict the real generation length \(\), we make predictions on the ranking list \(\). The prediction of the ranking list is defined as \(\) (generated by a predictor \(P\)). We compute the ranking metric Kendall's Tau  to measure the correlation between \(\) and \(\). A Kendall's Tau of 1 means the prediction \(\) perfectly aligns with the ground truth \(\), hence we can use it to achieve perfect SJF/SRTF execution order. Conversely, A Kendall's Tau of 0 suggests no correlation between \(\) and \(\). An example is FCFS: the execution order (i.e., by arrival time) is not correlated with the generation length.
+
+A higher Kendall's Tau reflects a more accurate rank prediction against the oracle (i.e., SJF/SRTF), which empirically translates into higher end-to-end performance, as evidenced in Fig. 2**b**. Hence, our goal is to optimize the predictor model \(P\) to generate predictions with a larger Kendall's Tau, which are more correlated to the ground truth. However, Kendall's tau is inherently non-continuous and difficult to optimize directly. To overcome this, we apply a listwise ranking loss _ListMLE_ to optimize the predictor \(P\). ListMLE considers the entire list of items simultaneously and treats items at all positions with equal importance, providing a more holistic evaluation of the ranking order compared to other alternatives such as pairwise and pointwise losses.
+
+### Generation Length Ranking Predictor
+
+For our predictor \(P\), we utilize a small OPT model as the backbone, capable of processing natural language prompts as input and generating a score for ranking. While previous methods [7; 6; 11] use classification (with bucketing) to generate accurate output length predictions, we find this approach both challenging and unnecessary. Instead, the relative ranking suffices. Based on this insight, we apply learning to rank to train the OPT model. This section explains how we train the OPT model as the predictor \(P\) to rank prompts by their expected generation length.
+
+**Predictor Structure**. The original OPT model can not directly output a score. To address this, we append a linear layer to map the hidden states of the last layer to a floating-point number, which serves as the ranking score.
+
+**Training Data**. We aim to train the OPT model to rank prompts according to their expected generation length when processed by a target LLM (e.g., Llama-3-70B). To achieve this, we first obtain full generations by feeding prompts into the target LLM and recording the number of generated tokens. When generating model outputs, we sample tokens with a temperature of 1.0, consistent with our evaluation methodology (SS5.1). The following is an example of the training data structure.
+
+"prompt": "Divide 10 by 4 and remove the remainder."N""output": ": 2 with a remainder of 0." "output_tokens_length": 12
+
+After obtaining the generation lengths, we convert them to labels representing the ranking. The simplest way would be to rank the generation lengths directly within the entire training batch and use these rankings as labels. However, recognizing that LLM generation involves some randomness due to sampling in real-world serving, we introduce a more robust approach. We bucket the generation lengths in increments of 10 tokens, then rank these processed lengths to create our training labels.
+
+**Training**. We train the OPT on 10k samples with a batch size of 32 for 5 epochs. We employ the ListMLE loss and the Adam optimizer with a constant learning rate of \(2e-5\), \(_{1}\) = 0.9, and \(_{2}\) = 0.999. To accommodate OPT's context length limitations, we truncate prompts to a maximum of 2,048 tokens.
+
+The use of ranking loss offers several advantages. First, ranking loss focuses on correct ordering rather than precise classification, making it more robust when dealing with batches of requests where the output length distribution for each bucket is uneven. In contrast, classification loss typically relies on bucket labels for training, which can lead to poor predictive performance for minority buckets in imbalanced datasets. Second, ranking loss ensures a more reasonable bucket size, while classification loss attempts to make the predicted labels as close to the actual labels as possible. This naturally leads to the pursuit of larger bucket sizes, which is not beneficial for scheduling. Finally, ranking loss can reduce the risk of overfitting. Classification loss forces the model to minimize classification errors on the training requests, which may not generalize well to requests with covariate shifts and can cause the model to be highly sensitive to bucket size (see our study in Tab. 3).
+
+### Request Scheduling with Rankings
+
+We propose a simple but effective algorithm, for scheduling requests using ranking information, as detailed in Algorithm 1. The core idea is to iteratively run the predictor model \(P\) to score new requests, then sort all requests according to their predicted generation length rankings. We form a running batch based on this sorted order, subject to memory or batch size constraints. To prevent the starvation of long requests, we've incorporated additional mechanisms, which we'll explain shortly. This ranking-based scheduling algorithm operates at the iteration level, making it compatible with established LLM serving techniques such as continuous batching  and PagedAttention .
+
+**Starvation Prevention.** While SJF/SRTF scheduling can improve overall latency, it may lead to starvation for long requests, causing users to wait excessively for responses. Different from previous fairness-promoting design , which focuses on the fairness between different clients, we propose a max_waiting_time fairness metric to evaluate the fairness at per-request level (hence reflecting per-user satisfaction). We define max_waiting_time fairness by considering both _Time To First Token_ (TTFT) and _Time Per Output Token_ (TPOT)  in LLM serving as follows:
+
+\[\!=\!(TTFT,\!(TPOT)).\] (3)
+
+Intuitively, max_waiting_time characterizes the maximum time interval a user experiences between receiving two tokens after sending a request to the server. A larger max_waiting_time indicates a longer waiting time for the user to obtain a response, signifying more severe starvation.
+
+To mitigate starvation, our algorithm implements the following mechanism: 1) For each scheduling step, we increment a request's starvation count (\(StarvationCount\)) if it is not executed. 2) When a request's starvation count reaches a pre-defined threshold (\(StarvationThreshold\)), we will promote this request's priority by allocating "quantum" of execution time. 3) The request maintains this elevated priority until it exhausts its allocated quantum (\(PriorityQuantum\)). This simple yet effective method prevents starvation at the request level, improves max_waiting_time, and ensures user satisfaction, as demonstrated in our experiments (SS5.5).
+
+## 5 Evaluation
+
+In this section, we evaluate our proposed method against several baselines and assess the effectiveness of each component. Our results demonstrate that our method achieves state-of-the-art performance in terms of both Kendall's Tau and end-to-end serving performance metrics: latency and throughput. Notably, we achieved a \(2.8\) lower latency in chatbot serving and a \(6.5\) higher throughput in synthetic data generation.
+
+### Evaluation Setup
+
+**Testbed.** Our end-to-end evaluation testbed consists of a DGX server with 8 NVIDIA A100 40GB GPUs, 256 vCPUs, and 1TB host memory. The GPUs are interconnected via NVLink.
+
+**Serving Models.** We utilize the latest Meta Llama-3 models in two sizes: 8B and 70B . All experiments use FP16/BF16 precision, which is the most common setting in LLM deployment. The 8B model runs on a single GPU, while the 70B model runs on 8 GPUs with tensor parallelism .
+
+**Workloads.** We evaluate using the ShareGPT  and LMSYS-Chat-1M  datasets, which comprise open-ended, real-world conversations with proprietary LLM chatbots such as ChatGPT  and Claude, as well as 25 other open-source LLMs. For each dataset and model pair, we sample 10k non-overlapping prompts for serving and another 10k for training the ranking predictor. The length distributions of the datasets are provided in Appendix B. Model generations are conducted using random sampling with a temperature of 1.0, ensuring consistency during predictor training and serving evaluation. It's worth noting that our framework is insensitive to the sampling parameters.
+
+**Evaluation metrics.** For chatbot serving, we measure average and p90 per-token latency, which is the per-request latency divided by the output length. For offline synthetic generation tasks, we use throughput (requests/second) to indicate request generation speed.
+
+**Scheduler Settings.** We compare our method (i.e., **ranking predictor**) with four baselines implemented on top of vLLM v0.4.1:* **FCFS**: A First-Come-First-Served scheduler that supports executing prefill and decode in the same step. For each scheduling step, it selects requests by earliest arrival time.
+* **MLFQ**: We implement a Multi-Level Feedback Queue in 1.2k lines of Python code on vLLM. This scheduler leverages chunked prefill from vLLM to run prefill and decode in the same step, as described in FastServe . The implementation's correctness is validated in Appendix A.
+* **Perception Only (PO)**: We implement Perception Only  on vLLM, enabling the LLM to self-predict its token generation length. The implementation consists of two phases: First, we configure the LLM to generate 15 tokens (half of the maximum token count used in ) following a FCFS policy, using this output to determine the predicted generation length. Second, after obtaining these predictions, we schedule subsequent requests based solely on the predicted lengths.
+* **Classification**: We train a classifier using an OPT model as a backbone. For Llama-3-8B, we use the OPT-125m model, and for Llama-3-70B, we use OPT-350m, which can be supported by 8-way tensor parallelism. Following the setting in S3 , we use 10 buckets with a bucket size of (max context length / number of buckets) for high classification accuracy. We map the hidden states of the OPT model to the number of buckets with a linear layer and use the same training settings as in SS4.2 but with a cross-entropy loss.
+* **Ranking (Ours)**: We implement our ranking scheduler (described in SS4.3) with the ranking predictor and training configuration detailed in SS4.2. The implementation uses an OPT model of identical size to that used in the classification method.
+
+### Chatbot Serving Scheduling
+
+Fig. 3 compares the latency of our proposed ranking method with four baseline methods on ShareGPT and LMSYS-Chat-1M datasets with increasing arrival rates . Under a rate of 64 requests/second, our method improves mean latency by up to \(6.9\) compared to FCFS and \(1.5\)\(-1.9\) compared to PO. MLFQ and PO still face severe HOL blockings as they must run _all_ requests for a certain time to obtain information for scheduling. PO must execute all arriving requests with the LLM to generate a length prediction. MLFQ must run all arriving requests before they enter the next priority level. The classification method optimizes for accuracy instead of ranking, missing optimization opportunities. While classification and our method still need to process all the requests first to obtain a prediction, using an OPT model takes less than 2% of the time (as shown in SS5.5), thus greatly reducing HOL blocking.
+
+**Handling burstiness**. We evaluate our method's performance under bursty workloads, where users suddenly submit many requests to the LLM server . Tab. 1 compares the latency of our method against baselines with a burst of 2k requests. Our proposed ranking method significantly improves latency, achieving up to \(2.0\) lower mean latency improve and \(2.8\) lower P90 latency compared to PO.
+
+Figure 3: Mean latency of different schedulers with Llama-3 models on real workloads.
+
+### Synthetic Data Generation Scheduling
+
+Synthetic data generation (SDG) is emerging as an important inference workload due to the data-hungry nature of LLMs. In SDG, shorter responses are often preferred for several practical reasons: First, generating concise conversations is more cost-effective given the large volume and diversity of samples required  in SDG. Second, longer generations can introduce evaluation metric bias [48; 49; 50]. Consequently, samples with shorter generation lengths are often preferred for model training in specific applications.
+
+Our proposed method can improve generation throughput in these scenarios by prioritizing shorter responses. We conducted two experiments to validate this approach: 1) We established a quantity threshold (i.e., 1k requests) and measure how long the schedulers need to generate such samples given 10k prompts. 2) We set a time constraint (5 minutes) and evaluated the number of samples each scheduler could generate from the same prompt pool. The results are presented in Tab. 2. The classification method underperformed compared to FCFS due to the overhead of preprocessing 10k prompts with the OPT model and its limited ability to identify shorter requests. In contrast, our proposed method effectively prioritized shorter requests, achieving a \(2.4\)-\(6.5\) reduction in generation time for 1k requests and up to \(3.2\) improvement in throughput within the 5-minute window. However, it's important to note that in scenarios where shorter generations are not preferred, the throughput improvements would be minor.
+
+### Comparing Ranking Predictors
+
+We show that the accuracy of the targeted classification method is suboptimal for LLM scheduling. Tab. 3 compares the prediction ability of the classification method with different bucket sizes. We evaluate the classification metric (i.e., accuracy) for the classification method and the ranking metric (i.e., Kendall's Tau) for all methods on the same randomly sampled test set. A larger bucket size shows better accuracy but does not necessarily indicate a higher Kendall's Tau.
+
+We also evaluate the end-to-end performance of these methods. The "Lat." column shows the mean latency to process 2k bursts of requests as in SS5.2. The "Time" column shows the time to generate 1k synthetic data as in SS5.3. A method with a higher Kendall's Tau correlates with lower latency, as proposed in SS3. The time to generate 1k synthetic data is less related to Kendall's Tau, as a high Tau with a large bucket size does not necessarily mean the predictor can correctly select the shortest requests.
+
+PO achieves higher Kendall's Tau on the LMSYS-Chat-1M dataset. However, it needs to use the LLM itself to process all requests and generate a few tokens first for prediction, which introduces a very large HOL overhead compared to light predictor-based methods, despite its good performance in terms of Kendall's Tau. In all other settings, our proposed ranking method outperforms all other methods in terms of ranking metrics and end-to-end performance.
+
+**Generalization Ability across Distribution Shifts.** We evaluate the predictor's performance under data distribution shifts by using the LMSYS-Chat-1M dataset to test the predictor trained on ShareGPT, and vice versa. The predictor trained on ShareGPT achieves a Kendall's Tau of 0.54 on ShareGPT but
+
+    & &  &  \\  Model & Dataset & FCFS & MLFQ & PO & Class. & **Ours** & FCFS & MLFQ & PO & Class. & **Ours** \\  Llama-3-8B & ShareGPT & 1.15 & 1.07 & 1.35 & 1.13 & **0.56** & 1.60 & 1.57 & 1.67 & 1.51 & **0.67** \\ Llama-3-8B & LMSYS-Chat-1M & 1.73 & 0.80 & 0.75 & 1.77 & **0.38** & 4.86 & 1.56 & 1.47 & 4.98 & **0.52** \\ Llama-3-70B & ShareGPT & 1.44 & 1.37 & 1.04 & 1.26 & **0.78** & 2.01 & 1.89 & 1.35 & 1.73 & **0.96** \\ Llama-3-70B & LMSYS-Chat-1M & 2.17 & 1.00 & 0.95 & 2.23 & **0.54** & 5.54 & 1.91 & 1.72 & 5.72 & **0.82** \\   
+
+Table 1: Latency (s/token) with Burst of 2K requests
+
+    & &  &  \\  Model & Dataset & FCFS & Classification & Ranking (**Ours**) & FCFS & Classification & Ranking (**Ours**) \\  Llama-3-8B & ShareGPT & 343.29 & 421.92 & **143.18** & 841 & 655 & **1706** \\ Llama-3-8B & LMSYS-Chat-1M & 197.38 & 237.40 & **30.48** & 1348 & 1644 & **4434** \\ Llama-3-70B & ShareGPT & 440.71 & 512.84 & **231.59** & 670 & 479 & **1299** \\ Llama-3-70B & LMSYS-Chat-1M & 253.68 & 338.83 & **59.67** & 1167 & 895 & **3710** \\   
+
+Table 2: Throughput Improvement with Proposed Ranking Methoddrops to 0.45 when tested on LMSYS-Chat-1M. Conversely, the predictor trained on LMSYS-Chat-1M achieves a Kendall's Tau of 0.62 on LMSYS-Chat-1M but decreases to 0.40 when tested on ShareGPT.
+
+Although the predictor experiences performance degradation, it still retains predictive capability, demonstrating a certain level of generalization ability. In real-world scenarios, we can mitigate the impact of distribution shifts by periodically retraining the model with historical data to maintain good ranking prediction performance.
+
+### Effectiveness Analysis
+
+**Effectiveness of Starvation Prevention.** We show that our proposed starvation prevention method (SS4.3) greatly reduces starvation, as measured by max_waiting_time. Fig. 4 shows that mean max_waiting_time is reduced by up to \(3.4\) on LMSYS-Chat-1M and up to \(3.3\) on ShareGPT compared to not using starvation prevention. Fig. 5 illustrates that starvation prevention has minimal side effects on latency, with less than 10% overhead in most cases and less than 30% in all cases, which is an acceptable trade-off.
+
+**Overhead of Predictor Model.** Tab. 4 illustrates the overhead of the ranking predictor in response 1k requests. "Prefill Time" is measured by only processing the prompts with the original LLM. The overhead of the ranking models (only processing the prompts) is less than 2% in all settings. The overhead on the ShareGPT dataset is slightly higher (i.e., 1.11% and 1.69%) because the prompt length of ShareGPT is longer, as shown in Appendix B. The execution time of OPT is 10%-15% of the execution time of the original LLM in processing the prompts, largely alleviating the HOL blocking cost in length prediction compared to PO in chatbot servings.
+
+Figure 4: Average max_waiting_time across all requests with different scheduling method
+
+Figure 5: Influence of starvation prevention on latency
+
+    &  &  \\  Method & Acc. (\%) & Tau (\(\)) & Lat. (\(\)). & Time (s) & Acc. (\%) & Tau (\(\)) & Lat. (\(\)). & Time (s) \\  _Optimal Prediction_ & / & 0.74 & 0.46 & 102.04 & / & 0.84 & 0.34 & 34.60 \\  Ranking (**Ours**) & / & **0.54** & **0.78** & **231.59** & / & 0.62 & **0.54** & **59.67** \\ Class (BucketS=10) & 85.1\% & 0.24 & 1.26 & 512.84 & 96.8\% & 0.17 & 2.23 & 338.83 \\ Class. (Bucket Size=100) & 28.1\% & 0.49 & 0.84 & 265.91 & 43.4\% & 0.58 & 0.77 & 101.61 \\ Class. (Bucket Size=10) & 4.7\% & 0.46 & 0.86 & 272.13 & 14.5\% & 0.57 & 0.61 & 78.84 \\ Class. (Bucket Size=1) & 1.0\% & 0.32 & 1.00 & 341.63 & 7.3\% & 0.50 & 0.68 & 92.93 \\ PO & / & 0.51 & 1.04 & >600 & / & **0.67** & 0.95 & 322.13 \\   
+
+Table 3: Ranking prediction ability with different classification (Class. in table) settings (i.e., different bucket sizes) for Llama-3-70B. Lat. column shows the mean latency processing a burst of 2k requests for chatbot serving. Time column shows the time to generate 1k requests for synthetic data generation. Optimal Prediction is using the generation length of one random seed to predict the length of another seed. Note that the p-values of Kendall’s Tau are below a given significance level (i.e., 1e-3) in all settings.
+
+## 6 Limitations
+
+**Limitation of the Ranking Metric.** Although Kendall's Tau is a widely used ranking metric, it has limitations when it comes to reflecting end-to-end performance. For example, consider a ranking prediction that accurately reflects generation length. If we randomly shuffle the predictions within the shortest 70% of requests and separately shuffle those within the longest 70%, the Kendall's Tau score will still be 0.5 for both. However, this leads to a significant latency difference, with the Llama-8B model on the ShareGPT dataset showing a \(1.8\) increase in latency. In contrast, when the ranking is uniformly shuffled across the entire list, Kendall's Tau exhibits a stronger correlation with latency, as shown in Fig. 2.
+
+**Limitations of the Proposed Ranking Scheduler.** The proposed ranking scheduler is designed to work with standard LLM serving techniques, such as continuous batching and paged attention. However, it has not yet been fully tested with newer optimizations like chunk-prefill  and prefill-decode disaggregation . Future work will focus on integrating the scheduler with these advanced techniques to assess their combined performance benefits.
+
+## 7 Conclusion
+
+In this paper, we propose a method to train a predictor that learns to rank the generation length of LLM responses based on the given prompts using a _learning-to-rank_ approach. We implement a rank-based scheduler on top of vLLM, demonstrating significant improvements across various tasks. Specifically, our method reduces latency by 2.8x in chatbot serving and increases throughput by 6.5x in synthetic data generation. Given the simplicity and effectiveness of our approach, we believe it can be easily integrated into production-level LLM serving systems, reducing serving latencies while enhancing service quality.

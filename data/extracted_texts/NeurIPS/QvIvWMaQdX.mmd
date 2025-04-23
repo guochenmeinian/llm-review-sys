@@ -1,0 +1,230 @@
+# SOAR: Improved Indexing for Approximate Nearest Neighbor Search
+
+Philip Sun, David Simcha, Dave Dopson, Ruiqi Guo, and Sanjiv Kumar
+
+Google Research
+
+{sunphil,dsimcha,ddopson,guorq,sanjivk}@google.com
+
+###### Abstract
+
+This paper introduces SOAR: Spilling with **O**rthogonality-**A**mplified **R**esiduals, a novel data indexing technique for approximate nearest neighbor (ANN) search. SOAR extends upon previous approaches to ANN search, such as spill trees, that utilize multiple redundant representations while partitioning the data to reduce the probability of missing a nearest neighbor during search. Rather than training and computing these redundant representations independently, however, SOAR uses an _orthogonality-amplified residual_ loss, which optimizes each representation to compensate for cases where other representations perform poorly. This drastically improves the overall index quality, resulting in state-of-the-art ANN benchmark performance while maintaining fast indexing times and low memory consumption.
+
+## 1 Introduction
+
+The \(k\)-nearest neighbor search problem is defined as follows: we are given an \(n\)-item dataset \(^{n d}\) composed of \(d\)-dimensional vectors, and for a query \(q^{d}\), we would like to return the \(k\) vectors in \(\) closest to \(q\). This problem naturally arises from a number of scenarios that require fast, online retrieval from vector databases; such applications include recommender systems , image search , and question answering , among many others.
+
+While nearest neighbor search may be easily implemented with a linear scan over the elements of \(\), many applications of nearest neighbor search utilize large datasets for which a brute-force approach is computationally intractable. The rapid development of deep learning and embedding techniques has been an especially strong driver for larger \(k\)-nearest neighbor datasets. For instance, multiple recent large language model (LLM) works incorporate external information by using \(k\)-nearest neighbors to retrieve from longer contexts  or large text corpora . While datasets from typical applications a decade ago (e.g. Netflix) had sizes of around 1 million , the standard evaluation datasets from big-ann-benchmarks  all have 1 billion vectors with hundreds of dimensions.
+
+These large datasets, in conjunction with the _curse of dimensionality_, a phenomenon which often makes it impossible to find the exact nearest neighbors without resorting to a linear scan, has led to a focus on approximate nearest neighbor (ANN) search, which can trade off a small search accuracy loss for a significant increase in search throughput.
+
+A number of indexing schemes proposed for ANN search, including spill trees , assign datapoints to multiple portions of the index, such that the overall index provides a replicated, non-disjoint ("spilled") view of the dataset. These algorithms have used partitioning schemes amenable to random analysis, so that the replication factor can be provably shown to exponentially reduce the probability of missing a nearest neighbor. However, partitioning high-dimensional data is difficult, even without the constraint of doing so with a method amenable to randomized analysis; such constrained partitioning techniques have led to inferior quality indices that have not yielded good compute-accuracy tradeoffs.
+
+On the other hand, another family of approaches, those leveraging vector quantization (VQ), have demonstrated excellent empirical ANN performance, but little research has been done exploring the use of multiple randomized initializations of VQ indices to further increase ANN search efficiency. This is partly due to the fact that multiple VQ indices initialized through different random seeds do not have strong statistical guarantees and cannot be proven independent in their failure probabilities. This paper bridges the gap between these two approaches to ANN:
+
+* We demonstrate the weaknesses of current VQ-based ANN indices and illustrate how multiple VQ indices may be used in conjunction to improve ANN search efficiency.
+* We show that the naive training of multiple VQ indices for a single dataset leads to correlation in failure probabilities among the indices, limiting ANN search efficiency uplift, and present _spilling with orthogonality-amplified residuals_ (SOAR) to ameliorate this correlation.
+* We benchmark SOAR and achieve state-of-the-art performance, outperforming standard VQ indices, spilled VQ indices trained without SOAR, and all other approaches to ANN search that were submitted to the benchmark.
+
+## 2 Preliminaries and Notation
+
+### Maximum inner product search (MIPS)
+
+SOAR applies to the subclass of nearest neighbor search known as maximum inner product search, defined as follows for a query \(q\) and a dataset \(\):
+
+\[_{k}(q,)=k}{ } q,x.\]
+
+Many nearest neighbor problems arise in the MIPS space naturally , and a number of conversions exist  from other commonly used ANN search metrics, such as Euclidean and cosine distance, to MIPS, and vice versa. We measure MIPS search accuracy using recall@\(k\), defined as follows: if our algorithm returns the set \(S\) of \(k\) candidate nearest neighbors, its recall@\(k\) equals \(|_{k}(q,) S|/k\). Additionally, we introduce the following notation to assist with MIPS analysis:
+
+\[(q,v,)=_{x}_{\{q,v \} q,x}.\]
+
+The max inner product's Rank is 1; assuming no ties, \((q,v,)[1,k]\) for \(v_{k}(q,)\).
+
+### Vector quantization (VQ)
+
+Vector quantization can be leveraged to construct data structures that effectively prune the ANN search space; these data structures are commonly known as inverted file indices (IVF) or k-means trees. Vector-quantizing a dataset \(\) produces two outputs:
+
+* \(^{c d}\), the codebook containing the \(c\) partition centers.
+* \((v):^{d}\{1,,c\}\), the partition assignments that map each vector in \(\) to one of the partition centers in \(\). Oftentimes, \((v)\) is defined as \(_{i\{1,,c\}}\|v-_{i}\|^{2}\), although other assignment functions may also be used.
+
+We can then construct an inverted index over \(\); for each partition \(i\), we store the set of datapoint indices belonging to that partition: \(\{j|(_{j})=i\}\). Then, instead of computing \(_{k}(q,)\) directly, we may first compute \(_{k^{}}(q,)\), which is much faster because \(||||\). We can then use our inverted index data structure to further evaluate the datapoints within the top \(k^{}\) partitions.
+
+#### 2.2.1 The k-means recall (KMR) curve
+
+The effectiveness of the VQ-based pruning approach depends on the rank of the partitions that \(_{k}(q,)\) are in. If these partitions rank very well, we can set \(k^{}\) very low, and search through few partitions while still achieving great MIPS recall. If these partitions rank poorly, however, the algorithm will have to spend lots of compute searching through many partitions in order to find the nearest neighbors. We may quantify this effectiveness using the _k-means recall_ (KMR) curve (namedbecause VQ indices are commonly trained through k-means, although KMR can be computed for any VQ index, not just those trained via k-means), defined as follows:
+
+\[_{k}(t;,,,)=|}_{q}_{v_{k}(q,)} _{(q,_{(v)},) t}\] (1)
+
+The KMR curve for a given query sample \(\), dataset \(\), and VQ index \((,)\) quantifies the proportion of MIPS nearest neighbors present in the top \(t\) VQ partitions, over varying \(t\). The KMR curve is non-decreasing, with \(_{k}(0)=0\) and \(_{k}(||)=1\). A KMR curve that more quickly approaches 1 indicates superior index quality.
+
+## 3 Method
+
+The key insight of our work is the use of a novel loss function to assign a datapoint \(x\) to multiple VQ partitions, such that these additional partitions effectively recover \(x\) in the pathological cases when \(x\) is a nearest neighbor for a query that \(x\)'s original VQ partition handles poorly. These partitions that include \(x\) work together synergistically to provide greater ANN search efficiency than any single partition could alone. Below, we describe the motivations behind our new loss and this multiple assignment. The supplementary materials contains the source code to generate this section's plots.
+
+### Search difficulty and quantized score error
+
+For a datapoint \(x\), define \(r\) as the _partitioning residual_, equal to \(x-_{(x)}\). The partition center \(_{(x)}\) is the quantized form of \(x\), so the difference between the exact and the quantized inner product scores is
+
+\[ q,x- q,_{(x)} = q,x-_{(x)}= q,r,\]
+
+which we denote the _quantized score error_. Consider the case when \(x\) is a nearest neighbor for the query: \(x_{k}(q,)\). In this scenario, we would like \((q,_{(x)},)\) to be low, so that the algorithm may search just the top few partitions and find the nearest neighbor \(x\). A high Rank would lead to increased search difficulty, because the algorithm would have to search more partitions and therefore do more work to find \(x\).
+
+Given that \( q,_{(x)}= q,x - q,r\) and that, by definition, \( q,x\) is large when \(x_{k}(q,)\), we know that \( q,_{(x)}\) will be small (leading to greater search difficulty) when \( q,r\) is highly positive. Indeed, this can be confirmed empirically; in Figure 1 we plot the mean \( q,r\) as a function of \((q,_{(x)},)\) for all query-neighbor pairs \((q,x)\) in the Glove-1M dataset. The more difficult-to-find pairs have, on average, notably higher \( q,r\).
+
+SOAR increases search efficiency in these situations when \(x_{k}(q,)\) and \( q,r\) is high.
+
+### Quantized score error decomposition
+
+By the definition of the inner product,
+
+\[ q,r=\|q\|\|r\|\]
+
+where \(\) is the angle formed between the query and the partitioning residual. Without loss of generality, we may assume that \(\|q\|=1\) without any effect on the ranking of MIPS nearest neighbors. The two contributors to a highly positive \( q,r\) are therefore a large \(\|r\|\) and \(\) being near unity; reducing \( q,r\) requires targeting either, or both, of these contributors.
+
+SOAR targets \(\), because that term is both easier to reduce and has greater impact on \( q,r\):
+
+* The VQ training loss already aims to minimize \([\|x-_{(x)}\|^{2}]=[\|r \|^{2}]\), so further reductions in \(\|r\|\) are difficult. In contrast, \(\) is not directly optimized for, making it more amenable to reduction.
+
+Figure 1: Greater search difficulty, as quantified by a higher \((q,_{(x)},)\), is associated with highly positive \( q,r\).
+
+* \(\) is typically much more strongly correlated with \( q,r\) than \(\|r\|\) is, so its reduction has greater impact on search difficulty. Qualitatively, this stronger correlation can be explained by the far greater range of values \(\) may take on, compared to \(\|r\|\). The latter's values are concentrated between 0 and \(\|x\|\), with not a very large ratio between the largest and smallest value. In comparison, \(\) can take on any value in the range \([-1,1]\); only this large multiplicative dynamic range can explain the variance in \( q,r\). Empirically, this can be seen demonstrated on Glove-1M in Figure 2 below.
+
+### Spilled VQ assignment
+
+We may attempt to mitigate the increase in search difficulty presented by high \(\) by assigning each datapoint \(x\) to a second VQ partition \(^{}(x)\), resulting in a second partitioning residual \(r^{}\) that forms an angle \(^{}\) with the query. We denote this second assignment a _spilled assignment_.
+
+This gives our ANN algorithm a "second chance"; assuming \(\) and \(^{}\) are independently distributed, the situations where \(\) is high, thereby leading to high \( q,r\) and greater search difficulty, are unlikely to also have a high \(^{}\). A low \(^{}\) should lead to a low \( q,r^{}\) and should allow the ANN algorithm to find \(x\) fairly efficiently. This idea can be extended to further (>2) assignments as well.
+
+This approach leads to some implementation intricacies, as discussed in Section 3.5, but for now we focus on problems concerning theory when the spilled assignment \(^{}(x)\) is chosen so as to minimize \(\|r^{}\|^{2}\).
+
+This proposed approach fails when there is correlation between \(\) and \(^{}\), shown to the extreme in Figure 3. In this figure, if \((x)=1\), we may pick \(^{}(x)=2\) because \(_{2}\) is the second-closest centroid to \(x\). However, \(_{2}\) is collinear with \(_{1}\) and \(x\), resulting in \(=^{}\). This leads to \(_{2}\) acting as a strictly worse version of \(_{1}\) for quantizing \(x\): \( q,r^{}=(1+)\, q,r\). The choice \(^{}(x)=3\) would've been more effective, despite \(\|x-_{3}\|>\|x-_{2}\|\), due to \(_{3}\)'s position giving a \(^{}\).
+
+Experiments show that more than a theoretical concern, this is also a real-world issue. On the Glove-1M dataset, if we choose \((x)\) and \(^{}(x)\) to be the closest and second-closest centroids by Euclidean distance, respectively, to \(x\), we find a noticeable correlation between \(\) and \(^{}\), shown in Figure 3(a). An even stronger correlation occurs between two VQ indices trained separately with different random seeds (Figure 3(b)). This correlation diminishes the benefit of spilled assignment, and reducing this correlation is critical to improving ANN search performance.
+
+Figure 3: Naive spilled VQ assignment may be ineffective; selecting the two closest centroids \(_{1}\) and \(_{2}\) provides no benefit over using just \(_{1}\).
+
+Figure 2: The cosine of the query-residual angle, \(\) (**left**), is far more correlated with \( q,r\) than the residual norm \(\|r\|\) (**right**), making the former a more promising target for reducing \( q,r\).
+
+### Spilling with orthogonality-amplified residuals
+
+We now derive _spilling with orthogonality-amplified residuals_ (SOAR), a novel VQ assignment loss that directly confronts the problem of correlated query-residual angles. To derive this loss, assume that the VQ centroids \(\) and assignments \(\) are fixed. The goal of further spilled assignments \(^{}\) is to achieve low quantized score error \( q,r^{}\) specifically when the original spilled assignment has high \(\), leading to high \( q,r\). In cases where \(\) is low, the original assignments already achieve low quantized score error, so in such cases, it is less important to also have low \( q,r^{}\).
+
+We now modify our assignment loss function to reflect this emphasis; rather than selecting \(c^{}\) to minimize \(_{q}[( q,x- q,c^{})^ {2}]=_{q}[(q,{r^{}})^{2}]\), we now also add a weighting term for \(\):
+
+\[(r^{},r,)=_{q}[w (){ q,{r^{} }}^{2}]=_{q}[w()\,{ q, r^{}}^{2}],\] (2)
+
+where the weight function \(w():^{ 0}\) should be chosen to give greater emphasis to higher \(\). To utilize this loss function in VQ assignment, we must evaluate the expectation, which leads to the following result:
+
+**Theorem 3.1**.: _For the weight function \(w(t)=|t|^{}\) and a query distribution \(\) that is uniformly distributed over the unit hypersphere,_
+
+\[(r^{},r,)\|r^{}\|^{2}+\| _{r}\,{r^{}}\|^{2}.\]
+
+Proof.: See Appendix A.1. 
+
+By leveraging Theorem 3.1, we may efficiently perform spilled VQ assignment using our new loss by computing the squared \(_{2}\) distance to each centroid, adding a penalty term for parallelism between the original residual \(r\) and the candidate residual \(r^{}\), and taking the \(\) among all centroids. We present the following statements to help develop intuition about the SOAR loss:
+
+**Corollary 3.1.1**.: _For the uniform weight function \(w(t)=1=|t|^{0}\), the SOAR loss is equivalent to standard Euclidean assignment: \((r^{},r,)\|r^{}\|^{2}\)._
+
+The parameter \(\) controls how much the spilled assignment \(^{}\) should prioritize quantization performance when the original assignment performs poorly, relative to general quantization performance. As \(\) is increased, the former is further emphasized; at \(=0\), only the latter is considered, leading to standard Euclidean assignment. See Figure 9 in Experiments for a visualization of this tradeoff.
+
+**Corollary 3.1.2**.: _For a fixed \(\|r^{}\|\), \(\) is minimized when \(r\) and \(r^{}\) are orthogonal, in which case \(\|_{r}\,{r^{}}\|^{2}=0\) and \((r^{},r,)\|r^{}\|^{2}\)._
+
+Our technique's name originates from the observation that residuals are encouraged to be orthogonal.
+
+**Lemma 3.2**.: \(\|_{r}\,{r^{}}\|=\|r^{}\|_{ q,r,{ q,r^{}}}\)_, where \(\) is the Pearson correlation coefficient, and the correlation is computed over \(q\) uniformly distributed over the hypersphere._
+
+Figure 4: On Glove-1M, both a naive top-2 spilled assignment and two separately trained VQ indices exhibit noticeable correlation in query-residual angles; this reduces spilled assignment efficacy.
+
+The above lemma shows that in addition to the weighted quantization error derivation in Equation 2, we may also interpret the SOAR loss as adding a penalization term for correlation in quantized score error, scaled by the magnitude of the quantization error.
+
+Proof.: \[_{ q,r, q,r^{}}=[ q,r, q,r^{}]}{_{ q,r^{ }}_{ q,r^{}}}=[ q,r q,r^{}]-[ q,r][ q,r^{}]}{_{  q,r^{}}_{ q,r^{}}},\]
+
+and by symmetry over the hypersphere, \([ q,r]=[ q,r^{ }]=0\) so our expression simplifies to
+
+\[_{ q,r, q,r^{}}=[  q,r q,r^{}]}{_ { q,r}_{ q,r^{}}}=[r^ {T}qq^{T}r^{}]}{_{ q,r}_{ q,r^{ }}}=[qq^{T}]r^{}}{_{ q,r }_{ q,r^{}}}.\]
+
+It's well known that for uniformly distributed, unit-norm \(q^{d}\) that \([qq^{T}]=I_{d}/d\), where \(I_{d}\) is the \(d\)-dimensional identity matrix, and that \(_{ q,v}=\|v\|/\) for any fixed \(v\). We leverage this to get
+
+\[_{ q,r, q,r^{}}=(I_{d}/d)r^{ }}{(\|r\|/)(\|r^{}\|/)}=r^{}}{\|r \|\|r^{}\|}=,}{\|r^{ }\|}=\|}\|_{r}r^{}\|.\]
+
+### Implementation considerations
+
+SOAR comes with some memory overhead relative to a non-spilled VQ MIPS index, due to its multiple assignments causing some duplication of data. The overhead is quite negligible because only the product-quantized (PQ)  datapoint representation, not the datapoint's highest-bitrate representation (usually int8 or float32), is duplicated. Since PQ is much more compressed than int8 or float32, duplicating the PQ data for each of a datapoint's spilled assignments only marginally increases memory footprint, as illustrated in Figure 5. This can be quantified analytically:
+
+* SOAR increases memory consumption by \(4+\) bytes/datapoint, assuming 16 centers per subspace (usually chosen for amenability to SIMD) and \(s\) dimensions per PQ subspace.
+* The datapoint's original assignment already contained a PQ representation occupying \(4+\) bytes, and its highest-bitrate representation requires \(d\) bytes (int8) or \(4d\) bytes (float32).
+
+When the ANN index's highest-bitrate datapoint representation is int8 or float32, the relative index size growth is therefore \(}{d+4+}}{d+}=\) or \(}{4d+4+}}{4d+ {2s}}=\), respectively. Table 1 empirically corroborates these estimates and shows the memory cost is indeed quite low (5%-20% relative increase over a non-spilled VQ index).
+
+Figure 5: Memory layout changes for a SOAR-enabled ANN index. Memory footprint is proportional to area of colored cell. VQ centroid data (not shown) remains unchanged. We can see that the additional memory occupied by SOAR (dark blue) is low relative to the total memory consumption.
+
+SOAR also results in a small amount of query-time CPU overhead over a non-spilled VQ index, due to SOAR's need for deduplication: a single datapoint may now appear in multiple partitions that are all searched. This overhead is low, though, because VQ inverted index performance is primarily bottlenecked by memory accesses to the VQ partition data, and this access pattern remains the same.
+
+Finally, SOAR requires a minor tweak to the indexing pipeline. Creating a SOAR-enabled index first requires training a standard, non-spilled VQ index as usual. This gets used to populate the primary assignments, but is also used to calculate the residual \(r\), which is then used in the SOAR loss to select further, spilled assignments. Other parts of the ANN indexing pipeline remain unchanged.
+
+Overall, SOAR's search efficiency gains greatly outweigh its memory, CPU, and indexing overheads.
+
+#### 3.5.1 Spilling to further centroids
+
+The analysis conducted in Section 3.4 focused specifically on the case of assigning to two partitions, \(\) and \(^{}\). This can be generalized to an arbitrary number of further assignments, where each subsequent assignment is done with a loss considering the distribution of quantized score errors from all prior assignments. We forgo this generalization in experiments and focus on the two-assignment setup because further assignments have diminishing returns; the first spilled assignment is generally sufficient to handle the cases where the primary assignment has high quantized score error, so further assignments are only needed in rare, doubly pathological situations. Meanwhile, the additional memory and indexing cost increases linearly with further assignments; two assignments strikes a good balance between these costs and KMR benefits while also keeping implementation simple.
+
+## 4 Related Works
+
+### Spill trees
+
+Spill trees (or sp-trees) were originally introduced in , and also assign datapoints to multiple vertices at the same level of the tree, just as SOAR may assign a datapoint to multiple VQ partitions. However, there are significant differences; spill trees were searched using _defeatist search_, a greedy, no-backtracking strategy that took the most promising root-to-leaf path. SOAR indices utilize backtracking in their search procedure; multiple partitions, not just the top one, are evaluated further.
+
+Spill trees also differ in how they perform assignment; their multiple assignments occur at each level of the tree, such that a single datapoint could appear in exponentially many leaves, with respect to the tree depth (which was significant, as spill trees are binary and therefore rather deep). This led to a large (sometimes >100x ) storage overhead, which was very costly. In contrast, SOAR performs the multiple assignments at individual levels of the tree, leading to a storage overhead that is constant with respect to the tree depth, and much lower (typically 10%-20%; see Table 1). Finally, SOAR leverages its custom, spilling-aware assignment loss to decide which among the many VQ partitions to spill to, while the spill tree, as a consequence of its binary structure, only had to make the binary decision of whether to spill at all.
+
+### Graph-based algorithms
+
+Graph-based approaches to ANN search, such as , have received significant amounts of recent research attention, and a number of such algorithms are featured in comparisons in Section 5.4. If one considers datapoints and partition centers to be vertices, and datapoint-to-partition assignments to be edges, a traditional VQ index would form a tree structure, while spilled VQ assignment (including SOAR) would transform the tree into a cycle-containing general graph data structure. In this sense, SOAR makes VQ indices more closely resemble graph-based ANN indices.
+
+However, graph-based ANN algorithms (as defined in the traditional sense) have no concept of partition centers, and only add edges between datapoints themselves, leading to a lack of hierarchy and linearizability. SOAR inherits the linearizability of tree-based approaches, leading to predictable and sequential memory access patterns that are necessary for achieving maximal performance on modern hardware. SOAR also inherits the small index sizes more easily achievable with tree-based methods. When viewed as a graph, a SOAR index only uses two edges (two partition assignments) per datapoint, while traditional graph-based indices typically use dozens of edges per datapoint, which incurs significant storage overhead that SOAR avoids.
+
+Experiments
+
+### KMR curve comparison
+
+The KMR curve is a deterministic and easily computable metric for VQ-style ANN indices that's highly predictive of real-world performance. Below, we plot \(_{k}(t)\) as defined in Equation 1, but rather than plotting with respect to \(t\), we plot with respect to the sum of the sizes of the \(t\) top-ranked partitions. This partition size weighting is necessary because spilled VQ data structures have more points per partition due to their multiple assignments, making each individual partition more expensive to search. The results are shown in Figure 6; further details are given in Appendix A.2.
+
+### Correlation analysis
+
+Here, we look at a number of statistics relating to the quantized score error that shed light on how SOAR improves KMR and overall VQ index quality. These statistics were computed on the Glove-1M dataset with the SOAR \(\) set to 1; see source code in supplementary materials for more details.
+
+Figure 7 looks at the query-residual angle, where the residuals are taken from the nearest neighbor results for each query. The scatterplot looks at \(\) from the primary VQ assignment and \(^{}\) from the spilled VQ done with SOAR. In comparison with the equivalent scatterplots in Figure 4 done without SOAR, we can see that SOAR significantly reduces the correlation between the cosines of the two angles, thus increasing the efficacy of multiple VQ assignments.
+
+The end result of this reduced correlation can be seen in Figure 8, which plots the mean rank of a nearest neighbor's spilled centroid against the rank of that neighbor's primary centroid. We can see that without SOAR, when a nearest neighbor's primary partition \((x)\) ranks poorly, the nearest neighbor's spilled partition \(^{}(x)\) tends to also rank poorly, meaning the spilled assignment is doing little to help ANN performance; the ANN algorithm will still have to search through many partitions to find \(x\). With SOAR, \((q,_{^{}(x)},)\) remains low, allowing the ANN algorithm to search significantly fewer partitions to find the nearest neighbors.
+
+Next, in Figure 9, we investigate the effect of SOAR's \(\) parameter on the resulting VQ index. We can see that as \(\) is increased, the resulting partitioning \(^{}\) from SOAR will have quantized score error \( q,r^{}\) less and less correlated with the quantized score error \( q,r\) from \(\). This is beneficial for ANN search efficiency, but on the other hand, \([\|x-_{^{}(x)}\|^{2}]= [\|r^{}\|^{2}]\) increases with respect to \(\). The diminishing relative importance of \(\|r^{}\|^{2}\) as \(\) increases is a natural consequence of Theorem 3.1, but nonetheless results in a general increase in magnitude of \( q,r^{}\) and is detrimental to ANN search accuracy; setting the optimal \(\) requires balancing these effects.
+
+### Effects of dataset size and recall target
+
+In Figure 10, we take various size samples from the \(\)-benchmarks.com DEEP dataset and compare the ratio of how many datapoints a SOAR VQ index must access compared to a standard VQ index to achieve the same recall. This ratio is the dependent variable in Figure 10; a higher ratio indicates a greater improvement from SOAR. We can see that higher recall targets, and larger samples, lead to greater ratios.
+
+We maintain a ratio of 400 datapoints per partition across all sample sizes (for example, the 1M datapoint sample was trained with 2500 partitions). This sampling-based approach was chosen over using various datasets of differing sizes, to eliminate effects due to varying search difficulties among datasets.
+
+### End-to-end recall-speed benchmarks
+
+ANN search algorithms are ultimately compared by their ability to trade off ANN search accuracy (measured by recall), and speed, measured by queries-per-second throughput. Here we perform this comparison between SOAR and state-of-the-art algorithms in two standardized benchmarking frameworks.
+
+First, we modify ScaNN  to utilize SOAR and benchmark its performance on a standardized testing environment with an Intel Xeon W-2135 processor and the test setup from ann-benchmarks.com . The algorithms for comparison were installed, configured, and tuned according to their respective benchmark submissions, and run on the same environment; see Appendix A.3 for more details. As shown in Figure 11, SOAR improves upon ScaNN's already state-of-the-art performance.
+
+Figure 11: SOAR + ScaNN on Glove-1M.
+
+Figure 10: SOAR’s ANN search efficiency benefit grows as SOAR is applied to larger datasets, and as the ANN recall target rises.
+
+Next, we benchmark an ANN search implementation using SOAR on a multi-level k-means clustering against submissions to Track 3 of big-ann-benchmarks.com . These benchmarks allow the use of custom hardware, enabling greater flexibility in approaches to ANN search, but also complicating direct comparison due to the difficulty in accounting for varying hardware costs. In an effort to present existing benchmark submissions in a fair light, we compare SOAR against these submissions in two ways:
+
+1. We compare the ratio of search throughput to hardware price. The ratios for competing algorithms were taken directly from the benchmark leaderboard, which was straightforward, but SOAR's results were from virtualized cloud compute, so the capital expenditure of buying a server with equivalent power had to be estimated. Hardware prices now may be slightly lower than prices used by other submissions in 2022, their time of submission; on the other hand, SOAR likely would've performed better if run on dedicated hardware, where no other jobs are competing for the processor's various shared resources.
+2. We compare the ratio of search throughput to estimated monthly cloud billing cost for each submission's hardware. One benefit of this method is that hardware costs are completely equalized; in contrast, the alternate method of comparison rewarded contestants for finding especially discounted offerings for the same memory or compute. Additionally, the popularity of cloud infrastructure over self-hosting implies this ratio is what truly matters for many deployers of ANN search algorithms. However, we can't compare against submissions that use proprietary or deprecated hardware, and benchmark contestants never directly optimized for this ratio, because cloud cost was never used in any original benchmark leaderboard.
+
+Although neither comparison alone is perfect, the two in aggregate provide a solid characterization of SOAR's performance. Further experimental details are provided in Appendix A.4, and results are shown in Figure 12 below; our index leads under both cost metrics, and SOAR is critical for our index's performance, roughly doubling throughput over a traditional, non-spilled VQ index.
+
+Finally, we present memory consumption figures for the ANN indices in these benchmarks in Table 1. The minor increase in memory usage is discussed and analyzed in Section 3.5, and we find that analysis corroborates well with the empirical measurements below. For all three datasets, the index size increase is very minor, and the throughput gains from SOAR could allow the same query traffic to be served by fewer server replicas, in fact potentially _reducing_ net memory consumption.
+
+  Dataset & Memory Usage, No SOAR & Memory Usage with SOAR \\  Glove-1M & 453.5 MB & 488.4 MB (+7.7\%) \\ Microsoft Turing-ANNS & 120.03 GB & 140.23 GB (+16.8\%) \\ Microsoft SPACEV & 120.85 GB & 141.80 GB (+17.3\%) \\  
+
+Table 1: ANN index memory consumption before/after SOAR.
+
+Figure 12: SOAR leads big-ann-benchmarks performance under both methods of comparison.

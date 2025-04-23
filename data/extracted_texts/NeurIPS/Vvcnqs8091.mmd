@@ -1,0 +1,164 @@
+# Pipeline Parallelism with Controllable Memory
+
+Penghui Qi\({}^{*}\)\({}^{12}\), Xinyi Wan\({}^{*}\)\({}^{1}\), Nyamdavaa Amar\({}^{}\)\({}^{2}\), Min Lin\({}^{1}\)
+
+\({}^{1}\)Sea AI Lab \({}^{2}\)National University of Singapore
+
+{qiph,wanxy,linmin}@sea.com amara@u.nus.edu
+
+Equal Contributors.Work was done during an internship at Sea AI Lab.
+
+###### Abstract
+
+Pipeline parallelism has been widely explored, but most existing schedules lack a systematic methodology. In this paper, we propose a framework to decompose pipeline schedules as repeating a building block, and show that the lifespan of the building block decides the peak activation memory of the pipeline schedule. Guided by the observations, we find that almost all existing pipeline schedules, to the best of our knowledge, are memory inefficient. To address this, we introduce a family of memory efficient building blocks with controllable activation memory, which can reduce the peak activation memory to 1/2 of 1F1B without sacrificing efficiency, and even to 1/3 with comparable throughput. We can also achieve almost zero pipeline bubbles while maintaining the same activation memory as 1F1B. Our evaluations demonstrate that in pure pipeline parallelism settings, our methods outperform 1F1B by from 7% to 55% in terms of throughput. When employing a grid search over hybrid parallelism hyperparameters in practical scenarios, our methods demonstrate a 16% throughput improvement over the 1F1B baseline for large language models. The implementation is open-sourced at this url.
+
+## 1 Introduction
+
+Distributed model training has attracted a lot of attention in recent years, especially after the boom of large language models (Brown et al., 2020). As the model size becomes larger and larger, data parallelism (DP) (Goyal et al., 2017) is no longer capable to hold all the parameters in a single device. Under this background, model parallelism (Harlap et al., 2018; Huang et al., 2019; Shoeybi et al., 2019; Zheng et al., 2022) is proposed to partition parameters into a set of devices to address the memory constraint. Tensor parallelism (TP) (Shoeybi et al., 2019) is a commonly used model parallel strategy, which partitions weight parameters into several devices and performs matrix multiplication separately. A well-known shortcoming of TP is that, it requires a lot of communication volume, which makes it inefficient when bandwidth becomes the bottleneck Narayanan et al. (2021). In such situations, pipeline parallelism (Harlap et al., 2018; Huang et al., 2019), which is another model parallel strategy, shows its advantage in low communication cost. The core idea of pipeline parallelism is to split the entire model into several stages, which can be processed by several devices in a streaming way. In a typical large-scale training scenarios such as Narayanan et al. (2021), TP is generally used within one compute node, and PP is used to scale up across nodes.
+
+Although PP has been widely adopted and developed, it suffers from two prominent disadvantages: pipeline bubbles and large activation memory. To eliminate pipeline bubbles, one line of work focuses on asynchronous PP (Gaunt et al., 2017; Yang et al., 2021), which is theoretically bubble free. However, it sacrifices the exact optimization semantics and may result in lower convergence performance (Lian et al., 2018; Tang et al., 2020). A parallel line of works revolve around synchronous PP, focusing on reducing pipeline bubbles and/or activation memory. GPipe (Huang et al., 2019) isan early work to reduce the bubble rate by increasing the number of microbatches, at the cost of more activation memory. 1F1B (Fan et al., 2021) avoids the activation memory growth with respect to the number of microbatches by staggering forward pass and backward pass, keeping the same bubble rate with GPipe. Another notable work is GEMS (Jain et al., 2020), which stores activation memory of only one forward pass by scheduling microbatches one after another among two model replicas, thus with a significantly large bubble rate. Chimera (Li and Hoefler, 2021) extends the ideas of GEMS by combining two pipelines in different directions together, which reduces pipeline bubbles when the number of microbatches is small, but with doubled parameter memory. Hanayo (Liu et al., 2023) is introduced to attain the same scheduling efficiency with Chimera without replicated models, but still suffering from scaling to more microbatches. Although its wave-like scheme is kind of similar to our V-shape building blocks, it is not motivated for memory balance, thus resulting in totally different pipeline schedules. In Megatron-LM (Narayanan et al., 2021), an interleaved strategy is proposed to further reduce the bubble rate, at the cost of more communication cost and a portion of extra activation memory. BPipe (Kim et al., 2023) focuses on reducing the activation memory of 1F1B from another perspective, transferring activations across devices based on the memory imbalance of 1F1B. However, it introduces a lot of extra communication and increases the complexity of the system, which makes it inefficient especially in settings with limited bandwidth. Zero Bubble (Qi et al., 2023) splits the backward into activation gradient computation and weight gradient computation, which can either reduce the pipeline bubbles without changing the maximum peak activation memory, or achieve zero bubble at the cost of doubled activation memory compared to 1F1B.
+
+In this paper, we first demonstrate all existing pipelines can be seen as repeating a basic building block in time. We then identify a direct link between the activation memory and the lifespan of each building block, which reveals the core insight of this paper: lifespan decides the activation memory. Based on this insight, we present a family of novel and memory-efficient building blocks and their pipelines. Compared to 1F1B, we reduce the activation memory to 1/2 asymptotically with even higher throughput, and to 1/3 asymptotically with comparable throughput. We can also achieve zero bubble under the same activation memory with 1F1B. Notably, our strategy is almost a pure gain to the existing methods, only at the cost of doubled communication cost between pipeline stages, which is relatively small and can be neglected.
+
+## 2 How to Build a Pipeline
+
+We propose a four-step framework to design pipeline schedules.
+
+**Building Block:** It starts by laying out the passes for a single microbatch, which we call a _building block_. For example, the building block of 1F1B is made of a sequence of forward passes followed by backward passes in the reverse order. We highlight the building block of 1F1B in color in Figure 0(a).
+
+**Repeating:** More microbatches are then introduced. The building blocks are repeated and woven together to form a pipeline. In Figure 1 (top), the repeating building blocks are shown in different shades of gray. Notably, legit building blocks are required to repeat without a collision, namely, the passes from two building blocks should not overlap with each other.
+
+**Squeezing:** Depending on the building block, there may be redundant bubbles in the pipeline, which can be simply removed by squeezing without changing the order of the passes. For example, Figure 0(b) shows a case where squeezing produces a more efficient pipeline.
+
+Figure 1: A pipeline can be built by repeating a building block, and then squeezing redundant bubbles.
+
+**Reordering (optional):** We can reorder the passes in the warm-up and cool-down phase to further improve the computation throughput. Intuitively, the peak of memory happens in the stable phase of the pipeline, while in the warm-up and cool-down phases the RAM is under utilized, leaving some space for improving the computation throughput without changing peak memory. We leave the details in Appendix C.
+
+Most of existing pipeline schedules can be explained under this framework. Besides the 1F1B and eager 1F1B shown in Figure 1, we show the interleaved 1F1B (Shoeybi et al., 2019), ZB-H1 (Qi et al., 2023) and a series of well-known pipelines in a more extensive gallery (see Appendix I).
+
+### Building Blocks
+
+The computation and memory efficiency of various pipelines can be attributed to their building blocks. The diversity of the building blocks primarily comes from three factors, **model partitioning**, **device placement**, and **offsets** between passes. We follow the idea and notations in zero bubble PP (Qi et al., 2023), using \(F\) to denote forward pass, \(B\) to denote "backward for the activations", and \(W\) to denote "backward for the weights". Note that such finer granularity can be generalized to previous methods like 1F1B, by always grouping \(B\) and \(W\) together.
+
+Model partitioning deals with how the model is divided into pipeline stages. The most common pattern is to equally divide the model to match the number of devices. A prominent example is the 1F1B schedule (Figure 0(a)). This is extended in interleaved 1F1B where the number of stages can be an integer multiple of the number of devices.
+
+Device placement is another key factor in the design of building blocks. While conventionally each pipeline stage is sequentially placed on a different device, it is not uncommon to place multiple stages on the same device like in interleaved 1F1B (Figure 0(h)). Another example of unconventional device placement is Chimera, where two pipelines are placed in reversed device order.
+
+Last but not least, the offsets between \(F\),\(B\),\(W\) passes play a major role in the computation and memory efficiencies of the pipeline. By simply enlarging the offsets between subsequent \(F\) passes in the building block of 1F1B, we obtain the eager 1F1B (Zhuang et al., 2023) (Figure 0(b)) where more \(F\) passes are eagerly scheduled, resulting in higher memory consumption (but better communication overlapping). GPipe can be seen as adding a large offset between the last \(F\) and the first \(B\) in the 1F1B building block. One more example on the effect of the offset is the comparison of ZB-H1 (Figure 0(c)) and ZB-H2 (Figure 0(d)) schedules, one can see that properly chosen offsets result in zero bubble schedules like ZB-H2. In this work, we assume that every \(F\), \(B\) or \(W\) pass takes equally one unit of computation time, and only consider integer unit of offsets. Although this may limit the number of feasible building blocks, it greatly improves the simplicity of analysis.
+
+### Calculating the Peak Memory
+
+Not every pipeline is born equal, researchers are constantly looking for pipelines that are more efficient in computation and/or memory. While efficient pipelines could be discovered by enumerating every possible building block, it is nonetheless prohibitively expensive. We discover that the peak memory consumption of a pipeline can be calculated from its building block via a simple formula. This enables us to design pipelines with a controllable peak memory.
+
+Two quantities are crucial for the calculation of peak memory, the _lifespan_ of a stage, and the repeating _interval_ of the building blocks, both of which are illustrated in Figure 1. The lifespan of a stage is defined as the amount of time between the starting of the \(F\) pass and the ending of \(B\) or \(W\) pass. A piece of activation memory is allocated at the starting of \(F\), and retained in the RAM throughout the lifespan until it is consumed by both \(B\) and \(W\). The peak memory consumption can be calculated by finding the maximum number of microbatches whose lifespans overlap with that of every other microbatch. Using \(l\) to denote lifespan, \(T\) to denote the repeating interval and \(m\) the size of activation memory for a single microbatch, we have the relation.
+
+\[ m\]
+
+When there are multiple stages on one device, e.g. interleaved 1F1B, their contributions to the peak memory are independent, using \(S_{i}\) to denote all the stages allocated to device \(i\), we sum thecontributions from every stage.
+
+\[i_{s S_{i}}}{T} m^{s}\] (1)
+
+Another key insight is that the repeating interval \(T\) is readily determined from the building block. In an efficient pipeline, \(T\) should be equal to the number of units of computation in each stage of the building block. Any \(T\) larger than that would cause pipeline bubbles in the stable phase, and \(T\) smaller than that would lead to collisions. A subtle exception is the interleaved 1F1B whose repeating interval is not uniform. We leave the discussion to Appendix G.
+
+### Repeating without Collision
+
+One constraint to keep in mind when designing the building blocks is that a legit building block is required to repeat without any collision. It may seem unintuitive how to design building blocks with this constraint. In practice, we design the building block first and perform a post-hoc verification. Another useful observation is that a legit building block usually produces a stable phase in the middle of the pipeline, which contains a repeating \(d T\) rectangle, where \(d\) is the number of devices and \(T\) is the repeating interval. This offers an alternative to constrain the building blocks. We can start by ordering passes within this rectangle and convert it back to a building block.
+
+## 3 Memory Efficient Building Blocks
+
+With the above framework, we can conveniently analyze the memory consumption pattern of existing pipelines. To our knowledge, all existing pipelines are memory inefficient due to two primary reasons: redundant dependency chain, and imbalanced memory usage. Before Zero Bubble , the backward is often regarded as a single pass, resulting in unnecessarily longer lifespan thus more memory footprint. In this paper, we leverage the backward splitting strategy to remove these redundant lifespan. The imbalanced memory comes from the innate heterogeneity of the lifespans across stages. From Figure 0(a), we can easily see that the lifespan of the stages differs greatly from each other, with the first stage having the longest lifespan. Consequently, it causes a memory bottleneck on the first device and under utilization of memory on all other devices. To resolve this problem, we introduce a family of novel building blocks, which we refer to as _V-Shape_ building blocks. The core insight comes from Equation 1 which says that the peak memory depends on the sum of the lifespans. Therefore, when we place multiple stages on the same device, we should always collocate stages of long lifespans with those of short lifespans. When the total sum of lifespans is fixed, balanced placement always means higher memory efficiency. This can be demonstrated by Figure 2, the parallel schedule (used in interleaved 1F1B) is imbalanced and has a memory bottleneck proportional to \(l_{1}+l_{4}\), while in the V-Shape schedule it is \(l_{1}+l_{6}\).
+
+The V-Shape schedule requests the model to be **partitioned** into stages twice the number of devices and the **device placement** of the second half of stages to be in reverse order as the first half. As the offsets directly determine the lifespan of each stage and therefore the peak memory by Equation 1, we can then further control the **offsets** between passes to generate building blocks with diverse memory.
+
+### Controllable Balanced Memory
+
+We assume the model is uniformly partitioned, namely, both the computation and memory of each stage are identical. For a single microbatch, we denote the activation memory of each stage as \(m\), and
+
+Figure 2: The V-Shape building block ensures balanced peak memory across all devices, whereas the parallel building block has a memory bottleneck in the first device.
+
+the total activation memory of the entire model as \(M\). Note that \(M=2dm\), where \(d\) is the number of devices. To make it simple and tractable, we use **uniform offsets within each half of \(F\) and \(B\) passes to control the peak memory. Specifically, we apply the same offset \(_{F}^{0}\) between two adjacent \(F\) passes within the first \(d\) stages (e.g., \(_{F}^{0}=2\) in Figure 2(b), \(_{F}^{0}=1\) in Figure 2(c) and \(_{F}^{0}=4\) in Figure 2(d)). Similar constraints are applied to the other half of the \(F\) passes and both halves of the \(B\) passes, denoted as \(_{F}^{1},_{B}^{0},_{B}^{1}\), respectively. To guarantee balanced peak memory across devices, we add another two constraints, \(_{F}^{0}=_{B}^{1}=^{0}\) and \(_{F}^{1}=_{B}^{0}=^{1}\), where we use notations \(^{0}\) and \(_{F}^{1}=_{B}^{0}=^{1}\).
+
+Figure 4: V-Shape schedules compared to 1F1B, under the setting of 4 devices and 8 microbatches. The stable phases adhere to the pattern of their building blocks.
+
+Figure 3: V-Shape building blocks with 4 devices (\(d=4\)), where white text colors represent the first half of model stages and black text colors represent the second half. \(F\), \(B\) and \(W\) represent the forward, backward (for activation gradients) and backward for weight gradients, respectively.
+
+\(^{1}\) for simplicity. For example, in Figure (d)d, we set \(^{0}=4\) and \(^{1}=2\). Note that we only control the offsets across different devices. For those adjacent passes within the same device (e.g., \(F\) and \(B\) of the last stage, two \(F\) and two \(B\) in the last device), we use brute force to find optimal solutions, ensuring their offsets are small (less than the repeating interval). Note that \(W\) can always be placed greedily after settling all \(F\) and \(B\) passes, so we don't need to search their offsets during brute force. According to Equation 1, we can analyze the asymptotic peak memory with respect to \(d\),
+
+\[i+^{1})+O(1)}{6}m +^{1}}{6}M\] (2)
+
+By ignoring the small constant, we can directly control the peak memory by the value of \(^{0}\) and \(^{1}\).
+
+### V-Shape Pipeline Schedules
+
+By varying the values of \(^{0}\) and \(^{1}\), we come up with 3 novel V-Shape building blocks (Figure 3), and present their final schedules based on our framework in Figure 4. The building block of _V-Min_ (Figure (c)c) has the minimum offsets, namely \(^{0}=^{1}=1\), thus the minimum memory consumption. With \(^{0}=4\) and \(^{1}=2\) as in Figure (d)d, _V-ZB_ eliminates the bubble to almost 0 (Figure (d)d), pushing to extreme throughput. The building block of _V-Half_ (Figure (b)b), which uses \(^{0}=2\) and \(^{1}=1\), sits between the two extremes and consumes about half of the activation memory required by 1F1B. Although both _V-Min_ and _V-Half_ have lower memory footprint than 1F1B, _V-Min_ contains about 2/3 and _V-Half_ contains about 1/2 of 1F1B's bubbles, assuming \(F\), \(B\), \(W\) have equal run time. We show the comparison between our proposed V-Shape schedules and 1F1B in Table 1. Notably, the exact peak memory is \(\) for _V-Min_, and \(\) for _V-Half_. To avoid collisions in the building blocks of _V-Min_ and _V-Half_, the offsets (within the same device) are slightly different for different values of \(d\). The details are in Appendix F.
+
+### Repeating Bubbles in _V-Min_
+
+In real-world scenarios where \(F\), \(B\) and \(W\) have different run times, _V-Min_ suffers from a repeating bubble. As shown in Figure 5, there exists bubbles for every repeating interval \(T\). Consequently, the bubble grows as the number of microbatches increases. Although _V-Half_ may encounter the same issue (when the times of \(F\), \(B\) and \(W\) differ significantly), it generates patterns that tessellate well in most empirical cases due to its loose dependencies. As illustrated in Figure (b)b, the throughput of _V-Half_ is robust to the variation of run times. Additionally, the bubbles of _V-ZB_ will never grow when increasing the number of microbatches. We leave the related discussions in Appendix E.
+
+  Building Block & \(^{0}\) & \(^{1}\) & Peak Memory & Bubbles \\  
+1F1B & \(2\) & \(4\) & \(M\) & \( 6d\) \\  _V-Min_ & \(1\) & \(1\) & \( M/3\) & \( 4d\) \\  _V-Half_ & \(2\) & \(1\) & \( M/2\) & \( 3d\) \\  _V-ZB_ & \(4\) & \(2\) & \(M\) & \(0\) \\  
+
+Table 1: Small constant values are ignored for bubbles and peak memory of _V-Min_ and _V-Half_. For 1F1B, \(^{0}\)/\(^{1}\) are redefined as the offsets between adjacent forward/backward passes. \(M\) represents the total activation memory of the entire model, and \(d\) is the number of devices.
+
+Figure 5: We take a repeating \(d T\) grid from _V-Min_ and _V-Half_ schedules, and assign _F/B/W_ with different values. The result shows _V-Min_ has bubbles for every repeating grid, while _V-Half_ does not.
+
+### Other Building Blocks
+
+Besides V-Shape building blocks, we also propose some other interesting building blocks in Appendix H, to show the generalization ability of our framework. Some useful examples include a) 1F1B-V achieving 2/3 of 1F1B's activation memory without doing B-W split; b) **a schedule consumes less memory than interleaved 1F1B but with the same bubble rate (Figure 16(c))**. Additionally, we design an adaptive scheduler to control the memory at a finer granularity in Appendix A.
+
+## 4 Experiments
+
+We construct our experiments to show three conclusions: a) The throughput and memory of _V-Min_, _V-Half_ and _V-ZB_ aligns with the theoretical analysis in Section 3.2; b) Memory-saving methods including _V-Min_ and _V-Half_ can bring accelerations; c) Our methods still perform best when combining with other state-of-the-art techniques.
+
+### Setup
+
+We evaluate our methods using a series of models detailed in Table 2 analogous to GPT-3 (Brown et al., 2020). Our implementation is based on the open-source Megatron-LM project (Narayanan et al., 2021) and is experimented on up to 40 NVIDIA A100 SXM 80G GPUs distributed across 5 nodes interconnected by a RoCE RDMA network. The running time of each iteration is recorded after several warm-up iterations. Similar to the settings in (Qi et al., 2023), we deduct one transformer layer from both the initial and final pipeline stage to compensate for the embedding and output layer in LM, which can otherwise become the bottleneck of the pipeline and interfere to the efficiency.
+
+Our experiments majorly focuses on the following pipeline parallel schedules: a) _V-Min_, _V-Half_ and _V-ZB_: schedules introduced in Section 3.2; b) 1F1B and Interleaved 1F1B: methods implemented in Megatron-LM; c) 1F1B-R: 1F1B with full activation rematerialization (Chen et al., 2016); d) ZB-1P and ZB-2P: the adaptive zero-bubble methods introduced in (Qi et al., 2023) with activation memory limit set to the 1x/2x times of 1F1B.
+
+  Model & Layers & Attention Heads & Hidden Size & GPUs \\  
+9.6B & 30 & 40 & 5120 & 16 \\ 
+21B & 46 & 48 & 6144 & 24 \\ 
+38.5B & 62 & 64 & 7168 & 32 \\ 
+98.5B & 78 & 80 & 10240 & 40 \\  
+
+Table 2: Models used in experiments.
+
+Figure 6: Throughput and activation memory using the same microbatch size.
+
+### Comparing Pipeline Schedules
+
+In Figure 6, we present comparisons of the throughput measured in FLOPS utilization (MFU) and activation memory consumption across different pipeline schedules under various settings. From the results, _V-ZB_ outperforms all other methods in terms of throughput, which aligns with Figure 4. When comparing the activation memory consumption, _V-Min_ and _V-Half_ stand out by significantly reducing activation memory to approximately 1/3 and 1/2, while other methods' memory is similar except for 1F1B-R. More details of our experiments and definition of metrics can be found in Appendix D.1.
+
+Notably _V-Min_ has a comparable throughput against 1F1B, but its throughput falls behind 1F1B at a larger number of microbatches due to the aforementioned repeating bubble in Figure 4(a), as discussed in Section 3.3. However, it still outperforms 1F1B with full activation rematerialization, providing a strong alternative for saving memory.
+
+We also plot both memory and MFU for the various methods in Figure 7 in a typical, but slightly different setting in which we reduced the microbatch size of 9.6B and 21B model to allow ZB-2P and Interleaved 1F1B to run which would otherwise run out of memory (OOM). It shows that the V-Shape pipeline schedules lie at the Pareto frontier.
+
+### When to Save Memory
+
+While _V-ZB_ provides optimal throughput, _V-Half_ and _V-Min_ methods are mainly used when memory budget is tight. Conventionally, rematerialization is used when it runs out of memory (OOM). However, rematerialization leads to repeated computation and consequently decrease the throughput. _V-Half_ and _V-Min_ significantly outperforms rematerialization (1F1B-R) as we show in Table 7.
+
+Another benefit of saving memory is that we can potentially use the extra memory for an increased microbatch size, which leads to a higher arithmetic intensity. We pres
+
+Figure 8: Throughput and activation memory under similar memory limit.
+
+Figure 7: Pareto frontier of MFU and memory for various setups.
+
+8. On bigger models, where memory pressure is higher and hence microbatch size is smaller, _V-Half_ schedule can surpass _V-ZB_ and other baselines because of its arithmetic intensity gain. This observation does not apply for _V-Min_, implying its arithmetic intensity gain can not compensate for the increased bubble. Doubling/Tripling the microbatch size for _V-Half/V-Min_ results in a slightly higher activation memory than the other methods. This reflects the constant factors we ignored in Section 3.2. The increase is less significant as the number of devices grows.
+
+### Combining with Existing Techniques
+
+We present our methods in the context of LLM training together with various other techniques. The following techniques are considered: a) Flash Attention (Dao et al., 2022; Dao, 2023); b) Tensor Parallelism (Narayanan et al., 2021) and Sequence Parallelism (Korthikanti et al., 2023); c) Distributed Optimizer provided in Megatron-LM. The implementations are all from Megatron-LM (Narayanan et al., 2021). Both our methods and the baseline methods are combined with the above techniques. Similar to the evaluation method in Kim et al. (2023), we perform a grid search on the following parameters: the size of PP; the size of TP; the size of DP; the microbatch size (\(mbs\)). We use 40 GPUs in this experiment. For each method, the best result from the grid search is reported.
+
+We present the best result for each pipeline parallel schedule in Table 3 and the corresponding parameters. We find that when sequence length is smaller and hence the memory budget is more abundant, _V-ZB_ performs the best due to the elimination of bubbles. When we increase the memory pressure by increasing the sequence length, _V-Half_ performs the best because of its memory efficiency. The detailed data and analysis of grid search can be found in the Appendix D.3.4.
+
+## 5 Conclusion And Future Work
+
+In this work, we present a framework that constructs pipeline schedules by focusing on their repeating building blocks. This framework enables direct computation of peak memory from the lifespan of the building block. Based on this capability, we design a family of memory-efficient building blocks. We discuss three representative methods from this family, namely _V-Min_, _V-Half_ and _V-ZB_, and demonstrate with experiments that our methods advance the Pareto frontier of throughput and memory in large model training. Furthermore, our methodology of designing pipeline schedules through building blocks may inspire the research community to explore more novel pipeline schedules. Notice that repeating a building block is not the only way of building a pipeline, other methods like greedy search could generate a pipeline that has no repeating patterns.
+
+  Common & PP & Best MFU &  \\ Setup & Method & (\%) & DP & TP & PP & \(mbs\) \\    & 1F1B & 54.77 & 2 & 4 & 5 & 2 \\  & 1F1B-R & 40.84 & 2 & 2 & 10 & 1 \\  & ZB-1P & 59.95 & 1 & 1 & 40 & 1 \\  & V-Half & 57.83 & 2 & 1 & 20 & 1 \\  & V-Min & 52.8 & 2 & 2 & 10 & 1 \\  & V-ZB & **63.31** & 1 & 1 & 40 & 1 \\   & 1F1B & 62.95 & 2 & 4 & 5 & 1 \\  & 1F1B-R & 50.37 & 2 & 1 & 20 & 1 \\  & ZB-1P & 62.18 & 1 & 4 & 10 & 1 \\  & V-Half & **66.34** & 1 & 2 & 20 & 1 \\  & V-Min & 61.04 & 1 & 1 & 40 & 1 \\  & V-ZB & 62.56 & 1 & 4 & 10 & 1 \\   & 1F1B & OOM &  \\  & 1F1B-R & 42.05 & 1 & 4 & 10 & 1 \\   & ZB-1P & OOM &  \\   & V-Half & **57.85** & 1 & 8 & 5 & 1 \\   & V-Min & 48.58 & 1 & 8 & 5 & 1 \\   & V-ZB & OOM &  \\  
+
+Table 3: V-Shape schedules combined with other memory saving methods.
+
+In the future, we plan to further explore more memory efficient pipeline schedules based on our framework. A major limitation of _V-Min_ is that, it suffers from growing bubbles when increasing the number of microbatches. Although _V-Half_ mitigates this issue, there is still a space to further reduce the memory consumption. Using continuous offsets or finer-granularity discretization is a possible way to solve it. We leave it in our future work.

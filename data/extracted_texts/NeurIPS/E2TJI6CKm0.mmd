@@ -1,0 +1,224 @@
+# VeriX: Towards Verified Explainability of
+
+Deep Neural Networks
+
+ Min Wu
+
+Department of Computer Science
+
+Stanford University
+
+minwu@cs.stanford.edu
+
+&Haoze Wu
+
+Department of Computer Science
+
+Stanford University
+
+haozewu@cs.stanford.edu
+
+&Clark Barrett
+
+Department of Computer Science
+
+Stanford University
+
+barrett@cs.stanford.edu
+
+###### Abstract
+
+We present VeriX (verified explainability), a system for producing _optimal robust explanations_ and generating _counterfactuals_ along decision boundaries of machine learning models. We build such explanations and counterfactuals iteratively using constraint solving techniques and a heuristic based on feature-level sensitivity ranking. We evaluate our method on image recognition benchmarks and a real-world scenario of autonomous aircraft taxiing.
+
+## 1 Introduction
+
+Broad deployment of artificial intelligence (AI) systems in safety-critical domains, such as autonomous driving  and healthcare , necessitates the development of approaches for trustworthy AI. One key ingredient for trustworthiness is _explainability_: the ability for an AI system to communicate the reasons for its behavior in terms that humans can understand.
+
+Early work on explainable AI includes well-known model-agnostic explainers which produce explanations that remain valid for nearby inputs in feature space. In particular, LIME  and SHAP  learn simple, and thus interpretable, models locally around a given input. Following LIME, work on Anchors  attempts to identify a subset of such input explanations that are (almost) sufficient to ensure the corresponding output value. Such approaches can produce explanations efficiently, however, they do not provide any _formal_ guarantees and are thus inappropriate for use in high-risk scenarios. For instance, in healthcare, if a diagnosis model used by a dermatologist has an explanation claiming that it depends only on a patient's skin lesions (such as "plaque", "putsule", and "ulcer" in ), yet in actuality, patients with similar such lesions but different skin tones ("Fitzpatrick I-II, III-IV, V-VI" ) receive dissimilar diagnoses, then the explanation is not only wrong, but may actually mask bias in the model. Another drawback of model-agnostic approaches is that they often depend on access to training data, which may not always be available (perhaps due to privacy concerns). And even if available, distribution shift can compromise the results.
+
+Recent efforts towards _formal_ explainable AI  aim to compute rigorously defined explanations that can guarantee _soundness_, in the sense that fixing certain input features is sufficient to ensure the invariance of a model's prediction. However, their work only considers _unbounded_ perturbations, which may be too course-grained to be useful (for other limitations, see Section 5). To mitigate those drawbacks,  bring in two types of _bounded_ perturbations, \(\)-ball and \(k\)-NN box closure, and show how to compute _optimal robust explanations_ with respect to these perturbations for naturallanguage processing (NLP) models. \(k\)-NN box closure essentially chooses a finite set of the \(k\) closest tokens for each word in a text sample, so the perturbation space is intrinsically discrete; on the other hand, \(\)-ball perturbations provide a way to handle a continuous word embedding (though the authors of  suggest that these may be more cumbersome in NLP applications and focus on \(k\)-NN box perturbations in their experimental results).
+
+In this paper, we present VeriX (verified explainability), a tool for producing _optimal robust explanations_ and generating _counterfactuals_ along decision boundaries of deep neural networks. Our contributions can be summarized as follows.
+
+* We utilize constraint solving techniques to compute _robust_ and _optimal_ explanations with provable guarantees against _infinite_ and _continuous_ perturbations in the input space.
+* We bring a _feature-level sensitivity traversal_ into the framework to efficiently approximate global optima, which improves scalability for _high-dimensional_ inputs and _large_ models.
+* We note for the first time the relationship between our explanations and _counterfactuals_, and show how to compute such counterfactuals automatically at no additional cost.
+* We provide an extensive evaluation on a variety of perception models, including a safety-critical real-world autonomous aircraft taxiing application.
+
+We start by providing intuition for our VeriX approach by analyzing an example explanation in Figure 1. This explanation is generated for a fully-connected model trained on the MNIST dataset. Model-agnostic explainers such as Anchors  rely on partitioning an image into a disjoint set of segments and then selecting the most prominent segment(s). Figure 0(b) shows "2" divided into 3 parts using k-means clustering . Based on this segmentation, the purple and yellow parts would be chosen for the explanation, suggesting that the model largely relies on these segments to make its decision. This also matches our intuition, as a human would immediately identify these pixels as containing information and disregard the background. However, does this mean it is enough to focus on the salient features when explaining a classifier's prediction? Not necessarily. VeriX's explanation is highlighted in green in Figure 0(c). It demonstrates that _whatever is prominent is important but what is absent in the background also matters_. We observe that VeriX not only marks those white pixels forming the silhouette of "2" but also includes some background pixels that might affect the prediction if changed. For instance, neglecting the bottom white pixels may lead to a misclassification as a "7"; meanwhile, the classifier also needs to check if the pixels along the left and in the middle are not white to make sure it is not "0" or "3". While Figures 0(d), 0(e), and 0(f) are simply illustrative to provide intuition about why different parts of the explanation may be present, we remark that explanations from VeriX are produced automatically and deterministically.
+
+## 2 VeriX: Verified eXplainability
+
+Let \(f\) be a neural network and \(\) a \(d\)-dimensional input vector of features \(^{1},,^{d}\). We use \(()\), or simply \(\), when the context is clear, to denote its set of feature indices \(\{1,,d\}\). We write \(}\) where \(()\) to denote only those features indexed by indices in \(\). We denote model prediction as \(f()=c\), where \(c\) is a single quantity in regression or a label among others (\(c C\)) in classification. For the latter, we use \(f_{c}()\) to denote the confidence value (pre- or post- softmax) of classifying as \(c\), i.e., \(f()=*{arg\,max}f_{c}()\). Depending on different application domains, \(\) can be an image consisting of \(d\) pixels as in our case or a text comprising \(d\) words as in NLP . In this paper, we focus on perception models. This has the additional benefit that explanations in this context are self-illustrative and thus easier to understand.
+
+Figure 1: Intuition for our VeriX approach: (a) An MNIST handwritten “2”; (b) Segmentation of “2” into 3 partitions; (c) Our VeriX explanation (green pixels) of “2”; (d)(e)(f) Masking white pixels or whitening black pixels may turn “2” into possible counterfactuals.
+
+### Optimal robust explanations
+
+Existing work such as abductive explanations , prime implicants , and sufficient reasons  define a formal explanation as a _minimal_ subset of input features that are responsible for a model's decision, in the sense that _any possible_ perturbations on the rest features will _never_ change prediction. Building on this,  introduces _bounded_ perturbations and computes "distance-restricted" such explanations for NLP models. Our definition closely follows  except: (1) rather than minimizing an arbitrary cost function, we consider the uniform case (i.e., the same cost is assigned to each feature) so as to compute the smallest number of features; (2) we focus on _continuous_\(\)-ball perturbations not _discrete_\(k\)-NN box closure; (3) we allow for bounded variation (parameterized by \(\)) in the output to accommodate both classification (set \(\) to \(0\)) and regression (\(\) could be some pre-defined hyper-parameter quantifying the allowable output change) whilst  focuses on sentiment analysis (i.e., binary classification).
+
+**Definition 2.1** (Optimal Robust Explanation).: Given a neural network \(f\), an input \(\), a manipulation magnitude \(\), and a discrepancy \(\), a _robust explanation_ with respect to norm \(p\{1,2,\}\) is a set of input features \(}\) such that if \(=()\), then
+
+\[\;}}.\;\|}-}}\|_{p}|f()-f(})| ,\] (1)
+
+where \(}}\) is some perturbation on features \(}\) and \(}\) is the input variant combining \(}\) and \(}}\). In particular, we say that the robust explanation \(}\) is _optimal_ if
+
+\[}.\;\;}},^{}.\;\|(})-(}}^{ })\|_{p}|f()-f(})| >,\] (2)
+
+where \(^{}\) is some perturbation of \(\) and \(\) denotes concatenation of two features.
+
+We refer to \(}\) as the _irrelevant_ features. Intuitively, perturbations bounded by \(\) imposed upon the irrelevant features \(}\) will _never_ change prediction, as shown by the small blue "+" variants in Figure 2. Moreover, each feature \(\) (and their combinations) in the optimal explanation \(}\) can be perturbed, together with the irrelevant features, to go beyond the decision boundary, i.e., the orange "+" variants. We mention two special cases: (1) if \(\) is \(\)-robust, then all features are irrelevant, i.e., \(=\), meaning there is no valid explanation as any \(\)-perturbation does not affect the prediction at all (in other words, a larger \(\) is required to get a meaningful explanation); (2) if perturbing any feature in input \(\) can change the prediction, then \(=()\), meaning the entire input is an explanation.
+
+We remark that our definition of optimality is _local_ in that it computes a _minimal_ subset of features. An interesting problem would be to find a _globally optimal_ explanation, i.e., the smallest (fewest features) among all possible local optima, also known as the cardinality-minimal explanation . Approaches (such as those based on minimum hitting sets [33; 4]) for computing such global optima are often too computationally difficult to converge for large models and high-dimensional inputs as in our case. Therefore, we propose a tractable heuristic (Section 3.3) that approximates the ideal and works fairly well in practice.
+
+### Counterfactuals along decision boundary
+
+While there are infinitely many variants in the input space, we are particularly interested in those that lie along the decision boundary of a model. Figure 2 shows several pairs of variants (blue and orange "+") connected by red dotted lines. Each pair has the property that the blue variant has the same prediction as the original input \(\), whereas the orange variant, obtained by further perturbing _one_
+
+Figure 2: Graphical illustration of VeriX. Each gray square denotes the original input \(\) (big blue “+”) or a variant (smaller “+”). Variants (blue “+”) that do not change the explanation \(\) (green circle) are guaranteed to lie on the same side of the decision boundary. Counterfactuals (orange “+”) with perturbed explanations \(}\) are classified differently.
+
+_single_ feature \(\) in the optimal explanation \(}\) (together with the irrelevant features, i.e., \(}}^{}\) in Equation (2), produces a different prediction. We note that these orange variants are essentially _counterfactual_ explanations : each is a concrete example of a nearby point in the input space illustrating one way to change the model prediction. We emphasize that our focus in this paper is to compute explanations of the form in Definition 2.1, but it is noteworthy that these counterfactuals are generated automatically and at no additional cost during the computation. In fact, we end up with a distinct counterfactual for each feature in our explanation, as we will see below (see [20; 50] for a comprehensive review of counterfactual explanations and their uses).
+
+## 3 Computing VeriX explanations by constraint solving
+
+Before presenting the VeriX algorithm (Algorithm 1) in detail, we first illustrate it via a simple example.
+
+_Example 3.1_ (_VeriX_ Computation).: Suppose \(\) is an input with \(9\) features \(^{1},,^{3}\) as in Figure 3, and we have classification network \(f\), a perturbation magnitude \(\), and are using \(p=\). The outer loop of the algorithm traverses the input features. For simplicity, assume the order of the traversal is from \(^{1}\) to \(^{9}\). Both the explanation index set \(\) and the irrelevant set \(\) are initialized to \(\). At each iteration, VeriX decides whether to add the index \(i\) to \(\) or \(\). The evolution of the index sets is shown in Table 1. Concretely, when \(i=1\), VeriX formulates a _pre-condition_ which specifies that \(^{1}\) can be perturbed by \(\) while the other features remain unchanged. An automated reasoner is then invoked to check whether the pre-condition logically implies the _post-condition_ (in this case, \(f()=f(})\), meaning the prediction is the same after perturbation). Suppose the reasoner returns True; then, no \(\)-perturbation on \(^{1}\) can alter the prediction. Following Equation (1) of Definition 2.1, we thus add \(^{1}\) to the irrelevant features \(}\). Figure 3, top left, shows a visualization of this. VeriX next moves on to \(^{2}\). This time the precondition allows \(\)-perturbations on both \(^{1}\) and \(^{2}\) while keeping the other features unchanged. The post-condition remains the same. Suppose the reasoner returns True again - we then add \(^{2}\) to \(}\) (Figure 3, top middle). Following similar steps, we add \(^{3}\) to \(}\) (Figure 3, top right). When it comes to \(^{4}\), we allow \(\)-perturbations for \(^{1},^{2},^{3},^{4}\) while the other features are fixed. Suppose this time the reasoner returns False - there exists a counterexample (this counterexample is the counterfactual for feature \(^{4}\)) that violates \(f()=f(})\), i.e., the prediction can be different. Then, according to Equation (2) of Definition 2.1, we add \(^{4}\) to the optimal explanation \(}\) (shown as green in Figure 3, middle left). The computation continues until all the input features are visited. Eventually, we have \(}=^{4},^{5},^{8}\) (Figure 3, bottom right), which means that, if the features in the explanation are fixed, the model's prediction is invariant to any possible \(\)-perturbation on the other features. Additionally, for each of the features in \(}\), we have a counterfactual that demonstrates how that feature can be altered (together with irrelevant features) to change the prediction.
+
+   feature & \(\) & \(\) & \(}\) & reasoner & irrelevant features \(}\) & explanation \(}\) \\  \(^{1}\) & \(\) & \(\) & \(\{1\}\) & True & \(^{1}\) & – \\ \(^{2}\) & \(\) & \(\{1\}\) & \(\{2\}\) & True & \(^{1},^{2}\) & – \\ \(^{3}\) & \(\) & \(\{1,2\}\) & \(\{3\}\) & True & \(^{1},^{2},^{3}\) & – \\ \(^{4}\) & \(\) & \(\{1,2,3\}\) & \(\{4\}\) & False & \(^{1},^{2},^{3}\) & \(^{4}\) \\ \(^{5}\) & \(\{4\}\) & \(\{1,2,3\}\) & \(\{5\}\) & False & \(^{1},^{2},^{3}\) & \(^{4},^{5}\) \\ \(^{6}\) & \(\{4,5\}\) & \(\{1,2,3\}\) & \(\{6\}\) & True & \(^{1},^{2},^{3},^{6}\) & \(^{4},^{5}\) \\ \(^{7}\) & \(\{4,5\}\) & \(\{1,2,3,6\}\) & \(\{7\}\) & True & \(^{1},^{2},^{3},^{6},^{7}\) & \(^{4},^{5}\) \\ \(^{8}\) & \(\{4,5\}\) & \(\{1,2,3,6,7\}\) & \(\{8\}\) & False & \(^{1},^{2},^{3},^{6},^{7}\) & \(^{4},^{5},^{8}\) \\ \(^{9}\) & \(\{4,5,8\}\) & \(\{1,2,3,6,7\}\) & \(\{9\}\) & True & \(^{1},^{2},^{3},^{6},^{7},^{7}\) & \(^{4},^{5},^{8}\) \\   
+
+Table 1: Evolving index set \(\) for explanation \(}\) and index set \(\) for irrelevant features \(}\) along reasoning result (True / False) of the check sub-procedure when processing Example 3.1.
+
+### Building optimal robust explanations and counterfactuals iteratively
+
+We now formally describe our VeriX methodology, which exploits an automated reasoning engine for neural network verification as a black-box sub-procedure. We assume the reasoner takes as inputs a network \(f\) and a specification
+
+\[_{in}(})_{out}()\] (3)
+
+where \(}\) are variables representing the network inputs and \(\) are expressions representing the network outputs. \(_{in}(})\) and \(_{out}()\) are formulas. We use \(^{i}\) to denote the variable corresponding to the \(i^{th}\) feature. The reasoner checks whether a specification holds on a network.
+
+Inspired by the deletion-based method , we propose Algorithm 1, in which the VeriX procedure takes as input a network \(f\) and an input \(=^{1},,^{d}\). It outputs an optimal explanation \(}\) with respect to perturbation magnitude \(\), distance metric \(p\), and discrepancy \(\). It also outputs a set of counterfactuals, one for each feature in \(}\). The procedure maintains three sets, \(\), \(\), and \(\), throughout: \(\) comprises feature indices forming the explanation; \(\) includes feature indices; that can be excluded from the explanation; and \(\) is the set of counterfactuals. Recall that \(}\) denotes the _irrelevant_ features (i.e., perturbing \(}\) while leaving \(}\) unchanged never changes the prediction). To start with, these sets are initialized to \(\) (Line 2), and the prediction for input \(\) is recorded as \(c\), for which we remark that \(c\) may or may not be an _accurate_ prediction according to the ground truth - VeriX generates an explanation regardless. Overall, the procedure examines every feature \(^{i}\) in \(\) according to traversalOrder (Line 5) to determine whether \(i\) can be added to \(\) or must belong to \(\). The traversal order can significantly affect the size and shape of the explanation. We propose a heuristic for computing a traversal order that aims to produce small explanations in Section 3.3 (in Example 3.1, a sequential order is used for ease of explanation). For each \(i\), we compute \(\), a formula that encodes two conditions: (i) the current \(^{i}\) and \(}\) are allowed to be perturbed by at most \(\) (Line 8); and (ii) the rest of the features are fixed (Line 9). The property that we check is that \(\) implies \(|-c|\) (Line 10), denoting prediction invariance.
+
+```
+1:neural network \(f\) and input \(=^{1},,^{d}\)
+2:\(\)-perturbation, norm \(p\), and discrepancy \(\)
+3:optimal robust explanation \(}\), counterfactuals C for each \(}\)
+4:functionVeriX(\(f,\))
+5:\(,,,,\)
+6:\(c f()\)
+7:\( f(})\)
+8:\(()\)
+9:for\(i\) in \(\)do
+10:\(^{+}\{i\}\)
+11:\((\|^{^{+}}-^{^{+}} \|_{p})\)
+12:\((^{^{+}}=^{ ^{+}})\)
+13:\((,m)(f,|-c|)\)
+14:ifHOLDthen\(^{+}\)
+15:else\(\{i\}\) ; \(\{m\}\)
+16:return\((},)\) ```
+
+**Algorithm 1** VeriX (verified explainability)
+
+An automated reasoning sub-procedure check is deployed to examine whether on network \(f\) the specification \(|-c|\) holds (Line 10), i.e., whether perturbing the current \(^{i}\) and irrelevant features while fixing the rest ensures a consistent prediction. It returns (True, \(m\)) if this is the case (where \(m\) is arbitrary) and (False, \(m\)) if not, where \(m\) is a concrete input falsifying the formula. In practice, this check can be instantiated with an off-the-shelf neural network verification tool . If HOLD is True, \(i\) is added to the irrelevant set \(\) (Line 11). Otherwise, \(i\) is added to the explanation index set \(\) (Line 12), which conceptually indicates that \(^{i}\) contributes to the explanation of the prediction (since feature indices in \(\) have already been proven to not affect prediction). In other words, an \(\)-perturbation that includes the irrelevant features as well as the current \(^{i}\) can breach the decision boundary of \(f\). This fact is represented by the counterexample \(m\), which represents the counterfactual1 for \(^{i}\) and is added to the set \(\) of counterfactuals. The procedure continues until all feature indices in \(\) are traversed and placed into one of the two disjoint sets \(\) and \(\). At the end, \(}\) is returned as the optimal explanation and \(\) is returned as the set of counterfactuals.
+
+### Soundness and optimality of explanations
+
+To ensure the VeriX procedure returns a _robust_ explanation, we require that check is _sound_, i.e., the solver returns True only if the specification actually holds. For the robust explanation to be _optimal_, check also needs to be _complete_, i.e., the solver always returns True if the specification holds. We can incorporate various existing reasoners as the check sub-routine. We note that an incomplete reasoner (the solver may return Unknown) does _not_ undermine the soundness of our approach, though it does affect optimality (the produced explanations may be larger than necessary).
+
+**Lemma 3.2**.: _If the check sub-procedure is sound, then, at the end of each_ for-loop _iteration (Lines 7-12) in Algorithm 1, the irrelevant set of indices \(\) satisfies_
+
+\[(^{}-^{}_{p} )(^{}=^{ })|-c|.\] (4)
+
+Intuitively, any \(\)-perturbation imposed upon all irrelevant features when fixing the others will always keep the prediction consistent, i.e., the infinite number of input variants (indicated with a small blue "+" in Figure 2) will always remain within the decision boundary. We include rigorous proofs for Lemma 3.2 and Theorems 3.3 and 3.4 in Appendix A. Soundness directly follows from Lemma 3.2.
+
+**Theorem 3.3** (Soundness).: _If the check sub-procedure is sound, then the value \(^{}\) returned by Algorithm 1 is a robust explanation - this satisfies Equation (1) of Definition 2.1._
+
+**Theorem 3.4** (Optimality).: _If the check sub-procedure is sound and complete, then the robust explanation \(^{}\) returned by Algorithm 1 is optimal - this satisfies Equation (2) of Definition 2.1._
+
+Intuitively, optimality holds because if it is not possible for an \(\)-perturbation on some feature \(^{i}\) in explanation \(^{}\) to change the prediction, then it will be added to the irrelevant features \(^{}\) when feature \(^{i}\) is considered during the execution of Algorithm 1.
+
+**Proposition 3.5** (Complexity).: _Given a \(d\)-dimensional input \(\) and a network \(f\), the complexity of computing an optimal robust explanation using the VeriX algorithm is \(O(d P(f))\), where \(P(f)\) is the cost of checking a specification (of the form in Equation (3)) over \(f\)._
+
+An optimal explanation can be achieved from _one_ traversal of input features as we are computing the local optima. If \(f\) is piecewise-linear, checking a specification over \(f\) is NP-complete . We remark that such complexity analysis is closely related to that of the deletion-based method ; here we particularly focus on how a network \(f\) and a \(d\)-dimensional input \(\) would affect the complexity of computing an optimal robust explanation.
+
+### Feature-level sensitivity traversal
+
+While Example 3.1 used a simple sequential order for illustration purpose, we introduce a heuristic based on _feature-level sensitivity_, inspired by the occlusion method , to produce actual traversals.
+
+**Definition 3.6** (Feature-Level Sensitivity).: Given an input \(=^{1},,^{d}\) and a network \(f\), the _feature-level sensitivity_ (in classification for a label \(c\) or in regression for a single quantity) for a feature \(^{i}\) with respect to a transformation \(\) is
+
+\[(^{i})=f_{(c)}()-f_{(c)}(^{}),\] (5)
+
+where \(^{}\) is \(\) with \(^{i}\) replaced by \((^{i})\).
+
+Typical transformations include _deletion_ (\(()=0\)) and _reversal_ (\(()=-\), where \(\) is the upper bound for feature \(\)). Intuitively, we measure how sensitive (in terms of an increase or decrease) a model's confidence is to each individual feature. Given sensitivity values with respect to some transformation, we rank the feature indices into a traversal order from least to most sensitive.
+
+## 4 Experimental results
+
+We have implemented the VeriX algorithm in Python, using the Marabou neural network verification tool  to implement the check sub-procedure of Algorithm 1 (Line 10). The VeriX code is available at https://github.com/NeuralNetworkVerification/VeriX. We trained fully-connected and convolutional networks on the MNIST , GTSRB , and TaxiNet  datasets for classification and regression tasks. Model specifications are in Appendix D. Experiments were performed on a workstation equipped with AMD Ryzen 7 5700G CPUs running Fedora 37. We set a time limit of \(300\) seconds for each check call.
+
+### Example explanations for image recognition benchmarks
+
+Figure 4 shows examples of VeriX explanations for GTSRB and MNIST images. The convolutional model trained on GTSRB and fully-connected model on MNIST are in Appendix D, Tables 8 and 6. Aligning with our intuition, VeriX can distinguish the traffic signs (no matter a circle, a triangle, or a square in Figure 5(a)) from their surroundings well; the explanations focus on the actual contents within the signs, e.g., the right arrow denoting "keep right" and the number \(50\) as in "50 mph". Interestingly, for traffic signs consisting of irregular dark shapes on a white background such as "road work" and "no passing", VeriX discovers that the white background contains the essential features. We observe that MNIST explanations for the fully-connected model are in general more scattered around the background because the network relies on the non-existence of white pixels to rule out different counterfactuals (Figure 5(b) shows which pixels in the explanation have associated counterfactuals with predictions of "8", "5", and "2", respectively), whereas GTSRB explanations for the convolutional model can safely disregard the surrounding pixels outside the traffic signs.
+
+### Visualization of the effect of varying perturbation magnitude \(\)
+
+A key parameter of VeriX is the perturbation magnitude \(\). When \(\) is varied, the irrelevant features change accordingly. Figure 5 visualizes this, showing how the irrelevant features change when \(\) is tightened from \(100\%\) to \(10\%\) and further to \(5\%\). As \(\) decreases, more pixels become irrelevant. Intuitively, the VeriX explanation helps reveal how the network classifies this image as "0". The deep blue pixels are those that are irrelevant with \(=100\%\). Light blue pixels are more sensitive, allowing perturbations of only \(10\%\). The light yellow pixels represent \(5\%\), and bright yellow are pixels that cannot even be perturbed \(5\%\) without changing the prediction. The resulting pattern is roughly consistent with our intuition, as the shape of the "0" can be seen embedded in the explanation.
+
+We remark that determining a suitable magnitude \(\) is non-trivial because if \(\) is too loose, explanations may be too conservative, allowing very few pixels to change. On the other hand, if \(\) is too small, nearly the whole set of pixels could become irrelevant. For instance, in Figure 5, if we set \(\) to \(1\%\) then all pixels become irrelevant - the classifier's prediction is robust to \(1\%\)-perturbations. The "color map" we propose makes it possible to visualize not only the explanation but also how it varies with \(\). The user then has the freedom to pick a specific \(\) depending on their application.
+
+### Sensitivity vs. random traversal to generate explanations
+
+To show the advantage of the _feature-level sensitivity_ traversal, Figure 6 compares VeriX explanations using sensitivity-based and random traversals. Sensitivity, as shown in the heatmaps of Figures 5(a) and 5(b), prioritizes pixels that have more influence on the network's decision, whereas a random ranking is simply a shuffling of all the pixels. We mention that, to compute the sensitivity, we used pixel deletion \(()=0\) for GTSRB and reversal \(()=-\) for MNIST (deleting background pixels of MNIST images may have little effect as they often have zero values). We observe that the sensitivity traversal generates much more sensible explanations. In Figure 5(c), we
+
+Figure 4: Optimal robust explanations (green) from VeriX on GTSRB (left) and MNIST (right) images. (b) Pixels in yellow are those in the explanation to rule out different counterfactuals.
+
+Figure 5: Expansion of the irrelevant pixels when perturbation magnitude \(\) decreases from \(100\%\) to \(10\%\) and further to \(5\%\) (from deep blue to light yellow). Each brighter color denotes the pixels added when moving to the next smaller \(\), e.g., \(100\%,90\%,80\%\) and so on.
+
+compare explanation sizes for the first \(10\) images (to avoid potential selection bias) of the MNIST test set. For each image, we show \(100\) explanations from random traversal compared to the deterministic explanation from sensitivity traversal. We observe that the latter is almost always smaller, often significantly so, suggesting that sensitivity-based traversals are a reasonable heuristic for attempting to approach globally optimal explanations.
+
+### VeriX vs. existing approaches
+
+We compare VeriX with Anchors . Figure 7 shows both approaches applied to two different "keep right" traffic signs. Anchors performs image segmentation and selects a set of the segments as the explanation, making its explanations heavily dependent on the quality of the segmentation. For instance, distractions such as strong light in the background may compromise the segments (Figure 6(a), last column) thus resulting in less-than-ideal explanations, e.g., the top right region of the anchor (red) is outside the actual traffic sign. Instead, VeriX utilizes the model to compute the sensitivity traversal, often leading to more reasonable explanations. Anchors is also not designed to provide _formal_ guarantees. In fact, replacing the background of an anchor explanation - used by the original paper  to justify "almost" guarantee - can change the classification. For example, the last column of Figure 6(b) is classified as "yield" with confidence \(99.92\%\). We conducted a quantitative evaluation on the robustness of explanations, as shown in Table 2 under "robust wrt # perturbations". When quantifying the robustness of Anchors, we generate \(100\) explanations for \(100\) MNIST and \(100\) GTSRB images separately, and impose \(10\), \(100\), \(500\), \(1000\) perturbations on each explanation by overlapping it with other images in the same dataset. If the prediction remains unchanged, then the explanation is robust against these perturbations. We notice that the robustness of Anchors decreases quickly when the number of perturbations increases, and when imposing \(1000\) perturbations per image, only \(37\) MNIST and \(15\) GTSRB explanations out of \(100\) are robust. This was not done for LIME, since it would be unfair to LIME as it does not have robustness as a primary goal. In contrast, VeriX provides provable robustness guarantees against any \(\)-perturbations in the input space.
+
+Two key metrics for evaluating the quality of an explanation are the _size_ and the _generation time_. Table 2 shows that overall, VeriX produces much smaller explanations than Anchors and LIME but
+
+Figure 6: Comparing VeriX explanations from _sensitivity_ and random traversals. (a)(b) 1st column: the original image; 2nd column: sensitivity heatmap; 3rd and 4th columns: explanations from sensitivity (green) and random (red) traversals. (c) Each blue triangle is a unique explanation size from sensitivity ranking, and each set of circles shows explanation sizes from \(100\) random rankings.
+
+Figure 7: Comparing VeriX (green) to Anchors (red) on two different versions of a “keep right” traffic sign from the GTSRB dataset, one with strong light in the background and one without.
+
+takes much longer (our limitation) to perform the computation necessary to ensure formal guarantees - this thus provides a trade-off between time and quality. Table 2 also shows that sensitivity traversal produces significantly smaller sizes than its random counterpart with only a modest overhead in time.
+
+### Deployment in vision-based autonomous aircraft taxiing
+
+We also applied VeriX to the real-world safety-critical aircraft taxiing scenario  shown in Figure 9. The vision-based autonomous taxiing system needs to make sure the aircraft stays on the taxiway utilizing only pictures taken from the camera on the right wing. The task is to evaluate the cross-track position of the aircraft so that a controller can adjust its position accordingly. To achieve this, a regression model is used that takes a picture as input and produces an estimate of the current position. A preprocessing step crops out the sky and aircraft nose, keeping the crucial taxiway region (in the red box). This is then downsampled into a gray-scale image of size \(27 54\) pixels. We label each image with its corresponding lateral distance to the runway centerline together with the taxiway heading angle. We trained a fully-connected regression network on this dataset, referred to as the TaxiNet model (Appendix D.3, Table 10), to predict the aircraft's cross-track distance.
+
+Figure 8 exhibits VeriX applied to the TaxiNet dataset, including a variety of taxiway images with different heading angles and number of lanes. For each taxiway, we show its VeriX explanation accompanied by the cross-track estimate. We observe that the model is capable of detecting the more remote line - its contour is clearly marked in green. Meanwhile, the model is mainly focused on the centerline (especially in Figures (b)b, (d)d, (e)e, and (f)f), which makes sense as it needs to measure how far the aircraft has deviated from the center. Interestingly, while we intuitively might assume that the model would focus on the white lanes and discard the rest, VeriX shows that the bottom middle region is also crucial to the explanation (e.g., as shown in Figures (a)a and (c)c). This is because the model must take into account the presence and absence of the centerline. This is in fact in consistent with our observations about the black background in MNIST images (Figure 1). We used \(=5\%\) for these explanations, which suggests that for modest perturbations (e.g., brightness change due to different weather conditions) the predicted cross-track estimate will remain within an acceptable discrepancy, and taxiing will not be compromised.
+
+    & &  &  \\  & & size & time & robust wrt \# perturbations & size & time & robust wrt \# perturbations \\   VeriX \\ random \\  } & **sensitivity** & **180.6** & **174.77** &  & **357.0** & **853.91** &  \\  & random & \(294.2\) & \(157.47\) &  &  &  &  \\   Anchors \\  } &  &  & \(10\) & \(100\) & \(500\) & \(1000\) &  &  & \(100\) & \(500\) & \(1000\) \\  & & & \(85\%\) & \(52\%\) & \(40\%\) & \(37\%\) & & & \(72\%\) & \(23\%\) & \(16\%\) & \(15\%\) \\   &  &  &  &  &  &  \\   
+
+Table 2: VeriX vs. existing approaches, showing average explanation _size_ (number of pixels), generation _time_ (seconds), and an empirical evaluation of the _robustness_ of the produced explanations against perturbations. In VeriX, \(\) is set to \(5\%\) for MNIST and \(0.5\%\) for GTSRB.
+
+Figure 8: VeriX applied to the TaxiNet dataset – each column includes a sampled camera view (top), its VeriX explanation (bottom), and the cross-track estimate of the form “actual (estimate) meters”.
+
+Figure 9: An autonomous aircraft taxiing scenario . Pictures taken from the camera fixed on the right wing are cropped (red box) and downsampled.
+
+### Using sound but incomplete analysis as the check sub-procedure
+
+We also evaluate using sound but _incomplete_ analysis, such as DeepPoly , as the check sub-procedure of Algorithm 1. In Table 3, we report the quantitative comparison.
+
+We observe that, in general, explanations are _larger_ when using incomplete analysis, but have _shorter_ generation times. In other words, there is a trade-off between complete and incomplete analyses with respect to explanation size and generation time. This makes sense as the DeepPoly analysis deploys bound propagation without complete search, so when the verifier returns Unknown on a certain feature (Line 10 of Algorithm 1), it is _unknown_ whether perturbing this feature (together with the current irrelevant set \(\)) can or cannot change the model's prediction. Therefore, such features are put into the explanation set \(\), as only \(\)-robust features are put into the irrelevant set \(\). This results in larger explanations. We re-emphasize that such explanations are no longer locally minimal, but they are still _sound_ as \(\)-perturbations on the irrelevant features will definitely not alter the prediction. Another observation is that on MNIST, the discrepancy between explanations (size and time) from complete and incomplete verifiers is more pronounced than the discrepancy on GTSRB. This is because here we set \(\) to \(5\%\) for MNIST and to \(0.5\%\) for GTSRB. So when generating explanations on MNIST, complete search is often required for a precise answer due to the larger \(\) value, whereas on GTSRB, bound propagation is often enough due to the small \(\), and thus complete search is not always needed.
+
+Due to space limitations, additional analyses of _runtime performance_ and _scalability_ for both complete and incomplete verifiers are included in Appendix B.
+
+## 5 Related work
+
+Earlier work on _formal_ explanations  has the following limitations. First, in terms of _scalability_, they can only handle simple machine learning models such as naive Bayes classifiers , random forests [28; 6], decision trees , and boosted trees [24; 25]. In particular,  addresses networks but with very simple structure (e.g., one hidden layer of \(15\) or \(20\) neurons to distinguish two MNIST digits). In contrast, VeriX works with models applicable to real-world safety-critical scenarios. Second, the _size_ of explanations can be unnecessarily large. As a workaround, approximate explanations [52; 53] are proposed as a generalization to provide probabilistic (thus compromised) guarantees of prediction invariance. VeriX, by using feature-level sensitivity ranking, produces reasonably-sized explanations with rigorous guarantees. Third, these formal explanations allow _any possible input_ in feature space, which is not necessary or realistic. For this,  brings in _bounded_ perturbations for NLP models but their \(k\)-NN box closure essentially chooses a finite set of the \(k\) closest tokens for each word so the perturbation space is intrinsically discrete. In other words, their method will not scale to our high-dimensional image inputs with infinite perturbations. One the other hand, those model-agnostic feature selection methods such as Anchors  and LIME  can work with large networks, however, they cannot provide strong guarantees like our approach can. A brief survey of work in the general area of neural network verification appears in Appendix C.
+
+## 6 Conclusions and future work
+
+We have presented the VeriX framework for computing optimal robust explanations and counterfactuals along the decision boundary. Our approach provides provable guarantees against infinite and continuous perturbations. A possible future direction is generalizing to other crucial properties such as _fairness_. Recall the diagnosis model in Section 1; our approach can discover potential bias (if it exists) by including skin tones ("Fitzpatrick I-II, III-IV, V-VI" ) in the produced explanation; then, a dermatologist could better interpret whether the model is producing a fair and unbiased result.
+
+    & &  &  \\  & &  &  &  &  \\  & & size & time & size & time & size & time & size & time \\   & sensitivity & \(180.6\) & \(174.77\) & \(\) & \(\) & \(357.0\) & \(853.91\) & \(\) & \(\) \\  & random & \(294.2\) & \(157.47\) & \(\) & \(\) & \(383.5\) & \(814.18\) & \(\) & \(\) \\   
+
+Table 3: Complete vs. _incomplete_ verification, showing average explanation _size_ (number of pixels) and generation _time_ (seconds). As in Table 2, \(\) is set to \(5\%\) for MNIST and \(0.5\%\) for GTSRB.

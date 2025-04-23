@@ -1,0 +1,159 @@
+# SceneDiffuser: Efficient and Controllable Driving Simulation Initialization and Rollout
+
+Chiyu Max Jiang  Yijing Bai  Andre Corman Christopher Davis  Xiukun Huang Hong Jeon  Sakhum Kulhrestha John Lambert Shuangyu Li Xuanyu Zhou
+
+Carlos Fuertes  Chang Yuan  Mingxing Tan  Yin Zhou  Dragomir Anguelov
+
+Equal contribution core technical contributors (alphabetically ordered).
+
+Waymo LLC
+
+###### Abstract
+
+Realistic and interactive scene simulation is a key prerequisite for autonomous vehicle (AV) development. In this work, we present SceneDiffuser, a scene-level diffusion prior designed for traffic simulation. It offers a unified framework that addresses two key stages of simulation: scene initialization, which involves generating initial traffic layouts, and scene rollout, which encompasses the closed-loop simulation of agent behaviors. While diffusion models have been proven effective in learning realistic and multimodal agent distributions, several challenges remain, including controllability, maintaining realism in closed-loop simulations, and ensuring inference efficiency. To address these issues, we introduce amortized diffusion for simulation. This novel diffusion denoising paradigm amortizes the computational cost of denoising over future simulation steps, significantly reducing the cost per rollout step (16x less inference steps) while also mitigating closed-loop errors. We further enhance controllability through the introduction of generalized hard constraints, a simple yet effective inference-time constraint mechanism, as well as language-based constrained scene generation via few-shot prompting of a large language model (LLM). Our investigations into model scaling reveal that increased computational resources significantly improve overall simulation realism. We demonstrate the effectiveness of our approach on the Waymo Open Sim Agents Challenge, achieving top open-loop performance and the best closed-loop performance among diffusion models.
+
+## 1 Introduction
+
+Simulation environments allow efficient and safe evaluation of autonomous driving systems [1; 8; 15; 22; 31; 32; 46; 50; 51; 52; 54]. Simulation involves initialization (determining starting conditions for agents) and rollout (simulating agent behavior over time), typically treated as separate problems . Inspired by diffusion models' success in generative media, such as video generation [2; 10] and video editing (inpainting [21; 24; 28], extension, uncropping etc.), we propose SceneDiffuser, a unified spatiotemporal diffusion model that addresses both initialization and rollout for autonomous driving, trained end-to-end on logged driving scenes. To our knowledge, SceneDiffuser is the first model to jointly enable scene generation, controllable editing, and efficient learned closed-loop rollout (Fig. 1).
+
+One challenge in simulation is evaluating long-tail safety-critical scenarios [1; 8; 22; 32; 46]. While data mining can help, such scenarios are often rare. We address this by learning a generative scene realism prior that allows editing logged scenes or generating diverse scenarios. Our model supports scene perturbation (modifying a scene while retaining similarity) and agent injection (adding agents to create challenging scenarios). We also enable synthetic scene generation on roadgraphs with realisticlayouts. We design a protocol for specifying scenario constraints, enabling scalable generation, and demonstrate how a few-shot prompted LLM can generate constraints from natural language.
+
+Given a scene, realistically simulating agents and AV behavior is challenging . Unlike motion prediction tasks  where entire future trajectories are jointly predicted in a single inference, simulator predictions are iteratively fed back into the model, requiring realism at each step. This poses challenges: distributional drift from compounding errors, high computational cost for models like diffusion, and the need to simulate various perception attributes realistically.
+
+We propose Amortized Diffusion for simulation rollout generation, a novel approach for amortizing the cost of the denoising inference over a span of physical steps that effectively addresses the challenges of simulation realism due to closed-loop drift and inference efficiency. Amortized diffusion iteratively carries over prior predictions and refines them over the course of future physical steps (see Sec. 3.2 and Fig. 4). This allows our model to produce stable, consistent, and realistic simulated trajectories, while requiring only a _single_ denoising function evaluation at each physical step while jointly simulating all perception attributes at each step. Experiments show that Amortized Diffusion not only requires 16x less model inferences per step, but is also significantly more realistic.
+
+In summary, SceneDiffuser's main contributions are:
+
+* A unified generative model for scene initialization and rollout, jointly learning distributions for agents, timesteps, and perception features including pose, size and type.
+* A novel amortized diffusion method for efficient and realistic rollout generation, significantly improving trajectory consistency and reducing closed-loop error.
+* Controllable scene initialization methods, including log perturbation, agent injection, and synthetic generation with a novel hard constraint framework and LLM.
+* Investigation of model scaling, showing increased compute effectively improves realism.
+* Demonstration of effectiveness on the Waymo Open Sim Agents Challenge, achieving top open-loop performance and the best closed-loop performance among diffusion models.
+
+Figure 1: SceneDiffuser: a generative prior for simulation initialization via log perturbation, agent injection, and synthetic scene generation, and for efficient closed-loop simulation at 10Hz via amortized diffusion. It progressively refines initial trajectories throughout the rollout. Environment sim agents are in green-blue gradient (temporal progression), AV agent in orange-yellow, and synthetic agents in red-purple.
+
+## 2 Related Work
+
+### Data-driven Agent Simulation
+
+A variety of generative models have been explored for scene initialization and simulation, including autoregressive models [8; 22; 46], cVAEs , cGANs , and Gaussian Mixture Models (GMMs) [8; 47]. For closed-loop rollouts, these models have been extended with GMMs , GANs , AR models over discrete motion vocabularies , cVAE , and deterministic policies [50; 52]. Open-loop rollouts have also been explored using cVAE .
+
+### Diffusion Models for Agent Simulation
+
+Open-loop SimOpen-loop simulation generates behavior for agents that all lie within one's control, i.e. does not receive any external inputs between steps. Open-loop simulation thus cannot respond to an external planner stack (AV), the evaluation of which is the purpose of simulation. Diffusion models have recently gained traction in multi-agent simulation, particularly in open-loop scenarios (multi-agent trajectory forecasting) [31; 39], using either single-shot or autoregressive (AR) generation. Single-shot approaches employ spatiotemporal transformers in ego-centric [6; 18] or scene-centric frames with motion/velocity deltas [9; 53]. Soft guidance techniques enhance controllability [17; 56]. DJINN  uses 2d condition masks for flexible generation.
+
+Closed-loop SimClosed-loop simulation with diffusion remains challenging due to compounding errors and efficiency concerns. Chang _et al._ explore route and collision avoidance guidance in closed-loop diffusion, while VBD  combines denoising and behavior prediction losses with a query-centric Transformer encoder . VBD found it computationally infeasible to replan at a 1Hz frequency in a receding horizon fashion over the full WOSAC test split due to the high diffusion inference cost, therefore testing in open-loop except over 500 selected scenarios.
+
+Initial Condition GenerationDiffusion-based initial condition generation has also been studied . Pronovost _et al._[32; 33] adapt the LDM framework to rendered scene images, while SLEDGE  and DriveSceneGen  diffuse initial lane polylines, agent box locations, and AV velocity.
+
+### Diffusion for Temporal World Modeling and Planning
+
+Outside of the autonomous driving domain, diffusion models have proven effective for world simulation through video and for planning. Various diffusion models for 4d data have been proposed, often involving spatiotemporal convolutions and attention mechanisms [11; 12; 43]. In robotics, diffusion-based temporal models leverage Model Predictive Control (MPC) for closed-loop control  and have shown state-of-the-art performance for imitation learning .
+
+Similar to our Amortized Diffusion approach, TEDi  proposes to entangle the physical timestep and diffusion steps for human animation, thereby reducing \(O(T)\) complexity for \(\) physical timesteps and \(T\) denoising steps to \(O()\). However, we are the first work to demonstrate the effectiveness of this approach for reducing closed-loop simulation errors, and the first to extend it to a multi-agent simulation setting.
+
+Figure 2: We formulate various different tasks, including behavior prediction, conditional scenegen and unconditional scenegen as inpainting tasks on the scene tensor. We represent the scene tensor as a normalized tensor \(x^{A D}\), for the number of agents, timesteps and feature dimensions.
+
+## 3 Method
+
+### Scene Diffusion Setup
+
+We denote the scene tensor as \(^{A D}\), where \(A\) is the number of agents jointly modeled in the scene, \(\) is the total number of modeled physical timesteps, and \(D\) is the dimensionality of all the features that are jointly modeled. We learn to predict the following attributes for each agent: positional coordinates \(x,y,z\), heading \(\), bounding box dimensions \(l,h,w\), and object type \(k\{\}\). We model all tasks considered in SceneDiffuser as multi-task inpainting on this scene tensor. Given an inpainting mask \(}^{A D}\), the corresponding inpainting context values \(}:=}\), a set of global context \(\) (such as roadgraph and traffic signals), and a validity mask for a given agent at a given timestep \(}^{A,}\) (to account for there being \(<A\) agents in the scene or for occlusion), we train a diffusion model to learn the conditional probability \(p(|)\), where \(:=\{},},,}\}\). See Fig. 2 for an illustration of the scene tensor.
+
+Feature NormalizationTo simplify the diffusion model's learning task, we normalize all feature channels before concatenating them along \(D\) to form the scene tensor. We first encode the entire scene in a scene-centric coordinate system, namely the AV's coordinate frame just before the simulation commences. We then scale \(x,y,z\) by fixed constants, \(l,h,w\) by their standard deviation, and one-hot encode \(k\). See Appendix A.6 for more details. This simple yet generalizable process allows us to jointly predict float, boolean, and even categorical attributes by converting into a normalized space of floats. After generating a scene tensor \(\), we apply a reverse process to obtain the generated features.
+
+Diffusion PreliminariesWe adopt the notation and setup for diffusion models from . The forward diffusion process gradually adds Gaussian noise to \(\). The noisy scene tensor at diffusion step \(t\) can be expressed as \((_{t}|)=(_{t}|_{t},_{ t}^{2})\), where \(_{t}\) and \(_{t}\) are parameters which control the magnitude and variances of the noise schedule under a variance-preserving model. Therefore \(_{t}=_{t}+_{t}_{t}\), where \(_{t}(0,)\). One major departure from the classic diffusion setup in our amortized diffusion regime is that we do not assume a uniform noise level \(t\) for the entire scene tensor \(\). Instead, we have \(t^{}\) where \(t\) can be relaxed to have a different value per physical timestep in the scene tensor as described in Sec. 3.2. We utilize the commonly used \(\)-cosine schedule where \(_{t}=( t/2)\) and \(_{t}=( t/2)\). At the highest noise level of \(t=1\), the forward diffusion process completely destroys the initial scene tensor \(\) resulting in \(_{t}=_{t}(0,)\). Assuming a Markovian transition process, we have the transition distributions \(q(_{t}|_{s})=(_{t}|_{ts}_{s},_ {ts}^{2})\), where \(_{ts}=_{t}/_{s}\) and \(_{ts}^{2}=_{t}^{2}-_{ts}^{2}_{s}^{2}\) and \(t>s\). In the denoising process, conditioned on a single datapoint \(\), the denoising process can be written as
+
+\[q(_{s}|_{t},)=(_{t}|_{t s}, _{t s}^{2}),\] (1)
+
+where \(_{t s}=_{s}^{2}}{_{t}^{2}}_{t}+ _{ts}^{2}}{_{t}^{2}}\) and \(_{t s}=^{2}_{s}^{2}}{_{t}^{2}}\). In the denoising process, \(\) is approximated using a learned denoiser \(}\). Following  and , we adopt the commonly used \(v\)_prediction_, defined as \(_{t}(_{t},)=_{t}_{t}-_{t} {x}\). We trained a model parameterized by \(\) to predict \(_{t}\) given \(_{t}\), \(t\) and context \(\): \(}_{t}:=}_{}(_{t},)\). The predicted \(}_{t}\) can be recovered via \(}_{t}=_{t}_{t}-_{t}}_{t}\). The model is end-to-end trained with a single loss:
+
+\[_{(,),t((0,1);),,_{t}(0,)}[||}_{ }(_{t},t,)-_{t}(_{t},)||_{2}^{ 2}],\] (2)
+
+Figure 3: SceneDiffuser architecture. Global scene context is encoded into a fixed number of \(N_{c}\) tokens via a Perceiver IO  encoder. The noisy scene tokens are fused with local and global context, then used to condition a spatiotemporal transformer-based backbone  via Adaptive LayerNorm (AdaLN) . Input/output tensor are in green, context tensors in blue, and ops in _italics_.
+
+\(=\{(_{i},_{i})|i=1,2,,||\}\) is the dataset containing paired agents and scene context data, \(t\) is probabilistically either sampled from a uniform distribution, or sampled as a monotonically increasing temporal schedule \(}\), where \(}_{}=0,(-_{})/_{}\) to facilitate amortized rollout which will be discussed in Sec. 3.2. Each is sampled with 50% probability. \(=\{}_{}}_{},}_{}}_{}\}\) is the set of inpainting masks for the varied tasks.
+
+**Scene Diffusion Tasks** Different tasks are formulated as inpainting problems (Fig. 2).
+
+_Scene Generation (SceneGen):_ Given the full trajectory of some agents, generate the full trajectory of other agents. We have \(}_{}^{A,1,1}\) (broadcastable to \(\) timesteps and \(D\) features), where \(}_{} Pr(X=A_{}/A_{})\), where \(A_{}(0,A_{})\) is the number of agents sampled to be selected as inpainting conditions out of \(A_{}\) valid agents in the scene.
+
+_Behavior Prediction (BP):_ Given past and current data for all agents, predict the future for all agents. We have \(}_{}^{1,,1}\) (broadcastable to \(A\) agents and \(D\) features), where \(}_{,}=(<_{history})\).
+
+_Conditional SceneGen and Behavior Prediction_: Both scenegen and behavior prediction masks are multiplied by a control mask at training time to enable controllable scenegen and controllable behavior prediction at inference time. We have \(}_{}^{A,,D}\), where \(}_{,(a,,d)}=I_{a} I_{} I_{d},I_{a}  Pr(X=A_{}/A_{}),I_{} Pr(X=_{ }/),I_{d} Pr(X=p_{d})\) where \(p_{d}\) of the corresponding feature channel. This allows us to condition on certain channels, such as positions \(x,y\) with or without specifying other features such as type and heading.
+
+**Architecture** We present a schematic for the SceneDiffuser architecture in Fig. 3, consisting of two end-to-end trained models: a global context encoder and a transformer denoiser backbone. Validity \(}\) is used as a transformer attention mask within the transformer denoiser backbone.
+
+**Diffusion Sampler** We use DPM++  with a Heun solver. We utilize 16 denoising steps for our one-shot experiments and for our amortized diffusion warmup process.
+
+### Scene Rollout
+
+Future prediction with no replanning ('One-Shot') is not used in simulation due to its non-reactivity, and forward scene inference, under the standard diffusion paradigm ('Full AR'), is computationally intensive due to the double for-loop over both physical rollout steps and denoising diffusion steps . Moreover, executing only the first step while discarding the remainder leads to inconsistent plans that result in compounding errors. We adopt an amortized autoregressive ('Amortized AR') rollout, aligning the diffusion steps with physical timesteps to amortize diffusion steps over physical time, requiring a single diffusion step at each simulation step while reusing previous plans.
+
+We illustrate the three algorithms in Algorithm 1-3 using the same model trained with a noise mixture \(t\{(0,1);}\) (Eqn. 2). We also illustrate Algorithm 3 in Fig. 4. We denote the total number of timesteps \(=H+F\), where \(H,F\) denote the number of past and future steps. We denote \(:=^{[-H:F]}\) to be the temporal slicing operator where \(^{}\) is the final history step.
+
+**Input:** Global context \(\) (roadgraph and traffic signals), history states \(^{[-H:0]}\), validity \(}\).
+
+**Output:** Simulated observations for unobserved futures \(}^{[1:F]}\).
+
+Figure 4: Amortized diffusion rollout procedure. The warm up step initializes the future predictions for the entire future horizon, which is then perturbed by a monotonic noise schedule \(\). The trajectory is iteratively denoised by one step at each simulation step.
+
+### Controllable Scene Generation
+
+To simulate long-tail scenarios such as rare behavior of other agents, it is important to effectively insert controls into the scene generation process. To do so, we input an inpainting context scene tensor \(}\), where some pixels are pre-filled. Through pre-filled feature values in \(}\), we can specify a particular agent of a specified type to be appear at a specific position at a specific timestamp.
+
+Data Augmentation via Log PerturbationThe diffusion framework makes it straightforward to produce additional perturbed examples of existing ground truth (log) scenes. Instead of starting from pure noise \(_{t}(0,)\) and diffusing backwards from \(t 0\), we take our original log scene \(^{}\) and add noise to it such that our initial \(_{t}=_{t}^{}+_{t}\) where \(_{t}(0,_{t})\). Starting the diffusion process at \(t=0\) yields the original data, while \(t=1\) produces purely synthetic data. For \(t(0,1)\), higher values increase diversity and decrease resemblance to the log. See Figs. 2 and 2 (Appendix).
+
+Language-based Few-shot Scene GenerationThe diffusion model inpaint constraints can be defined through structured data such as a Protocol Buffer3 ('proto'). Protos can be converted into inpainting values, and we leverage the off-the-shelf generalization capabilities of a publicly accessiblechat app powered by a large language model (LLM)4, to generate new Scene Diffusion constraints prots solely using natural language via few-shot prompt engineering. We show example results generated by the LLM in Fig. 10. Details in the Appendix (A.7).
+
+### Generalized Hard Constraints
+
+Users of simulation often require agents to have specific behaviors while maintaining realistic trajectories. However, diffusion soft constraints [27; 56; 57] require a differentiable cost for the constraint and do not guarantee constraint satisfaction. Diffusion hard constraints  are modeled as inpainting values and are limited in their expressivity.
+
+Inspired by dynamic thresholding  in the image generation domain, where intermediate images are dynamically clipped to a range at every denoising step, we introduce _generalized hard constraints_ (GHC), where a generalized clipping function is iteratively applied at each denoising step. We modify Eqn. 1 such that at each denoising step \(_{t s}=_{s}^{2}}{_{t}^{2}} +_{s}^{2}}{_{t}^{2}}( )\), where \(()\) denotes the GHC-specific clipping operator. See more details on constraints in Appendix A.9.
+
+We qualitatively demonstrate the effect of hard constraints for unconditional scene generation in Fig. 8. Applying hard constraints post-diffusion removes overlapping agents but results in unrealistic layouts, while applying the hard constraints after each diffusion step both removes the overlapping agents and takes advantage of the prior to improve the realism of the trajectories. We find that the basis on which the hard constraints operate is important: a good constraint will modify a significant fraction of the scene tensor (for example, shifting an agent's entire trajectory rather than just the overlapping waypoints), or else the model "rejects" the constraint on the next denoising step.
+
+## 4 Experimental Results
+
+**Dataset** We use the Waymo Open Motion Dataset (WOMD) for both our scene generation and agent simulation experiments. WOMD includes tracks of all agents and corresponding vectorized maps in each scenario, and offers a large quantity of high-fidelity object behaviors and shapes produced by a state-of-the-art offboard perception system.
+
+### Simulation Rollout
+
+**Benchmark** We evaluate our closed-loop simulation models on the Waymo Open Sim Agent Challenge (WOSAC)  metrics (see Appendix A.1), a popular sim agent benchmark used in many recent works [9; 14; 31; 51; 53]. Challenge submissions consist of x/y/z/\(\) trajectories representing centroid coordinates and heading of the objects' boxes that must be generated in closed-loop and
+
+Figure 8: Applying no-collision constraints prevents collisions (red-purple) in generated scenes (b, c). Iteratively applying constraints with every diffusion step further enhances realism (c vs b).
+
+with factorized AV vs. agent models. WOSAC uses the test data from the Waymo Open Motion Dataset (WOMD). Up to 128 agents (one of which must represent the AV) must be simulated in each scenario for the 8 second future (comprising 80 steps of simulation), producing 32 rollouts per scenario for evaluation. In a small departure from the official setting, we utilize the logged validity mask as input to our transformer and unify the AV and agents' rollout step for simplicity.
+
+**Evaluation**  In Tab. 2, we show results on WOSAC. We show that Amortized AR (10 Hz) not only requires 16x fewer model inference calls, but is also significantly more realistic than Full AR at a 10Hz replan rate. In Amortized AR, we re-use the plan from the previous step, leading to increased efficiency and consistency. The one-shot inference setting is equivalent to Full AR with no replanning (0.125 Hz) and achieves comparably higher realism, though as it is not executed in closed-loop, it is not reactive to external input in simulation, and thus not a valid WOSAC entry.
+
+In Figs. 5 and 7, we investigate the effects of varied replan rates to simulation realism. While high replan frequency leads to significant degredation in realism under the Full AR rollout paradigm, Amortized AR significantly reduces error accumulation while being \(16\) more efficient.
+
+In Tab. 4, we compare against the WOSAC leaderboard with the aforementioned modifications. We achieve top open-loop performance and the best closed-loop performance among diffusion models.
+
+### Scene Generation
+
+**Unconstrained Scene Generation**  We use the unconditional scene generation task as a means to quantitatively measure the distributional realism of our model. We condition the scene using the same logged road graph and traffic signals, as well as the logged agent validity to control for the same number of agents generated per scene. All agent attributes are generated by the model.
+
+Due to a lack of public benchmarks for this task, we adopt a slightly modified version of the WOSAC  metrics, where different metrics buckets are aggregated per-scene instead of per-agent, due to the lack of one-to-one correspondence between agents in the generated scene versus the logged scene (see Appendix A.2 for more details). Metrics are aggregated over all agents that are ever valid in the 9 second trajectory.
+
+We show our model's realism metrics in Tab. 1. Even compared to the oracle performance (comparing logged versus logged distributions), our model achieves comparable realism scores in every realism bucket. Introducing hard constraints on collisions can significantly improve the composite metric by preventing collisions, while scaling the model without hard constraints improves most realism metrics as the model learns to generate more realistic trajectories. The realism metrics only apply to trajectories and do not account for generated agent type and size distributions. We compare the generated size distributions versus log distributions in Fig. 10 and find the marginal and joint distributions both closely track the logged distribution. We show more examples of diverse, unconstrained scene generation when conditioning on the same global context in Appendix A.8 Fig. 13.
+
+Constrained Scene Generation and AugmentationThe controllability we possess in the scene generation process as a product of our diffusion model design can be useful for targeted generation and augmentation of scenes. In Fig. 10, we show qualitative results of scenes with constrained agents generated either via manually defined configs or by a few-shot prompted LLM. Extended qualitative results are listed in Appendix A.7.3.
+
+### Model Design Analysis and Ablation Studies
+
+Scaling AnalysisGiven two options of scaling model compute, either by increasing transformer temporal resolution by decreasing temporal patch sizes, or increasing the number of model parameters, we investigate the performance of multiple transformer backbones: {Model Size} \(\) {Temporal Patch Size} = {L, M, S} \(\) {8, 4, 2, 1}. We vary model size by jointly scaling the number of transformer layers, hidden dimensions, and attention heads (see Sec. A.6 of Appendix for details). We show quantitative results from this model scaling in Fig. 6 and qualitative comparisons in Fig. 11. Increasing both temporal resolution and number of model parameters improves realism of the simulation.
+
+Multi-task CompatibilityWe find that multitask co-training across BP, SceneGen and with random control masks improves performance compared to a single-task, BP only model on the sim agent rollout task, notably reducing collision and offroad rates. We find that jointly learning multiple agent features (\(x,y,z,\), size, type) achieves on-par performance with a pose-only (\(x,y,z,\)) model.
+
+    &  &  &  &  &  &  &  &  \\  &  &  &  &  &  &  &  &  &  &  \\   & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\  & (M/S) & (7) & (1) & (7) & (1) & (1) & (1) & (1) & (1) & (1) & (1) & (1) & (1) & (1) \\   & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\  & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\   & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\  & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\  & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\   & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\  & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\   & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\  & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\  & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\   & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** \\  & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSE** & **RMSEModel Architecture AblationAs shown in Tab. 3, replacing AdaLN-Zero conditioning with cross attention leads to a 7.99% decrease in realism performance, largely due to significantly higher collision rates and offroad rates. Removing the agent-wise spatial attention layer very significantly increases collision rate, as it removes the mechanism for agents to learn a joint distribution.
+
+## 5 Conclusion
+
+We have introduced SceneDiffuser, a scene-level diffusion prior designed for traffic simulation. SceneDiffuser combines scene initialization with scene rollout to provide a diffusion-based approach to closed-loop agent simulation that is efficient (through amortized autoregression) and controllable (through generalized hard constraints). We performed scaling and ablation studies and demonstrated model improvements with computational resources. On WOSAC, we demonstrate competitive results with the leaderboard and state-of-the-art performance among diffusion methods.
+
+LimitationsWhile our amortized diffusion approach is, to our knowledge, the only and best performing closed-loop diffusion-based agent model with competitive performance, we do not exceed current SOTA performance for other autoregressive models. We do not explicitly model validity masks and resort to logged validity in this work. Future work looks to also model the validity mask.
+
+Broader ImpactThis paper aims to improve AV technologies. With our work we aim to make AVs safer by providing more realistic and controllable simulations. The generative scene modeling techniques developed in this work could have broader social implications regarding generative media and content generation, which poses known social benefits as well as risks of misinformation.

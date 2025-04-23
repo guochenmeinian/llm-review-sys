@@ -1,0 +1,163 @@
+# WorldCoder, a Model-Based LLM Agent:
+
+Building World Models by Writing Code and
+
+Interacting with the Environment
+
+ Hao Tang
+
+Cornell University
+
+haotang@cs.cornell.edu &Darren Key
+
+Cornell University
+
+dyk34@cornell.edu &Kevin Ellis
+
+Cornell University
+
+kellis@cornell.edu
+
+###### Abstract
+
+We give a model-based agent that builds a Python program representing its knowledge of the world based on its interactions with the environment. The world model tries to explain its interactions, while also being optimistic about what reward it can achieve. We define this optimism as a logical constraint between a program and a planner. We study our agent on gridworlds, and on task planning, finding our approach is more sample-efficient compared to deep RL, more compute-efficient compared to ReAct-style agents, and that it can transfer its knowledge across environments by editing its code.
+
+## 1 Introduction
+
+Consider yourself learning to use a new device or play a new game. Given the right prior knowledge, together with relatively few interactions, most people can acquire basic knowledge of how many devices or games work. This knowledge can help achieve novel goals, can be transferred to similar devices or games, and can be communicated symbolically to other humans. How could an AI system similarly acquire, transfer, and communicate its knowledge of how things work? We cast this as learning a world model: a mapping, called the _transition function_, that predicts the next state of affairs, given a current state and action . Our proposed solution is an architecture that synthesizes a Python program to model its past experiences with the world, effectively learning the transition function, and which takes actions by planning using that world model.
+
+In theory, world models have many advantages: they allow reasoning in radically new situations by spending more time planning different actions, and accomplishing novel goals by just changing the reward function. Representing world knowledge as code, and generating it from LLMs, brings other advantages. It allows prior world knowledge embedded in the LLM to inform code generation, allows sample-efficient transfer across tasks by reusing pieces of old programs, and allows auditing the system's knowledge, because programming languages are designed to be human-interpretable.
+
+But there are also steep engineering challenges. Learning the world model now requires a combinatorial search over programs to find a transition function that explains the agent's past experiences. Obtaining those experiences in the first place requires efficient exploration, which is difficult in long horizon tasks with sparse reward. To address the challenge of efficient exploration, we introduce a new learning objective that prefers world models which a planner thinks lead to rewarding states, particularly when the agent is uncertain as to where the rewards are. To address the program search problem, we show how curriculum learning can allow transfer of knowledge across environments, making combinatorial program synthesis more tractable by reusing successful pieces of old programs.
+
+Fig. 1 diagrams the resulting architecture, which we cast as model-based reinforcement learning (MB RL). In Fig. 2 we position this work relative to deep RL as well as LLM agents. In contrast to deepRL [55, i.a.], we view the world model as something that should be rapidly learnable and transferable. Central to our work is a particular claim about how an LLM should relate to world models. In our setup, the LLM does not simulate the world, but instead _builds_ a simulation of the world. This should be contrasted with LLM agents such as ReAct  where the LLM plays the role of a world model by reasoning about different actions and their consequences. We also do not expect the LLM to perform planning, which they are known to struggle with . Instead, we require the LLM to possess fuzzy prior knowledge of how the world _might_ be, together with the programming skill to code and debug a transition function. Our use of LLMs is closest to , which generate planning productions, which can be seen as a particular kind of world model. Overall though, our problem statement is closer to , which learn world models in domain-specific programming languages. We further show how to use Turing-complete languages like Python--which we believe important for general-purpose learners--and we also study efficient transfer learning and exploration strategies.
+
+We make the following three contributions:
+
+1. An architecture, which we call WorldCoder, for learning world models as code. The architecture supports learning that is more transferable, interpretable, and dramatically more sample-efficient compared to deep RL, and also more compute-efficient than prior LLM agents.
+2. A new learning objective for program-structured world models that favors _optimism in the face of (world model) uncertainty_ (Section 2.2). We show theoretically and empirically that this learning objective generates goal-driven exploratory behavior, which can reduce by orders of magnitude the number of environment interactions needed to obtain reward
+3. An analysis of different forms of transfer of world models, finding that code can be quickly adapted to new world dynamics within grid-world and robot task planning domains.
+
+## 2 Methods
+
+### Problem statement and core representations
+
+We start with the standard MDP formalism but modify it in three important ways. First, we assume a goal is given in natural language. The goal could be something specific such as "pickup the ball", or underspecified, such as "maximize reward." Second, we restrict ourselves to deterministic environments, and assume that environment dynamics are fixed across goals. Third, we assume an episodic MDP with the current episode terminating upon reaching the goal.
+
+Figure 1: Overall agent architecture. The agent also inputs a goal in natural language
+
+Figure 2: Qualitative comparison of our method against deep model-based RL and LLM agents (ReAct, RAP, etc: Yao et al. , Hao et al. , Zhao et al. , Liu et al. ). Sample complexity refers to the number of environment interactions needed to learn a world model (“LLM agents do not update their world model). LLM calls/task is the number of LLM calls needed to solve a new task in a fixed environment, amortized over many such tasks, as a function of the maximum episode length \(T\). Asymptotically, after learning a world model, our method can accomplish new tasks by only at most one LLM query to update the reward function.
+
+We formalize this as a Contextual Markov Decision Process (CMDP: Hallak et al. ), which is a tuple \((C,S,A,M)\) where \(C\) is a set of contexts (i.e. goals), \(S\) is a set of states, \(A\) is a set of actions, and \(M\) is a function mapping a context \(c C\) to a Markov Decision Process (MDP). The context-conditioned MDP, \(M(c)\), is a tuple \((S,A,T,R^{c},)\) with transition function \(T:S A S\), discount factor \(\), and reward function \(R^{c}:S A S\). The transition function does not depend on the context. The objective is to select actions to maximize cumulative discounted future reward, which is given by \(_{t=0}^{}^{t}r_{t}\), where \(r_{t}\) is the reward received \(t\) timesteps into the future. Termination is modeled by assuming there is a special absorbing state.
+
+**State representation.** Motivated by robot task planning [20; 59; 57] we represent states as sets of objects, each with a string-valued field name, fields x and y for its position, and additional fields depending on the object type. For example, if name="door", then there are two Boolean fields for if the door is open/closed and locked/unlocked. This can be seen as an Object Oriented MDP .
+
+**Representing world models as code.** The agent uses Python code to model the transition and reward functions. Mathematically we think of this Python code as a tuple \((,)\) of a transition function \(:S A S\) and a reward model \(:C(S A S\{0,1\})\). Note again that the reward depends on the context, and returns an extra Boolean indicating whether the goal has been reached, in which case the current episode terminates. Both functions are implemented as separate Python subroutines, which encourages disentangling the dynamics from the reward.
+
+### The world model learning problem
+
+What objectives and constraints should the world model satisfy? Clearly, the learned world model should explain the observed data by correctly predicting the observed state transitions and rewards. This is a standard training objective within model-based RL .
+
+One less obvious learning objective is that _the world model should suffice to plan to the goal_. Given two world models, both consistent with the observed data, the agent should prefer a model which implies it is possible to get positive reward, effectively being optimistic in the face of uncertainty about world dynamics. Assuming the low-data regime, there will be multiple world models consistent with the data: preferring an optimistic one guarantees that the agent can at least start making progress toward the goal, even if it later has to update its beliefs because they turned out to be too optimistic.
+
+Concretely, the agent collects a dataset \(\) of past environment interactions, each formatted as a tuple \((s,a,r,s^{},c,d)\) of current state \(s\), next state \(s^{}\), action \(a\), and reward \(r\) in context \(c\) with \(d\) indicating if the episode ended upon reaching \(s^{}\). (The variable \(d\) should be read as "done.") The agent also stores the initial state \(s_{0}\) and context \(c\) of each episode, so that it can prefer world models that can reach the goal from an initial state. The learning problem is to construct Python programs implementing a transition function \(\) and reward model \(\) satisfying constraints \(_{1}\) and \(_{2}\), defined below:
+
+\[} _{1}(,,)=(s,a, r,s^{},c,d):(,)(s,a,r,s^{},c,d)\] (1) \[(,)(s,a,r,s^{},c,d) (s,a)=s^{}(c)(s,a,s^{})=(r,d)\] \[} _{2}(s_{0},c,,)= a_{1},s _{1},a_{2},s_{2},...,a_{},s_{}\] (2) \[ i[]:(s_{i-1},a_{i})=s_{i} r >0:(c)(s_{-1},a_{},s_{})=(r,1)\]
+
+where \(s_{0},c\) is the initial state/context of the episode, and the turnstile (\(\)-) should be read as meaning that a given program entails a given logical constraint or predicts a given replayed experience.
+
+Constructing a world model satisfying \(_{1}_{2}\) is a program synthesis problem. We solve it by prompting an LLM with a random subset of \(\) and asking it to propose a candidate program. If the resulting program does not fit all the data, the LLM is backprompted with members of \(\) inconsistent with its latest program, and asked to debug its code, following [7; 47]. Sec. 2.5 details this process.
+
+### Understanding optimism under uncertainty
+
+Optimism under uncertainty is a pervasive principle throughout learned decision-making , including model-based RL [75; 40]. We contribute a new instantiation of that principle as a logical constraint between a program and a planner, and which we show can be made compatible with 
+
+[MISSING_PAGE_FAIL:4]
+
+### Overall architecture
+
+Ultimately our world models exist to serve downstream decision-making: and in turn, taking actions serves to provide data for learning better world models. There are many architectures for combining acting with world-model learning, such as via planning , training policies in simulation , or hybrid approaches . We use the architecture shown in Algorithm 1. At a high level, it initially performs random exploration to initialize a dataset of environmental interactions; it updates its world model using the program synthesis algorithm of Sec. 2.5; and, past its initial exploration phase, performs planning. Different planners are possible, and we use depth-limited value iteration (in simple domains) and MCTS (for more complex domains).
+
+``` Hyperparam:\(\), random exploration probability (default to \(5\%\)) Hyperparam:MinDataSize, min # actions before learning begins (default to 10) \(,_{sc},\)\(\) replay buffer. \(_{sc}\) holds initial states and contexts needed for \(_{2}\)\(,\)null, null loop forever through episodes:\(\) init empty world model \(c\)EpisodeGoal()\(\) get context (goal) \(s_{0}\)CurrentState()\(\) record initial state \(_{sc}_{sc}\{(s_{0},c)\}\)\(\) Replay buffer of initial conditions for \(_{2}\) loop until episode ends:\(s\)CurrentState() ifnot\(_{1}_{2}\)and\(||\)MinDataSize then \(,\)Synthesize(\(,,,_{sc}\))\(\) Section 2.5 with probability \(\)do \(a\)RandomAction()\(\)\(\)-greedy explore else \(a\)Plan(\(s,,(c)\))\(\) Value Iteration \(s^{},r,d\)Env.Step(\(a\))\(\) take action in state \(s\)\(\{(s,a,r,s^{},c,d)\}\)\(\) record experience ```
+
+**Algorithm 1** WorldCoder Agent Architecture
+
+### Program Synthesis via Refinement
+
+One approach to program synthesis is to have an LLM iteratively improve and debug its initial outputs [7; 47], which we call _refinement_. For world models as programs, this means prompting the LLM with an erroneous program it previously generated, together with state-action transitions that program cannot explain, and prompting it to fix its code. This process repeats until the program satisfies \(_{1}_{2}\). Refinement can be very successful when the target program has many corner-cases, each of which can be inferred from a few examples, because the LLM can incrementally grow the program driven by each failed test case. This is exactly the case for world models, which might need to handle a wide range of objects and their interactions, but typically don't demand intricate algorithms. Refinement also allows computationally efficient transfer between environments, because a new world model can be built by refining an old one, instead of programming it from scratch.
+
+We use a concurrently developed algorithm called REx to determine which program to refine next . REx prioritizes refining programs that appear more promising, which in the context of world model learning, we instantiate by defining by a heuristic \(h\), which measures progress towards satisfying \(_{1}_{2}\):
+
+\[h(,)=}[ x ]+[_{1}(,,)] _{s_{0},c_{sc}}[[_{2}(s_{0},c, ,)]]}{||+|_{sc}|}\] (3)
+
+The above heuristic computes the fraction of the replay buffer which is consistent with \(_{1}\), and the fraction which is consistent with \(_{2}\). (We incentivize satisfying \(_{1}\) first by multiplying the average accuracy on the optimism objective by the indicator \([_{1}(,,)]\).) REx also prioritizes refining programs that have not been refined very many times, and uses a bandit formulation to balance (1) exploring programs that have not been refined very many times against (2) exploiting by refining programs that are better according to \(h\). See  for more details.
+
+We implement this refinement process using GPT-4 because recent work  finds it is the strongest model for repairing and improving code (as opposed to just generating code from scratch). Using this technique and this LLM we can generate world models with 250+ lines of code.
+
+## 3 Experimental Results
+
+We study our system in three environments, Sokoban, Minigid, and AlfWorld, with the goal of understanding the sample efficiency and computational efficiency of the learner, especially when transferring knowledge across environments, as well as the impact of optimism under uncertainty.
+
+**Sokoban** is a puzzle-solving task where the agent pushes boxes around a 2d world, with the goal of pushing every box onto a target (Fig. 3A). Solving hard Sokoban levels is a challenging planning task that has received recent attention from the planning and RL communities [10; 11; 37; 19; 18; 54]. Unlike these other works, our emphasis is not on solving the hardest Sokoban levels. Instead, we wish to show that our agent can rapidly achieve basic competence. Master-level play could then be achieved via any of the cited works that focus on sophisticated planning and search.
+
+Starting with only the natural-language goal of "win the game", our agent builds a world model over the first 50 actions. The resulting code is human-understandable (Appendix D), and generalizes to solving levels with more boxes (Fig. 3B). While the system cannot solve very hard Sokoban levels (eg, 5+ boxes), that is an artifact of the difficulty of planning, and could be addressed by plugging the world model into any of the techniques cited above. In contrast to this work, both model-based and model-free deep RL require millions of experiences to solve basic levels (Fig. 3D).
+
+Almost surely, an important reason why our system learns quickly is because the underlying LLM already knows about Sokoban from its pretraining data, and can quickly infer that it is playing a similar game. However, simply knowing about Sokoban does _not_ suffice for the LLM to play the game, as demonstrated by the poor performance of ReAct (Fig. 3B). ReAct is a baseline which prompts the LLM with the state-action history, then asks it to think step-by-step (Reason) and before predicting an action (Act). Quantitatively, ReAct succeeds on only \(15\% 8\%\) of basic levels, showing that pretrained knowledge of Sokoban does not, by itself, allow strong play. ReAct-style architectures [29; 78; 41; i.a.], also require expensive LLM calls _at every action_, and so asymptotically their cost grows linearly with the number of actions taken. Our approach has different asymptotics:
+
+Figure 3: (A) Sokoban domain (per-step reward of -0.1 elided from figure). (B) Learning curves. ReAct has the same pretrained knowledge of Sokoban but cannot effectively play the game. (C) Our method has different asymptotic LLM cost compared to prior LLM agents, which consume LLM calls/tokens at every action. (D) Deep RL takes >1 million steps to learn 2-box Sokoban. (E) Nonstandard Sokoban with teleport gates
+
+after front-loading 400k LLM tokens (about $15), it can issue as many actions as needed without subsequent LLM queries (Fig. 3C).
+
+To further demonstrate that pretrained knowledge of Sokoban cannot explain the success of our system, we modify the game to include extra rules by adding a pair of warp gates/teleportation portals to each level which the agent can use to instantly transport itself (Fig. 3E). The teleportation portals have subtle dynamics, because they become deactivated whenever they are blocked by a Sokoban box. Our agent continues to be able to learn in this environment, including modeling the blocking behavior of the teleportation gates, and learns to use the teleporters to more rapidly solve levels.
+
+On Sokoban, the optimism under uncertainty objective (\(_{2}\), orange curves in Fig. 3B) has little effect: Sokoban has a dense reward structure that allows easy learning through random exploration. Next we consider problems with sparse rewards and natural language instructions, which the optimism objective is designed to handle.
+
+**Minigrid.** To better understand the transfer learning and instruction following aspects of our approach, we next study Minigrid [9; 8], a suite of grid games designed for language-conditioned RL. Minigrid environments include objects such as keys, doors, walls, balls, and boxes.
+
+Fig. 4 illustrates results for our agent playing a sequence of minigrid environments, while Appendix A.1 gives a walk-through of an example learning trajectory. The agent interacts with each environment episodically through different randomly-generated levels. We order the environments into a curriculum designed to illustrate different forms of transfer learning. For example, when transferring from the first to the second environment, the agent needs to extend its knowledge to incorporate new objects and their associated dynamics (keys and doors). Learning about these new objects requires extra environment interactions, during which the agent experiments with the objects to update its transition function. In contrast, the third environment presents no new dynamics, but instead introduces new natural-language goals. Our agent can follow these natural-language instructions by enforcing optimism under uncertainty (\(_{2}\)).
+
+Transfer is especially helpful in quickly solving new environments (Fig. 4B). Without transfer, more episodes of exploration are needed to collect experience to build a good world model. However, optimism under uncertainty (\(_{2}\)) helps in non-transfer setting by promoting goal-directed exploration, and in fact, absent transfer, it is only with \(_{2}\) that WorldCoder can solve the harder environments. Optimism is also necessary for zero-shot generalization to new goals (Fig. 4B, env 3).
+
+To better understand the importance of \(_{2}\)--which both encourages exploration and enables natural-language instruction following--we contrast against a version of our approach which simply prompts GPT4 to generate a new reward function upon receiving a new goal (green in Fig. 4B, labelled 'prompt4reward'). Theoretically this suffices to follow new natural-language instructions, provided
+
+Figure 4: (A) Minigrid environments ordered into a curriculum that tests different kinds of transfer learning. (B) Transfer learning performance, compared with (C) performance when solving each environment independently. Appendix Fig. 6: deep RL comparison.
+
+the LLM is reliable. Surprisingly, this ablation struggles to follow new instructions (e.g., transfer from env 2\(\)3 in Fig. 4A), showing the importance of \(_{2}\) in correcting mistakes made by the LLM when generating reward functions.
+
+AlfWorld.To test the scalability of our method we work with the AlfWorld robot task planning domain. This is a household robot planning environment with a variety of different kinds of objects, such as microwaves, cabinets, utensils, food, and different rooms the robot can navigate. We convert AlfWorld into a MDP by representing the state as a set of fluents (in the style of PDDL ), and study our agent as it progresses through representative AlfWorld tasks.
+
+In Fig. 5 we find that our method learns models of picking up and placing objects, and then improves its model by learning how to use cooking appliances such as refrigerators and stoves. This stresses the scalability of the exploration and program synthesis methods: We find that we can synthesize a world model containing 250+ lines of code, which serves as an adequate model of how AlfWorld works (Appendix E), and that the optimism under uncertainty objective is necessary for nonzero performance on all of these tasks. Typically the agent solves the task in the first episode, but requires around 20 exploratory steps to get reward, with subsequent episodes serving to make small corrections to the world model. Fig. 5 indicates with arrows the episodes where these small corrections occur.
+
+These tasks have relatively long horizons, so we use a more sophisticated planner based on MCTS. Because these tasks also have sparse rewards, we engineer a domain-general partial reward function that incentivizes actions and states which have more textual overlap with the natural-language goal, based on established document retrieval metrics (BM25 , Appendix B). This shows that our framework can interoperate with different kinds of planners.
+
+## 4 Related Work
+
+**World models.** World modeling is a classic paradigm for decision-making: It is the basis of model-based RL [27; 26], task-and-motion-planning in robotics , and it is corroborated by classic behavioral experiments suggesting biological decision-making features a similar architecture . In practice, world models are hard-won, requiring either large volumes of training data [26; 25], or careful hand-engineering  (cf. Mao et al. , Konidaris et al. ).
+
+**Neurosymbolic world models,** such as Cosmos and NPS [56; 22], learn a factored, object-based neural world model. This factoring helps compositional generalization--like in our work--but importantly they can learn from raw perception, but at the expense of transfer and sample complexity. Combining our work with these others might be able to get the best of both.
+
+Figure 5: AlfWorld environments and tasks. Each learning curve shows average reward at each episode (solid line) and how many steps the episode took (dashed), averaged over 3 seeds. Curves annotated with arrows and text explaining what was learned at each episode. Optimism objective is necessary for any non-zero performance.
+
+**LLMs as a world model.** Whether LLMs can model the world is an open question, but there is evidence that, given the right training data in large quantities, transformers can act as decent world models, at least within certain situations [38; 76; 45]. These works aim to learn a rich but frozen world model from a relatively large volume of examples. We tackle a different problem: building a simple world model on-the-fly from a modest amount of data.
+
+**LLMs for building world models.** Recent works [79; 74; 24] consider using LLMs to generate planning operators: a kind of world model that as abstract, symbolic, and expressed in a domain-specific programming language for planning (cf. DECKARD , another LLM system which generates state-machine world models). In these works, the primary driver of world-model generation--what the LLM first inputs--is natural language describing affordances and goals. Our work considers a different problem: building world models from first-and-foremost from interacting with the environment. In practice, agents have knowledge both from language and from acting in the world, and so these families of works should be complementary.
+
+**LLMs for decision-making** is an emerging paradigm that includes ReAct  and many others [29; 78; 41; 1, i.a.], which directly use LLMs to issue actions and reason about their consequences in the world. For instance, ReAct works by prompting the LLM to think step-by-step and then predict an action. To the extent that these methods use a world model, it is implicitly encoded within the weights of a neural network. We instead build an explicit world model.
+
+**Programs as Policies.** Instead of learning a world model, one can learn a policy as a program. The first wave of these works [69; 70] considered domain-specific languages, while recent LLM work [73; 39; 61] uses more flexible general-purpose languages like Python. An advantage of learning a policy is that it does not need to model all the details of the world, many of which may be irrelevant to decision making. A disadvantage is that policies cannot readily generalize to new goals--unlike world models, which can be used by a planner to achieve a variety of objectives. Relatedly, other recent work considers synthesizing programs that implement reward functions , and then generating a policy with conventional deep RL.
+
+**Programs as world models.** We are strongly inspired by existing program synthesis algorithms for constructing world models from state-action trajectories [13; 17; 67]. We believe that this family of methods will not be generally applicable until they can support general-purpose Turing-complete programming languages: So far these works have used restricted domain-specific languages, but we show that a general-purpose computational language, like Python, can be used to learn world models, which we hope expands the scope of this paradigm. We also show how to bias learning toward goal-directed behaviors, and how to support transfer across environments and goals. Last, we simplify the core program synthesis algorithm: the cited prior works required relatively intricate synthesis algorithms, which we can avoid by using LLMs as general-purpose synthesizers. We hope our work can help make this paradigm simpler and more general.
+
+Other works have also explored how humans can manually provide knowledge to RL agents via source code: e.g., RLLLang  uses programs to specify parts of policies and world models, which could be combined with our system to integrate prior knowledge.
+
+**Exploration & Optimism in the face of (model) uncertainty.** Being optimistic about actions with uncertain consequences is common in decision-making, including in model-based RL [63; 40; 75; 3; 60; 31]. We mathematically instantiate that principle in a new way--as a logical constraint between a program and a planner--and show how it can work with LLM-guided discrete program search.
+
+## 5 Limitations and Open Directions
+
+Our work has important limitations, and naturally suggests next steps. Currently we assume deterministic dynamics, which could be addressed by synthesizing probabilistic programs [14; 21]. Given recent advances in synthesizing probabilistic programs , together with advances in using LLMs for deterministic code, this limitation seems nontrivial but surmountable.
+
+By representing knowledge as code, our approach delivers better sample efficiency and transferability, but at high cost: Our states must be symbolic and discrete, whereas the real world is messy and continuous. While the obvious response is that the agent can be equipped with pretrained object detectors--a common assumption in robotic task planning [36, i.a.]--alternative routes includemultimodal models  and using neurosymbolic programs [6; 56; 64] to bridge the gap between perception and symbol processing, which might be more robust to missing or misspecified symbols.
+
+Last, our method uses only a very basic mechanism for growing and transferring its knowledge. Instead of prompting to debug its code, we could have built a library of reusable subroutines and classes shared across different environments and goals, reminiscent of library learning systems [16; 72; 23; 4], which refactor their code to expose sharable components. Further developing that and other ways of managing and growing symbolic knowledge about the world remains a prime target for future work.
+
+Acknowledgements.This work was supported by NSF grant #2310350 and a gift from Cisco.

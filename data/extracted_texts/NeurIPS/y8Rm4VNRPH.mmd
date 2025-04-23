@@ -1,0 +1,214 @@
+# Parallelizing Linear Transformers with the Delta Rule over Sequence Length
+
+Songlin Yang\({}^{}\)  Bailin Wang\({}^{}\)  Yu Zhang\({}^{}\)  Yikang Shen\({}^{}\)  Yoon Kim\({}^{}\)
+
+\({}^{}\)Massachusetts Institute of Technology \({}^{}\)Soochow University \({}^{}\)MIT-IBM Watson AI Lab
+
+yangsl66@mit.edu
+
+###### Abstract
+
+Transformers with linear attention (i.e., linear transformers) and state-space models have recently been suggested as a viable linear-time alternative to transformers with softmax attention. However, these models still underperform transformers especially on tasks that require in-context retrieval. While more expressive variants of linear transformers which replace the additive update in linear transformers with the delta rule  have been found to be more effective at associative recall, existing algorithms for training such models do not parallelize over sequence length and are thus inefficient to train on modern hardware. This work describes a hardware-efficient algorithm for training linear transformers with the delta rule, which exploits a memory-efficient representation for computing products of Householder matrices . This algorithm allows us to scale up DeltaNet to standard language modeling settings. We train a 1.3B model for 100B tokens and find that it outperforms recent linear-time baselines such as Mamba  and GLA  in terms of perplexity and zero-shot performance on downstream tasks. We also experiment with two hybrid models which combine DeltaNet layers with (1) sliding-window attention layers every other layer or (2) two global attention layers, and find that these hybrids outperform strong transformer baselines.
+
+## 1 Introduction
+
+The attention mechanism  has been shown to be an important primitive for accurate sequence modeling. Attention is moreover efficient during training as it is rich in matrix multiplications and can thus take advantage of highly parallel processing capabilities and specialized accelerators on modern GPUs. However, the complexity of attention is quadratic in sequence length, and hence it is a fundamentally expensive primitive. And while recent techniques have made it possible to scale attention to longer sequences through hardware-aware restructuring of the intermediate computations , these methods still require storing the key/value vectors of previous elements, and this "KV cache" (whose size grows linearly) can be unwieldy to manage for long sequences.
+
+Linear attention transformers  replace the exponential kernel in softmax attention with a dot-product over (possibly transformed) key and query vectors. This makes it possible to formulate linear attention as a linear RNN with matrix-valued hidden states, thus obviating the need for a KV cache and enabling constant-memory inference. While initial variants of linear attention generally underperformed softmax attention on language modeling, gated variants of linear attention which incorporate a data-dependent gating factor have recently been shown to be competitive against strong transformer baselines . These gated linear transformers, along with time-varying state space models such as Mamba  (which can be reparameterized as a gated linear transformer ), have been suggested as a potential alternative to ordinary transformers. However, despitethe competitive language modeling performance, these models have been shown to underperform transformers on recall-intensive tasks [6; 7], which is important for many practical downstream tasks of interest (e.g., in retrieval-augmented generation ).
+
+To enhance associative recall over long contexts, Schlag et al.  propose DeltaNet, a variant of a linear transformer which uses a delta rule-like update  to retrieve and update a value vector that is associated with the current key. DeltaNet was found to be effective on synthetic tasks and small scale language modeling/machine translation. However, the original work used a sequential algorithm that did not parallelize across sequence length, thus resulting in hardware-inefficient training, and it has not been clear how to scale DeltaNet to larger models and datasets.
+
+This work describes a hardware-efficient training algorithm for DeltaNets which parallelizes the forward/backward passes across sequence length. We reparameterize the DeltaNet as a matrix-valued RNN whose recurrence is given by a generalized Householder transformation. This reparameterization enables the use of the compact WY representation  for products of Householder matrices, eliminating the need to materialize the hidden states of matrix size at each time step during parallel training, which would otherwise result in high I/O costs. The memory-efficient representation makes it possible to straightforwardly extend the chunkwise parallel strategy for training linear attention models [34; 108; 124] to the DeltaNet case. We scale DeltaNets to moderate-scale language modeling benchmarks (1.3B models trained on 100B tokens), where DeltaNet is found to obtain better language modeling and zero-shot downstream task performance than strong linear recurrent models such as Mamba  and GLA . For in-context retrieval and learning evaluation, we evaluate DeltaNet on synthetic and real benchmarks [4; 2; 84; 6], where it is again found to perform well against linear recurrent baselines. Finally, we experiment with a hybrid approach where we combine DeltaNet layers with sliding attention layers or global attention layers, and find that these hybrid models can improve upon ordinary transformers, as well as the pure DeltaNet transformer.
+
+## 2 Background
+
+### Linear Transformer: Transformers with Linear Attention
+
+Given a sequence of \(d\)-dimensional input vectors \(_{1},,_{L}\), transformers use the softmax attention mechanism to attend over the entire past,
+
+\[_{t},\ _{t},\ _{t}=_{Q}_{t},_{K}_{t},_{V}_{t}, _{t}=_{i=1}^{t}_{i}^{}_{t})}{ _{j=1}^{t}(_{j}^{}_{t})}_{i},\]
+
+where \(_{Q},_{K},_{V}^{d d},_{t},_{t },_{t},_{t}^{d}\). (Here we assume a single attention head for simplicity). Linear attention  replaces the exponential kernel \((_{i}^{}_{t})\) with the dot-product \((_{i})^{}(_{t})\) where \(:^{d}^{n}\) is a feature map. This makes it possible to rearrange computations to represent linear attention as a linear RNN with matrix-valued hidden states,
+
+\[_{t}=_{i=1}^{t}_{i})^{}(_{t})}{_ {j=1}^{t}(_{j})^{}(_{t})}_{i}=^{t}_{i}(_{i})^{})(_{t})}{(_{j=1}^{t} (_{j})^{})(_{t})}=_{t}(_{t})}{_{t}^{}(_{t})},\]
+
+where \(_{t}=_{i=1}^{t}_{i}(_{i})^{}^{d  n}\) and \(_{t}=_{i=1}^{t}(_{i})^{n}\). If we allow \(n\) to go to infinity, linear attention can use feature maps associated with polynomial kernels to compute a polynomial approximation to the exponential kernel as a dot product, and can thus approximate softmax attention arbitrarily well . The denominator \(_{t}^{}(_{t})\) can result in numerical instabilities  and is removed in recent works [101; 63]. It is also common to use the identity mapping for \(\)[63; 108], which results in the following simplified linear transformer: \(_{t}=_{t-1}+_{t}_{t}^{}\), \(_{t}=_{t}_{t}\).
+
+Efficient training.Let \(,,^{L d}\) be the stacked query, key, value vectors, e.g., \(_{i}=_{i}\). We can then compute the output \(^{L d}\) in parallel via \(=(^{}_{L})\), where \(_{L}^{L L}\) is the causal mask. This fully "parallel form" and the above "recurrent form" have different FLOPs and parallelization tradeoffs. The parallel form takes \(O(L^{2}d+Ld^{2})\) and thus requires more FLOPs than the recurrent form, which takes \(O(Ld^{2})\). However, the parallel form is often much faster in practice for moderate-length sequences as it can be done in \(O(1)\) steps. This sequence-level parallelellism also enables high GPU occupancy. The recurrent form requires fewerFLOPs but cannot be parallelized across sequence length1 and the elementwise operations involved in recurrence moreover cannot make use of specialized matmul accelerators (e.g., tensor cores).
+
+Chunkwise parallel form.The chunkwise parallel form  strikes a balance between the parallel and recurrent forms, allowing for fewer FLOPs than the parallel form and more sequence-level parallelism than the recurrent form. Concretely, suppose the query/key/value vectors are split into \(\) chunks where each chunk is of length \(C\). Let \(_{[t]}^{C d}\) be all the query vectors for chunk \(t\), and let \(_{[t]}^{i}=_{tC+i}\) be the \(i\)-th query vector within the \(t\)'th chunk; the key/value chunks are defined similarly. Note that \(t[0,L/C)\), \(i[1,C]\). The state matrices are also re-indexed such that \(_{[t]}^{i}=_{tC+i}\), and we additionally define \(_{[t]}^{0}=_{[t-1]}^{C}\), i.e., the initial state of a chunk is the last state of the previous chunk. We can then obtain the following identity for the hidden state and output vector for the \(r\)-th element within the \(t\)-th chunk,
+
+\[_{[t]}^{r}=_{[t]}^{0}+_{i=1}^{r}_{[t]}^{i}_{[t]}^{},_{[t]}^{r}=_{[t]}^{0}_{[t]}^{ r}+_{i=1}^{r}_{[t]}^{i}(_{[t]}^{i}_{[t]}^{r} ).\]
+
+By further rewriting the intra-chunk computation based on the parallel form, we obtain following,
+
+\[_{[t+1]} =_{[t]}+_{[t]}^{}_{[t]} ^{d d},\] (1) \[_{[t]} =_{[t]}_{[t]}^{}+(_{ [t]}_{[t]}^{}_{C})_{[t]} ^{C d}\] (2)
+
+where we let \(_{[t]}=_{[t]}^{0}\) to reduce notational clutter. With this "chunkwise parallel form", information is propagated chunk-to-chunk through \(_{[t]}\), and the intra-chunk states \(_{[t]}^{i}\) for \(i[1,C]\) need not be materialized, thus saving memory.
+
+The complexity of the chunkwise parallel form is \(O(LCd+Ld^{2})\), and the number of steps (without chunk-level parallel scan) is \(O()\). Hence, \(C=L\) recovers the fully parallel form and \(C=1\) recovers the recurrent form. The chunkwise parallel form allows us to interpolate between the two forms, in essence trading off the number of sequential computations against sequence-level parallelism. In practice \(C\) is set to a small constant (usually 64 or 128), allowing for subquadratic training. This chunkwise form enables practical speed-ups against parallel-form-only softmax attention even on moderate-length sequences, as demonstrated by FlashLinearAttention 
+
+### DeltaNet: Linear Transformers with the Delta Update Rule
+
+The above linear transformer employs a simple linear recurrence: \(_{t}=_{t-1}+_{t}_{t}^{}\). This can be seen as additively updating the memory \(_{t-1}\) with new key-value associations at each time step. However, a purely additive update rule makes it difficult to deallocate past key-value associations, eventually leading to key "collisions" when \(L>d\), as pointed out by Schlag et al. . A model should ideally learn to remove less important key-value associations to make room for new ones, and this removal should depend on the interaction between the new key and the memory content.
+
+From a fast weight programming  perspective, the recurrent hidden state of linear attention is the fast weight mapping the input \(_{t}\) to output \(_{t}\) with a Hessian-like update rule, which has limited memory capacity . DeltaNet, on the other hand, uses the delta update rule or the Widrow-Hoff learning rule  for fast weight update: \(_{t}=_{t-1}-_{t}(_{t-1}_{t}-_{t })_{t}^{}\), where \(_{t}\) is the learning rate, \(_{t-1}_{t}\) represents the current prediction, \(_{t}\) is the target value. The method derives its name from the core principle of updating weights based on the "delta" (difference) between the prediction \(_{t-1}_{t}\) and the target \(_{t}\), which has been shown better memory capacity . This process can also be regarded as optimizing an online regression loss using a single step of SGD,2
+
+\[_{t}()=\|_{t}-_{t}\|^{2},_{t}=_{t-1}-_{t}_{_{t-1}} _{t}(_{t-1})=_{t-1}-_{t}(_{t-1} _{t}-_{t})_{t}^{},\]
+
+which has been discussed in several recent works . In contrast, linear transformerscan be regarded as optimizing an online linear (negative inner-product) loss \(_{t}=-_{t},_{t}\).3
+
+An alternative interpretation for DeltaNet is from the perspective of key-value retrieval. It first retrieves the old value using the current key, \(_{t}^{}=_{t-1}_{t}\). It then obtains a new value \(_{t}^{}\) by interpolating between the old value and the current value \(_{t}\), which replaces \(_{t}^{}\) in the memory:
+
+\[_{t}^{} =_{t}_{t}+(1-_{t})_{t}^{}, _{t} =_{t-1}_{t}^{}_{t}^{ }}_{}_{t}^{}_{t}^{ }}_{}\]
+
+Here \(_{t}=(_{}_{t})(0,1)\) is a soft "writing strength": when \(_{t}=1\), the old value is completely removed and \(_{t}^{}=_{t}\); when \(_{t}=0\), the memory remains unmodified and we have \(_{t}=_{t-1}\). The output computation is the same as vanilla linear attention, i.e., \(_{t}=_{t}_{t}\). The complexity of this recurrent form is the same as that of vanilla linear attention, i.e., \((Ld^{2})\).
+
+Schlag et al.  demonstrate that DeltaNet outperforms ordinary linear transformers on small-scale language modeling and synthetic in-context retrieval tasks. However, their training algorithm, an extension of the memory-efficient recurrent implementation for linear Transformers [48, SS3.3.1], is strictly sequential and thus hardware inefficient, as discussed in [124, SS3.2], motivating us to derive an equivalent chunkwise algorithm to train DeltaNet at scale, as introduced below.
+
+## 3 Parallelizing DeltaNet Across the Sequence Dimension
+
+### A Memory-efficient Reparameterization
+
+We first observe that \(_{t}\) admits a purely additive representation of the form \(_{t}=_{i=1}^{t}_{t}_{i}^{}\) for \(_{i},_{i}^{d}\), since we can simply set \(_{i}=_{i}^{}-_{i}^{}=_{i}(_{i }-_{i}^{})\). Recall from SS2.1 that simple linear attention has the form \(_{t}=_{i=1}^{t}_{i}_{i}^{}\). Thus, DeltaNet simply replaces the value vector \(_{i}\) in linear attention with the "pseudo" value vector \(_{i}\). Once the \(_{i}\)'s have been constructed, the rest of computation can proceed as in ordinary linear attention, i.e., \(=(^{})\) where \(^{L d}\) is the row-wise concatenation of the \(_{i}\) vectors.
+
+However, computing \(_{t}\) naively requires explicitly materializing \(_{t-1}\) to compute \(_{t}^{}\), which would require \((d^{2})\) memory. We now show that we can obtain the \(_{t}\)'s _without_ explicitly materializing \(_{t-1}\) in \((d)\) memory. Our simple proof (by induction) relies on an application of the WY representation for products of Householder matrices . The base case is clear since we have \(_{1}=_{1}_{1}_{1}^{}\), so \(_{1}=_{1}_{1}\). For the inductive step, we first observe that the DeltaNet update is given by,
+
+\[_{t}=_{t-1}-_{t}^{}_{t}^{}+ _{t}^{}_{t}^{}=_{t-1}-_{t}( _{t-1}_{t})_{t}^{}+_{t}_{t}_{t}^{}=_{t-1}(-_{t}_{t}_{t}^{ })+_{t}_{t}_{t}^{},\]
+
+which can be seen as applying a generalized Householder transformation (i.e., matmul with an identity plus rank-one matrix) to the previous state. The inductive step is then given by,
+
+\[_{t}=_{t-1}(-_{t}_{t}_{t}^{ })+_{t}_{t}_{t}^{}=_{i=1}^{t-1}_{i} _{i}^{}+(_{t}-_{i=1}^{t-1} _{i}(_{i}^{}_{t}))}_{_{t}$}}_{t}^{}=_{i=1}^{t}_{i}_{i}^{ }\] (3)
+
+Note that \(_{t}\) does not require materializing any of the hidden states and requires \((d)\) memory to compute, thus completing the proof. While we have avoided materializing \(_{t}\)'s, computing \(_{t}\)'s for all \(L\) (that is, \(\)) takes \((L^{2}d)\) and moreover cannot be fully parallelized, unlike in linear attention where we can calculate all the value vectors \(\) in parallel in \((1)\) steps. We now show that the above trick still enables an efficient chunkwise parallel form for DeltaNet.
+
+### Chunkwise Parallel Form for DeltaNet
+
+To derive the chunkwise parallel form, we first unroll the recurrence,
+
+\[_{t}=_{t-1}(-_{t}_{t}_{t}^{ })+_{t}_{t}_{t}^{}=_{i=1}^{t}_{i}( _{i}_{i}^{})(_{j=i+1}^{t}(-_{j} _{j}_{j}^{})).\] (4)We then define the following variables: \(^{j}_{i}=_{t=i}^{d}(-_{t}_{t}_{t}^{ })^{d d}\), \(^{j}_{i}=_{t=i}^{j}_{t}(_{t}_{t}^{}) ^{j}_{t+1}^{d d}\), where we let \(^{j}_{i}=\) whenever \(i>j\). Intuitively, \(^{j}_{i}\) is the "decay factor" to be applied to \(_{i}\) for obtaining \(_{j}\), and \(^{j}_{i}\) represents the contributions to \(_{j}\) starting from token \(i\). (Hence \(_{t}=^{}_{1}\)). The chunkwise recurrence can then be written as,
+
+\[^{r}_{[t]}=^{0}_{[t]}^{r}_{[t]}+ ^{r}_{[t]}\] (5)
+
+where we define the chunkwise variables \(^{i}_{[t]}=_{tC+i}\), \(^{r}_{[t]}=^{tC+r}_{tC+1}\), \(^{r}_{[t]}=^{tC+r}_{tC+1}\). Here we have \(\) chunks of size \(C\). The trick is to now efficiently represent the \(^{r}_{[t]},^{r}_{[t]}^{d d}\) matrices using a similar approach described in SS3.1, so that these matrices can be stored in \((d)\) memory,
+
+\[^{r}_{[t]}=-_{i=1}^{r}^{i}_{[t]} ^{}_{[t]},^{r}_{[t]}=_{i=1}^{r}^{i}_ {[t]}^{}_{[t]}^{d d}\] (6) \[^{r}_{[t]}=^{r}_{[t]}(^{r}_{[t]}-_{i=1}^ {r-1}^{i}_{[t]}(^{}_{[t]}^{}_{[t]}) ),^{r}_{[t]}=^{r}_{[t]}(^{r}_{[t]}-_{i=1} ^{r-1}^{i}_{[t]}(^{}_{[t]}^{}_{[t]}^ {r}_{[t]}))^{d}\] (7)
+
+The derivations for the above can be found in the appendix. Subsequently, based on Eq. 5, we can obtain the chunk-level recurrence for hidden states and outputs as,
+
+\[^{r}_{[t]}=^{0}_{[t]}-(^{0}_{[ t]}_{i=1}^{r}^{i}_{[t]}^{}_{[t]})+_{i=1}^{r} ^{i}_{[t]}^{}_{[t]}=^{0}_{[t]}+_{i=1}^{r} (^{i}_{[t]}-^{0}_{[t]}^{i}_{[t]})^{ }_{[t]},\] \[^{r}_{[t]}=^{r}_{[t]}^{r}_{[t]}=^ {0}_{[t]}^{r}_{[t]}+_{i=1}^{r}(^{i}_{[t]}-^{0}_ {[t]}^{i}_{[t]})(^{}_{[t]}^{i}_{[t]} ).\]
+
+Letting \(_{[t]}=^{0}_{[t]}\), the above can be simplified to matrix notations similarly to Eq.1-2,
+
+\[_{[t+1]}=_{[t]}+(_{[t]}-_{[t]} ^{}_{[t]})^{}_{[t]},\] (8)
+
+\[_{[t]}=_{[t]}^{}_{[t]}+ (_{[t]}^{}_{[t]})( _{[t]}-_{[t]}^{}_{[t]})\] (9)
+
+where \(_{[t]}=_{[t]}^{1:C}^{C d}\) for \(\{,,,,,\}\) defines the chunkwise matrices that are formed from stacking the \(_{t},_{t},_{t},_{t},_{t},_{t}\) vectors.
+
+Practical considerations.In the above, Eq. 7 is fully recurrent and thus cannot use tensor cores written as is. To solve this, we further leverage the _UT transform_ (see SSB.2 for derivations):
+
+\[_{[t]} =(+((_{[t]}) _{[t]}^{}_{[t]},-1))^{-1}( _{[t]})\] (10) \[_{[t]} =_{[t]}_{[t]},_{[t]}= _{[t]}_{[t]}\] (11)
+
+to rewrite most operations in matmutls. The inverse of lower triangular matrices could be solved efficiently using forward substitution. Once computed, the hidden state updates (Eq. 8) and the output computations (Eq. 9) are largely the same as in vanilla linear attention. We adapt FlashLinearAttention  to implement Eq. 8 and 9 with hidden states recomputed during the backward pass for saving GPU memory. The PyTorch pseudocode for the forward pass is shown in Listing 1.
+
+Speed comparison.We implement both the pure recurrent form4 and the chunkwise parallel form in Triton  and show the speed-ups for various sequence lengths (L) and head dimensions (\(d_{}\)) in the right figure, where the model dimension \(d\) is 2048 and we vary batch size and sequence length so that they multily to 16384.5 Our chunkwise algorithm achieves greater speed-ups as sequence length \(L\) and head dimension \(d_{}\) increase, where the use of sequence-level parallelism (for high GPU occupancy) and tensor core (for fast matmuls) become more important [124, SS3].
+
+Figure 1: Speed-up of the chunkwise parallel form vs. the recurrent form.
+
+Fully Parallel Form for DeltaNet.For completeness, we also discuss the fully parallel form of DeltaNet. While we use the concept of a "pseudo" value, it is possible to avoid modifying values. From Eq. 4, it is straightforward to compute the attention matrix \(\): \(_{ij}=_{j}^{}_{j+1}^{i}_{i}\) if \(j i\) and \(0\) otherwise. Notably, \(\) has the matrix form \(=(^{T})\), obtained by combining Eq. 3 and 11. However, computing \(\) requires a matrix inverse (Eq. 10), which scales cubically with sequence length without further algorithmic changes. Due to the above we avoid using the fully parallel form for training DeltaNet; however the "attention" matrix derived from this form could be of interest to the interpretability study for RNNs .
+
+### DeltaNet Transformer
+
+We describe how the DeltaNet layer primitive is used to build up a transformer-like model using standard modules. We largely follow the LLaMA-architecture [Transformer++, 114] and simply replace the self-attention layer with the DeltaNet layer. We also apply normalization before output projection for stable training . As the additional parameters for computing scalar \(_{t}\) terms are negligible, parameter allocation is roughly the same as in Transformer++, i.e., \(4d^{2}\) for the DeltaNet layer and \(8d^{2}\) for the SwiGLU FFN layer .
+
+Feature map and normalization.Our key/query vectors are given by \(_{t}=(_{K}_{t})}{\| (_{K}_{t})\|_{2}}\), \(_{t}=(_{Q}_{t})}{\| (_{Q}_{t})\|_{2}}\). Schlag et al.  originally follow Katharopoulos et al.  and apply a "ELU + 1"  to nonlinearly transform the key/query vectors. We instead use the SiLU activation , which was found to perform better . For stability, it is crucial to ensure that the norm of each eigenvalue of the transition matrices does not exceed one. The eigenvalues of \(-_{t}_{t}_{t}^{}\) are 1 with multiplicity \(d-1\) and \(1-_{t}\|_{t}\|_{2}\) with multiplicity 1. Schlag et al.  used the \(L_{1}\) norm to normalize query/key vectors, ensuring that \(0 1-_{t}\|_{t}\|_{2} 1\). We instead apply \(L_{2}\) normalization, which we found to perform better and offers a more intuitive interpretation: when \(_{t}=1\), \(-_{t}_{t}^{}\) becomes a projection matrix, erasing information in one subspace while preserving the other \(d-1\) subspaces. This is beneficial for retaining information while enabling more _targeted_ forgetting.
+
+### Hybrid Models
+
+Following recent work on combining subquadratic token-mixing layers with existing neural network primitives , we also experiment with hybridizing DeltaNet models.
+
+Convolutional layers.Recent linear recurrent models typically incorporate a lightweight depthwise-separable convolution layer after the query/key/value projections . This "short convolution" layer  generalizes the shift SSM , and is efficient in both number of parameters and computational cost. We also add a short convolution layer after the query/key/value projections.
+
+Local sliding window and global attention.Linear attention largely uses a content-based addressing mechanism  and lacks positional information . Arora et al.  also argue that linear attention lacks the ability to perform precise local token shifts and comparisons, thus facing difficulties on retrieval-intensive tasks. Motivated by this, we experiment with two different hybrid architectures that incorporate softmax attention. We first explore _sliding window attention_ (SWA) which has been shown to significantly improve linear attention ; we follow Griffin  and Samba  to interleave DeltaNet layers and SWA layers. We also experiment with _global attention_, which has been found to be helpful  even if only few of the recurrent layers are replaced with global attention . We follow Fu et al.  to replace only two layers with global attention: the second layer and the \((+1)\)-th layer, where \(N\) is total number of layers.
+
+## 4 Empirical Study
+
+We compare the DeltaNet against strong baselines in both synthetic and real-world language modeling settings. Our main baselines include: LLaMA-architecture Transformer++ ; RetNet , a linear attention Transformer with non-data-dependent exponential decay and large head dimension;
+
+Figure 2: An illustration of DeltaNet neural architecture.
+
+GLA , a linear attention Transformer with data-dependent decay; and Mamba , a selective state-space model with data-dependent decay.
+
+### Synthetic Benchmarks
+
+We evaluate on three synthetic benchmarks: Multi-query associative recall [MQAR; 4], Mechanistic Architecture Design [MAD; 84], and in-context language learning [RegBench; 2].
+
+MQAR evaluates language models' ability to (in-context) recall information within a context when faced with multiple recall queries. We use Arora et al. 's training setting and for DeltaNet we use 2 heads. We do not use convolutions for these experiments. Figure 4 shows that DeltaNet performs perfectly (even without convolution) in the hardest setting and outperforms Mamba (which uses convolutions) in the low-dimension setting. Next, we consider the MAD benchmark , a suite of synthetic token manipulation tasks designed to probe capabilities of model architectures. The results are shown in Table 3. Compared with other architectures, including MHA, DeltaNet is better at recalling tasks, especially on Fuzzy Recall as expected, although it somehow struggles on the "Memorize" task. We defer the RegBench results to the SSA.2 due to space constraints.
+
+### Language Modeling
+
+Experimental setup.Following prior work [31; 124], we evaluate on Wikitext perplexity and zero-shot common sense reasoning tasks, including LAMBADA [LMB.; 77], PiQA , HellaSwag [Hella.; 127], WinoGrande [Wino.; 99], ARC-easy (ARC-e) and ARC-challenge (Arc-c) . Following Arora et al. , we also evaluate the models real-world recall-intensive tasks, including FDA , SWDE , and SQUAD . Both SWDE and FDA focus on extracting structured information: SWDE from raw HTML to identify semi-structured relationships, and FDA from PDFs to retrieve key-value pairs. SQUAD evaluates language models on reading comprehension by providing a text passage and a related question. See SSA.1 for hyperparameter settings.
+
+Results.Our main language modeling results are shown in Table 1. Since Mamba uses convolutions by default while GLA does not, we retrain the GLA with convolution, and also train DeltaNet without convolution. For the 1.3B setting we only train the DeltaNet with convolution due to limited compute resources. In general we find that DeltaNet outperforms the strong Mamba/GLA baselines in terms of both perplexity and downstream task performance. For recall-intensive tasks (i.e., SWDE, SQuAD, FDA), we find that under the same state size at the 340M scale, DeltaNet outperforms GLA, confirming the effectiveness of the delta rule. However, at the 1.3B scale, DeltaNet underperforms GLA due to its poorer state size scability (see SS5.3), since state size plays an important role in recall-intensive tasks. Finally, we confirm the benefits of hybrid architectures [21; 55]: both the sliding window and global attention hybrids work well, outperforming the strong Transformer++ baselines. We also scale DeltaNet to the 3B parameter scale trained with 1T tokens using the same settings as Shen et al. . The results are shown in Table 5, where 3B DeltaNet slightly underperforms a Transformer architecture trained with the same setting (PowerLM-3B), but outperforms other RNN baselines in the 2B-3B range (though these are trained for a different number of tokens so are not exactly comparable).
+
+Ablations.In Table 1 (bottom) we ablate the choice of feature map and normalization. We find that simply replacing the \(L_{1}\)-norm with the \(L_{2}\)-norm greatly increases performance. For the feature map, we experiment with \(\{,1+,\}\) and find that SiLU performs the best, consistent with prior work .
+
+Training throughput.Figure 6 compares the training throughputs of different 1.3B models in different training lengths and batch size settings. The training speed of DeltaNet is close to GLA
+
+Figure 4: Accuracy (%) on MQAR.
+
+Figure 3: Results on the synthetic MAD benchmark. Results other than DeltaNet are directly borrowed from Poli et al. . (Multi-head) Hyena, DeltaNet and Mamba make use of convolutions, whereas GLA does not.
+
+and significantly faster than Mamba. All linear-time models outperform Transformers for longer-sequence training.
+
+## 5 Discussion and Related Work
+
+### DeltaNet vs. State Space Models / Linear RNNs
+
+To discuss DeltaNet against existing linear RNNs (including state-space models) we first introduce a general class of associative RNNs with matrix-valued hidden states. Given a matrix-valued hidden state \(_{t}^{d n}\) and current input \(_{t}^{d}\), these models have the following form:
+
+\[_{t} =_{t-1}_{t}+_{t} _{t}^{},\] (recurrence) \[_{t} =_{t}_{t},\] (memory read-out)
+
+where \(\) is an associative operator (e.g., Hadamard product, matrix multiplication, etc.). The matrix \(_{t}\) and vectors \(_{t}\), \(_{t}\), \(_{t}\) are (potentially non-linear) functions of the current input \(_{t}\).
+
+As is the case in vector-valued linear RNNs , the use of an associative operator enables the use of parallel scan  to calculate \(_{1},,_{L}\) in \(O( L)\) steps and \(O(L)\) work (ignoring the terms associated with the associative operation) if the inputs \(_{1},,_{L}\) are given (though see our discussion in footnote 1). Hence, as long as the associative operator is not too expensive, training
+
+  
+**Model** & **Wiki** & **LMB** & **LMB** & **PIQA** & **Hella** & **Wino** & **ARC-e** & **ARC-e** & **Avg.** & **SWDE** & **SQuAD** & **FDA** & **Sate** \\  & ppl \(\) & ppl \(\) & ppl \(\) & \(\) & acc \(\) & acc \(\) & acc\(\) & acc \(\) & acc\(\) & acc\(\) & acc\(\) & acc\(\) & exp. \\  _340M params / 15B tokens_ & & & & & & & & & & & & & & \\ Transformer++ & 28.39 & 42.69 & 31.0 & 63.3 & 34.0 & 50.4 & 44.5 & 24.2 & 41.2 & 42.2 & 22.1 & 21.4 & N/A \\ ResNet (_w/o. com_) & 32.33 & 49.19 & 28.6 & 63.5 & 33.5 & 52.5 & 44.5 & 23.4 & 41.0 & 13.3 & 27.6 & 2.9 & 512x \\ Mamba (_w. com_) & 28.39 & 39.66 & 30.6 & 65.0 & 35.4 & 50.1 & 46.3 & 23.6 & 41.8 & 12.4 & 23.0 & 2.1 & 64x \\ GLA (_w. com_) & 28.65 & 43.53 & 30.3 & 64.8 & 34.5 & 51.4 & 45.1 & 22.7 & 41.5 & 18.6 & 27.2 & 8.1 & 128x \\ (_w. com_) & 29.47 & 45.53 & 31.3 & 65.1 & 33.8 & 51.6 & 44.4 & 24.6 & 41.8 & 24.0 & 24.7 & 7.3 & 128x \\ DeltaNet (_w. com_) & 29.08 & 50.87 & 30.0 & 63.6 & 33.6 & 51.7 & 46.0 & 23.0 & 41.3 & 24.6 & 26.9 & 4.5 & 128x \\ DeltaNet (_w. com_) & 28.24 & 37.37 & 32.1 & 64.8 & 34.3 & 52.2 & 45.8 & 23.5 & 42.1 & 26.4 & 28.9 & 12.8 & 128x \\ + Sliding Atm & 27.06 & 38.17 & 33.4 & 64.0 & 35.3 & 50.9 & 45.9 & 23.2 & 42.1 & 39.3 & 32.5 & 18.8 & N/A \\ + Global Attn (2 layers) & 27.51 & 35.04 & 33.5 & 64.0 & 34.5 & 51.7 & 46.0 & 23.3 & 42.1 & 42.9 & 32.1 & 23.1 & N/A \\  _1.3B params / 100B tokens_ & & & & & & & & & & & & & \\ Transformer++ & 16.85 & 13.44 & 48.9 & 70.8 & 49.6 & 53.6 & 56.0 & 26.5 & 50.9 & 66.6 & 31.5 & 27.4 & N/A \\ ResNet (_w/o. com_) & 18.64 & 17.27 & 43.3 & 70.0 & 47.3 & 52.5 & 54.8 & 25.6 & 48.9 & 42.8 & 34.7 & 14.3 & 512x \\ Mamba (_w. com_) & 17.06 & 13.89 & 46.2 & 72.2 & 40.1 & 54.1 & 59.0 & 28.2 & 50.0 & 41.4 & 35.2 & 6.2 & 64x \\ GLA (_w. com_) & 17.22 & 14.47 & 46.9 & 71.8 & 49.8 & 53.9 & 57.2 & 26.6 & 51.0 & 50.6 & 42.6 & 19.9 & 256x \\ (_w. com_) & 17.25 & 14.92 & 46.2 & 70.6 & 49.9 & 53.0 & 55.3 & 27.0 & 50.4 & 52.4 & 37.4 & 22.3 & 256x \\ DeltaNet (_w. com_) & 16.87 & 12.21 & 48.9 & 71.2 & 50.2 & 53.6 & 57.2 & 28.3 & 51.6 & 49.5 & 37.4 & 17.2 & 128x \\ + Sliding Atm & 16.56 & 11.74 & 49.2 & 71.8 & 51.1 & 52.8 & 58.9 & 28.8 & 52.1 & 53.3 & 43.3 & 22.3 & N/A \\ + Global Attn (2 layers) & 16.55 & 12.40 & 48.8 & 70.8 & 50.7 & 54.2 & 58.4 & 28.1 & 51.8 & 71.0 & 43.0 & 29.8 & N/A \\  _DeltaNet Ablation (340M)_ & & & & & & & & & & & & & \\ _w: L\({}_{1}\)-norm \& 1+tELM_ & 31.12 & 55.96 & 26.3 & 63.9 & 33.0 & 50.9 & 44.3 & 21.8 & 40.1 & 14.5 & 23.9 & 6.2 & 128x \\ \({}_{w: L\_{2}\)-norm \& 1+tELM} & 28.03 & 37.62 & 32.2 & 65.7 & 34.7 & 51.8 & 45.4 & 22.5 & 42.1 & 23.8 & 28.6 & 13.1 & 128x \\ \({}_{w: L\_{2}\)-norm \& ReLU & 28.75 & 43.53 & 30.2 & 64.0 & 33.9 & 48.9 & 45.6 & 22.8 & 40.9 & 27.2 & 26.7 & 9.0 & 128x \\   
+
+Table 1: Main language modeling results against Transformer++, RetNet , Mamba , and GLA . All models are trained on the same subset of the SlimPajama dataset with the Mistral tokenizer. The Transformer++, RetNet, Mamba, GLA (_w/o. com_) results are taking from Yang et al. . For hybrid models, “Sliding Attn” interleaves a sliding window attention every other layer, and “Global Attn” uses full global attention on two layers. The 340M/1.3B models are trained for 15B/100B tokens respectively. All results are obtained through 1m-evaluation-harness. The last column denotes the expansion ratio of the recurrent state size relative to the product of the number of layers and model dimension (see Zhang et al. [131, App. C]).
+
+Figure 5: Zero-shot model performance across selected benchmarks for 3B models. Llama-3.2-3B and PowerLM-3B are Transformer models, while the others are recurrent models. ARC results are averaged over normalized accuracy across ARC-Easy and ARC-Challenge.
+
+can be efficient. However, parallel scan by itself is not sufficient for training language models at practical scale due to some associative operator's being too expensive. Recent models such as such as Mamba  and gated linear attention Transformers [108; 124; 92; 79; 9] thus make use of cheap element-wise recurrence updates, in particular the Hadamard product, i.e., \(=\). See Table 2 for how recent models can be cast into this form.
+
+Standard matrix multiplications (i.e., \(_{t-1}_{t}=_{t-1}_{t}\)) on the other hand can model richer interactions that go beyond elementwise recurrence. Without any structural assumptions on \(_{t}\) however, these operations would take \(O(dn^{2})\) for each update (as opposed to \(O(dn)\) for elementwise products), which would be prohibitively expensive. Hence, DeltaNet's use of \(_{t}=-_{t}_{t}_{t}^{}\) can be seen as exploiting structured matrices to efficiently model interactions beyond elementwise recurrences. Our chunkwise algorithm could generalize to a broader class of matrices in the Diagonal-Plus-Low-Rank (DPLR) form \(_{t}=-_{t}_{t}^{}\), which has been explored in S4 , although their DPLR transition matrices are data-independent. We adopt DeltaNet's parameterization in this work (i.e., \(=,_{t}=_{t}_{t},_{t}=_{t}\)) as we are primarily interested in improving recall (through DeltaNet's key-value update rule) while maintaining parameter efficiency. We leave the exploration of more generalized parameterizations for future work.
+
+### Towards a Unifying Framework for Efficient Autoregressive Sequence Transformations
+
+While the above class of models makes it possible to unify recent models, we do not claim that it is the "right" level at which view (autoregressive) sequence transformations of the form \(\{_{t}\}_{t=1}^{L}\{_{t}\}_{t=1}^{L}\), where \(_{t}\) cannot depend on any \(_{j}\) if \(j>t\). For example, this framing makes it difficult to (neatly) capture other subquadratic models that have been shown to be effective [126; 49; 83; 83]. An alternative unifying framework might be to view the above sequence transformations as a discretization of a continuous state space model [32; 106; 31], or as a matrix multiplication with a masked structured matrix [76; 87; 46; 19]. What does seem important, however, is that a framework should ideally expose efficient algorithms for training, and the algorithm should be hardware-efficient, which, in the case of modern GPUs, means that it should be rich in matrix multiplications. From this perspective, the state-space duality (SSD) framework recently proposed by Dao and Gu , which provides a connection between SSM-based sequence transformations and structured matrix multiplications with a semiseparable matrix, seems a promising candidate. However, this framework may not capture an important class of models, e.g., models where the as
+
+   Model & Recurrence & Memory read-out \\  Linear Attention [48; 47] & \(_{t}=_{t-1}+_{t}_{t}^{}\) & \(_{t}=_{t}_{t}\) \\ + Kernel & \(_{t}=_{t-1}+_{t}(_{t})^{}\) & \(_{t}=_{t}(_{t})\) \\ + Normalization & \(_{t}=_{t-1}+_{t}(_{t})^{}\), \(_{t}=_{t-1}+(_{t})\) & \(_{t}=_{t}(_{t})/(_{t}^{}(_{t}))\) \\ DeltaNet  & \(_{t}=_{t-1}(-_{t}_{t}_{t}^{ })+_{t}_{t}_{t}\) & \(_{t}=_{t}_{t}/(_{t}^{}(_{t}))\) \\ Gaed RFA  & \(_{t}=_{t-1}+(1-_{t}_{t}_{t}^{}, \ _{t}=g_{t}_{t-1}+(1-g_{t})_{t}\) & \(_{t}=_{t}(_{t})+_{t}\) \\ S4 [32; 106] & \(_{t}=_{t-1}(-(t)^{}())+ (_{t}^{})\) & \(_{t}=_{t}^{}_{t}^{}\) \\ ABC  & \(_{t}^{}=_{t-1}^{}+_{t}_{t}^{}\), \(_{t}^{}=_{t-1}^{}+_{t}_{t}^{}\) & \(_{t}=_{t}^{}\) \\ DFW  & \(_{t}=_{t-1}(_{t}_{t}^{})+ _{t}_{t}^{}\) & \(_{t}=_{t}_{t}\) \\ RetNet  & \(_{t}=_{t-1}+_{t}_{t}^{}\) & \(_{t}=_{t}q_{t}\) \\ Mamba  & \(_{t}=_{t-1}(-(_{t}^{}) ())+(_{t}_{t})_{t}^{}\) & \(_{t}=_{t}q_{t}+_{t}\) \\ GLA  & \(_{t}=_{t-1}(_{t})+_{t}_{t }^{}=_{t-1}(_{t})+_{t}_{t}^{ }\) & \(_{t}=_{t}q_{t}\) \\ RWKv-6  & \(_{t}=_{t-1}(_{t})+_{t}_{t }^{}\) & \(_{t}=_{t-1}+(_{t})_{t}^{}\) \\ HGRN-2  & \(_{t}=_{t-1}(_{t})+_{t}(-_{t})^{}\) & \(_{t}=_{t}q_{t}\) \\ mLSTM  & \(_{t}=f_{t}_{t-1}+i_{t}_{t}_{t}^{}\) & \(_{t}=f_{t}_{t-1}+i_{t}_{t}\) & \(_{t}=_{t}q_{t}/\{1,|_{t}^{}_{t}|\}\) \\ Mamba-2  & \(_{t}=_{t}_{t-1}+_{t}_{t}^{}\) & \(_{t}=_{t}q_{t}\) \\ GSA  & \(_{t}^{}=_{t-1}^{}(_{t})+_{t}_{t}^{}\), \(_{t}^{}=_{t-1}^{}(_{t})+_{t}_{t}^{}\) & \(_{t}=_{t}^{}(_{t}^{}_{t})\) \\ Gaed DeltaNet  & \(_{t}=_{t-1}(_{t}(-_{t}_{t}_{t }^{}))+_{t}_{t}_{t}^{}\) & \(_{t}=_{t}q_{t}\) \\   
+
+Table 2: Overview of recent linear recurrent models that have been proposed and applied to autoregressive language modeling (ordered in rough chronological order). These works make use of a matrix-valued hidden state \(_{t}^{d n}\) (or two sociative recurrence involves matrix multiplication with an unstructured matrix, or models that make use of more exotic associative operators (e.g., in Peng et al. ).
+
+Finally, we observe that there have been many recent linear-time models that have been proposed which purportedly match or outperform classic transformers. As can be seen in Table 2, the "sequence mixing" component of these works are closely related to one another. However, the way in which the token-mixing primitive is used to build up a transformer-like model varies widely. For example, while most recent works make use of depthwise-separable convolution layers (not shown in Table 2) [31; 9; 15; 125], earlier works generally do not [48; 101; 81]. There are also differences in the parameterizations of the feedforward layers used for the "channel mixing" component. Such variations should be taken into account before declaring a particular model layer superior to another.
+
+### Limitations and Future Work
+
+Our work has several limitations. First, in terms of computation, although we propose a new hardware-efficient algorithm, the training speed still lags behind that of GLA. This is due to the overhead caused by modeling state-to-state dependencies as described above, which requires "marginalizing" over the head dimension inside the kernel, similar to the case of softmax attention. However, for GLA since there are no intra-state dependencies (everything is elementwise), and thus it is easy to use tiling to support arbitrary size of head dimension, as implemented in Yang and Zhang . This limitation would potentially limit DeltaNet's memory size, consequently lowering the recall-intensive task performance as we observed in SS4.2. However, it may be feasible to adopt block diagonal generalized Householder transition matrices with block sizes fitting GPU SRAM (e.g., 128) while maintaining a overall large head dimension (and thus a large recurrent state size).
+
+We also found that the length generalization of DeltaNet was limited, while GLA and RetNet (and Mamba to an extent) have been found to be able to extrapolate beyond the training length . We speculate that this is because DeltaNet lacks explicit decay factors. This could be improved through incorporating a gating term in the recurrence, as demonstrated in a recent work by Yang et al. .
+
+## 6 Related Work
+
+We briefly discuss related work here and give an extended discussion in Appendix C.
+
+Linear transformers can be seen as a type of iterated Hopfield networks , and this connection can provide perspectives on the limitations and improvements of linear attention transformers. For example, vanilla linear transformers use a Hebbian-like update rule, which has been shown to have limited memory capacity . Later works in Hopfield networks use higher-order polynomials  and exponential kernels [94; 50] to enhance the memory capacity, which is also related to linear attention with polynomial kernels [45; 6; 1]. On the other hand, the delta rule has been shown to have better memory capacity [28; 85; 56; 101]. In this sense, given the fixed size recurrent state, using the delta rule is able to achieve a better frontier of the recall-memory tradeoff curve , and has recently been applied to enhance real-world retrieval tasks [74; 96]. Moreover, it outperforms the additive rule used in vanilla linear transformers across multiple domains [101; 38; 40; 36; 42].
+
+Despite these advantages, Irie et al.  revealed theoretical limitations of the delta update rule in terms of expressiveness. Recurrent enhancements of DeltaNet, such as Recurrent DeltaNet  and the Modern Self-Referential Weight Matrix , and the mesa-layer  were proposed and found superior. However, these models extend beyond linear RNNs and cannot be parallelized across sequence length. This suggests a fundamental trade-off between parallelism and expressiveness . How to further enhance DeltaNet without sacrificing parallelism remains an open question, and the hybrid cross-chunk nonlinear and intra-chunk linear strategy used in TTT  might provide a suitable middle ground. Finally, we remark that delta rule is closely related to meta or online learning via gradient descent [73; 39], which has been revisited in recent works like Longhorn  and TTT . Recently, Titans  improves TTT by introducing a momentum and weight decay term.
+
+## 7 Conclusion
+
+We describe an algorithm that parallelizes DeltaNet training across the sequence length dimension, achieving significant speed-ups against existing implementations on modern hardware. This makes it possible to scale up DeltaNet to moderate-scale language modeling settings, where we find that it performs well compared to recent linear-recurrent baselines.

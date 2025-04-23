@@ -1,0 +1,302 @@
+# Legendre-SNN on Loihi-2: Evaluation and Insights
+
+ Ramashish Gaurav\({}^{1}\)1 Terrence C. Stewart\({}^{2}\) Yang Yi\({}^{1}\)
+
+\({}^{1}\)Department of Electrical and Computer Engineering, Virginia Tech, Blacksburg, VA 24060, USA
+
+\({}^{2}\)National Research Council Canada, University of Waterloo, Waterloo, ON N2L3G1, Canada
+
+Footnote 1: Corresponding author: rgaurav@vt.edu, https://r-gaurav.github.io/
+
+###### Abstract
+
+A majority of the works on Spiking Neural Networks (SNNs) do _not_ deploy and evaluate their network on a neuromorphic hardware. This not only limits the credibility of their claims of energy-efficiency and latency gains, but also discounts the opportunity to appraise neuromorphic technology for real-world computing. Herein, we especially study the technical facets of _deploying_ and _evaluating_ a recently formulated _State-Space Model_ based spiking network called "Legendre-SNN" on Loihi-2 neuromorphic hardware. Legendre-SNN is a highly resource-efficient _reservoir_-based univariate Time-Series Classification (TSC) model. This work's emphasis is not only on its deployment on Loihi-2, but also on leveraging the Loihi-2 embedded Lakemont (LMT) cores for its _non-spiking_ reservoir deployment and spike encoding. Since the documentation to program LMT is very limited, researchers often implement their _non-spiking_ operations on _less_ power-efficient CPUs (than LMTs). Here, we present the technical know-how to program LMT (as part of our reservoir deployment) that can be employed by later works. In our evaluation of Legendre-SNN on Loihi-2 hardware, we pleasantly find that it outperforms a complex LSTM-Conv integrated architecture on \(3\) of \(15\) datasets. We also present the _energy_ & _latency_ metrics of Legendre-SNN on Loihi-2, where we find that (for our settings) the reservoir on LMT consumes more than \(85\%\) of total energy; consequently, we advocate for a _spiking_ reservoir in Legendre-SNN.
+
+## 1 Introduction
+
+AI computing with Spiking Neural Networks (SNNs) is progressively gaining traction in the wake of calls for Green AI [1; 2; 3]. Training Deep Learning (DL) models on power-hungry GPUs is highly energy intensive [4; 5], and inference too - consumes notable amount of energy, e.g., ResNet-\(50\) consumes more than \(2.5\)K Joules per sample in inference mode [6]. SNNs on the other hand have proven highly energy efficient when deployed (generally for inference) on neuromorphic hardware [7], e.g., Loihi [8; 9]. Note that SNNs are still trained primarily on GPUs with methods falling under two categories: ANN-to-SNN conversion and Direct Training. Under ANN-to-SNN conversion, an ANN is first trained via conventional Back-propagation followed by its _conversion_ to an isomorphic SNN [10; 11; 12]. Under Direct Training, an SNN is _directly_ trained either via non-gradient methods [13; 14] or by accounting for its non-differentiable spike function [15], e.g., SLAYER [16].
+
+Time-Series Classification (TSC) is one popular AI domain that has ubiquitous applications in Edge Computing/Smart Wearables/IoT devices. RNNs and their specialized types, e.g., GRUs and LSTMs have proven quite effective for a variety of TSC tasks, however, at the cost of _high_ energy consumption - owing to their deployment on multi-CPUs/GPUs. Training RNNs is also computationally complex and time consuming in contrast to training Reservoir Computing (RC) networks [17], where, the recurrent _reservoir_ is kept static, and learning adapts only the _linear readout_ layer. RC networks have outperformed RNNs on a variety of tasks with ample room for improvements [17]. Note that the simplicity of RC networks also allows for their efficient hardware implementations [18]. A few popular RC models are Echo State Networks (ESNs) [19] and Liquid State Machines (LSMs) [20], where the ESNs are composed of _non-spiking_ neurons and LSMs are composed of _spiking_ neurons.
+
+Recently, a novel reservoir-based SNN called _Legendre-SNN_ (LSNN) was formulated by Gaurav et al. [21] that outperformed the LSM-based models. The LSNN consists of a static reservoir followed by an encoding layer and a trainable _non-linear_ spiking readout layer - unlike conventional RC. The reservoir in LSNN is actually a _State-Space Model_ (SSM) implemented via simple matrix operations (_no_ neurons) and its output is encoded to spikes, while the non-linear readout layer comprises _one_ spiking hidden layer followed by a classification layer - more architectural details in Sec 2.4. Note: the authors [21] in their ablation study found that the LSNN _without_ a hidden layer still outperformed the LSM-based models; they also energy-profiled LSNN on Loihi-1 (only the post-reservoir spiking part). We chose LSNN for our deployment because it offers a _unique_ blend of crucial _non-spiking_ & _spiking_ components that enable the utilization of Loihi-2's _two_ computational resources: Lakemont cores & Neuro-Cores; also, quantized SSMs are gaining traction [22]. SSMs are dynamical systems that accept an input \(u(t)\) and maintain an internal state \(x(t)\), where \(x(t)\) captures the latent dynamics governing the response \(y(t)\); state \(x(t)\) evolves over time guided by a defined _state-transition_ rule, and is used to predict the future states and generate the output \(y(t)\) via an _observation_ rule [23]. The SSM used in LSNN is called _Legendre Delay Network_ (LDN) [24; 25] - more details in Sec 2.3.
+
+In this study, given that the authors of LSNN did _not evaluate_ it (on any dataset) on a neuromorphic chip, we put its performance to test on Loihi-2. Note: the mix of _non-spiking_ & _spiking_ also makes LSNN _non-trivial_ to port _entirely_ on Loihi-2. With these motivations, our contributions are:
+
+* We deploy & evaluate LSNN on _physical_ Loihi-2 and report energy & latency metrics. This work can be considered one of the firsts to deploy a RC-based TSC model on _Loihi-2_[26].
+* In a first (to our best knowledge), we implement a quantized SSM (i.e., the LDN) on the embedded Lakemont cores of Loihi-2 and energy-profile it. As part of this implementation:
+* We add to the _scarce_ technical documentation to program Lakemont cores (Appx F)
+
+## 2 Background
+
+We now present the necessary background relevant to our work. We start with a short description of Loihi-2 & Lava, followed by the description of the LDN (an SSM used as reservoir) and the LSNN.
+
+### Loihi-2 chip
+
+Loihi-2 [27] is the \(2^{\text{nd}}\) generation neuromorphic chip from Intel, which improves upon Loihi-1 [28]. Notably, Loihi-2 comes with \(1,048,576\) spiking units, \(120\) million synapses, and \(6\) embedded x86 Lakemont (LMT) cores per chip; it has \(128\) Neuromorphic Cores (Neuro-Cores), each housing \(8192\) spiking units. The LMT cores are responsible for many essential tasks, e.g., facilitating spike-based communication, data I/O (i.e., encoding and decoding), and network management/configuration, etc. The embedded LMTs execute standard C code, however, with support for _only_\(32\)-bit operations; this implies that _only quantized operations_ can be executed on LMTs. The spiking units on Neuro-Cores are asynchronous programmable CURET BAsed (CUBA) neurons that generate binary (as well as, \(32\)-bit graded) spikes; the Neuro-Cores also support Three-Factor Rules [29] based On-chip training.
+
+### Lava software suite
+
+The Loihi-2 chips can be programmed using Intel's "Lava" software suite; the suite consists of multiple libraries e.g., lava, lava-dl, etc., that can be used to build and train a variety of spiking networks, along with support for their deployment and profiling on Loihi-2. A concise documentation and programming features of Lava2 can be found in [30]; herein, we describe only those programming paradigms of Lava that are most relevant to our work. The two important lava paradigms used to build (our) Loihi-2 deployable networks are Process and ProcessModel. Note that a Process can have multiple _corresponding_ ProcessModels depending on the hardware backend the Process is intended to be deployed upon. A Process defines the _interface_ of a component of the network, while the corresponding ProcessModel defines the _implementation_ of its Process (on the desired backend). Lava supports \(3\) types of ProcessModels: PyLoihiProcessModel (meant for Python implementations to be deployed on CPU), CLoihiProcessModel (meant for C implementations to be deployed on embedded LMT), and NcProcessModel (meant for NxCore implementations to be deployed on Neuro-Cores). The ProcessModels of different Processes synchronize among themselves via a _protocol_ called LoihiProtocol that consists of multiple execution _phases_ implemented by the participating Processes (details in Appx A). Coming to lava-dl, it assists in building and directly training the SNNs on GPUs (via its slayer [16] API), and their deployment on Loihi-2 (via its netx API). Lava also provides a _simulation_ backend for the _physical_ Loihi-2 chip; the switch to _simulation_ and _physical_ backends can be made via Lava's Loihi2SimCfg and Loihi2HwCfg APIs.
+
+### Legendre Delay Network (LDN)
+
+LDN - a type of an SSM introduced by Voelker et al. [24; 25] is a neural approximation of a Linear Time-Invariant system implementing a delay of \(\theta\) secs, i.e., for a univariate input signal \(u(t)\) to the LDN, its output is \(y(t)=u(t{-}\theta)\). Following are the state equations of the LDN in _continuous_-time i.e., Eqs (1) & (2), and _discrete_-time i.e., Eqs. (3) & (4) (note: Legendre-NN uses only Eq (3)):
+
+\[\dot{x}(t) =Ax(t)+Bu(t)\] (1) \[y(t) =Cx(t)+Du(t)\] (2)
+
+\[\mathbf{x}[t+1] =\mathbf{A}\mathbf{x}[t]+\mathbf{B}\mathbf{u}[t]\] (3) \[\mathbf{y}[t] =\mathbf{C}\mathbf{x}[t]+\mathbf{D}\mathbf{u}[t]\] (4)
+
+where the Eq (1) (& Eq (3)) is the _state-transition_ equation and the Eq (2) (& Eq (4)) is the _observation_ equation. Note that \(u(t){\in}\mathbb{R}\), \(x(t){\in}\mathbb{R}^{d}\), and \(y(t){\in}\mathbb{R}\) (\(\mathbf{u}[t]\), \(\mathbf{x}[t]\), and \(\mathbf{y}[t]\)) are the LDN's input, state-vector, and output in continuous-time (and discrete-time). The values of the state-matrices \(A\), \(B\), \(C\), & \(D\) (and \(\mathbf{A}\), \(\mathbf{B}\), \(\mathbf{C}\), & \(\mathbf{D}\)) in the equations above that define an LDN are stated in Appx B.
+
+### Legendre-SNN (LSNN) [21]
+
+LSNN is a highly resource efficient reservoir-based SNN for TSC tasks. In their experiments, the authors [21] used a maximum of \(120\) "Integrate & Fire" (IF) neurons and achieved SoTA _spiking_ performance on \(5\) univariate-TSC datasets. The LSNN constitutes of an LDN functioning as a _static_ reservoir followed by an SNN comprising an encoding layer, _one_ hidden and an output layer - both trainable. The LDN accepts a univariate signal \(\mathbf{u}[t]\) and outputs a \(d\)-dimensional state-vector \(\mathbf{x}[t]\) (authors [21] refer \(\mathbf{x}[t]\) as the _temporal features_ of input \(\mathbf{u}[t]\)). The features \(\mathbf{x}[t]\) are rate-encoded to binary spikes via a two-neuron (IF) encoder layer (ENC). Note that the scalars in \(\mathbf{x}[t]\) can either be _positive_ or _negative_, therefore, one needs a _pair_ of neurons, each sensitive to the sign of the scalar, to encode. Thus, the number of neurons in ENC is \(2{\times}d\) (henceforth, \(2d\)). The ENC layer is followed by a hidden layer (HDN) of \(3{\times}d\) (henceforth, \(3d\)) number of IF neurons; the spikes of which are forwarded to the _non-spiking_ output layer (OTP), where, the classes are inferred on the maximally accumulated voltage of OTP nodes. Thus, the total number of IF neurons in LSNN is \(2d{+}3d{=}5d\) and the number of _trainable_ connections is \(2d{\times}3d{+}3d{\times}c{=}6d^{2}{+}3dc\) (where \(c\) is number of OTP nodes/classes). Compared to the original LSNN, there are _two_ distinctions in our adapted LSNN (see Fig 1): (1) Instead of a _non-spiking_ OTP layer, for programming constraints/ease on Loihi-2 we use a _spiking_ OTP layer; we forward these OTP spikes to a new classification layer (CLS) that infers class on the maximally firing OTP neuron, & (2) Except the ENC layer IF neurons, all the neurons in HDN and OTP are CUBA neurons (details later). Henceforth, term "LSNN" implies our adapted LSNN. In Fig 1, the number of "Relay" nodes is equal to \(d\), and each of them _duplicates_ the corresponding scalar in \(\mathbf{x}[t]\) and forwards it to ENC. The total number of neurons in our adapted LSNN is \(5d{+}c\) and the number of trainable connections remain same (similar to [21] - only the black connections in Fig 1 are trainable). In the original LSNN, the authors considered the maximum value of \(d{=}24\) and \(c{=}2\); in our experiments, this implies that the number of neurons\({=}5{\times}24{+}2{=}122\) and number of connections\({=}6{\times}24(24{+}1){=}3600\).
+
+## 3 LSNN's Training on GPU, and Evaluation & Profiling on Loihi-2
+
+We now explain our framework to train our adapted LSNN (Fig 1) on GPU and evaluate & profile it on Loihi-2. Note that the reservoir LDN in LSNN is implemented via regular matrix operations (i.e., Eq (3)) and _not_ with spiking neurons; whereas, the spiking network following the LDN is composed of IF (in ENC) and CUBA neurons (in HDN & OTP). Although the LSNN as a whole can be easily trained on CPU/GPU, its evaluation & profiling on Loihi-2 is _not_ straightforward, the _non-spiking_ LDN and _spiking_ network must be accounted appropriately; we do that by deploying the LDN along with ENC layer on the embedded LMT cores and the following HDN & OTP layers on the Neuro-Cores. However, implementing the LDN on LMT is _not_ trivial either - because the LMT cores support only 32-bit signed integer operations. Therefore, to implement the LDN (& ENC layer) on LMT, we must _quantize_ all its real-valued variables and operations to 32-bit integers. Note that for the uniformity of our experiments, we train the LSNN with _quantized_ LDN (instead of a _continuous_-valued one). The
+
+Figure 1: Our _adapted_ LSNN model [21]. Connections ENC to HDN to OTP are all-to-all.
+
+[MISSING_PAGE_FAIL:4]
+
+(see Appx G). The _two_ parameters that characterize the LDN (in LSNN) are its delay value \(\theta\) and dimension \(d\) of its state-vector \(\mathbf{x}[t]\) (these values define the state-matrices \(\mathbf{A}\)\(\&\)\(\mathbf{B}\)). In our experiments, we tune \(\theta\)\(\in\)\(\{110,130,150\}\) time-steps, and \(d\)\(\in\)\(\{4,6,8,10,12,14,16,24\}\); the CUBA neurons' \(\tau_{\text{cur}}\) and \(\tau_{\text{vol}}\) decays are tuned in \(\{0.00,0.10,0.20\}\). The batch size and number of training epochs vary with dataset and can be found in our code [32]. For all the experiments we shuffle the train and test data every \(20^{\text{th}}\) epoch and halve the learning rate \(\eta\) every \(40^{\text{th}}\) epoch (initial \(\eta=0.001\)). Note that we set the factor \(\mathcal{P}\)\(=\)\(4096\), such that the operations in Eq (5) are well represented in \(32\)-bit.
+
+### Training and test procedure on CPU/GPU
+
+As stated above, we train our LSNN (SlayerSNN specifically, with quantized LDN) on GPU (see Fig 2a). For each dataset, we conduct grid-search on the abovementioned values of \(\theta\), \(d\), \(\tau_{\text{cur}}\), & \(\tau_{\text{vol}}\) (we ensure \(\theta\leq\) signal duration). Let \(\kappa_{m}\) denote one combination of \((\theta_{i}\),\(d_{j}\),\(\tau_{\text{cur}_{i}}\),\(\tau_{\text{vol}_{i}})\); for each \(\kappa_{m}\) we train the LSNN on \(5\) different \(s_{n}\)\(\in\)SEEDs. Note that for each of the training runs for a dataset, we obtain the best performing LSNN test-accuracy: \(slyr\_acc_{s_{n}}^{\kappa_{m}}\), and use the same trained network to obtain the _corresponding_LavaLSNN accuracy: \(l2sim\_acc_{s_{n}}^{\kappa_{m}}\) on Loihi-2 _simulation_ i.e., on CPU. We then compute the final test accuracies reported in Tab 1 as follows (where \(\textsf{mdl}\)=\(slyr\) or \(l2sim\)):
+
+\[\textsf{mdl}\_best=\max_{\kappa_{m},s_{n}}(\textsf{mdl}\_acc_{s_{n}}^{\kappa_{ m}})\qquad,\qquad\textsf{mdl}\_mean=\max_{\kappa_{m}}(\underset{s_{n}}{\text{mean}}( \textsf{mdl}\_acc_{s_{n}}^{\kappa_{m}}))\] (6)
+
+### Evaluation procedure on _physical_ Loihi-2
+
+We evaluate our _LavaLSNN_ on _physical_ Loihi-2 for all the \(15\) datasets; Fig 2b shows _LavaLSNN_'s respective backends for deployment. Since the Loihi-2 boards on Intel's INRC cloud are on shared access, we prioritize the variety of _LavaLSNN_ models that we evaluate on _physical_ Loihi-2. Therefore, for each dataset, we first choose and evaluate _all_ those _LavaLSNN_ models that correspond to \(l2sim\_best\), followed by evaluating a next few models with \(l2sim\_acc_{s_{n}}^{\kappa_{m}}\) within \(2\%\) or \(3\%\) absolute margin of \(l2sim\_best\) accuracy; we then report the best accuracy (among all) - \(l2hw\_best\) in Tab 1.
+
+### Results Analysis
+
+We now analyze our results in Tab 1, where we compare ours with that of LSTM-FCN [33]. LSTM-FCN is composed of _one_ LSTM block, _three_ 1D Convolution blocks (each accompanied with batch normalization), and dropout & average pooling blocks. As the LSTM-FCN is a significantly complex architecture than the LSNN and the related work [33] provides a benchmark on all our experimented datasets, we choose it for comparison. In Tab 1, the simple LSNN either achieves the _same accuracy_ or _outperforms_ the well established LSTM-FCN on \(5\) datasets - considering the best and average performance of both: LSNN on GPU (\(slyr\_*\)) and on Loihi-2 _simulation_ (\(l2sim\_*\)). Regarding the variation of \(\text{mean}(slyr\_acc_{s_{n}}^{\kappa_{m}})\) and \(\text{mean}(l2sim\_acc_{s_{n}}^{\kappa_{m}})\) (over SEEDs \(s_{n}\)) with hyperparameters \(d\), \(\theta\), \(\tau_{\text{cur}}\), & \(\tau_{\text{vol}}\), we did _not_ find any conclusive trend between them (similar to [21]); although, for a few datasets, we observed that higher \(d\) results in higher accuracy. Coming to LSNN's performance on _physical_ Loihi-2 (\(l2hw\_best\)), we see it _outperforming_ LSTM-FCN on \(3\) datasets. It is expected that a typical network's deployment on a hardware and its simulation should produce same results, however, we did _not_ observe this in our Loihi-2 experiments. In fact, for a few datasets, we observed that _non_\(l2sim\_best\) models achieved better accuracies on Loihi-2 hardware; here too, we observed that _generally_ higher \(d\) achieved better accuracies. Regarding comparison with other spiking networks, we found other _spiking_ works on \(8\) of our experimented datasets. For the first five datasets in Tab 1 -[21] achieved (max) \(98.49\), \(93.56\), \(82.72\), \(99.51\), \(80.43\) (\(\%\)) accuracies (resp.), for _Cofe_ & _Light_2: -[34] achieved \(100.0\) & \(80.33\) (\(\%\)) accuracies (resp.), and for _ToSe_2: -[35] achieved \(83.00\%\). Note: [21] tune their LSNN on a much wider set of hyper-parameters with a different loss function, and [34] use trainable ReLU Conv layers to extract temporal features - hence, they obtain higher accuracies. Additionally, we conducted two _intrusive_ experiments with LSNN, where (a) we used _continuous_ valued LDN and (b) the neuron decays (\(\tau_{\text{cur}}\) & \(\tau_{\text{vol}}\), along with the weights) were set to trainable. For _ToSe_2 dataset, upon inferring with such an \(l2sim\_best\) model on _physical_ Loihi-2, we obtained \(93.08\%\) accuracy (same as LSTM-FCN, Tab 1); we present more details in Appx H.
+
+## 5 Discussion & Insights
+
+We now profile the LSNN on _physical_ Loihi-2 and present some insights from its analysis.
+
+Figure 3: _LavaLSNN_ Processes, their connections and supported backends; ‘\(\Xi\)’ is an adapter Process to adapt spikes from Neuro-Core to CPU. For _LavaLSNN’s physical_ Loihi-2 deployment, blocks are color coded with Fig 2b (backends are: LMT & Neuro-Core); for deployment on Loihi-2 _simulation_, all backends are CPU.
+
+[MISSING_PAGE_FAIL:6]
+
+## Acknowledgment
+
+We thank the anonymous reviewer(s) for their inputs to improve the presentation of this work, and Intel for providing us the access to Loihi-2 boards on their INRC cloud. This work was supported in part by the U.S. National Science Foundation (NSF) under Grant CCF-1750450, Grant ECCS-1731928, Grant ECCS-2128594, Grant ECCS- 2314813, and Grant CCF-1937487.
+
+## Appendix A LoihiProtocol
+
+Here we briefly describe the LoihiProtocol used to synchronize the Lava Processes, more details can be found at https://lava-nc.org/. The _phases_ in LoihiProtocol are executed in a _particular order_, and all the phases (except one) have an implementable _guard_ method that returns a boolean value - determining if its corresponding phase should be executed in a given time-step. The phases and their guard methods are described below; phases are in the order of their execution:
+
+1. Spiking phase (run_spk()): This phase is executed \(1^{\text{st}}\) in order and has _no_ guard method, i.e., it is executed unconditionally every time-step.
+2. Pre-management phase (run_pre_mgmt()): Executed \(2^{\text{nd}}\) in order, and has a guard method pre_guard() that must return True along with lrn_guard() to execute this phase.
+3. Learning phase (run_lrn()): Executed \(3^{\text{rd}}\) in order, and its guard method lrn_guard() must return True for this phase to be executed.
+4. Post-management phase (run_post_mgmt()): Executed \(4^{\text{th}}\) in order, and its guard method post_guard() must return True for this phase to be executed.
+5. Host phase (run_host_mgmt()): Executed \(5^{\text{th}}\) in order, its guard method host_guard() must return True for this phase to be executed.
+
+Note: one can choose to skip a few phases depending on their implementation requirements.
+
+## Appendix B LDN's State-matrices
+
+Below, we mention the values of the state-matrices \(A\), \(B\), \(C\), and \(D\) that define an LDN - characterized by the dimension \(d\) (of its state-vector \(x(t)\)) and delay \(\theta\) (i.e., its encoding memory window):
+
+\[A=\tfrac{[a]_{i,j}}{\theta},\quad a_{i,j}=(2i+1)\begin{cases}-1&i<j\\ (-1)^{i-j+1}&i\geq j\end{cases}\qquad\text{and}\qquad B=\tfrac{[b]_{i}}{\theta },\quad b_{i}=(2i+1)(-1)^{i}\] (7a) \[C=[c]_{i},\quad c_{i}=(-1)^{i}\sum_{j=0}^{i}\binom{i}{j}\binom{i+j}{j}(-1)^{j}\] and \[D=0\] (7b)
+
+for \(i,j\in[0,d-1]\). Note: \(\mathbf{A}\), \(\mathbf{B}\), \(\mathbf{C}\), and \(\mathbf{D}\) in Eqs. (3) & (4) are obtained from \(A\), \(B\), \(C\), and \(D\) via Zero-Order Hold (ZOH) method - Eq. (8) below:
+
+\[\mathbf{A}=\mathsf{e}^{(A\Delta t)},\qquad\mathbf{B}=A^{-1}(\mathsf{e}^{(A \Delta t)}-I)B,\qquad\mathbf{C}=C,\qquad\text{and}\qquad\mathbf{D}=D\] (8)
+
+where \(I\) is an Identity matrix, \(\mathsf{e}^{(\cdot)}\) is _matrix exponential_ function, and \(\Delta t{=}1ms\).
+
+## Appendix C LSNN's neuron equations
+
+Here we present the neuron equations of our adapted LSNN.
+
+### Enc layer
+
+We rate encode the quantized LDN state-vectors \(\mathbf{\bar{x}}[t]\) to binary spikes \(S[t]\) (using Heaviside \(\Theta(.)\)).
+
+\[\overline{J}=\alpha<\mathcal{E}.\mathbf{\bar{x}}[t]>+\overline{\beta}\quad, \quad\overline{V}[t]=\overline{V}[t-1]+\overline{J}\quad\text{and}\quad S[t]= \Theta(\overline{V}[t]-\overline{V}_{\text{thr}})\] (9)
+
+where \(\alpha\) (=1) & \(\overline{\beta}\) (=0) are the neuron's _gain_ & _bias_ values, \(\mathcal{E}\) is encoder vector \(\in\{-1,1\}\), and \(\overline{V}[t]\) & \(\overline{V}_{\text{thr}}\) are the neuron's quantized _voltage_ & _threshold_ respectively (we set \(V_{\text{thr}}\)=\(1,\implies\overline{V}_{\text{thr}}\)=\(\mathcal{P}\times 1\)).
+
+### Hdn & Otp layers
+
+Following are the equations of the CUBA neurons used in HDN and OTP layers. Note that depending on the _voltage_ decay \(\tau_{\text{vol}}\), the CUBA neurons will function either as LIF or IF neurons.
+
+\[U_{i}[t]=(1-\tau_{\text{cur}})U_{i}[t-1]+\sum_{j}W_{i,j}S_{j}[t],\quad\quad V_{i}[t]=(1-\tau_{\text{vol}})V_{i}[t-1]+U_{i}[t]\] (10a) \[S_{i}[t]=V_{i}[t]\geq V_{\text{thr}},\quad\quad\quad V_{i}[t]=V_{i}[t](1-S_{i}[t])\] (10b)
+
+## Appendix D Spike-train synchrony tests
+
+Here we present the spike-train synchrony tests to validate our quantization of the LDN. Spike-train synchrony metrics measure the extent of _temporal alignment_ of _two_ spike-trains, i.e., how _similar_ or _dissimilar_ they are; for which, a number of methods exists [38], we pick _three_: (1) Victor-Purpura distance [39] (VPR-dist) - a popular time-scale dependent metric, (2) Inter-Spike Interval distance [40] (ISI-dist) - a time-scale independent metric, & (3) SPIKE-synchrony [41] (SPK-sync) - another time-scale independent metric (libraries: PySpike [42] & Elephant [43]) For any two spike-trains:
+
+* based on certain defined operations. For highly _dissimilar_ spike-trains, VPR-distance metric will be high, and vice-versa.
+* ISI-distance metric also measures the _dissimilarity_ between them by using inter-spike intervals to estimate instantaneous local firing rates of spike-trains and quantifying that difference. For highly _dissimilar_ spike-trains, ISI-distance will be high, and vice-versa.
+* SPIKE-synchrony metric measures the _similarity_ between them by using coincidence windows to determine if a pair of spikes, each from two different spike-trains are coincident or not. For highly _similar_ spike-trains, SPIKE-synchrony will be high, and vice-versa.
+
+We now explain the _procedure_ of our spike-train synchrony tests. We consider spike-trains generated from _four_ implementations of LDN: _Two_ Python implementations - (1) Original Continuous-valued LDN implemented on CPU (OC-LDN-CPU-Py) & (2) Quantized LDN implemented on CPU (QT-LDN-CPU-Ly), and _two_ Lava implementations - (3): Quantized LDN implemented on CPU (QT-LDN-CPU-Lv) & (4): Quantized LDN implemented on Loihi-2 embedded LMT cores (QT-LDN-LMT-Lv). Note that in our experiments, we have utilized _three_ (all quantized) implementations of LDN, i.e., QT-LDN-CPU-Py while training, and QT-LDN-CPU-Lv & QT-LDN-LMT-Lv while evaluation on Loihi-2's _simulation_ & _physical_ backends respectively. For comparisons among the _four_ implementations of LDN, we consider all the \(6\) pairs (i.e., taking two at a time), denoted below:
+
+* _Comparisons between Continuous-valued LDN and its Quantized implementations_
+* \(OC^{\text{cpu}}_{\text{py}}\)-vs-\(QT^{\text{cpu}}_{\text{py}}\): Comparison between OC-LDN-CPU-Py and QT-LDN-CPU-Py
+* \(OC^{\text{cpu}}_{\text{py}}\)-vs-\(QT^{\text{cpu}}_{\text{1v}}\): Comparison between OC-LDN-CPU-Py and QT-LDN-CPU-Lv
+* \(OC^{\text{cpu}}_{\text{py}}\)-vs-\(QT^{\text{last}}_{\text{1v}}\): Comparison between OC-LDN-CPU-Py and QT-LDN-LMT-Lv
+* _Comparison between two Quantized LDNs in Lava: one on CPU and another on LMT_
+* \(QT^{\text{cpu}}_{\text{1v}}\)-vs-\(QT^{\text{last}}_{\text{1v}}\): Comparison between QT-LDN-CPU-Lv and QT-LDN-LMT-Lv
+* _Comparisons between Quantized LDNs in Python and Lava (on CPU & LMT)_
+* \(QT^{\text{cpu}}_{\text{py}}\)-vs-\(QT^{\text{cpu}}_{\text{1v}}\): Comparison between QT-LDN-CPU-Py and QT-LDN-CPU-Lv
+* \(QT^{\text{cpu}}_{\text{py}}\)-vs-\(QT^{\text{last}}_{\text{1v}}\): Comparison between QT-LDN-CPU-Py and QT-LDN-LMT-Lv
+
+With respect to designing the LDN, note that it is characterized by two values: '\(d\)' & '\(\theta\)'; for our tests, we consider all the values of \(d\) & \(\theta\) over which we tune our LSNN, i.e., \(d\in\{4\), \(6\), \(8\), \(10\), \(12\), \(14\), \(16\), \(24\}\) and \(\theta\in\{110\), \(130\), \(150\}\), thus, a total of \(8\times 3=24\) combinations or \(24\) LDNs. Consider one input signal and _two_ different _implementations_ of an LDN, we get _two sets_ - each of \(d\)-dimensional state-vectors \(\mathbf{x}[t]\) - that are encoded to binary spikes via the two-neuron encoder system (ENC in LSNN), thus producing _two sets_ of \((2\times d)\)-dimensional spike-trains - i.e., one _set_ foreach _implementation_ of LDN. Note that a scalar similarity/dissimilarity \(score\) is computed between _two_ individual spike-trains. Therefore, we align those _two sets_ of spike-trains dimension-wise, and \(\forall\) dimensions \(i\in(2\times d)\) we compute a \(score_{i}\) between the _two_\(i^{\text{th}}\)-dimension's spike-trains followed by the mean of all \(score_{i}\), thus producing one _final-score_ - representing how similar or dissimilar are the \((2\times d)\) spike-trains on average (for the considered LDN and input signal). Likewise, for the same input signal we compute \(24\) similarity/dissimilarity _final-scores_ for all the \(24\) LDNs. We repeat this process for \(75\) randomly chosen signals (\(5\) each from our \(15\) datasets), thereby obtaining \(75\) such \(24\)-dimensional _final-scores_; we then again compute mean and std across all these \(75\) vectors. Thus, for a considered comparison (out of the six above), this averaged \(24\)-dimensional _final-scores_ represents how similar/dissimilar are the two compared _implementations_ of LDN over the \(15\) datasets. For all our \(6\) comparisons, Fig 4 below shows the (considered) \(3\) types of spike-train similarity/dissimilarity mean _final-scores_ (and corresponding std) for all the \(24\) LDNs averaged over all \(75\) random signals.
+
+As can be seen above, in Fig 4a, our quantized LDN implementation (\(QT^{\text{cpu}}_{\text{py}}\)) is quite similar to the continuous-valued LDN (\(OC^{\text{cpu}}_{\text{py}}\)), where the mean SPK-sync scores tend to be near \(1\) and the mean ISI-dist & VPR-dist scores are closer to \(0\). Coming to the Figs 4b & 4c, we see that both are same, this is because the quantized implementations of LDN via Lava on CPU (\(QT^{\text{cpu}}_{\text{1v}}\)) & LMT (\(QT^{\text{1nt}}_{\text{1v}}\)) are same; this is further proved in the Fig 4d where we see that ISI-dist & VPR-dist are exactly \(0\) and SPK-sync is exactly \(1\), i.e., perfect synchrony. However, note that the Figs 4b & 4c are _different_ from Fig 4a - ideally, this should _not_ be the case, as the underlying maths for \(QT^{\text{cpu}}_{\text{py}}\), \(QT^{\text{cpu}}_{\text{1v}}\), & \(QT^{\text{1nt}}_{\text{1v}}\) is same; the _difference_ exists because of our programming implementations in Python & Lava.
+
+In our Python implementations (\(OC^{\text{cpu}}_{\text{py}}\) & \(QT^{\text{cpu}}_{\text{py}}\)), in the _first_ time-step (of the input signal's duration), the signal's _first_ element is rightly accounted for LDN's state-vector generation and encoding to spikes, whereas, in our Lava implementations (\(QT^{\text{cpu}}_{\text{1v}}\) & \(QT^{\text{1nt}}_{\text{1v}}\)), in the _first_ time-step, we generate an _all zero_ state-vector, thus (certainly) _no_ spikes; rather, from the _second_ time-step onwards the actual input signal is accounted for LDN's state-vector generation and encoding to spikes. Therefore, \(QT^{\text{cpu}}_{\text{1v}}\) & \(QT^{\text{1nt}}_{\text{1v}}\) run one time-step _late_ than \(OC^{\text{cpu}}_{\text{py}}\) & \(QT^{\text{cpu}}_{\text{py}}\). This behavior is partly because of the unique LoihiProtocol that our Lava Process - for inputting signals to the LDN follows. In this Process, every time-step, the run_spk() phase sends a contiguous scalar of the input signal to the LDN. Note that, by the LoihiProtocol's design, in every time-step, run_spk() phase is the _first_ phase to be executed. Since in the first time-step, the actual signal is yet to be initialized and the run_spk() phase executes first, it sends a zero scalar to the LDN; the next phase to execute (in the same first time-step) in our implementation is run_post_mgmt(), where the input signal then gets initialized. Thus, from the _second_ time-step onwards, the actual signal is accounted for state-vectors and subsequent spike generation. We opted for such Lava implementation for our experimental ease, however, one can choose to implement \(QT^{\text{cpu}}_{\text{1v}}\) & \(QT^{\text{1nt}}_{\text{1v}}\) to match \(QT^{\text{cpu}}_{\text{py}}\) outputs. In the Figs 4e &
+
+Figure 4: _Spike-train synchrony tests._ All \(6\) pair-wise comparisons of _four_ LDN implementations. For VPR-dist & ISI-dist, lower is better, and for SPK-sync, higher is better. Solid line is mean and shaded region is std.
+
+4f, we explicitly compare our \(QT_{\texttt{py}}^{\texttt{cpu}}\) with \(QT_{\texttt{1v}}^{\texttt{cpu}}\) & \(QT_{\texttt{1v}}^{\texttt{1st}}\), where, we see that both the plots are expectedly same, and the spike-trains from \(QT_{\texttt{1v}}^{\texttt{1st}}\) & \(QT_{\texttt{1v}}^{\texttt{1st}}\) are quite similar to those from \(QT_{\texttt{py}}^{\texttt{cpu}}\).
+
+Overall, Fig 4a shows the difference purely due to quantization, Figs 4b & 4c show the difference due to quantization and one time-step late processing, Fig 4d shows that \(QT_{\texttt{1v}}^{\texttt{cpu}}\) & \(QT_{\texttt{1v}}^{\texttt{1st}}\) are exactly same, and finally, Figs 4e & 4f show the difference (only) due to one time-step late processing.
+
+## Appendix E ProcessModels of LavaLSNN
+
+The ProcessModels of our defined ImpSigToLdn, LdnEncToSpk, and OutSpkToCls Processes of LavaLSNN are briefly described below; their implementations are in our code [32].
+
+* ImpSigToLdn: For this Process, we implement only _one_ProcessModel: PyInSpigToLdnModel that is inherited from lava's PyLoihiProcessModel and executes on CPU. It is responsible for feeding an input signal to the LDN (that runs either on CPU or on LMT).
+* LdnEncToSpk: For this Process (considering _simulated_ and _physical_ Loihi-2), we implement _two_ProcessModels: (a) CLdnEncToSpkOnLmtModel that is inherited from lava's CLoihiProcessModel and executes on LMT, and (b) PyLdnEncToSpkOnCpuModel that is inherited from lava's PyLoihiProcessModel and executes on CPU. Depending on the backend, only _one_ of the two ProcessModels is executed. It is responsible for computing the quantized state-vectors \(\bar{\mathbf{x}}[t]\) i.e., temporal features and encoding these to binary spikes.
+* OutSpkToCls: For this Process, we implemented only one ProcessModel: PyOutSpkToClsModel that is inherited from lava's PyLoihiProcessModel and executes on CPU. It is responsible for collecting the output spikes from NctxSNN and inferring classes/accuracy.
+
+When LavaLSNN is deployed on Loihi-2's _simulation_ i.e., on CPU (via Loihi2SimCfg), following ProcessModels (of the constituent Processes) are executed: PyInSpigToLdnModel, PyLdnEncToSpkOnCpuModel, and PyOutSpkToClsModel. And when LavaLSNN is deployed on the _physical_ Loihi-2 chips (via Loihi2WcGg), following ProcessModels (of the constituent Processes) are executed: PyInSpigToLdnModel, CLdnEncToSpkOnLmtModel, and PyOutSpkToClsModel. All these ProcessModels follow the LoihiProtocol for synchronization. Note that we _have to_ deploy the signal-input Process:InSpigToLdn and output-spikes collection Process: OutSpkToCls (in case of both - Loihi-2's _simulation_ and _physical_ hardware) on CPU - as these two Processes are the I/Os. Also note that Lava automatically deploys Processes obtained from lava-dL's next API (in our case - the NctxSNN Process obtained from slayer-trained SlayerSNN) on the appropriate backends depending on the choice of: Loihi2SimCfg (on CPU) & Loihi2WcGg (on Neuro-Core).
+
+## Appendix F CLdnEncToSpkOnLmtModel for deploying LDN and ENC layers on LMT
+
+Documentation for programming Loihi-2 chips via Lava can be found at https://lava-nc.org/. On one hand, where the documentation to program Neuro-Cores is well presented there, on the other, _little to no_ documentation to program LMT cores is provided - this paucity limits the researchers to use LMT cores for their Loihi-2 deployments, and prompts them to otherwise use the CPU for implementing _non-spiking_ operations or _encoding_ continuous values to spikes. Note that the embedded LMT cores are _more_ power-efficient than CPUs. In Algorithm 1, we present our CLdnEncToSpkOnLmtModel that implements a quantized SSM (i.e., LDN) on LMT cores. Our implementation also serves as an _addition_ to the limited documentation on programming LMT cores.
+
+We next explain our code in Algorithm 1 (Alg-1, note: only \(32\)-bit ops are supported on LMT) by first recalling that the CLoihiProcessModel: CLdnEncToSpkOnLmtModel has a corresponding Process: LdnEncToSpk that provides the interface to communicate with other Processes. Note that the C file (in our case: ldn_enc_to_spkn_lmt.c) containing the code in Alg-1 _must_ have a corresponding _header_ file bearing the same time (in our case: ldn_enc_to_spkn_lmt.h), see line 1 in Alg-1. The _header_ file should contain the function prototypes of all LoihiProtocol phases used in the C file. One should also include another _header_ file with name predefs_X_.h, where X is the name of CLoihiProcessModel of the Process to be executed on LMT; in our case X is CLd-nEncToSpkOnLmtModel (see line 2). Note that the file predefs_CLdnEncToSpkOnLmtModel.h is auto-generated containing the variables of the corresponding Process (in our case: LdnEncToSpk).
+
+As can be seen in Alg-1 (lines \(8\),\(12\),\(27\),&\(32\)), one can implement each phase of the LoihiProtocol (on LMT) with an argument runState *rs passed to it. The current time-step of the execution can be accessed via the time-step attribute of *rs, which can be used to implement time-step dependent ops (lines \(13\), \(34\)). One can also define global variables (lines \(5\), \(6\)) and custom functions(line 19) in the \(\mathcal{C}\) file, as well as, access the variables defined in the corresponding Lava Process by their same name (lines \(13\), \(20\), i.e., ps_ts & ORDER) - this is because of the inclusion of auto-generated header file predefs_CLdnEncToSpkOnLmtModel.h. Note that all the functions can access all global variables and Process variables. An important thing to consider is that the Process running on LMT cores communicates with Processes running on CPUs and Neuro-Cores. In our case, the LMT Process receives a quantized input (i.e., the input signal \(\bar{\mathbf{u}}[t]\)) from an input Process on CPU; for the same, the recv_vec_dense() function (line \(40\)) can be used that accepts the *rs and two other variables: sig_inp & input. Note that sig_inp is an input port (defined in Ld_nEncToSpk_ Process) that receives a signal from the CPU Process, and input is a local variable that stores the received signal for local processing. Subsequently, when the input (for the current time-step) is processed and spikes are generated, they can be sent from the LMT Process to the Neuro-Core Process via the send_vec_dense() function (line \(83\)) that accepts *rs and two other variables: spk_out & spike_data. Note that spk_out is an output port (defined in LdnEncToSpk Process) that sends the spikes stored in local variable spike_data to the Neuro-Core Process.
+
+```
+1#include"ldn_enc_to_spk_on_lmt.h"
+2#include"predefs_CLdnEncToSpkOnLmtModel.h"
+3
+4//DefinetheglobalLDNstatevectorwithmaximumORDER=128.
+5int32t_g_ldn_state[128]={0};
+6int32t_g_volt[256]={0};//SettwicetheORDERnumberofspikingneurons.
+7
+8intspk_guard(runState*rs){
+9return1;//keeprunningthe'run_spk()'everytime-step.
+10}
+11
+12intpost_guard(runState*rs){
+13if(rs->time_step%ps_ts[0]==1)//Presentationtimeofonesampleisover.
+14return1;
+15
+16return0;
+17}
+18voidzero_out_global_arrays(){
+19for(uint32_ti=0;i<ORDER[0];i++)
+20g_ldn_state[i]=0;
+21
+22
+23for(uint32_ti=0;i<2*ORDER[0];i++)
+24g_volt[i]=0;
+25}
+26
+27voidrun_post_mgmt(runState*rs){
+28zero_out_global_arrays();
+29}
+30
+31//Followingfunctioniscalledeverytime-step.
+32voidrun_spk(runState*rs){
+33
+34if(rs->time_step%ps_ts[0]==1)//Presentationtimeofonesampleisover.
+35zero_out_global_arrays();
+36
+37int32_tinput[sig_inp.size];
+38uint32_tspike_data[spk_out.size];
+39
+40recv_vec_dense(rs,&sig_inp,input);//Getu[t].
+41//Note that the matrices Ap, Bp, encoders E, and ORDER are already defined //in Process. The variable ORDER can be accessed as *ORDER or ORDER[0].
+* //Compute Ap
+* x[t] and Bp
+* u[t]. int32_t Apx[*ORDER], Bpu[*ORDER]; for(uint32_t i=0; i< *ORDER; i++) { int32_t sum = 0; for(uint32_t j=0; j< *ORDER; j++) { sum += (Ap[i][j]
+* g_ldn_state[j]); } Apx[i] = sum; Bpu[i] = Bp[i][0]
+* input[0]; }
+* //Compute Apx[t] + Bpu[t]. for(uint32_t i=0; i< *ORDER; i++) { int32_t state = Apx[i] + Bpu[i]; g_ldn_state[i] = ( //Ceil Integer Division (state > 0)? (1 + (state-1)/ *scale_factor) : (state/ *scale_factor) ); } //Rate Encode the current time-step's ldn_state to the spikes. Note that the // g_gain, g_bias, and g_v_thr are already defined in the the Process. for(uint32_t i=0; i< 2
+* *ORDER; i++) { int32_t J = *g_gain
+* g_ldn_state[i/2] + *g_bias; // g_bias = 0 here. g_vol[i] = g_vol[i] + J; //Update the global voltage state of IF neurons. if(g_vol[i] > *g_v_thr) { spike_data[i] = 1; g_vol[i] = 0; } else { spike_data[i] = 0; if(g_vol[i] < 0) g_vol[i] = 0; //Rectify the voltage. } } send_vec_dense(rs, &spk_out, spike_data);
+
+[MISSING_PAGE_FAIL:14]
+
+Procedure and distribution plots of LSNN's profiling on _physical_ Loihi-2
+
+Here, we explain our procedure to _energy-_ and _latency_-profile the LSNN on _physical_ Loihi-2 chip, as well as, present the frequency distribution plots of the profiled metrics. With respect to LavaLSNN's (and LDN's) variations to profile, we fixed \(\tau_{\text{cur}}\)=\(\tau_{\text{vol}}\)=0 & \(\theta\)=\(130\), and varied the order \(d\)\(\in\)\(\{8,16,\,24\}\) - as \(d\) determines the size of LavaLSNN (& LDN). \(\forall\)\(d\), we consider all the combinations of \(\mathcal{S}_{j}\)\(\in\)\(\{256,\,512,\,1024,\,2048\}\) & \(\mathcal{B}_{k}\)\(\in\)\(\{2,\,3,\,4\}\); and \(\forall\)\((\mathcal{S}_{j},\mathcal{B}_{k})\), we _run_ the considered LavaLSNN's components for \(2000\)_duplicates_ of the hard-coded signal (of duration \(140\) time-steps (t.s.)) i.e., \(28e4\) t.s. in total, and record the total energy consumed and execution time _on_ Loihi-2 each _run_ is repeated \(15\) times (in real-time, each _run_ executed for \(30s\)-\(120s\)). To obtain the _per-sample_ energy & latency metrics of processing a \(140\) t.s. long signal on Loihi-2, we divide the total energy & execution time of each _run_) by the number of _duplicates_ i.e., \(2000\). Finally, \(\forall\)\(d\), we report the (mean, std) of _per-sample_ energy & latency metrics over all the \(15\) repeats of all \(12\) combinations \((\mathcal{S}_{j},\mathcal{B}_{k})\) in Tab 2.
+
+We next present the frequency distribution plots of the LSNN's different components' energy & latency profiling - on different backends of _physical_ Loihi-2, namely (1) LMT & Neuro-Core (combined), (2) only LMT, and (3) only Neuro-Core. Note that, the LDN & ENC layers, both execute on LMT, where the LDN has \(\mathcal{O}(d^{2})\) operations (matrix multiplied to a vector - lines \(46\)-\(55\) in Algorithm 1), and the ENC has \(\mathcal{O}(d)\) operations (lines \(67\)-\(81\) in Algorithm 1). Therefore, the LDN accounts for (or contributes to) much of the energy & latency metrics values. The \(\mathcal{O}(d^{2})\) also explains why the metric values in Tab 2 (for (1)& (2)) for \(d\) = 8 & \(16\) are similar, and clearly different for \(d\)=\(24\). On a side note, we conducted profiling experiments with \(\mathcal{B}_{k}=1\) time-step binning too, however, the results were either not consistent or the simulation threw runtime errors for lower buffer size \(\mathcal{S}_{j}\).
+
+### Energy distribution plots for (1), (2), & (3) in Tab 2
+
+#### i.1.1 For (1) LMT & Neuro-Core: By _LdnEncToSpk_\(\rightarrow\)NetxSNN
+
+#### i.1.2 For (2) only LMT: By _LdnEncToSpk_
+
+Figure 5: Frequency distribution of per-sample energy consumed on LMT & Neuro-Core
+
+Figure 6: Frequency distribution of per-sample energy consumed on only LMT
+
+[MISSING_PAGE_FAIL:16]
+
+[MISSING_PAGE_FAIL:17]
+
+## References
+
+* [1] Roy Schwartz, Jesse Dodge, Noah A Smith, and Oren Etzioni. Green ai. _Communications of the ACM_, 63(12):54-63, 2020.
+* [2] Roberto Verdecchia, June Sallou, and Luis Cruz. A systematic review of green ai. _Wiley Interdisciplinary Reviews: Data Mining and Knowledge Discovery_, page e1507, 2023.
+* [3] Tim Yarally, Luis Cruz, Daniel Feitosa, June Sallou, and Arie Van Deursen. Uncovering energy-efficient practices in deep learning training: Preliminary steps towards green ai. In _2023 IEEE/ACM 2nd International Conference on AI Engineering-Software Engineering for AI (CAIN)_, pages 25-36. IEEE, 2023.
+* [4] Ioannis Mavromatis, Kostas Katsaros, and Aftab Khan. Computing within limits: An empirical study of energy consumption in ml training and inference. _arXiv preprint arXiv:2406.14328_, 2024.
+* [5] Siddharth Samsi, Dan Zhao, Joseph McDonald, Baolin Li, Adam Michaleas, Michael Jones, William Bergeron, Jeremy Kepner, Devesh Tiwari, and Vijay Gadepally. From words to watts: Benchmarking the energy costs of large language model inference. In _2023 IEEE High Performance Extreme Computing Conference (HPEC)_, pages 1-9. IEEE, 2023.
+* [6] Negar Alizadeh and Fernando Castor. Green ai: A preliminary empirical study on energy consumption in dl models across different runtime infrastructures. In _Proceedings of the IEEE/ACM 3rd International Conference on AI Engineering-Software Engineering for AI_, pages 134-139, 2024.
+* [7] Bodo Rueckauer, Connor Bybee, Ralf Goettsche, Yashwardhan Singh, Joyesh Mishra, and Andreas Wild. Nxtf: An api and compiler for deep spiking neural networks on intel loihi. _ACM Journal on Emerging Technologies in Computing Systems (JETC)_, 18(3):1-22, 2022.
+* [8] Mike Davies. Lessons from loihi: Progress in neuromorphic computing. In _2021 Symposium on VLSI Circuits_, pages 1-2. IEEE, 2021.
+* [9] Mike Davies, Andreas Wild, Garrick Orchard, Yulia Sandamirskaya, Gabriel A Fonseca Guerra, Prasad Joshi, Philipp Plank, and Sumedh R Risbud. Advancing neuromorphic computing with loihi: A survey of results and outlook. _Proceedings of the IEEE_, 109(5):911-934, 2021.
+* [10] Yongqiang Cao, Yang Chen, and Deepak Khosla. Spiking deep convolutional neural networks for energy-efficient object recognition. _International Journal of Computer Vision_, 113:54-66, 2015.
+* [11] Peter U Diehl, Daniel Neil, Jonathan Binas, Matthew Cook, Shih-Chii Liu, and Michael Pfeiffer. Fast-classifying, high-accuracy spiking deep networks through weight and threshold balancing. In _2015 International joint conference on neural networks (IJCNN)_, pages 1-8. ieee, 2015.
+* [12] Bodo Rueckauer, Iulia-Alexandra Lungu, Yuhuang Hu, Michael Pfeiffer, and Shih-Chii Liu. Conversion of continuous-valued deep networks to efficient event-driven networks for image classification. _Frontiers in neuroscience_, 11:682, 2017.
+* [13] Yunzhe Hao, Xuhui Huang, Meng Dong, and Bo Xu. A biologically plausible supervised learning method for spiking neural networks using the symmetric stdp rule. _Neural Networks_, 121:387-395, 2020.
+* [14] Alex Vigneron and Jean Martinet. A critical survey of stdp in spiking neural networks for pattern recognition. In _2020 international joint conference on neural networks (ijcnn)_, pages 1-9. IEEE, 2020.
+* [15] Friedemann Zenke and Surya Ganguli. Superspike: Supervised learning in multilayer spiking neural networks. _Neural computation_, 30(6):1514-1541, 2018.
+
+* [16] Sumit B Shrestha and Garrick Orchard. Slayer: Spike layer error reassignment in time. _Advances in neural information processing systems_, 31, 2018.
+* [17] Mantas Lukosevicius and Herbert Jaeger. Reservoir computing approaches to recurrent neural network training. _Computer science review_, 3(3):127-149, 2009.
+* [18] Gouhei Tanaka, Toshiyuki Yamane, Jean Benoit Heroux, Ryosho Nakane, Naoki Kanazawa, Seiji Takeda, Hidetoshi Numata, Daiju Nakano, and Akira Hirose. Recent advances in physical reservoir computing: A review. _Neural Networks_, 115:100-123, 2019.
+* [19] Herbert Jaeger. The "echo state" approach to analysing and training recurrent neural networks-with an erratum note. _Bonn, Germany: German national research center for information technology gmd technical report_, 148(34):13, 2001.
+* [20] Wolfgang Maass, Thomas Natschlager, and Henry Markram. Real-time computing without stable states: A new framework for neural computation based on perturbations. _Neural computation_, 14(11):2531-2560, 2002.
+* [21] Ramashish Gaurav, Terrence C Stewart, and Yang Yi. Reservoir based spiking models for univariate time series classification. _Frontiers in Computational Neuroscience_, 17:1148284, 2023.
+* [22] Steven Abreu, Jens E Pedersen, Kade M Heckel, and Alessandro Pierro. Q-s5: Towards quantized state space models. _arXiv preprint arXiv:2406.09477_, 2024.
+* [23] Zhiqi Shao, Michael GH Bell, Ze Wang, D Glenn Geers, Haoning Xi, and Junbin Gao. St-ssms: Spatial-temporal selective state of space model for traffic forecasting. _arXiv preprint arXiv:2404.13257_, 2024.
+* [24] Aaron R Voelker and Chris Eliasmith. Improving spiking dynamical networks: Accurate delays, higher-order synapses, and time cells. _Neural computation_, 30(3):569-609, 2018.
+* [25] Aaron Voelker, Ivana Kajic, and Chris Eliasmith. Legendre memory units: Continuous-time representation in recurrent neural networks. _Advances in neural information processing systems_, 32, 2019.
+* [26] Samip Karki, Diego Chavez Arana, Andrew Sornborger, and Francesco Caravelli. Neuromorphic on-chip reservoir computing with spiking neural network architectures. _arXiv preprint arXiv:2407.20547_, 2024.
+* [27] Garrick Orchard, E Paxon Frady, Daniel Ben Dayan Rubin, Sophia Sanborn, Sumit Bam Shrestha, Friedrich T Sommer, and Mike Davies. Efficient neuromorphic signal processing with loihi 2. In _2021 IEEE Workshop on Signal Processing Systems (SiPS)_, pages 254-259. IEEE, 2021.
+* [28] Mike Davies, Narayan Srinivasa, Tsung-Han Lin, Gautham Chinya, Yongqiang Cao, Sri Harsha Choday, Georgios Dimou, Prasad Joshi, Nabil Imam, Shweta Jain, et al. Loihi: A neuromorphic manycore processor with on-chip learning. _Ieee Micro_, 38(1):82-99, 2018.
+* [29] Nicolas Fremaux and Wulfram Gerstner. Neuromodulated spike-timing-dependent plasticity, and theory of three-factor learning rules. _Frontiers in neural circuits_, 9:85, 2016.
+* [30] Walter Gallego Gomez, Andrea Pignata, Riccardo Pignari, Vittorio Fra, Enrico Macii, and Gianvito Urgese. First steps towards micro-benchmarking the lava-loihi neuromorphic ecosystem. In _2023 IEEE 16th International Symposium on Embedded Multicore/Many-core Systems-on-Chip (MCSoC)_, pages 462-469. IEEE, 2023.
+* [31] Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. _arXiv preprint arXiv:1412.6980_, 2014.
+* [32]https://github.com/R-Gaurav/lsnn-on-loihi2.
+* [33] Fazle Karim, Somshubra Majumdar, Houshang Darabi, and Shun Chen. Lstm fully convolutional networks for time series classification. _IEEE access_, 6:1662-1669, 2017.
+
+* [34] Anjali Gautam and Vrjendra Singh. Clr-based deep convolutional spiking neural network with validation based stopping for time series classification. _Applied Intelligence_, 50(3):830-848, 2020.
+* [35] Tasbiha Ibad, Said Jadid Abdulkadir, Norshakirah Aziz, Mohammed Gamal Ragab, and Qasem Al-Tashi. Hyperparameter optimization of evolving spiking neural network for time-series classification. _New Generation Computing_, 40(1):377-397, 2022.
+* [36] Ramashish Gaurav, Terrence C Stewart, and Yang Cindy Yi. Spiking reservoir computing for temporal edge intelligence on loihi. In _2022 IEEE/ACM 7th Symposium on Edge Computing (SEC)_, pages 526-530. IEEE, 2022.
+* [37] Chris Eliasmith and Charles H Anderson. _Neural engineering: Computation, representation, and dynamics in neurobiological systems_. MIT press, 2003.
+* [38] Eero Satuvuori, Mario Mulansky, Nebojsa Bozanic, Irene Malvestio, Fleur Zeldenrust, Kerstin Lenk, and Thomas Kreuz. Measures of spike train synchrony for data with multiple time scales. _Journal of neuroscience methods_, 287:25-38, 2017.
+* [39] Jonathan D Victor and Keith P Purpura. Nature and precision of temporal coding in visual cortex: a metric-space analysis. _Journal of neurophysiology_, 76(2):1310-1326, 1996.
+* [40] Thomas Kreuz, Julie S Haas, Alice Morelli, Henry DI Abarbanel, and Antonio Politi. Measuring spike train synchrony. _Journal of neuroscience methods_, 165(1):151-161, 2007.
+* [41] Thomas Kreuz, Mario Mulansky, and Nebojsa Bozanic. Spiky: a graphical user interface for monitoring spike train synchrony. _Journal of neurophysiology_, 113(9):3432-3445, 2015.
+* [42] Mario Mulansky and Thomas Kreuz. Pyspike--a python library for analyzing spike train synchrony. _SoftwareX_, 5:183-189, 2016.
+* [43] M. Denker, A. Yegenoglu, and S. Grun. Collaborative HPC-enabled workflows on the HBP Collaboratory using the Elephant framework. In _Neuroinformatics 2018_, page P19, 2018.

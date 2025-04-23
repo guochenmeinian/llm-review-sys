@@ -1,0 +1,825 @@
+# WorldCoder, a Model-Based LLM Agent:
+
+Building World Models by Writing Code and
+
+Interacting with the Environment
+
+ Hao Tang
+
+Cornell University
+
+haotang@cs.cornell.edu &Darren Key
+
+Cornell University
+
+dyk34@cornell.edu &Kevin Ellis
+
+Cornell University
+
+kellis@cornell.edu
+
+###### Abstract
+
+We give a model-based agent that builds a Python program representing its knowledge of the world based on its interactions with the environment. The world model tries to explain its interactions, while also being optimistic about what reward it can achieve. We define this optimism as a logical constraint between a program and a planner. We study our agent on gridworlds, and on task planning, finding our approach is more sample-efficient compared to deep RL, more compute-efficient compared to ReAct-style agents, and that it can transfer its knowledge across environments by editing its code.
+
+## 1 Introduction
+
+Consider yourself learning to use a new device or play a new game. Given the right prior knowledge, together with relatively few interactions, most people can acquire basic knowledge of how many devices or games work. This knowledge can help achieve novel goals, can be transferred to similar devices or games, and can be communicated symbolically to other humans. How could an AI system similarly acquire, transfer, and communicate its knowledge of how things work? We cast this as learning a world model: a mapping, called the _transition function_, that predicts the next state of affairs, given a current state and action [63, 55, 26]. Our proposed solution is an architecture that synthesizes a Python program to model its past experiences with the world, effectively learning the transition function, and which takes actions by planning using that world model.
+
+In theory, world models have many advantages: they allow reasoning in radically new situations by spending more time planning different actions, and accomplishing novel goals by just changing the reward function. Representing world knowledge as code, and generating it from LLMs, brings other advantages. It allows prior world knowledge embedded in the LLM to inform code generation, allows sample-efficient transfer across tasks by reusing pieces of old programs, and allows auditing the system's knowledge, because programming languages are designed to be human-interpretable.
+
+But there are also steep engineering challenges. Learning the world model now requires a combinatorial search over programs to find a transition function that explains the agent's past experiences. Obtaining those experiences in the first place requires efficient exploration, which is difficult in long horizon tasks with sparse reward. To address the challenge of efficient exploration, we introduce a new learning objective that prefers world models which a planner thinks lead to rewarding states, particularly when the agent is uncertain as to where the rewards are. To address the program search problem, we show how curriculum learning can allow transfer of knowledge across environments, making combinatorial program synthesis more tractable by reusing successful pieces of old programs.
+
+Fig. 1 diagrams the resulting architecture, which we cast as model-based reinforcement learning (MB RL). In Fig. 2 we position this work relative to deep RL as well as LLM agents. In contrast to deepRL [55, i.a.], we view the world model as something that should be rapidly learnable and transferable. Central to our work is a particular claim about how an LLM should relate to world models. In our setup, the LLM does not simulate the world, but instead _builds_ a simulation of the world. This should be contrasted with LLM agents such as ReAct [77] where the LLM plays the role of a world model by reasoning about different actions and their consequences. We also do not expect the LLM to perform planning, which they are known to struggle with [68]. Instead, we require the LLM to possess fuzzy prior knowledge of how the world _might_ be, together with the programming skill to code and debug a transition function. Our use of LLMs is closest to [24, 74, 79], which generate planning productions, which can be seen as a particular kind of world model. Overall though, our problem statement is closer to [13, 17, 67], which learn world models in domain-specific programming languages. We further show how to use Turing-complete languages like Python--which we believe important for general-purpose learners--and we also study efficient transfer learning and exploration strategies.
+
+We make the following three contributions:
+
+1. An architecture, which we call WorldCoder, for learning world models as code. The architecture supports learning that is more transferable, interpretable, and dramatically more sample-efficient compared to deep RL, and also more compute-efficient than prior LLM agents.
+2. A new learning objective for program-structured world models that favors _optimism in the face of (world model) uncertainty_ (Section 2.2). We show theoretically and empirically that this learning objective generates goal-driven exploratory behavior, which can reduce by orders of magnitude the number of environment interactions needed to obtain reward
+3. An analysis of different forms of transfer of world models, finding that code can be quickly adapted to new world dynamics within grid-world and robot task planning domains.
+
+## 2 Methods
+
+### Problem statement and core representations
+
+We start with the standard MDP formalism but modify it in three important ways. First, we assume a goal is given in natural language. The goal could be something specific such as "pickup the ball", or underspecified, such as "maximize reward." Second, we restrict ourselves to deterministic environments, and assume that environment dynamics are fixed across goals. Third, we assume an episodic MDP with the current episode terminating upon reaching the goal.
+
+Figure 1: Overall agent architecture. The agent also inputs a goal in natural language
+
+Figure 2: Qualitative comparison of our method against deep model-based RL and LLM agents (ReAct, RAP, etc: Yao et al. [77], Hao et al. [29], Zhao et al. [78], Liu et al. [41]). Sample complexity refers to the number of environment interactions needed to learn a world model (“LLM agents do not update their world model). LLM calls/task is the number of LLM calls needed to solve a new task in a fixed environment, amortized over many such tasks, as a function of the maximum episode length \(T\). Asymptotically, after learning a world model, our method can accomplish new tasks by only at most one LLM query to update the reward function.
+
+We formalize this as a Contextual Markov Decision Process (CMDP: Hallak et al. [28]), which is a tuple \((C,S,A,M)\) where \(C\) is a set of contexts (i.e. goals), \(S\) is a set of states, \(A\) is a set of actions, and \(M\) is a function mapping a context \(c\in C\) to a Markov Decision Process (MDP). The context-conditioned MDP, \(M(c)\), is a tuple \((S,A,T,R^{c},\gamma)\) with transition function \(T:S\times A\to S\), discount factor \(\gamma\), and reward function \(R^{c}:S\times A\times S\rightarrow\mathbb{R}\). The transition function does not depend on the context. The objective is to select actions to maximize cumulative discounted future reward, which is given by \(\sum_{t=0}^{\infty}\gamma^{t}r_{t}\), where \(r_{t}\) is the reward received \(t\) timesteps into the future. Termination is modeled by assuming there is a special absorbing state.
+
+**State representation.** Motivated by robot task planning [20; 59; 57] we represent states as sets of objects, each with a string-valued field name, fields x and y for its position, and additional fields depending on the object type. For example, if name="door", then there are two Boolean fields for if the door is open/closed and locked/unlocked. This can be seen as an Object Oriented MDP [15].
+
+**Representing world models as code.** The agent uses Python code to model the transition and reward functions. Mathematically we think of this Python code as a tuple \((\hat{T},\hat{R})\) of a transition function \(\hat{T}:S\times A\to S\) and a reward model \(\hat{R}:C\rightarrow(S\times A\times S\rightarrow\mathbb{R}\times\{0,1\})\). Note again that the reward depends on the context, and returns an extra Boolean indicating whether the goal has been reached, in which case the current episode terminates. Both functions are implemented as separate Python subroutines, which encourages disentangling the dynamics from the reward.
+
+### The world model learning problem
+
+What objectives and constraints should the world model satisfy? Clearly, the learned world model should explain the observed data by correctly predicting the observed state transitions and rewards. This is a standard training objective within model-based RL [62].
+
+One less obvious learning objective is that _the world model should suffice to plan to the goal_. Given two world models, both consistent with the observed data, the agent should prefer a model which implies it is possible to get positive reward, effectively being optimistic in the face of uncertainty about world dynamics. Assuming the low-data regime, there will be multiple world models consistent with the data: preferring an optimistic one guarantees that the agent can at least start making progress toward the goal, even if it later has to update its beliefs because they turned out to be too optimistic.
+
+Concretely, the agent collects a dataset \(\mathcal{D}\) of past environment interactions, each formatted as a tuple \((s,a,r,s^{\prime},c,d)\) of current state \(s\), next state \(s^{\prime}\), action \(a\), and reward \(r\) in context \(c\) with \(d\) indicating if the episode ended upon reaching \(s^{\prime}\). (The variable \(d\) should be read as "done.") The agent also stores the initial state \(s_{0}\) and context \(c\) of each episode, so that it can prefer world models that can reach the goal from an initial state. The learning problem is to construct Python programs implementing a transition function \(\hat{T}\) and reward model \(\hat{R}\) satisfying constraints \(\phi_{1}\) and \(\phi_{2}\), defined below:
+
+\[\text{\emph{fit data}} \phi_{1}\left(\mathcal{D},\hat{T},\hat{R}\right)=\quad\forall(s,a, r,s^{\prime},c,d)\in\mathcal{D}:(\hat{T},\hat{R})\vdash(s,a,r,s^{\prime},c,d)\] (1) \[\text{where }(\hat{T},\hat{R})\vdash(s,a,r,s^{\prime},c,d)\text{ if } \hat{T}(s,a)=s^{\prime}\wedge\hat{R}(c)(s,a,s^{\prime})=(r,d)\] \[\text{\emph{optimism}} \phi_{2}\left(s_{0},c,\hat{T},\hat{R}\right)=\quad\exists a_{1},s _{1},a_{2},s_{2},...,a_{\ell},s_{\ell}\] (2) \[\forall i\in[\ell]:\hat{T}(s_{i-1},a_{i})=s_{i}\wedge\exists r >0:\hat{R}(c)(s_{\ell-1},a_{\ell},s_{\ell})=(r,1)\]
+
+where \(s_{0},c\) is the initial state/context of the episode, and the turnstile (\(\vdash\)-) should be read as meaning that a given program entails a given logical constraint or predicts a given replayed experience.
+
+Constructing a world model satisfying \(\phi_{1}\wedge\phi_{2}\) is a program synthesis problem. We solve it by prompting an LLM with a random subset of \(\mathcal{D}\) and asking it to propose a candidate program. If the resulting program does not fit all the data, the LLM is backprompted with members of \(\mathcal{D}\) inconsistent with its latest program, and asked to debug its code, following [7; 47]. Sec. 2.5 details this process.
+
+### Understanding optimism under uncertainty
+
+Optimism under uncertainty is a pervasive principle throughout learned decision-making [63], including model-based RL [75; 40]. We contribute a new instantiation of that principle as a logical constraint between a program and a planner, and which we show can be made compatible with 
+
+[MISSING_PAGE_FAIL:4]
+
+### Overall architecture
+
+Ultimately our world models exist to serve downstream decision-making: and in turn, taking actions serves to provide data for learning better world models. There are many architectures for combining acting with world-model learning, such as via planning [55], training policies in simulation [26], or hybrid approaches [62]. We use the architecture shown in Algorithm 1. At a high level, it initially performs random exploration to initialize a dataset of environmental interactions; it updates its world model using the program synthesis algorithm of Sec. 2.5; and, past its initial exploration phase, performs planning. Different planners are possible, and we use depth-limited value iteration (in simple domains) and MCTS (for more complex domains).
+
+``` Hyperparam:\(\epsilon\), random exploration probability (default to \(5\%\)) Hyperparam:MinDataSize, min # actions before learning begins (default to 10) \(\mathcal{D},\mathcal{D}_{sc}\leftarrow\varnothing,\varnothing\)\(\triangleright\) replay buffer. \(\mathcal{D}_{sc}\) holds initial states and contexts needed for \(\phi_{2}\)\(\hat{T},\hat{R}\leftarrow\)null, null loop forever through episodes:\(\triangleright\) init empty world model \(c\leftarrow\)EpisodeGoal()\(\triangleright\) get context (goal) \(s_{0}\leftarrow\)CurrentState()\(\triangleright\) record initial state \(\mathcal{D}_{sc}\leftarrow\mathcal{D}_{sc}\cup\{(s_{0},c)\}\)\(\triangleright\) Replay buffer of initial conditions for \(\phi_{2}\) loop until episode ends:\(s\leftarrow\)CurrentState() ifnot\(\phi_{1}\land\phi_{2}\)and\(|\mathcal{D}|\geq\)MinDataSize then \(\hat{T},\hat{R}\leftarrow\)Synthesize(\(\hat{T},\hat{R},\mathcal{D},\mathcal{D}_{sc}\))\(\triangleright\) Section 2.5 with probability \(\epsilon\)do \(a\leftarrow\)RandomAction()\(\triangleright\)\(\epsilon\)-greedy explore else \(a\leftarrow\)Plan(\(s,\hat{T},\hat{R}(c)\))\(\triangleright\) Value Iteration \(s^{\prime},r,d\leftarrow\)Env.Step(\(a\))\(\triangleright\) take action in state \(s\)\(\mathcal{D}\leftarrow\mathcal{D}\cup\{(s,a,r,s^{\prime},c,d)\}\)\(\triangleright\) record experience ```
+
+**Algorithm 1** WorldCoder Agent Architecture
+
+### Program Synthesis via Refinement
+
+One approach to program synthesis is to have an LLM iteratively improve and debug its initial outputs [7; 47], which we call _refinement_. For world models as programs, this means prompting the LLM with an erroneous program it previously generated, together with state-action transitions that program cannot explain, and prompting it to fix its code. This process repeats until the program satisfies \(\phi_{1}\land\phi_{2}\). Refinement can be very successful when the target program has many corner-cases, each of which can be inferred from a few examples, because the LLM can incrementally grow the program driven by each failed test case. This is exactly the case for world models, which might need to handle a wide range of objects and their interactions, but typically don't demand intricate algorithms. Refinement also allows computationally efficient transfer between environments, because a new world model can be built by refining an old one, instead of programming it from scratch.
+
+We use a concurrently developed algorithm called REx to determine which program to refine next [65]. REx prioritizes refining programs that appear more promising, which in the context of world model learning, we instantiate by defining by a heuristic \(h\), which measures progress towards satisfying \(\phi_{1}\land\phi_{2}\):
+
+\[h(\hat{T},\hat{R})=\frac{\sum_{x\in\mathcal{D}}\mathds{1}\left[\rho\vdash x \right]+\mathds{1}\left[\phi_{1}\left(\mathcal{D},\hat{T},\hat{R}\right)\right] \times\sum_{s_{0},c\in\mathcal{D}_{sc}}\left[\mathds{1}\left[\phi_{2}(s_{0},c, \hat{T},\hat{R})\right]\right]}{|\mathcal{D}|+|\mathcal{D}_{sc}|}\] (3)
+
+The above heuristic computes the fraction of the replay buffer which is consistent with \(\phi_{1}\), and the fraction which is consistent with \(\phi_{2}\). (We incentivize satisfying \(\phi_{1}\) first by multiplying the average accuracy on the optimism objective by the indicator \(\mathds{1}[\phi_{1}(\mathcal{D},\hat{T},\hat{R})]\).) REx also prioritizes refining programs that have not been refined very many times, and uses a bandit formulation to balance (1) exploring programs that have not been refined very many times against (2) exploiting by refining programs that are better according to \(h\). See [65] for more details.
+
+We implement this refinement process using GPT-4 because recent work [47] finds it is the strongest model for repairing and improving code (as opposed to just generating code from scratch). Using this technique and this LLM we can generate world models with 250+ lines of code.
+
+## 3 Experimental Results
+
+We study our system in three environments, Sokoban, Minigid, and AlfWorld, with the goal of understanding the sample efficiency and computational efficiency of the learner, especially when transferring knowledge across environments, as well as the impact of optimism under uncertainty.
+
+**Sokoban** is a puzzle-solving task where the agent pushes boxes around a 2d world, with the goal of pushing every box onto a target (Fig. 3A). Solving hard Sokoban levels is a challenging planning task that has received recent attention from the planning and RL communities [10; 11; 37; 19; 18; 54]. Unlike these other works, our emphasis is not on solving the hardest Sokoban levels. Instead, we wish to show that our agent can rapidly achieve basic competence. Master-level play could then be achieved via any of the cited works that focus on sophisticated planning and search.
+
+Starting with only the natural-language goal of "win the game", our agent builds a world model over the first 50 actions. The resulting code is human-understandable (Appendix D), and generalizes to solving levels with more boxes (Fig. 3B). While the system cannot solve very hard Sokoban levels (eg, 5+ boxes), that is an artifact of the difficulty of planning, and could be addressed by plugging the world model into any of the techniques cited above. In contrast to this work, both model-based and model-free deep RL require millions of experiences to solve basic levels (Fig. 3D).
+
+Almost surely, an important reason why our system learns quickly is because the underlying LLM already knows about Sokoban from its pretraining data, and can quickly infer that it is playing a similar game. However, simply knowing about Sokoban does _not_ suffice for the LLM to play the game, as demonstrated by the poor performance of ReAct (Fig. 3B). ReAct is a baseline which prompts the LLM with the state-action history, then asks it to think step-by-step (Reason) and before predicting an action (Act). Quantitatively, ReAct succeeds on only \(15\%\pm 8\%\) of basic levels, showing that pretrained knowledge of Sokoban does not, by itself, allow strong play. ReAct-style architectures [29; 78; 41; i.a.], also require expensive LLM calls _at every action_, and so asymptotically their cost grows linearly with the number of actions taken. Our approach has different asymptotics:
+
+Figure 3: (A) Sokoban domain (per-step reward of -0.1 elided from figure). (B) Learning curves. ReAct has the same pretrained knowledge of Sokoban but cannot effectively play the game. (C) Our method has different asymptotic LLM cost compared to prior LLM agents, which consume LLM calls/tokens at every action. (D) Deep RL takes >1 million steps to learn 2-box Sokoban. (E) Nonstandard Sokoban with teleport gates
+
+after front-loading 400k LLM tokens (about $15), it can issue as many actions as needed without subsequent LLM queries (Fig. 3C).
+
+To further demonstrate that pretrained knowledge of Sokoban cannot explain the success of our system, we modify the game to include extra rules by adding a pair of warp gates/teleportation portals to each level which the agent can use to instantly transport itself (Fig. 3E). The teleportation portals have subtle dynamics, because they become deactivated whenever they are blocked by a Sokoban box. Our agent continues to be able to learn in this environment, including modeling the blocking behavior of the teleportation gates, and learns to use the teleporters to more rapidly solve levels.
+
+On Sokoban, the optimism under uncertainty objective (\(\phi_{2}\), orange curves in Fig. 3B) has little effect: Sokoban has a dense reward structure that allows easy learning through random exploration. Next we consider problems with sparse rewards and natural language instructions, which the optimism objective is designed to handle.
+
+**Minigrid.** To better understand the transfer learning and instruction following aspects of our approach, we next study Minigrid [9; 8], a suite of grid games designed for language-conditioned RL. Minigrid environments include objects such as keys, doors, walls, balls, and boxes.
+
+Fig. 4 illustrates results for our agent playing a sequence of minigrid environments, while Appendix A.1 gives a walk-through of an example learning trajectory. The agent interacts with each environment episodically through different randomly-generated levels. We order the environments into a curriculum designed to illustrate different forms of transfer learning. For example, when transferring from the first to the second environment, the agent needs to extend its knowledge to incorporate new objects and their associated dynamics (keys and doors). Learning about these new objects requires extra environment interactions, during which the agent experiments with the objects to update its transition function. In contrast, the third environment presents no new dynamics, but instead introduces new natural-language goals. Our agent can follow these natural-language instructions by enforcing optimism under uncertainty (\(\phi_{2}\)).
+
+Transfer is especially helpful in quickly solving new environments (Fig. 4B). Without transfer, more episodes of exploration are needed to collect experience to build a good world model. However, optimism under uncertainty (\(\phi_{2}\)) helps in non-transfer setting by promoting goal-directed exploration, and in fact, absent transfer, it is only with \(\phi_{2}\) that WorldCoder can solve the harder environments. Optimism is also necessary for zero-shot generalization to new goals (Fig. 4B, env 3).
+
+To better understand the importance of \(\phi_{2}\)--which both encourages exploration and enables natural-language instruction following--we contrast against a version of our approach which simply prompts GPT4 to generate a new reward function upon receiving a new goal (green in Fig. 4B, labelled 'prompt4reward'). Theoretically this suffices to follow new natural-language instructions, provided
+
+Figure 4: (A) Minigrid environments ordered into a curriculum that tests different kinds of transfer learning. (B) Transfer learning performance, compared with (C) performance when solving each environment independently. Appendix Fig. 6: deep RL comparison.
+
+the LLM is reliable. Surprisingly, this ablation struggles to follow new instructions (e.g., transfer from env 2\(\rightarrow\)3 in Fig. 4A), showing the importance of \(\phi_{2}\) in correcting mistakes made by the LLM when generating reward functions.
+
+AlfWorld.To test the scalability of our method we work with the AlfWorld robot task planning domain. This is a household robot planning environment with a variety of different kinds of objects, such as microwaves, cabinets, utensils, food, and different rooms the robot can navigate. We convert AlfWorld into a MDP by representing the state as a set of fluents (in the style of PDDL [52]), and study our agent as it progresses through representative AlfWorld tasks.
+
+In Fig. 5 we find that our method learns models of picking up and placing objects, and then improves its model by learning how to use cooking appliances such as refrigerators and stoves. This stresses the scalability of the exploration and program synthesis methods: We find that we can synthesize a world model containing 250+ lines of code, which serves as an adequate model of how AlfWorld works (Appendix E), and that the optimism under uncertainty objective is necessary for nonzero performance on all of these tasks. Typically the agent solves the task in the first episode, but requires around 20 exploratory steps to get reward, with subsequent episodes serving to make small corrections to the world model. Fig. 5 indicates with arrows the episodes where these small corrections occur.
+
+These tasks have relatively long horizons, so we use a more sophisticated planner based on MCTS. Because these tasks also have sparse rewards, we engineer a domain-general partial reward function that incentivizes actions and states which have more textual overlap with the natural-language goal, based on established document retrieval metrics (BM25 [50], Appendix B). This shows that our framework can interoperate with different kinds of planners.
+
+## 4 Related Work
+
+**World models.** World modeling is a classic paradigm for decision-making: It is the basis of model-based RL [27; 26], task-and-motion-planning in robotics [32], and it is corroborated by classic behavioral experiments suggesting biological decision-making features a similar architecture [66]. In practice, world models are hard-won, requiring either large volumes of training data [26; 25], or careful hand-engineering [32] (cf. Mao et al. [44], Konidaris et al. [36]).
+
+**Neurosymbolic world models,** such as Cosmos and NPS [56; 22], learn a factored, object-based neural world model. This factoring helps compositional generalization--like in our work--but importantly they can learn from raw perception, but at the expense of transfer and sample complexity. Combining our work with these others might be able to get the best of both.
+
+Figure 5: AlfWorld environments and tasks. Each learning curve shows average reward at each episode (solid line) and how many steps the episode took (dashed), averaged over 3 seeds. Curves annotated with arrows and text explaining what was learned at each episode. Optimism objective is necessary for any non-zero performance.
+
+**LLMs as a world model.** Whether LLMs can model the world is an open question, but there is evidence that, given the right training data in large quantities, transformers can act as decent world models, at least within certain situations [38; 76; 45]. These works aim to learn a rich but frozen world model from a relatively large volume of examples. We tackle a different problem: building a simple world model on-the-fly from a modest amount of data.
+
+**LLMs for building world models.** Recent works [79; 74; 24] consider using LLMs to generate planning operators: a kind of world model that as abstract, symbolic, and expressed in a domain-specific programming language for planning (cf. DECKARD [46], another LLM system which generates state-machine world models). In these works, the primary driver of world-model generation--what the LLM first inputs--is natural language describing affordances and goals. Our work considers a different problem: building world models from first-and-foremost from interacting with the environment. In practice, agents have knowledge both from language and from acting in the world, and so these families of works should be complementary.
+
+**LLMs for decision-making** is an emerging paradigm that includes ReAct [77] and many others [29; 78; 41; 1, i.a.], which directly use LLMs to issue actions and reason about their consequences in the world. For instance, ReAct works by prompting the LLM to think step-by-step and then predict an action. To the extent that these methods use a world model, it is implicitly encoded within the weights of a neural network. We instead build an explicit world model.
+
+**Programs as Policies.** Instead of learning a world model, one can learn a policy as a program. The first wave of these works [69; 70] considered domain-specific languages, while recent LLM work [73; 39; 61] uses more flexible general-purpose languages like Python. An advantage of learning a policy is that it does not need to model all the details of the world, many of which may be irrelevant to decision making. A disadvantage is that policies cannot readily generalize to new goals--unlike world models, which can be used by a planner to achieve a variety of objectives. Relatedly, other recent work considers synthesizing programs that implement reward functions [42], and then generating a policy with conventional deep RL.
+
+**Programs as world models.** We are strongly inspired by existing program synthesis algorithms for constructing world models from state-action trajectories [13; 17; 67]. We believe that this family of methods will not be generally applicable until they can support general-purpose Turing-complete programming languages: So far these works have used restricted domain-specific languages, but we show that a general-purpose computational language, like Python, can be used to learn world models, which we hope expands the scope of this paradigm. We also show how to bias learning toward goal-directed behaviors, and how to support transfer across environments and goals. Last, we simplify the core program synthesis algorithm: the cited prior works required relatively intricate synthesis algorithms, which we can avoid by using LLMs as general-purpose synthesizers. We hope our work can help make this paradigm simpler and more general.
+
+Other works have also explored how humans can manually provide knowledge to RL agents via source code: e.g., RLLLang [51] uses programs to specify parts of policies and world models, which could be combined with our system to integrate prior knowledge.
+
+**Exploration & Optimism in the face of (model) uncertainty.** Being optimistic about actions with uncertain consequences is common in decision-making, including in model-based RL [63; 40; 75; 3; 60; 31]. We mathematically instantiate that principle in a new way--as a logical constraint between a program and a planner--and show how it can work with LLM-guided discrete program search.
+
+## 5 Limitations and Open Directions
+
+Our work has important limitations, and naturally suggests next steps. Currently we assume deterministic dynamics, which could be addressed by synthesizing probabilistic programs [14; 21]. Given recent advances in synthesizing probabilistic programs [53], together with advances in using LLMs for deterministic code, this limitation seems nontrivial but surmountable.
+
+By representing knowledge as code, our approach delivers better sample efficiency and transferability, but at high cost: Our states must be symbolic and discrete, whereas the real world is messy and continuous. While the obvious response is that the agent can be equipped with pretrained object detectors--a common assumption in robotic task planning [36, i.a.]--alternative routes includemultimodal models [30] and using neurosymbolic programs [6; 56; 64] to bridge the gap between perception and symbol processing, which might be more robust to missing or misspecified symbols.
+
+Last, our method uses only a very basic mechanism for growing and transferring its knowledge. Instead of prompting to debug its code, we could have built a library of reusable subroutines and classes shared across different environments and goals, reminiscent of library learning systems [16; 72; 23; 4], which refactor their code to expose sharable components. Further developing that and other ways of managing and growing symbolic knowledge about the world remains a prime target for future work.
+
+Acknowledgements.This work was supported by NSF grant #2310350 and a gift from Cisco.
+
+## References
+
+* Ahn et al. [2022] Michael Ahn, Anthony Brohan, Noah Brown, Yeygen Chebotar, Omar Cortes, Byron David, Chelsea Finn, Chuyuan Fu, Keerthana Gopalakrishnan, Karol Hausman, Alex Herzog, Daniel Ho, Jasmine Hsu, Julian Ibarz, Brian Ichter, Alex Irpan, Eric Jang, Rosario Jauregui Ruano, Kyle Jeffrey, Sally Jesmonth, Nikhil Joshi, Ryan Julian, Dmitry Kalashnikov, Yuheng Kuang, Kuang-Huei Lee, Sergey Levine, Yao Lu, Linda Luu, Carolina Parada, Peter Pastor, Jornell Quiambao, Kanishka Rao, Jarek Rettinghouse, Diego Reyes, Pierre Sermanet, Nicolas Sievers, Clayton Tan, Alexander Toshev, Vincent Vanhoucke, Fei Xia, Ted Xiao, Peng Xu, Sichun Xu, Mengyuan Yan, and Andy Zeng. Do as i can and not as i say: Grounding language in robotic affordances. In _arXiv preprint arXiv:2204.01691_, 2022.
+* Auer [2002] Peter Auer. Using confidence bounds for exploitation-exploration trade-offs. _Journal of Machine Learning Research_, 3(Nov):397-422, 2002.
+* Azar et al. [2017] Mohammad Gheshlaghi Azar, Ian Osband, and Remi Munos. Minimax regret bounds for reinforcement learning. In _International conference on machine learning_, pages 263-272. PMLR, 2017.
+* Bowers et al. [2023] Matthew Bowers, Theo X. Olausson, Lionel Wong, Gabriel Grand, Joshua B. Tenenbaum, Kevin Ellis, and Armando Solar-Lezama. Top-down synthesis for library learning. _Proc. ACM Program. Lang._, 7(POPL), jan 2023. doi: 10.1145/3571234. URL https://doi.org/10.1145/3571234.
+* Browne et al. [2012] Cameron B Browne, Edward Powley, Daniel Whitehouse, Simon M Lucas, Peter I Cowling, Philipp Rohlfshagen, Stephen Tavener, Diego Perez, Spyridon Samothrakis, and Simon Colton. A survey of monte carlo tree search methods. _IEEE Transactions on Computational Intelligence and AI in games_, 4(1):1-43, 2012.
+* Chaudhuri et al. [2021] Swarat Chaudhuri, Kevin Ellis, Oleksandr Polozov, Rishabh Singh, Armando Solar-Lezama, Yisong Yue, et al. Neurosymbolic programming. _Foundations and Trends(r) in Programming Languages_, 7(3), 2021.
+* Chen et al. [2023] Xinyun Chen, Maxwell Lin, Nathanael Scharli, and Denny Zhou. Teaching large language models to self-debug. _arXiv preprint arXiv:2304.05128_, 2023.
+* Chevalier-Boisvert et al. [2018] Maxime Chevalier-Boisvert, Lucas Willems, and Suman Pal. Minimalistic gridworld environment for openai gym. https://github.com/maximecb/gym-minigrid, 2018.
+* Chevalier-Boisvert et al. [2023] Maxime Chevalier-Boisvert, Bolun Dai, Mark Towers, Rodrigo de Lazcano, Lucas Willems, Salem Lahlou, Suman Pal, Pablo Samuel Castro, and Jordan Terry. Minigrid & miniworld: Modular & customizable reinforcement learning environments for goal-oriented tasks. _CoRR_, abs/2306.13831, 2023.
+* Chrestien et al. [2023] Leah Chrestien, Stefan Edelkamp, Antonin Komenda, and Tomas Pevny. Optimize planning heuristics to rank, not to estimate cost-to-goal. In _Thirty-seventh Conference on Neural Information Processing Systems_, 2023. URL https://openreview.net/forum?id=Mgy6sgslPV.
+
+* Chung et al. [2023] Stephen Chung, Ivan Anokhin, and David Krueger. Thinker: Learning to plan and act. In _Thirty-seventh Conference on Neural Information Processing Systems_, 2023. URL https://openreview.net/forum?id=mumEBl0arj.
+* Coulom [2006] Remi Coulom. Efficient selectivity and backup operators in monte-carlo tree search. In _International conference on computers and games_, pages 72-83. Springer, 2006.
+* Das et al. [2023] Ria Das, Joshua B. Tenenbaum, Armando Solar-Lezama, and Zenna Tavares. Combining functional and automata synthesis to discover causal reactive programs. _Proc. ACM Program. Lang._, 7(POPL), jan 2023. doi: 10.1145/3571249. URL https://doi.org/10.1145/3571249.
+* De Raedt et al. [2007] Luc De Raedt, Angelika Kimmig, and Hannu Toivonen. Problog: a probabilistic prolog and its application in link discovery. In _Proceedings of the 20th International Joint Conference on Artifical Intelligence_, IJCAI'07, page 2468-2473, San Francisco, CA, USA, 2007. Morgan Kaufmann Publishers Inc.
+* Diuk et al. [2008] Carlos Diuk, Andre Cohen, and Michael L Littman. An object-oriented representation for efficient reinforcement learning. In _Proceedings of the 25th international conference on Machine learning_, pages 240-247, 2008.
+* Ellis et al. [2023] Kevin Ellis, Lionel Wong, Maxwell Nye, Mathias Sable-Meyer, Luc Cary, Lore Anaya Pozo, Luke Hewitt, Armando Solar-Lezama, and Joshua B Tenenbaum. Dreamcoder: growing generalizable, interpretable knowledge with wake-sleep bayesian program learning. _Philosophical Transactions of the Royal Society A_, 381(2251):20220050, 2023.
+* Evans et al. [2021] Richard Evans, Matko Bosnjak, Lars Buesing, Kevin Ellis, David Pfau, Pushmeet Kohli, and Marek Sergot. Making sense of raw input. _Artificial Intelligence_, 299:103521, 2021.
+* Feng et al. [2020] Dieqiao Feng, Carla P Gomes, and Bart Selman. A novel automated curriculum strategy to solve hard sokoban planning instances. In H. Larochelle, M. Ranzato, R. Hadsell, M.F. Balcan, and H. Lin, editors, _Advances in Neural Information Processing Systems_, volume 33, pages 3141-3152. Curran Associates, Inc., 2020. URL https://proceedings.neurips.cc/paper_files/paper/2020/file/2051bd70fcf110a2208bdbd4a743e7f79-Paper.pdf.
+* Feng et al. [2022] Dieqiao Feng, Carla Gomes, and Bart Selman. Left heavy tails and the effectiveness of the policy and value networks in dnn-based best-first search for sokoban planning, 2022.
+* Garrett et al. [2020] Caelan Reed Garrett, Rohan Chitnis, Rachel Holladay, Beomjoon Kim, Tom Silver, Leslie Pack Kaelbling, and Tomas Lozano-Perez. Integrated task and motion planning, 2020.
+* Goodman et al. [2008] Noah D. Goodman, Vikash K. Mansinghka, Daniel Roy, Keith Bonawitz, and Joshua B. Tenenbaum. Church: a language for generative models. In _Proceedings of the Twenty-Fourth Conference on Uncertainty in Artificial Intelligence_, UAI'08, page 220-229, Arlington, Virginia, USA, 2008. AUAI Press. ISBN 0974903949.
+* Goyal et al. [2021] Anirudh Goyal, Aniket Didolkar, Nan Rosemary Ke, Charles Blundell, Philippe Beaudoin, Nicolas Heess, Michael Mozer, and Yoshua Bengio. Neural production systems: Learning rule-governed visual dynamics. _arXiv preprint arXiv:2103.01937_, 2021.
+* Grand et al. [2023] Gabriel Grand, Lionel Wong, Matthew Bowers, Theo X. Olaussson, Muxin Liu, Joshua B. Tenenbaum, and Jacob Andreas. Lilo: Learning interpretable libraries by compressing and documenting code, 2023.
+* Guan et al. [2023] Lin Guan, Karthik Valmeekam, Sarath Sreedharan, and Subbarao Kambhampati. Leveraging pre-trained large language models to construct and utilize world models for model-based task planning. _NeurIPS_, 2023.
+* Ha and Schmidhuber [2018] David Ha and Jurgen Schmidhuber. Recurrent world models facilitate policy evolution. In _Advances in Neural Information Processing Systems 31_, pages 2451-2463. Curran Associates, Inc., 2018. https://worldmodels.github.io.
+
+* Hafner et al. [2021] Danijar Hafner, Timothy Lillicrap, Mohammad Norouzi, and Jimmy Ba. Mastering atari with discrete world models. _ICLR_, 2021.
+* Hafner et al. [2023] Danijar Hafner, Jurgis Pasukonis, Jimmy Ba, and Timothy Lillicrap. Mastering diverse domains through world models, 2023.
+* Hallak et al. [2015] Assaf Hallak, Dotan Di Castro, and Shie Mannor. Contextual markov decision processes. _arXiv preprint arXiv:1502.02259_, 2015.
+* Hao et al. [2023] Shibo Hao, Yi Gu, Haodi Ma, Joshua Jiahua Hong, Zhen Wang, Daisy Zhe Wang, and Zhiting Hu. Reasoning with language model is planning with world model. _arXiv preprint arXiv:2305.14992_, 2023.
+* Hu et al. [2023] Yingdong Hu, Fanqi Lin, Tong Zhang, Li Yi, and Yang Gao. Look before you leap: Unveiling the power of gpt-4v in robotic vision-language planning. _arXiv preprint arXiv:2311.17842_, 2023.
+* Jin et al. [2020] Chi Jin, Zhuoran Yang, Zhaoran Wang, and Michael I Jordan. Provably efficient reinforcement learning with linear function approximation. In _Conference on learning theory_, pages 2137-2143. PMLR, 2020.
+* Kaelbling and Lozano-Perez [2011] Leslie Pack Kaelbling and Tomas Lozano-Perez. Hierarchical task and motion planning in the now. In _2011 IEEE International Conference on Robotics and Automation_, pages 1470-1477, 2011. doi: 10.1109/ICRA.2011.5980391.
+* Karpukhin et al. [2020] Vladimir Karpukhin, Barlas Oguz, Sewon Min, Patrick Lewis, Ledell Wu, Sergey Edunov, Danqi Chen, and Wen-tau Yih. Dense passage retrieval for open-domain question answering. _arXiv preprint arXiv:2004.04906_, 2020.
+* Kobayashi and Takeda [2000] Mei Kobayashi and Koichi Takeda. Information retrieval on the web. _ACM computing surveys (CSUR)_, 32(2):144-173, 2000.
+* Kocsis and Szepesvari [2006] Levente Kocsis and Csaba Szepesvari. Bandit based monte-carlo planning. In _European conference on machine learning_, pages 282-293. Springer, 2006.
+* Konidaris et al. [2018] George Konidaris, Leslie Pack Kaelbling, and Tomas Lozano-Perez. From skills to symbols: Learning symbolic representations for abstract high-level planning. _Journal of Artificial Intelligence Research_, 61:215-289, 2018.
+* Kujampaa et al. [2023] Kalle Kujampaa, Joni Pajarinen, and Alexander Ilin. Hybrid search for efficient planning with completeness guarantees. In _Thirty-seventh Conference on Neural Information Processing Systems_, 2023. URL https://openreview.net/forum?id=bY0c46ZtXa.
+* Li et al. [2023] Kenneth Li, Aspen K Hopkins, David Bau, Fernanda Viegas, Hanspeter Pfister, and Martin Wattenberg. Emergent world representations: Exploring a sequence model trained on a synthetic task. _ICLR_, 2023.
+* Liang et al. [2022] Jacky Liang, Wenlong Huang, Fei Xia, Peng Xu, Karol Hausman, Brian Ichter, Pete Florence, and Andy Zeng. Code as policies: Language model programs for embodied control. In _arXiv preprint arXiv:2209.07753_, 2022.
+* Liu et al. [2023] Qinghua Liu, Praneeth Netrapalli, Csaba Szepesvari, and Chi Jin. Optimistic mle: A generic model-based algorithm for partially observable sequential decision making. In _Proceedings of the 55th Annual ACM Symposium on Theory of Computing_, pages 363-376, 2023.
+* Liu et al. [2023] Zhihan Liu, Hao Hu, Shenao Zhang, Hongyi Guo, Shuqi Ke, Boyi Liu, and Zhaoran Wang. Reason for future, act for now: A principled framework for autonomous llm agents with provable sample efficiency. _arXiv preprint arXiv:2309.17382_, 2023.
+* Ma et al. [2023] Yecheng Jason Ma, William Liang, Guanzhi Wang, De-An Huang, Osbert Bastani, Dinesh Jayaraman, Yuke Zhu, Linxi Fan, and Anima Anandkumar. Eureka: Human-level reward design via coding large language models. _arXiv preprint arXiv: Arxiv-2310.12931_, 2023.
+* Manning et al. [2008] Christopher D Manning, Prabhakar Raghavan, and Hinrich Schutze. _Introduction to information retrieval_. Cambridge university press, 2008.
+
+* Mao et al. [2022] Jiayuan Mao, Tomas Lozano-Perez, Josh Tenenbaum, and Leslie Kaelbling. Pdsketch: Integrated domain programming, learning, and planning. _Advances in Neural Information Processing Systems_, 35:36972-36984, 2022.
+* Micheli et al. [2023] Vincent Micheli, Eloi Alonso, and Francois Fleuret. Transformers are sample-efficient world models. In _The Eleventh International Conference on Learning Representations_, 2023. URL https://openreview.net/forum?id=vhFu1Acb0xb.
+* Nottingham et al. [2023] Kolby Nottingham, Prithviraj Ammanabrolu, Alane Suhr, Yejin Choi, Hannaneh Hajishirzi, Sameer Singh, and Roy Fox. Do Embodied Agents Dream of Pixelated Sheep: Embodied Decision Making using Language Guided World Modelling. In _International Conference on Machine Learning (ICML)_, 2023.
+* Olausson et al. [2023] Theo X. Olausson, Jeevana Priya Inala, Chenglong Wang, Jianfeng Gao, and Armando Solar-Lezama. Is self-repair a silver bullet for code generation?, 2023.
+* Raffin [2020] Antonin Raffin. R1 baselines3 zoo. https://github.com/DLR-RM/rl-baselines3-zoo, 2020.
+* Raffin et al. [2021] Antonin Raffin, Ashley Hill, Adam Gleave, Anssi Kanervisto, Maximilian Ernestus, and Noah Dormann. Stable-baselines3: Reliable reinforcement learning implementations. _Journal of Machine Learning Research_, 22(268):1-8, 2021. URL http://jmlr.org/papers/v22/20-1364.html.
+* Robertson et al. [2009] Stephen Robertson, Hugo Zaragoza, et al. The probabilistic relevance framework: Bm25 and beyond. _Foundations and Trends(r) in Information Retrieval_, 3(4):333-389, 2009.
+* Rodriguez-Sanchez et al. [2023] Rafael Rodriguez-Sanchez, Benjamin A. Spiegel, Jennifer Wang, Roma Patel, Stefanie Tellex, and George Konidaris. Rlang: A declarative language for describing partial world knowledge to reinforcement learning agents, 2023.
+* Russell and Norvig [2016] Stuart J Russell and Peter Norvig. _Artificial intelligence: a modern approach_. Pearson, 2016.
+* Saad [2022] Feras Saad. _Scalable Structure Learning, Inference, and Analysis with Probabilistic Programs_. PhD thesis, Massachusetts Institute of Technology, 2022.
+* Schrader [2018] Max-Philipp B. Schrader. gym-sokoban. https://github.com/mpSchrader/gym-sokoban, 2018.
+* Schrittwieser et al. [2020] Julian Schrittwieser, Ioannis Antonoglou, Thomas Hubert, Karen Simonyan, Laurent Sifre, Simon Schmitt, Arthur Guez, Edward Lockhart, Demis Hassabis, Thore Graepel, et al. Mastering atari, go, chess and shogi by planning with a learned model. _Nature_, 588(7839):604-609, 2020.
+* Sehgal et al. [2023] Atharva Sehgal, Arya Grayeli, Jennifer J. Sun, and Swarat Chaudhuri. Neurosymbolic grounding for compositional world models, 2023.
+* Shridhar et al. [2021] Mohit Shridhar, Xingdi Yuan, Marc-Alexandre Cote, Yonatan Bisk, Adam Trischler, and Matthew Hausknecht. ALFWorld: Aligning Text and Embodied Environments for Interactive Learning. In _Proceedings of the International Conference on Learning Representations (ICLR)_, 2021. URL https://arxiv.org/abs/2010.03768.
+* Silver et al. [2016] David Silver, Aja Huang, Chris J Maddison, Arthur Guez, Laurent Sifre, George Van Den Driessche, Julian Schrittwieser, Ioannis Antonoglou, Veda Panneershelvam, Marc Lanctot, et al. Mastering the game of go with deep neural networks and tree search. _nature_, 529(7587):484-489, 2016.
+* Silver and Chitnis [2020] Tom Silver and Rohan Chitnis. Pddlgym: Gym environments from pddl problems. In _International Conference on Automated Planning and Scheduling (ICAPS) PRL Workshop_, 2020. URL https://github.com/tomsilver/pddlgym.
+* Sinclair et al. [2019] Sean R Sinclair, Siddhartha Banerjee, and Christina Lee Yu. Adaptive discretization for episodic reinforcement learning in metric spaces. _Proceedings of the ACM on Measurement and Analysis of Computing Systems_, 3(3):1-44, 2019.
+
+* Sun et al. [2023] Haotian Sun, Yuchen Zhuang, Lingkai Kong, Bo Dai, and Chao Zhang. Adaplanner: Adaptive planning from feedback with language models. _NeurIPS_, 2023.
+* Sutton [1990] Richard S Sutton. Integrated architectures for learning, planning, and reacting based on approximating dynamic programming. In _Machine learning proceedings 1990_, pages 216-224. Elsevier, 1990.
+* Sutton and Barto [2018] Richard S Sutton and Andrew G Barto. _Reinforcement learning: An introduction_. MIT press, 2018.
+* Tang and Ellis [2023] Hao Tang and Kevin Ellis. From perception to programs: Regularize, overparameterize, and amortize. _International Conference on Machine Learning (ICML)_, 2023.
+* Tang et al. [2024] Hao Tang, Keya Hu, Jin Peng Zhou, Sicheng Zhong, Wei-Long Zheng, Xujie Si, and Kevin Ellis. Code repair with llms gives an exploration-exploitation tradeoff. _NeurIPS_, 2024.
+* Tolman and Honzik [1930] Edward Chace Tolman and Charles H Honzik. Introduction and removal of reward, and maze performance in rats. _University of California publications in psychology_, 1930.
+* Tsividis et al. [2021] Pedro A Tsividis, Joao Loula, Jake Burga, Nathan Foss, Andres Campero, Thomas Pouncy, Samuel J Gershman, and Joshua B Tenenbaum. Human-level reinforcement learning through theory-based modeling, exploration, and planning. _arXiv preprint arXiv:2107.12544_, 2021.
+* a critical investigation. In _Thirty-seventh Conference on Neural Information Processing Systems_, 2023. URL https://openreview.net/forum?id=X6dEqXIsEW.
+* Verma et al. [2018] Abhinav Verma, Vijayaraghavan Murali, Rishabh Singh, Pushmeet Kohli, and Swarat Chaudhuri. Programmatically interpretable reinforcement learning. In _International Conference on Machine Learning_, pages 5045-5054. PMLR, 2018.
+* Verma et al. [2019] Abhinav Verma, Hoang Le, Yisong Yue, and Swarat Chaudhuri. Imitation-projected programmatic reinforcement learning. _Advances in Neural Information Processing Systems_, 32, 2019.
+* Vygotsky [1980] Lev Semenovich Vygotsky. _Mind in society: The development of higher psychological processes_. Harvard university press, 1980.
+* Wang et al. [2023] Guanzhi Wang, Yuqi Xie, Yunfan Jiang, Ajay Mandlekar, Chaowei Xiao, Yuke Zhu, Linxi Fan, and Anima Anandkumar. Voyager: An open-ended embodied agent with large language models. _arXiv preprint arXiv: Arxiv-2305.16291_, 2023.
+* Wang et al. [2023] Huaxiaoyue Wang, Gonzalo Gonzalez-Pumariega, Yash Sharma, and Sanjiban Choudhury. Demo2code: From summarizing demonstrations to synthesizing code via extended chain-of-thought. _NeurIPS_, 2023.
+* Wong et al. [2023] Lionel Wong, Jiayuan Mao, Pratyusha Sharma, Zachary S. Siegel, Jiahai Feng, Noa Korneev, Joshua B. Tenenbaum, and Jacob Andreas. Learning adaptive planning representations with natural language guidance, 2023.
+* Wu et al. [2022] Chenyang Wu, Tianci Li, Zongzhang Zhang, and Yang Yu. Bayesian optimistic optimization: Optimistic exploration for model-based reinforcement learning. _Advances in neural information processing systems_, 35:14210-14223, 2022.
+* Xiang et al. [2023] Jiannan Xiang, Tianhua Tao, Yi Gu, Tianmin Shu, Zirui Wang, Zichao Yang, and Zhiting Hu. Language models meet world models: Embodied experiences enhance language models. _NeurIPS_, 2023.
+* Yao et al. [2022] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and Yuan Cao. React: Synergizing reasoning and acting in language models. _arXiv preprint arXiv:2210.03629_, 2022.
+* Zhao et al. [2023] Zirui Zhao, Wee Sun Lee, and David Hsu. Large language models as commonsense knowledge for large-scale task planning. _NeurIPS_, 2023.
+
+* [79] Feiyu Zhu and Reid Simmons. Bootstrapping cognitive agents with a large language model. In _AAAI_, 2024.
+* [80] Yutao Zhu, Huaying Yuan, Shuting Wang, Jiongnan Liu, Wenhan Liu, Chenlong Deng, Zhicheng Dou, and Ji-Rong Wen. Large language models for information retrieval: A survey. _arXiv preprint arXiv:2308.07107_, 2023.
+
+Theoretical analysis of Sample Efficiency using optimism under uncertainty (\(\phi_{2}\))
+
+The optimism under uncertainty objective (\(\phi_{1}\wedge\phi_{2}\) in Sec. 2) is much more sample efficient than the traditional data-consistency objective (\(\phi_{1}\)) as shown in Figure 4 in our experiments. We will later show a learning trajectory of it in the MiniGrid-UnlockPickup-v0 environment in Appendix A.1. This UnlockPickup environment is difficult for exploration due to its large search space. PPO failed to gain enough positive-reward supervision signals after \(3\times 10^{8}\) actions as shown in Figure 6. Our method failed _without_ the optimism objective as well. Nevertheless, our method _with_ the optimism objective learned the correct world model from scratch with no more than 100 actions due to its better sample efficiency in exploration.
+
+Here we provide a simple theorem stating that significantly better sample efficiency is theoretically guaranteed when using this objective (polynomial w.r.t the diameter of the state space and the solution space) following an intuitive observation:
+
+Observation.When planning with a world model that satisfies the \(\phi_{1}\wedge\phi_{2}\) there are only two possible outcomes:
+
+* Either the model is correct: the agent achieves the goal successfully;
+* Or the model is incorrect: the agent then must find a counter-example to its world model's prediction and gain more knowledge of the environment.
+
+It shows that the world model that satisfies \(\phi_{1}\wedge\phi_{2}\) is either correct or is efficient in guiding the agent to find a counter-example of the current world model. Counter-example are precious because, when in search of the correct world model, each interaction data \((s,a,s^{\prime},r,d)\) in the replay buffer implies a constraint to satisfy for the potentially correct world models in the space of world models. Collecting data that can be explained by all potentially correct world models is useless because it implies no stricter constraints than the current ones. Only through the counter-examples which cannot be explained by the current world model, the size of the set of the potentially correct world models can become smaller and smaller, which eventually leads to a set that only contains the good-enough world models that guide the agent towards the goal.
+
+The optimism under uncertainty objective is much more sample efficient to get those valuable counter-examples than random exploration. For deterministic environments, the number of actions to find a counter-example with a world model that satisfies \(\phi_{1}\wedge\phi_{2}\) is guaranteed to be smaller than the diameter of the state space, \(D_{S}\), when equipped with an optimal planner (by definition). Random exploration needs exponentially more number of actions to find this counter-example in the worst case. (Note that we _do not_ assume free reset to all possible states, so the agent needs to go through the trajectories from the initial state to each target state.)
+
+More formally, we show that the maximum number of actions to learn/find a good-enough world model is polynomial w.r.t. intrinsic properties of the state space and model space:
+
+**Definition A.1**.: A dataset \(\mathcal{D}\) is **mutually independent** w.r.t. a solution space \(\mathcal{M}\), denoted, \(\mathcal{D}\perp\!\!\!\perp\mathcal{M}\), if and only if for all data points in \(d\in\mathcal{D}\), there exists a solution in \(\mathcal{M}\) which explains all the data _except for \(d\)_:
+
+\[\forall d\in\mathcal{D},\exists m\in\mathcal{M},m\not\vdash d\wedge(\forall d ^{\prime}\in\mathcal{D}-\{d\},m\vdash d^{\prime}).\]
+
+**Definition A.2**.: The **logical dimensionality of \(\mathcal{M}\)**, denoted as \(K_{\perp\!\!\!\perp\mathcal{M}}\), is
+
+\[K_{\perp\!\!\!\perp\mathcal{M}}=\max\{|\mathcal{D}|:\forall\mathcal{D}\text{ where }\mathcal{D}\perp\!\!\!\perp\mathcal{M}\}\]
+
+It is straightforward to prove that this is at most \(|\mathcal{M}|\):
+
+**Lemma A.3**.: \(K_{\perp\!\!\!\perp\mathcal{M}}\leq|\mathcal{M}|\)_, i.e., the maximum size of the mutually independent data sets w.r.t. to a solution space is smaller than the size of the solution space._
+
+Proof: each data point \(d\in\mathcal{D}\) at least exclude one more unique solution in the solution space than the other data points. Otherwise, the data set is not mutually independent w.r.t. the solution space.
+
+Note that this is the loosest upper bound of \(K_{\perp\!\!\!\perp\mathcal{M}}\). We assume nothing about the model space and the learning algorithm. In practice, \(K_{\perp\!\!\!\perp\mathcal{M}}\) should be much smaller than the size of the solution space. For example, for linear models, we only need \(n\) independent data points to characterize the correct solution for \(d\in\mathbb{R}^{n}\).
+
+**Theorem A.4**.: _Assume an episodic MDP \((S,A,T,R,\gamma)\). Assume an agent acting according to an optimal planner operating over world model \((\hat{T},\hat{R})\in\mathcal{T}\times\mathcal{R}\) satisfying \(\phi_{1}\wedge\phi_{2}\), and that the true MDP is in the agent's model class: \(T\in\mathcal{T}\) and \(R\in\mathcal{R}\). Then the maximum number of actions needed to achieve the goal (exit with positive reward) is \(D_{S,A,T}\times(K_{\mathcal{T}\times\mathcal{R}}+1)\)._
+
+Proof Outline:
+
+_Lemma \(\alpha\):_ Each replay buffer data set, \(\mathcal{D}\), can be represented by its mutually independent data subset, \(\mathcal{D}_{\perp\mathcal{T}\times\mathcal{R}}\), from the perspective of finding the correct world model, i.e.,
+
+\[\mathcal{D}_{\perp\mathcal{T}\times\mathcal{R}}\subseteq\mathcal{D}\bigwedge D _{\perp\mathcal{T}\times\mathcal{R}}\perp\!\!\!\perp\mathcal{T}\times\mathcal{ R}\bigwedge\forall(\hat{T},\hat{R})\in\mathcal{T}\times\mathcal{R},(\hat{T},\hat{R}) \vdash\mathcal{D}\Leftrightarrow(\hat{T},\hat{R})\vdash\mathcal{D}_{\perp \mathcal{T}\times\mathcal{R}}.\]
+
+_Lemma \(\beta\):_ For the replay buffer, \(\mathcal{D}^{(t)}\), at any step \(t\), if a world model \((\hat{T}^{(t)},\hat{R}^{(t)})\) satisfies the optimism under uncertainty objective as well as the traditional data-consistency objective, i.e., \((\hat{T},\hat{R})\vdash\mathcal{D}^{(t)}\wedge(\hat{T},\hat{R})\vdash\phi_{2}\), then either the word model is correct, which means it can guide the agent to the goal successfully, or the agent finds a counter-example, \(d^{\prime}\), to the current world model in \(D_{S}\) steps when given an optimal planner.
+
+_Lemma \(\gamma\):_ This counter example, \(d^{\prime}\), is mutually independent to the replay buffer, \(\mathcal{D}^{(t)}\), because there is a model \((\hat{T}^{(t)},\hat{R}^{(t)})\) such that \((\hat{T}^{(t)},\hat{R}^{(t)})\nvdash d^{\prime}\wedge(\hat{T}^{(t)},\hat{R}^{ (t)})\vdash\mathcal{D}^{(t)}\).
+
+Given these lemmas, we have
+
+\[|D^{(t+D_{S})}_{\perp\mathcal{T}\times\mathcal{R}}|\geq|D^{(t)}_{\perp \mathcal{T}\times\mathcal{R}}|+1\]
+
+and therefore
+
+\[|D^{D^{S}\times(K_{\perp\mathcal{T}\times\mathcal{R}}+1)}_{\perp\mathcal{T} \times\mathcal{R}}|\geq K_{\perp\mathcal{T}\times\mathcal{R}}+1+D^{(0)}\geq K _{\perp\mathcal{T}\times\mathcal{R}}+1>K_{\perp\mathcal{T}\times\mathcal{R}}.\]
+
+Assume the world model after \(D_{S}\times(K_{\perp\mathcal{T}\times\mathcal{R}}+1)\) steps is still incorrect, we then build a mutually independent data set, \(D^{(D_{S}\times(K_{\perp\mathcal{T}\times\mathcal{R}}+1)}_{\perp\mathcal{T} \times\mathcal{R}}\), with size larger than \(K_{\perp\mathcal{T}\times\mathcal{R}}\), which is contradictory to its definition. 
+
+The proofs of Lemma \(\alpha\) and \(\gamma\) are straightforward by definitions. For example, we can build \(\mathcal{D}^{(0)}_{\perp\mathcal{T}\times\mathcal{R}}\) by dropping data points in \(\mathcal{D}^{(0)}\) that are not mutually independent to the left subset one by one. We can build \(D^{(t+1)}_{\perp\mathcal{T}\times\mathcal{R}}\) by adding the counter-example \(d^{\prime}\) to \(D^{(t)}_{\perp\mathcal{T}\times\mathcal{R}}\).
+
+We prove Lemma \(\beta\) by construction. Given the definition of the optimism under uncertainty objective, \(\phi_{2}\) in Sec. 2:
+
+\[\phi_{2}\left(s_{0},c,\hat{T}^{(t)},\hat{R}^{(t)}\right)=\] \[\exists a_{1},s_{1},a_{2},s_{2},...,a_{\ell},s_{\ell}\ :\] \[\forall i\in[\ell]:\hat{T}^{(t)}(s_{i-1},a_{i})=s_{i}\wedge\] \[\exists r>0:\hat{R}^{(t)}(c)(s_{\ell-1},a_{\ell},s_{\ell})=(r,1),\]
+
+there exists a trajectory \(a_{1},s_{1},a_{2},s_{2},...,a_{\ell},s_{\ell}\) such that either the model correctly leads the agent to the goal, i.e., \(\exists r>0:R(c)(s_{\ell-1},a_{\ell},s_{\ell})=(r,1)\), or there exists a counter-example, i.e., \(\exists i\in[\ell]:\hat{T}^{(t)}(s_{i-1},a_{i})\neq T(s_{i-1},a_{i})\lor\hat{R}^ {(t)}(c)(s_{i-1},a_{i},s_{i})\neq R(c)(s_{i-1},a_{i},s_{i})\), which means \((\hat{T}^{(t)},\hat{R}^{(t)})\nvdash(s_{i-1},a_{i},s_{i},r_{i},d_{i})\). We also have \((\hat{T}^{(t)},\hat{R}^{(t)})\vdash D^{(t)}\) due to \((\hat{T}^{(t)},\hat{R}^{(t)})\vdash\phi_{1}\). We thus prove Lemma \(\beta\).
+
+### Example learning trajectory using (\(\phi_{1}\wedge\phi_{2}\)) MiniGridUnlockPickup
+
+To demonstrate the effectiveness of the optimism objective (\(\phi_{2}\) in Sec. 2) in improving the sample efficiency through guided exploration, we show here an example of the learning trajectories in the MiniGrid-UnlockPickup-v0 environment. In comparison with agents that only use the traditional data-consistency objective (\(\phi_{1}\)), which merely relies on random exploration to gain new knowledge of the world through new data, agents that use the extra optimism under uncertainty objective can
+
+* imagine the functionality of actions and their interactions with the necessary tools, in order to achieve the goal, without any real interactions with the environment;* explore much more efficiently guided by the imagined world model;
+* and correct the imagined world model given the newly collected data after the efficient exploration.
+
+The learning trajectory is as follows:
+
+[MISSING_PAGE_POST]
+
+\begin{tabular}{|p{113.8pt}|} \hline \(\mu\) \\ \hline \end{tabular}
+
+\begin{tabular}{|p{113.
+
+Data-based search of this (random guess given the control infusion)
+
+``` defreward_func(state,action,next_state): #Ifthestatedoesnotchangeafteraction,therewardis0.0andnotdone ifstate=next_state: return0.0,False agent_n,agent_o=get_entities_by_name( next_state,"Agent")[0],get_entities_by_name( state,"Agent")[0] box_n,box_o=get_entities_by_name(next_state,"Box")[0],get_entities_by_name(state,"Box")[0]
+#Iftheagent'spositiongetsclosertothebox,giveabiggerreward ifabs(agent_n.x-box_n.x)+abs(agent_n.y-box_n.y)+abs(agent_o.x-box_o.x)+abs( agent_o.y-box_o.y): return1.0,False #Iftheagentchangesdirectionbutnot position,therewardis0.8andnotdone elifagent_o.x==agent_n.xandagent_o.y== agent_n.yandagent_o.direction!=agent_n. direction: return0.0,False #Iftheagentpicksupthegreenbox,giveabigrewardandfinish elifagent_n.carryingandagent_n.carrying.color =="green": return100.0,True #Iftheagentmovesbutdoesnotmake significantprogress,givesmallpenaltytomake itefficient else: return-0.01,False ```
+
+Code-driven transit-time (ranging how to move forward without interactions) (impact through its not considering the locked (too))
+
+``` deftransition(state,action):... elifaction=='moveforward' dx,dy=agent.direction new_x,new_y=x+dx,y+dy ifnotget_entities_by_name( get_entities_by_position(next_state,new_x,new_y),'Wall'): agent.x,agent.y=new_x,new_y... ```
+
+[MISSING_PAGE_FAIL:20]
+
+Goal-driven transit-function (fusing how to pickup, to pickup at the same position as the agent)
+
+``` deftransition(state,action):... eifaction=='pickup's items_at_agent_location= get_entities_by_position(next_state, agent_x,agent_y) pickable_items= =itemforitem items_at_agent_locationifitem.namenotin['Door','Walt','Agent'] ifpickable_items: agent.carrying=pickable_items[0] next_state.remove(pickable_items[0]) eifaction=='drop's ifagent.carrying: agent.carrying.x,agent.carrying.y= agent.x,agent.y next_state.append(agent.carrying) agent.carrying=None elifaction=='topsize' ifisinstance(agent.carrying, Key): door_at_right=[doordoorin get_entities_by_position(next_state, right_x, right_y)ifdoor.name=='Door' ] ifdoor_at_rightanddoor_at_right[0]. color==agent.carrying.color: door_at_right[0].state='unlocked' returnnext_stateGustd by Imagined transit-flint
+
+Time
+
+Trying to step on the key to pick it up
+
+...
+
+def transition(state, action): ...
+
+elif action =='move forward':
+
+entities_at_front = [entity for entity in
+
+get_entities_by_position(next_state, front_x
+
+, front_y) if entity.name!= 'Agent']
+
+if entities_at_front:
+
+if entities_at_front[0].name == "Door"
+
+and entities_at_front[0].state == "
+
+unlocked":
+
+agent.x, agent.y = front_x, front_y
+
+# other entities should prevent agent
+
+from:moving forward
+
+else:
+
+agent.x, agent.y = front_x, front_y
+
+elif action == 'pick up':
+
+items_at_agent_location =
+
+get_entities_by_position(next_state,
+
+agent_x, agent.y)
+
+pickable_items = [item for item in
+
+items_at_agent_location if item.name not in
+
+['Door','Wall', 'Agent']]
+
+if pickable_items:
+
+agent.carrying = pickable_items[0]
+
+next_state.remove(pickable_items[0])
+
+...
+
+Gustd driven transit-flint
+
+(transine the agent can also pick the object in front of it, which is coupled, without interactions.
+
+def transition(state, action): ...
+
+elif action == 'pick up':
+
+items_at_agent_location =
+
+get_entities_by_position(next_state, agent.x
+
+, agent.y)
+
+items_at_front_location =
+
+get_entities_by_position(next_state)
+
+from_x, front_y)
+
+pickable_items = (item for item in
+
+items_at_agent_location #
+
+items_at_front_location if item.name not in
+
+['Door','Wall', 'Agent']]
+
+if pickable_items:
+
+agent.carrying = pickable_items[0]
+
+next_state.remove(pickable_items[0])
+
+...
+
+Guothed by Imagined transit-flute
+
+fine
+
+Trying to to tagid the door
+
+...
+
+def toggle_door(agent, next_state, next_x, next_y):
+
+doors_in_next_position = [door for door in
+
+get_entities_by_position(next_state, next_x,
+
+next_y) if door.name == 'Door']
+
+if doors_in_next_position and
+
+doors_in_next_position[0].color == agent.
+
+carrying.color :
+
+doors_in_next_position[0].state = 'open'...
+
+Guarded by Imagined transit time
+
+Figure 10 plots the key while carrying the key
+
+Gated driver transit time
+
+(figure 10) on control pickup objects with carrying others in
+
+prove the drop action that was imagined before) (SUCCESS)
+
+...
+
+def drop_item(agent, next_state, next_x, next_y):
+
+entities_in_next_position =
+
+get_entities_by_position(next_state, next_x,
+
+next_y)
+
+if not entities_in_next_position and agent.
+
+carrying:
+
+# Drop can only drop object if there's no
+
+obstacle and agent carries something.
+
+agent.carrying.x, agent.carrying.y = next_x,
+
+next_y
+
+agent.carrying = None
+
+...
+
+def check_no_obstacle_between(agent, next_state, x,
+
+y):
+
+dx, dy = x - agent.x, y - agent.y
+
+for i in range(min(abs(dx), abs(dy))):
+
+entities_at_next_position =
+
+get_entities_by_position(next_state, agent.x
+
++ i * dx, agent.y + i * dy)
+
+if any(isinstance(entity, Wall) or (
+
+isinstance(entity, Door) and entity.state!=
+
+'open') for entity in
+
+entities_at_next_position):
+
+return False
+
+return True
+
+def pickup_item(agent, next_state):
+
+items_in_current_location =
+
+get_entities_by_position(next_state, agent.x,
+
+agent.y)
+
+pickable_items = [item for item in
+
+items_in_current_location if item.name not in ['
+
+Door', 'Wall', 'Agent']]
+
+if agent.carrying is None: # Agent can only pick
+
+up an item when it is not carrying an item
+
+if not pickable_items:
+
+dx, dy = agent.direction
+
+facing_x, facing_y = agent.x + dx, agent
+
+.y + dy
+
+if check_no_obstacle_between(agent,
+
+next_state, facing_x, facing_y): # Make
+
+sure there is no wall or door between
+
+the agent and the item
+
+items_in_facing_location =
+
+get_entities_by_position(next_state,
+
+facing_x, facing_y)
+
+pickable_items = [item for item in
+
+items_in_facing_location if item.
+
+name not in ['Door', 'Wall']]
+
+if pickable_items:
+
+agent.carrying = pickable_items[0]
+
+next_state.remove(pickable_items[0])
+
+...
+
+The final synthesized world world world ends
+
+class Entity:def__init__(self,x,y,**kwargs):  self.name=self.__class____name__ self.x=x  self.y=y  forkey,valueinkwargs.items():  setattr(self,key,value) def__repr__(self):  attr=','.join(f'(key)={value}'forkey,valueinself.__dict__.items ()ifkeynotin('name','x','y'))  ifattr:returnf"{self.name}({self.x},{self.y},{attr})"  else:returnf"{self.name}({self.x},{self.y})"  def__eq__(self,other):  returnall(getattr(self,key)==getattr(other,key,None)forkeyin  self.__dict__keys()) def__hash__(self):  returnhash(tuple(sorted(self.__dict__.items()))) classAgent(Entity):pass classKey(Entity):pass classBoor(Entity):pass classGoal(Entity):pass classWall(Entity):pass classBoal(Entity):pass classLava(Entity):pass defupdate_direction(agent,action):  all_directions=[(0,-1),(-1,0),(0,1),(1,0)] current_dir_idx=all_directions.index(agent.direction) ifaction==turnright:  agent.direction=all_directions[(current_dir_idx-1)%4]  else:#turnleft  agent.direction=all_directions[(current_dir_idx+1)%4]  defdrop_item(agent,next_state,next_x,next_y):  entities_in_next_position=get_entities_by_position(next_state,next_x,next_y)  ifnotentities_in_next_positionandagent.carrying:  #Dropcanonlydropobjectifthere'snobostacleandagentcarries  something.  agent.carrying.x,agent.carrying.y=next_x,next_y  next_state.append(agent.carrying)  agent.carrying=None  deftoggle_door(agent,next_state,next_x,next_y):  doors_in_next_position=[doorfordooringet_entities_by_position( next_state,next_x,next_y)ifdoor.name=='Door']  ifdoors_in_next_positionanddoors_in_next_position[0].color==agent.carrying.color : doors_in_next_position[0].state='open'  defget_entities_by_name(entities,name):  return[entityforentityinentitiesifentity.name==name]  defget_entities_by_position(entities,x,y):  return[entityforentityinentitiesifentity.x==xandentity.y==y]  defcheck_no_obstacle_between(agent,next_state,x,y):  dx,dy=x-agent.x,y-agent.y  foriinrange(min(abs(dx),abs(dy))):  entities_at_next_position=get_entities_by_position(next_state,agent.  x+i*dx,agent.y+i*dy)  ifany(isinstance(entity,Walt)or(isinstance(entity, Door)andentity.state!='open')forentityinentities_at_next_position):  returnFalse  returnTrue  defpickup_item(agent,next_state):  items_in_current_location=get_entities_by_position(next_state,agent.x,  agent.y)  pickable_items=[itemforitemitems_in_current_locationifitem.name  notin['Door','Wall','Agent']]if agent.carrying is None:# Agent can only pick up an item when it is not carrying an item  if not pickable_items:  dx, dy = agent.direction  facing_x, facing_y = agent.x + dx, agent.y + dy  if check_no_obstacle_between(agent, next_state, facing_x, facing_y)  :# Make sure there is no wall or door between the agent and the item  :items_in_facing_location = get_entities_by_position(next_state,  facing_x, facing_y)  pickable_items = [item for item in items_in_facing_location if  :item.name not in ['Door', 'Walt']]  if pickable_items:  agent.carrying = pickable_items[0]  next_state.remove(pickable_items[0])  def transition(state, action):  next_state = list(state)  agent = get_entities_by_name(next_state, 'Agent')[0]  dx, dy = agent.direction  front_x, front_y = agent.x + dx, agent.y + dy  if action == 'turn right' or action == 'turn left':  update_direction(agent, action)  elif action =='move forward':  update_position(agent, next_state, front_x, front_y)  elif action == 'pick up':  pickup_item(agent, next_state)  elif action == 'drop':  drop_item(agent, next_state, front_x, front_y)  elif action == 'topgle':  toggle_door(agent, next_state, front_x, front_y)  return next_state  def update_position(agent, next_state, next_x, next_y):  entities_at_next_position = get_entities_by_position(next_state, next_x,  next_y)  if not any(  ( isinstance(entity, Wall) or  isinstance(entity, Box) or  isinstance(entity, Ball) or  isinstance(entity, Lava) or  ( isinstance(entity, Door) and entity.state!= 'open') or  isinstance(entity, Key)  )  for entity in entities_at_next_position  ):  agent.x, agent.y = next_x, next_y  else:  agent.x, agent.y = agent.x, agent.y # Agent stays in place ```
+
+## Appendix B Planning with Monte Carlo Tree Search and the BM25-based Heuristic
+
+We propose a BM25-based heuristic to guide planning in text-based environments, and trade off the exploration and exploitation using a variant of Monte Carlo Tree Search (MCTS) for deterministic environments with sparse rewards. The heuristic encourages the planner to focus on trajectories that are "closer" to the goal as specified by users, while MCTS enables the planner to explore other options after failing on the seemingly promising ones for too long.
+
+### Monte Carlo Tree Search for Deterministic Environments with Sparse Rewards
+
+Monte Carlo Tree Search (MCTS) [12; 5] is a classic heuristic search algorithm and has achieved speculative success in difficult problems such as _Go_[58]. It uses tree policies such as UCT (UpperConfidence bounds for Trees) [35; 2] to trade exploration and exploitation while deciding on which part of the search space to search more. It then evaluates the potential benefits of searching in this selected part of space, i.e., trajectories with the same prefix as the selected partial trajectory, by rolling them out in simulations. The UCT tree policy makes a balance between exploiting the search space with higher potential benefits and exploring the lesser-considered regions.
+
+However, the MCTS algorithm is designed for general planning problems and is not efficient enough for deterministic environments with sparse rewards, such as Alfworld in our experiments. We thus modify the algorithm to make it faster by making use of the additional assumptions of the environments: deterministic and sparse rewards. Specifically, we remove the rollout procedure and instead substitute it with an optional heuristic to estimate the promise of the partial trajectories. Noticing that there is no randomness and no partial rewards in the environments, roll-outs are not cost-effective in the usage of simulations. We do not need to run a trajectory multiple times to estimate its expectations of returns. All returns of partial trajectories are zero and, once a trajectory gets a positive return, we find the goal state and should immediately return the trajectory from the initial state to this goal state. Computation spent on simulating the roll-outs should instead be spent on expanding the search tree with the smarter online tree policy rather than the fixed one in roll-outs. We thus remove the rollout procedure, or equivalently, set the rollout depth to zero with a hard-coded Q-value estimator, i.e., the heuristic. We adopt the classic UCT-based MCTS algorithm and replace the rollouts with a BM25-based heuristic in our experiments, as shown in Algorithm 2. We refer the readers to the other surveys [5] for details about MCTS.
+
+``` functionUCTSearch(\(s_{0}\))\(\triangleright\) MCTS Search with the UCT tree policy create the root node \(v_{0}\) with state \(s_{0}\) while within computation budget do \(v_{l}\leftarrow\textsc{TreePolicy}(v_{0})\) \(v^{\prime}_{l}\leftarrow\textsc{Expand}(v_{l})\) \(\Delta\gets h(v^{\prime}_{l})\)\(\triangleright\) No more rollouts, BM25-based heuristic BackUp(\(v^{\prime}_{l}\)) return\(a(\textsc{BestChild}(v_{0}\), \(0))\) functionTreePolicy(\(v\))\(\triangleright\) Select node to expand using the UCT criterion while\(v\) is nonterminal do if\(v\) not fully expanded then returnExpand(\(v\)) else \(v\leftarrow\textsc{BestChild}(v\), \(C)\) return\(v\) functionExpand(\(v\))\(\triangleright\) Select a child to expand choose \(a\in\) untried actions from \(A(s(v))\) add a new child \(v^{\prime}\) to \(v\) with \(s(v^{\prime}),r(v^{\prime})=\textsc{WorldModel}(s(v),a)\) and \(a(v^{\prime})=a\) return\(v^{\prime}\) functionBestChild(\(v\), \(c\))\(\triangleright\) The UCT criterion for selecting nodes return\(\arg\max_{v^{\prime}\in\textsc{children}}\textsc{of}\textsc{v}\frac{Q(v^{\prime})}{N(v^{ \prime})}+c\sqrt{\frac{2\ln N(v)}{N(v^{\prime})}}\)\(\triangleright\) Exploit: \(\frac{Q(v^{\prime})}{N(v^{\prime})}\), Exploration: \(c\sqrt{\frac{2\ln N(v)}{N(v^{\prime})}}\) functionBackUp(\(v,\Delta\))\(\triangleright\) Back propagation of the heuristic values while\(v\) is notnull do \(N(v)\gets N(v)+1\) \(Q(v)\gets Q(v)+\Delta\) \(v\leftarrow\) parent of \(v\) ```
+
+**Algorithm 2** Monte Carlo Tree Search for Deterministic Sparse-Reward Environment
+
+### BM25 as a Heuristic for Planning in Text-based Environments
+
+We propose to estimate the promise/goodness of a selected state with information on the similarity between the goal (specified by the user in texts) and the partial trajectory (texts that describe the path the agent has traversed from the initial state to the selected state). An example of the goal and the partial trajectory in the Alfworld environment is as follows:Mission example:  put a alarmclock in desk  Partial trajectory example 1:  goto(dest=sidetable1)  The agent1 at loc5 is now at loc20.  Pickup(obj=alarmclock1, receptacle=sidetable1)  The agent1 is now holding alarmclock1. The alarmclock1 at loc20 is now at None  goto(dest=desk1)  The agent1 at loc20 is now at loc1.
+
+Partial trajectory example 2:  goto(dest=microwave1)  The agent1 at loc41 is now at loc36.  Heat(obj=applied, receptacle=microwave1)  The appl at None is now hot.  goto(dest=garbagecan1)  The agent1 at loc36 is now at loc41.
+
+Intuitively, the assumption is that the more similar the partial trajectory is to the goal, the more relevant the current state is to the goal, and thus the closer the current state is to the goal states. For example, if the goal is "put a hot alarmclock in desk", trajectories that involve "alarmclock", "desk", and "hot" should be more promising to exploit than other irrelevant ones.
+
+There are various metrics and methods from the text retrieval field to estimate the text similarities [43, 34, 33, 80]. We focus on the symbolic ones for efficiency issues and find BM25 [50], a state-of-the-art algorithm for web-scale information retrieval, works significantly well in our experiments. Our algorithm is different from the classic BM25 algorithm in the sense that we do not have a static previously collected trajectory/document corpus. Instead, we maintain an online trajectory corpus during the search, as shown in Algorithm 3 and Algorithm 2.
+
+One interesting finding in our preliminary experiments is that the saturating formulation of the term frequency, \(\frac{n_{\tau}(k_{1}+1)}{n_{\tau}+k_{1}\cdot(1-b+b\cdot|\tau|/l_{D})}\), in BM25 significantly outperforms its linear variant in TF-IDF. Without the saturating formulation, the heuristic will assign too high scores to seemingly promising too long trajectories such as those that repetitively pick up "alarmclock" and go to "desk" (the concrete states are different in minor irrelevant details throughout the trajectory, so they are not the same), which results in the planner to be stuck in meaningless local minimum until exhausting the budget.
+
+## Appendix C More Experimental Results
+
+### PPO for MiniGrid
+
+Figure 6: Performance of PPO in MiniGrid environments.
+
+We evaluate PPO, as a Deep RL baseline, in minigrid experiments. We use the tuned hyper-parameters from RL Baselines3 Zoo [48] for each environment and use the same symbolic memory state as ours. As shown in Figure 6, PPO is much more sample inefficient than ours. It needs \(10^{4}-10^{5}\) steps to learn valid policies (not perfect though) in most environments. It cannot solve the UnlockPickup environment even in \(3\times 10^{8}\) steps.
+
+### PPO for Sokoban
+
+The PPO baseline was implemented using Stable Baselines3 [49] and the gym-sokoban library [54] with \(256\) parallel environments, a batch_size of \(2048\), a horizon of \(50\) steps, and the rest default hyperparameters according to the Stable Baselines3 library (n_steps \(2048\), learning rate \(0.0003\), gamma \(0.99\), n_epochs \(10\), gae_lambda \(0.95\), clip_range \(0.2\), normalized advantage, ent_coef \(0\), vf_coef \(0.5\)).
+
+The input to the network is a \((3,7,7)\) corresponding to the 7 by 7 Sokoban grid, with each item in the grid represent as an RGB pixel.
+
+The policy network used was a convolutional neural network with 3 convolutional layers with 16, 32, and 64 filters and all with a kernel of size \((2,2)\) and a stride of \(1\), followed by a linear layer with 9 outputs, corresponding to the 9 possible actions. All layers are separated by Rectified Linear Units (ReLu).
+
+### DreamerV3 for Sokoban
+
+The DreamerV3 baseline was implemented using the simple training script provided by the open-source DreamerV3 library created by Danijar Hafner [27], and the gym-sokoban library [54] with default hyperparameters and 1 environment.
+
+Example of synthesized world models for Sokoban
+
+``` deftransition(state,action): """ Args: state: a set of entities representing the state of the environment action: the action can be "move right", "move left", "move up", " move down" Returns: next_state: the next state of the environment """
+here we define how the player coordinates change for each action action_to_delta = { "move right": (1, 0), "move left": (-1, 0), "move up": (0, -1), "move down": (0, 1) } # Here we get the player and the boxes in the current state player = get_entities_by_name(state, 'player')[0] boxes = get_entities_by_name(state, 'Box') walls = get_entities_by_name(state, 'Walt') # Then, we calculate the new player position according to the action delta_x, delta_y = action_to_delta[action] new_player_x = player_x + delta_x new_player_y = player_y + delta_y # We check if the new player position is a Wall if get_entities_by_position(walls, new_player_x, new_player_y): # If so, the player does not move pass else: # If not, the player moves to the new position pushed_box = get_entities_by_position(boxes, new_player_x, new_player_y) if pushed_box: pushed_box_x = pushed_box[0].x + delta_x pushed_box_y = pushed_box[0].y + delta_y # Check if there is a wall or other box at the pushed box destination if get_entities_by_position(boxes + walls, pushed_box_x, pushed_box_y): # If so, the player and the box do not move pass else: # If not, the box moves to the new position pushed_box[0].x += delta_x pushed_box[0].y += delta_y player.x += delta_x player.y += delta_y else: player.x += delta_x player.y += delta_y return state ```
+
+Synthesized reward function for Sokoban
+
+``` defreward_func(state,action,next_state): reward=-0.1 ```
+
+[MISSING_PAGE_FAIL:31]
+
+returnhash(tuple(sorted(self.__dict__.items())))  defentity_type(self):  returnentity_type(self.name)  defis_entity_type(self, etype):  returnis_entity_type(self.name, etype)  class Agent(Entity):  def__init__(self, name, loc=None, holding=None, **kwargs):  super()__init__(name, loc, **kwargs)  self.holding = holding  def__repr__(self):  returnf^{self.__class__.__name__}(name={self.name}, loc={self.loc},  holding={self.holding})"  class Action:  def__init__(self, name, **kwargs,):  for key, value in kwargs.items():  setattr(self, key, value)  def__repr__(self):  attr= ", ':join([f^{key}={value}" for key, value in self.__dict__.items()])  returnf^{self.__class__.__name__}({attr})"  def__eq__(self, other):  return all(getattr(self, key) == getattr(other, key, None) for key  in self.__dict__.keys())  def__hash__(self):  return hash(tuple(sorted(self.__dict__.items())))  class Goto(Action):  def__init__(self, entity_name,):  super()__init__('goto', dest=entity_name)  class Open(Action):  def__init__(self, entity_name,):  super()__init__('open', obj=entity_name)  class Close(Action):  def__init__(self, entity_name,):  super()__init__('close', obj=entity_name)  class Examine(Action):  def__init__(self, entity_name,):  super()__init__('examine', obj=entity_name)  class Use(Action):  def__init__(self, entity_name,):  super()__init__('use', obj=entity_name)  class Pickup(Action):  def__init__(self, entity1_name, entity2_name):  super()__init__('pickup', obj=entity1_name, receptacle=entity2_name  )  class Put(Action):  def__init__(self, entity1_name, entity2_name, cancontain,):  super()__init__('put', obj=entity1_name, receptacle=entity2_name,  cancontain=cancontain)  class Clean(Action):  def__init__(self, entity1_name, entity2_name):  super()__init__('clean', obj=entity1_name, receptacle=entity2_name)  class Heat(Action):  def__init__(self, entity1_name, entity2_name):  super()__init__('heat', obj=entity1_name, receptacle=entity2_name)  class Cool(Action):  def__init__(self, entity1_name, entity2_name):  super()__init__('cool', obj=entity1_name, receptacle=entity2_name)  def entity_type(name):  return name.strip('0123456789').strip()  defis_entity_type(name, etype):  return etype.lower().strip() == entity_type(name).lower().strip()  defis_receptacle_open(state, obj):  if obj.in_on is None:returnTrue  recpetacle=get_entity_by_name(state,obj.in_on)  if receptacleisNoneornotrecpetacle.openable:  returnTrue  returnreceptacle.isopen  defmove_and_heat_with_microwave(state,action_obj_name,  action_recpetacle_name):  agent=get_entities_by_type(state,'agent')[0]  heating_entity=get_entity_by_name(state,action_obj_name)  microwave_entity=get_entity_by_name(state,action_receptacle_name)  #Ensureagentisinthecorrectlocationwherethemicrowaveis  ifagent.loc!=microwave_entity.loc:  agent.loc=microwave_entity.loc  #Checkingwhethertheagenthastheobject  ifagent.holding==heating_entity.nameandheating_entity.heatable:  #Heattheobject  heating_entity.isnot=True  heating_entity.iscool=False#Resettingcool  returnstate  #create_agent()functioncreatesanagententityinstance  defcreate_agent(name,loc=None,holding-None,**kwargs):  returnAgent(name,loc=loc,holdingholdingholding,**kwargs)  #CorrectingandoptimizingthePythoncodetobettersimulateworldlogic  #Importingnecessary libraries  fromcopyimportdeecopy  defget_entities_by_type(entities,etype):  return[entityforentityinentitiesifentity.entity_type().lower()==  etype.lower()]  defis_receptacle(entity):  returngetart(entity,'isreceptacle',False)  defmove_and_heat(state,obj_name,receptacle_name):  #Similarimplementationasbeforeisassumed  pass  defget_entity_by_type(entities,type_name):  returnnext((entityforentityinentitiesifentity.entity_type().lower  ()==type_name.lower()),None)  defget_entity_by_name(entities,name):  returnnext((entityforentityinentitiesif_canonicalize_name(entity.  name)==_canonicalize_name(name)),None)  def_canonicalize_name(name):  return'.join(name.split()).lower()  defopen_state(state,obj_name):  obj=get_entity_by_name(state,obj_name)  ifobjandobj.openableandnotobj.isopen:  obj.isopen=True  returnstate  defclose_state(state,obj_name):  obj=get_entity_by_name(state,obj_name)  ifobjandobj.openableandobj.isopen:  obj.isopen=False  returnstate  defmove_and_put(state,obj_name,receptacle_name):  agent=get_entity_by_type(state,'Agent')  obj=get_entity_by_name(state,obj_name)  receptacle=get_entity_by_name(state,receptacle_name)  ifobjandreceptacleandobj.loc==agent.locandagent.holding==  obj_name:  ifreceptacle.openableandnotreceptacle.isopen:  returnstate #Can'tputintoacclosedreceptacle  obj.loc=receptacle.loc  obj.in_on=receptacle.name  agent.holding=None  returnstatedefset_agent_holding(state,agent_name,obj_name):  """Setstheagent'sholdingattributetotheobject'snameifpossible.  """"  agent=get_entity_by_name(state,agent_name)  obj=get_entity_by_name(state,obj_name)  ifobj.pickupable:  agent.holding=obj_name  obj.in_on=None#Theobjectisnolongerinoronareceptacle  obj.loc=None  defmove_and_pickup(state,obj_name):  """Movestheagenttotheobject'slocationandthenpicksitup,if  nearandpickupable"""  agent=get_entity_by_type(state,'Agent')  obj=get_entity_by_name(state,obj_name)  ifobjandobj.pickupableandobj.loc==agent.loc:  set_agent_holding(state,agent.name,obj.name)  returnstate  #Assumedhelperfunctions(simplifiedforclarity)  defmove_and_use(state,obj_name):  #Implementactionlogichereifneeded  pass  #Examplefunctionsignatures,definingotherrequiredactionssimilarly  defmove_agent(state,destination_name):  agent=get_entity_by_type(state,'Agent')  destination=get_entity_by_name(state,destination_name)  ifdestination:  agent.loc=destination.loc  returnstate  defopen_receptacle(state,receptacle_name):  recepecncle=get_entity_by_name(state,receptacle_name)  ifreceptacleandreceptacle.openableandnotreceptacle.isopen:  receptacle.isopen=True  returnstate  defcreate_item(name,loc=None,in_on=None,**kwargs):  returnEntity(name,loc=loc,in_on=in_on,**kwargs)  defcool_object(state,obj_name,receptacle_name):  """  Refactoredtoensurethereceptacleisopenbeforeplacingtheobject  inside.  """  receptacle=get_entity_by_name(state,receptacle_name)  ifreceptacle.openableandnotis_open(receptacle):  state=open_receptacle(state,receptacle_name)  returnapply_cooling(state,obj_name,receptacle_name)  #HelperFunction  defis_open(entity):  returngetattr(entity,'isopen',False)  #Helperfunctiontoensureareceptacleisopenandupdatedcorrectly  defopen_receptacle_if_closed(state,receptacle_name):  recepecncle=get_entity_by_name(state,receptacle_name)  ifreceptacleandreceptacle.openableandnotreceptacle.isopen:  recepecncle.isopen=True  returnstate  defapply_cooling(state,obj_name,receptacle_name):  agent=get_entity_by_name(state,'Agent')  obj=get_entity_by_name(state,obj_name)  recepecncle=get_entity_by_name(state,receptacle_name)  ifobjandreceptacleandobj.coolable:  ifagent.holding=obj.nameor(obj.in_on==receptacle.nameand  is_open(receptacle)):  #notis_open(receptacle):  state=open_receptacle_if_closed(state,receptacle_name)  obj.loc=Noneobj.in_on=receptacle_name  obj.iscool=True  obj.ishot=False  agent.holding=None  else:  print("Agentdoesnotholdtheobjectorthefridgeisnotopen.")  returnstate  deftransition(state,action):  """  Performatransitionbasedontheactiontypeandupdatethestate  accordingly.  Args:  state(set):Currentstaterepresentedasasetofentities.  action(Action):Actiontobeexecuted.  Returns:  set:Updatedstateaftertheactionhasbeenperformed.  """  state=deepcopy(state)#Copystatetoavoidmutation  action_type=type(action).__name__.lower()  ifaction_type=="goto":  returnmove_agent(state,action.dest)  elifaction_type=="open":  returnopen_receptacle(state,action.obj)  elifaction_type="close":  returnclose_state(state,action.obj)  elifaction_type=="pickup":  returnmove_and_pickup(state,action.obj)  elifaction_type=="put":  returnmove_and_put(state,action.obj,action.receptacle)  elifaction_type=="use":  returnmove_and_use(state,action.obj)  elifaction_type=="heat":  returnmove_and_heat(state,action.obj,action.receptacle)  elifaction_type=="cool":  returnmove_and_cool(state,action.obj,action.receptacle)  else:  raiseValueError(f"Unsupportedactiontype:{action_type}")  returnstate  defmove_and_cool(state,obj_name,receptacle_name):  """  Moveanobjecttoacoolingreceptacle(e.g.,afridge)andcoolitdown .  Args:  state(set):Thecurrentstateofthenenvironment.  obj_name(str):Thenameofthenobjecttobecooled.  receptacle_name(str):Thenameoftheneceptaclewheretheobject  willbecooled.  Returns:  set:Theupdatedstateafterthecoolingprocess.  """  agent=get_entity_by_name(state,'Agent')  obj=get_entity_by_name(state,obj_name)  receptacle=get_entity_by_name(state,receptacle_name)  ifobjandreceptacleandobj.coolable:  ifagent.holding==obj_name:  ifreceptacle.openableandnotreceptacle.isopen:  state=open_receptacle(state,receptacle.name)  agent.holding=None#Agentreleasestheobject  obj.in_on=receptacle.name#Placeobjectin/onthereceptacle  obj.loc=None#Sinceit'sinsidethereceptacle,locationis  notdirect  obj.iscool=Trueobj.ishot=False else:  print("Conditionnotmet:Agentmustholdtheobject.")  else:  print("Conditionnotmet:Objectmustbecoolableandreceptacle  mustexist.")  returnstate ```
+
+Example reward function:
+
+``` Synthesizedrewardfunctionfor"inputalhotgesinfridge"
+
+```
+#putabotegginfridge defget_entities_by_type(entities,etype): return[entityforentityinentitiesifentity.is_entity_type(etype)] defget_entities_by_loc(entities,loc): entities=[entityforentityinentitiesifentity.loc==loc] returnentities defentity_type(name): returnname.strip('0123456789').strip() defis_entity_type(name,etype): returnetype.lower().strip()==entity_type(name).lower().strip() defreward_func(state,action,next_state): """ Args: state:thestateofthenenvironment action:theactiontobeexecuted next_state:thenextstateofthenenvironment Returns: reward:therewardofthenaction done:whethertheepisodeisdone """ agent=next(iter(get_entities_by_type(state,'agent'))) next_agent=next(iter(get_entities_by_type(next_state,'agent'))) #Ifit'saputaction,checkifthemovingobjectiseggand destinationisfridge ifisinstance(action,Put): obj_name=action.obj rec_name=action.receptacle ifis_entity_type(obj_name,'egg')andis_entity_type(rec_name,'fridge')andnotnext_agent.holding: matching_entity=[entityforentityinget_entities_by_loc( next_state,agent.loc)ifentity.name==obj_nameandentity. in_on==rec_name) ifmatching_entity: #checkiftheeggishot ifmatching_entity[0].ishot: return1,True else: return0,False else: return0,False
+#Otherpartsofthenrewardfunction #Iftheactionisnotaputactionortheobjectisnotaeggorthe destinationisnotafridge,return0rewardanddone=False return0,False
+
+Prompts
+
+We list all the prompts that are used in our experiments in this section. The functionality for each prompt is stated in its subsection name. We highlight the dynamic information as yellow and the main instruction as blue. The dynamic information includes the data collected so far in the replay buffer and the codes synthesized so far by previous LLM calls.
+
+### Initializing the transition function
+
+It asks LLMs to generate a transition function \((s,a)\to s^{\prime}\) following the code template to model seven uniformly randomly sampled experience data \((s,a,s^{\prime})\) in the replay buffer.
+
+``` Youarearobotexploringinanobject-centricenvironment.Yourgoalistomodelthelogicoftheworldinpython.Youwillbecprovidedexperiencesintheformatof(state,action,next_state)tuples.Youwillalsobecprovidedwithabortnaturallanguagedescriptionthatbrieflysummarizesthedifferencebetweenthestateandthenextstateforeach(state,next_state,),pair.Youneedtoimplementthepythoncodetomodelthelogicoftheworld,asseenintheprovidedexperiences.Pleasefollowthetemplatetoimplementthecode.Thecodeneedstobedirectlyrunnableonthestateandreturnthenextstateinpythonasprovidedintheexperiences. Youneedtoimplementpythoncodetomodelthelogicoftheworldasseeninthefollowingexperiences: Theaction"toggle"transformthestatefrom ++ wall(0,0);Wall(1,0);Wall(2,0);Wall(3,0);Wall(4,0);Wall(0,1);empty;Wall(2,1);empty;Wall(4,1);wall(0,2);Agent(1,2,direction=(0,-1),carrying=None);Door(2,2,color=yellow,state=locked);empty;Wall(4,2);Wall(0,3);Key(1,3,color=yellow);Wall(2,3);Goal(3,3);Wall(4,3);Wall(4,3);Wall(4,4);'...'to'... Wall(0,0);Wall(1,0);Wall(2,0);Wall(3,0);Wall(4,0);Wall(0,1);empty;Wall(2,1);empty;Wall(4,1);wall(0,2);Agent(1,2,direction=(0,-1),carrying=None);Door(2,2,color=yellow,state=locked);empty;Wall(4,2);Wall(0,3);Key(1,3,color=yellow);Wall(2,3);Goal(3,3);Wall(4,3);Wall(4,3);Wall(4,4);Wall(1,4);Wall(2,4);Wall(3,4);Wall(4,4);'...'Thedifferenceis"""Nothinghappened"""Theaction"toggle"transformthestatefrom """Wall(0,0);Wall(1,0);Wall(2,0);Wall(3,0);Wall(4,0);Wall(0,1);empty;Wall(2,1);empty;Wall(4,1);Wall(0,2);Agent(1,2,direction=(0,1),carrying=None);Door(2,2,color=yellow,state=locked);empty;Wall(4,2);Wall(0,3);Key(1,3,color=yellow);Wall(2,3);Goal(3,3);Wall(4,3);Wall(4,4);'...'to...  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(0, 1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...  The difference is  """  Nothing happened  """  The action "turn right" transforms the state from ...  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  wall(0, 2) ; Agent(1, 2, direction=(1, 0), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...  to ...  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  wall(0, 2) ; Agent(1, 2, direction=(0, 1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(4, 3) ;  Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...  The difference is  """  The agent (direction=(1, 0)) at pos (1, 2) becomes an agent (direction=(0, 1)).  """  The action "turn left" transforms the state from ...  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  wall(0, 2) ; Agent(1, 2, direction=(-1, 0), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(4, 4) ; ...  to ...  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  wall(0, 2) ; Agent(1, 2, direction=(0, 1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(4, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...  The difference is  """ )The agent (direction=(-1, 0)) at pos (1, 2) becomes an agent (direction=(0, 1)). """
+
+The action "turn right" transforms the state from "...  Wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ; Wall(8, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(8, 2) ; Agent(1, 2, direction=(0, 1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(9, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...
+
+to ...  Wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(-1, 0), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(4, 3) ; Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...
+
+The difference is  """  The agent (direction=(0, 1)) at pos (1, 2) becomes an agent (direction=(-1, 0)).  """
+
+The action "turn right" transforms the state from "...  Wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ; Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ; Wall(0, 2) ; Agent(1, 2, direction=(-1, 0), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(4, 4) ;  Wall(4, 4) ; ...
+
+to ...
+
+Wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ; Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(0, -1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ; Wall(4, 3) ; Wall(4, 4) ; Wall(4, 4) ; ...
+
+The difference is  """  The agent (direction=(-1, 0)) at pos (1, 2) becomes an agent (direction=(0, -1)).  """
+
+The action "turn left" transforms the state from "...  Wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ; Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(0, 1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ; Wall(4, 3) ; Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ;... {to...  Wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ; Wall(8, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ; Wall(8, 2) ; Agent(1, 2, direction=(1, 0), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ; Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ; Wall(4, 3) ; Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ;... {The difference is """  The agent (direction=(0, 1)) at pos (1, 2) becomes an agent (direction=(1, 0)). """  Please implement code to model the logic of the world as demonstrated by the experiences. Here is the template for the transition function. Please implement the transition function following the template. The code needs to be directly runnable on the inputs of (state, action) and return the next state in python as provided in the experiences....  class Entity:  def__init__(self, x, y, **kwargs):  self.name = self.__class__...name__  self.x = x  self.y = y  for key, value in kwargs.items():  scatter(self, key, value)  def__repr__(self):  attr = ", 'join(f'(key)={value}' for key, value in self.__dict__  items() if key not in ('name', 'x', 'y'))  if attr: return f"(self.name)((self.x), (self.y), (attr))"  else: return f"(self.name)((self.x), (self.y))"  def__eq__(self, other):  return all(getattr(self, key) == getattr(other, key, None) for key  in self.__dict__keys())  def__hash__(self):  return hash(tuple(sorted(self.__dict__.items())))  class Agent(Entity): pass  class Key(Entity): pass  class Door(Entity): pass  class Goal(Entity): pass  class Wall(Entity): pass  class Box(Entity): pass  class Ball(Entity): pass  class Law(Entity): pass  def get_entities_by_name(entities, name):  return [ entity for entity in entities if entity.name == name ]  def get_entities_by_position(entities, x, y):  return [ entity for entity in entities if entity.x == x and entity.y ==  y ]  def transition(state, action):  """  Args:  state: the state of the environment  action: the action to be executed Returns:  next_state: the next state of the environment """  raise NotImplementedErrorError ... ``` Please implement code to model the logic of the world as demonstrated by the experiences. Please implement the code following the template. feel free to implement the helper functions you need. You can also implement the logic for difference actions in different helper functions. However, you must implement the'transition'function as the main function to be called by the environment. The code needs to be directly runnable on the inputs as ( state, action) and return the next state in python as provided in the experiences. Let's think step by step. ```
+
+### Initializing the reward function
+
+It asks LLMs to generate a reward function \((s,a,s^{\prime})\rightarrow(r,d)\) for the mission \(c\) following the code template to model seven uniformly randomly sampled experience data \((s,a,s^{\prime},r,d)\) in the replay buffer for the mission \(c\).
+
+``` Youarearobotexploringinanobject-centricenvironment.Yourgoalistomodelthelogicoftheworldinpython.Youwillbeprovidedexperiencesintheformatof(state,action,next_state,reward,done)tuples.Youwillalsobeprovidedwithashortnaturallanguagedescriptionthatbrieflysummarizesthedifferencebetweenthestateandthenextstateforeach(state,next_state)pair.Youneedtoimplementthepythoncodetomodelthelogicoftheworld,asseenintheprovidedexperiences.Pleasefollowthetemplatetoimplementthecode.Thecodeneedstobedirectlyrunnableonthe(state,action,next_state)tupleandreturnthe(reward,done)tupleinpythonasprovidedintheexperiences. Youneedtoimplementpythoncodetomodelthelogicoftheworldasseeninthefollowingexperiencesformission"usethekeytoopenthedoorandthengettothegoal": Theaction"turnleft"transformsthestatefrom' ``` Wall(0,0);Wall(1,0);Wall(2,0);Wall(3,0);Wall(4,0);Wall(0,1);empty;Wall(2,1);empty;Wall(4,1);Wall(0,2);Agent(1,2,direction=(0,-1),carrying=None);Door(2,2,color=yellow,state=locked);empty;Wall(4,2);Wall(0,3);Key(1,3,color=yellow);Wall(2,3);Goal(3,3);Wall(4,3);Wall(1,4);Wall(2,4);Wall(3,4);Wall(4,4);;... ```
+* '... Wall(0,0);Wall(1,0);Wall(2,0);Wall(3,0);Wall(4,0);Wall(0,1);empty;Wall(2,1);empty;Wall(4,1);Wall(0,2);Agent(1,2,direction=(-1,0),carrying=None);Door(2,2,color=yellow,state=locked);empty;Wall(4,2);Wall(0,3);Key(1,3,color=yellow);Wall(2,3);Goal(3,3);Wall(4,3);Wall(4,4);Wall(1,4);Wall(2,4);Wall(3,4);Wall(4,4);;Wall(4,4);Wall(4,4);ThedifferenceisThe agent (direction=(0, -1)) at pos (1, 2) becomes an agent (direction=(-1, 0)).  """ , the returned reward is'0.0'and the returned done is'False' The action "toggle" transforms the state from  """  Wall(0, 0) ;  Wall(1, 0) ;  Wall(2, 0) ;  Wall(3, 0) ;  Wall(4, 0) ;  Wall(0, 1) ;  empty ;  Wall(2, 1) ;  empty ;  Wall(4, 1) ;  Wall(0, 2) ;  Agent(1, 2, direction=(0, -1), carrying=None) ;  Door(2, 2,  color=yellow, state=locked) ;  empty ;  Wall(4, 2) ;  Wall(0, 3) ;  Key(1, 3, color=yellow) ;  Wall(2, 3) ;  Goal(3, 3) ;  Wall(4, 3) ;  Wall(1, 4) ;  Wall(2, 4) ;  Wall(3, 4) ;  Wall(4, 4) ; ...  out(0, 0) ;  Wall(1, 0) ;  Wall(2, 0) ;  Wall(3, 0) ;  Wall(4, 0) ;  Wall(0, 1) ;  empty ;  Wall(2, 1) ;  empty ;  Wall(4, 1) ;  Wall(0, 2) ;  Agent(1, 2, direction=(0, -1), carrying=None) ;  Door(2, 2,  color=yellow, state=locked) ;  empty ;  Wall(4, 2) ;  Wall(0, 3) ;  Key(1, 3, color=yellow) ;  Wall(2, 3) ;  Goal(3, 3) ;  Wall(4, 3) ;  Wall(0, 4) ;  Wall(1, 4) ;  Wall(2, 4) ;  Wall(3, 4) ;  Wall(4, 4) ; ...  The difference is  """  Noting happened  """, the returned reward is'0.0'and the returned done is'False' The action "turn right" transforms the state from ...  Wal(0, 0) ;  Wall(1, 0) ;  Wall(2, 0) ;  Wall(3, 0) ;  Wall(4, 0) ;  Wall(0, 1) ;  empty ;  Wall(2, 1) ;  empty ;  Wall(4, 1) ;  Wall(0, 2) ;  Agent(1, 2, direction=(1, 0), carrying=None) ;  Door(2, 2,  color=yellow, state=locked) ;  empty ;  Wall(4, 2) ;  Wall(0, 3) ;  Key(1, 3, color=yellow) ;  Wall(2, 3) ;  Goal(3, 3) ;  Wall(4, 3) ;  Wall(0, 4) ;  Wall(1, 4) ;  Wall(2, 4) ;  Wall(3, 4) ;  Wall(4, 4) ; ...  to ...  Wall(0, 0) ;  Wall(1, 0) ;  Wall(2, 0) ;  Wall(3, 0) ;  Wall(4, 0) ;  Wall(0, 1) ;  empty ;  Wall(2, 1) ;  empty ;  Wall(4, 1) ;  Wall(0, 2) ;  Agent(1, 2, direction=(0, 1), carrying=None) ;  Door(2, 2,  color=yellow, state=locked) ;  empty ;  Wall(4, 2) ;  Wall(0, 3) ;  Key(1, 3, color=yellow) ;  Wall(2, 3) ;  Goal(3, 3) ;  Wall(4, 3) ;  Wall(4, 3) ;  Wall(0, 4) ;  Wall(1, 4) ;  Wall(2, 4) ;  Wall(3, 4) ;  Wall(4, 4) ; ...  The difference is  """  The agent (direction=(1, 0)) at pos (1, 2) becomes an agent (direction=(0, 1)).  """ , the returned reward is'0.0'and the returned done is'False' The action "nothing" transforms the state from ...  Wall(0, 0) ;  Wall(1, 0) ;  Wall(2, 0) ;  Wall(3, 0) ;  Wall(4, 0) ;  Wall(0, 1) ;  empty ;  Wall(2, 1) ;  empty ;  Wall(4, 1) ;wall(0, 2) ; Agent(1, 2, direction=(0, -1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...  to ...  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(0, -1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...  The difference is ...  Nothing happened ..., the returned reward is'0.0'and the returned done is'False' The action "drop" transforms the state from ...  Wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(0, -1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(4, 4) ;  Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...  to ...  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(0, -1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(4, 3) ;  Wall(4, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...  The difference is ...  Nothing happened ..., the returned reward is'0.0'and the returned done is'False' The action "turn left" transforms the state from ...  Wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(-1, 0), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(4, 3) ;  Wall(4, 4) ; ...  to ...  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;
+
+[MISSING_PAGE_FAIL:44]
+
+def__hash__(self):  returnhash(tuple(sorted(self.__dict__.items())))  class Agent(Entity): pass  class Key(Entity): pass  class Door(Entity): pass  class Goal(Entity): pass  class Wall(Entity): pass  class Box(Entity): pass  class Ball(Entity): pass  class Lava(Entity): pass  def get_entities_by_name(entities, name):  return [ entity for entity in entities if entity.name == name ]  def get_entities_by_position(entities, x, y):  return [ entity for entity in entities if entity.x == x and entity.y == y ]  def reward_func(state, action, next_state):  """  Args:  state: the state of the environment  action: the action to be executed  next_state: the next state of the environment  Returns:  reward: the reward of the action  done: whether the episode is done  """  raise NotImplementedError  """  Please implement code to model the logic of the world as demonstrated by the  experiences. Please implement the code following the template. You must  implement the'reward_func'function as the main function to be called by  the environment. The code needs to be directly runnable on the inputs as (  state, action, next_state) and return (reward, done) in python as provided  in the experiences. Let's think step by step.
+
+### Refining the transition function
+
+It asks LLMs to refine a partially correct transition function by providing it with a data point that it fails to model as well as a few other data points that it succeeds in modelling. We also provide the wrong prediction by the partially correct code or the error message during execution.
+
+You are a robot exploring in an object-centric environment. Your goal is to  model the logic of the world in python. You have tried it before and came up  with one partially correct solution. However, it is not perfect. They can  model the logic for some experiences but failed for others. You need to  improve your code to model the logic of the world for all the experiences.  The new code needs to be directly runnable on the (state, action) pair and  return the next state in python as provided in the experiences.
+
+Here is the partially correct solution you came up with. It can model the  logic for some experiences but failed for others. You need to improve your  code to model the logic of the world for all the experiences. The new code  needs to be directly runnable on the (state, action) pair and return the  next state in python as provided in the experiences.  """  class Entity:  def__init__(self, x, y, **kwargs):self.name=self.__class______name__ self.x=x self.y=y forkey,valueinkwargs.items(): setattr(self,key,value) def__repr.(self): attr=",'.join(f'(key)={value}'forkkey,valueinself.__dict__items()ifkeynotin('name','x','y')) ifattr:returnf"(self.name)((self.x),(self.y),(attr))" else:returnf"(self.name)({self.x},{self.y})" def__eq__(self,other): returnall(getattr(self,key)==getattr(other,key,None)forkkey inself.__dict__keys() def__hash.(self): returnhash(tuple(sorted(self.__dict__items()))) classAgent(Entity):pass classKey(Entity):pass classDoor(Entity):pass classGoal(Entity):pass classWall(Entity):pass classBox(Entity):pass classBall(Entity):pass classLava(Entity):pass importcopy defget_entities_by_name(entities,name): return[entityforentityinentitiesifentity.name==name] defget_entities_by_position(entities,x,y): return[entityforentityinentitiesifentity.x==xandentity.y== y] deftransition(state,action): next_state=copy.deepcopy(state) agent=get_entities_by_position(state,*next_pos):#Determineagent'snextpositionbasedonaction ifaction=='moveforward': next_pos=(agent.x+agent.direction[0],agent.y+agent.direction[1]) #Checkifthenextpositionisn'tawall ifnotany(isinstance(entity,Wall)forentityin get_entities_by_position(state,*next_pos)):#Ifagentisinfrontofadoor andhastherightcolorkey, unlockthedoor ifany(isinstance(entity,Door)andentity.color==agent. carrying.colorforentityinget_entities_by_position(state,*next_pos)): ifaction=='toggle': agent.carrying=None#Dropthekey else: agent.x,agent.y=next_pos#Moveforward elifaction=='pickup': #Pickupakeifythereisakeyattheagent'sposition forentityinget_entities_by_position(next_state,agent.x,agent.y) : ifisinstance(entity,Key): agent.carrying=entity next_state.remove(entity) break elifaction=='drop': #Dropthekeyattheagent'spositioniftheagentiscarryinga key ifagent.carryingisnotNone: dropped_key=Key(agent.x,agent.y,color=agent.carrying.color) next_state.append(dropped_key) agent.carrying=None elifactionin['turnleft','turnright']:Existing code for turn left/right here  pass  elifaction == 'toggle':  # Existing code for toggle here  pass  return next_state
+
+ """
+
+ The given code cannot model the logic of the world for all the experiences. Here are some experiences that the code have successfully modeled.
+
+ The action "toggle" transforms the state from  """  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(0, -1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...
+
+ """ ```
+
+ The action "drop" transforms the state from  """  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(0, -1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...
+
+ The difference is  """  Nothing happened  """ ```
+
+ The action "drop" transforms the state from  """  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(0, -1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ;  Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(4, 4) ;  Wall(4, 4) ; ...
+
+ to  """  wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;  Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ;  Wall(0, 2) ; Agent(1, 2, direction=(0, -1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ;  Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ;  Wall(4, 3) ;  Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ; ...
+
+ The difference is  """  Nothing happened  """
+
+[MISSING_PAGE_FAIL:48]
+
+For this failed experience, do you know what is different between the true transitions from the environment and the predictions from the code? Do you know why the environment behaves in this way? Do you know why the code behaves differently from the environment? Which part of the code causes the problem? How to fix it? Please improve your code to model the logic of the world for all the experiences, accordingly. Please implement the code following the template. Feel free to implement any helper functions you need. You can also implement the logic for difference actions in different helper functions. However, you must implement the'transition'function as the main function to be called by the environment. The code needs to be directly runnable on the (state, action) tuple and return the new state in python as provided in the experiences. If the code is too long, try to refactor it to be shorter.
+
+### Refine the reward function
+
+It asks LLMs to refine a partially correct reward function by providing it with a data point that it fails to model as well as a few other data points that it succeeds in modelling. We also provide the wrong prediction by the partially correct code or the error message during execution.
+
+``` Youarearobotexploringinanobject-centricenvironment.Yourgoalistomodelthelogicoftheworldinpython.Youhavetrieditbeforeandcameupwithonepartiallycorrectsolution.However,itisnotperfect.Theycanmodelthelogicforsomeexperiencesbutfailedforothers.Youneedtoimproveyourcodetomodelthelogicoftheworldforalltheexperiences.Thenewcodeneedstobedirectlyrunnableonthe(state,action,next_state)tupleandreturnthe(reward,done)tupleinpythonasprovidedintheexperiences. Hereisthepartiallycorrectsolutionyoucameupwithformission"usethekeytoopenthedoorandthengettothegoal".Itcanmodelthelogicforsomeexperiencesbutfailedforothers.Youneedtoimproveyourcodetomodelthelogicoftheworldforalltheexperiences.Thenewcodeneedtobedirectlyrunnableonthe(state,action,next_state)tupleandreturnthe(reward,done)tupleinpythonasprovidedintheexperiences.... ```
+
+``` classEntity: def__init__(self,x,y,**kwargs): self.name=self.__class__name__ self.x=x self.y=y forkey,valueinkwargs.items():
+
+``` def__repr__(self): attr=",'.join(f'(key)={value}'forkey,valueinself.__dict__ items()ifkeynotin('name','x','y')) ifattr:returnf"(self.name)({self.x},{self.y},{attr})" else:returnf"(self.name)({self.x},{self.y})" def__eq__(self,other): returnall(getattr(self,key)==getattr(other,key,None)forkey inself.__dict__.keys() def__hash__(self): returnhash(tuple(sorted(self.__dict__.items()))) classAgent(Entity):pass classKey(Entity):pass classDoor(Entity):pass classGoal(Entity):pass classWall(Entity):passclassBox(Entity):pass classBall(Entity):pass classLava(Entity):pass defget_entities_by_position(entities,x,y): return[entityforentityinentitiesifentity.x==xandentity.y==y] defreward_func(state,action,next_state): state_set=set(state) next_state_set=set(next_state) agent=[eforeinstate_setifisinstance(e,Agent)][0] agent_next=[eforeinnext_state_setifisinstance(e,Agent)][0] on_goal=any(isinstance(entity,Goal)forentityin get_entities,by_position(next_state,agent_next.x,agent_next.y)) done=on_goal ifstate_set=next_state_set: reward=-0.1#Smallnegativerewardforno-opactionsto encouragefastersolution elifdone: reward=1.0#Rewardforreachingthegoal else: reward=0.0#Nrewardinothercases returnreward,done... Thegivencodecannotmodelthelogicoftheworldforalltheexperiences. Herearesomeexperiencesthatthecodehassuccessfully modeled. Theaction"turnright"transformsthestatefrom ""  wall(0,0); Wall(1,0); Wall(2,0); Wall(3,0); Wall(4,0); Wall(0,1); empty; Wall(2,1); empty; Wall(4,1); Wall(0,2); Agent(1,2,direction=(-1,0),carrying=None); Door(2,2, color=yellow,state=locked); empty; Wall(4,2); Wall(0,3); Key(1,3,color=yellow); Wall(2,3); Goal(3,3); Wall(4,3); Wall(0,4); Wall(1,4); Wall(2,4); Wall(3,4); Wall(4,4);...  to...  wall(0,0); Wall(1,0); Wall(2,0); Wall(3,0); Wall(4,0); Wall(0,1); empty; Wall(2,1); empty; Wall(4,1); Wall(0,2); Agent(1,2,direction=(0,-1),carrying=None); Door(2,2, color=yellow,state=locked); empty; Wall(4,2); Wall(0,3); Key(1,3,color=yellow); Wall(2,3); Goal(3,3); Wall(4,3); Wall(4,4); Wall(1,4); Wall(2,4); Wall(3,4); Wall(4,4);...  Thedifferenceis """  Theagent(direction=(-1,0))atpos(1,2)becomesanagent(direction=(0, -1)). """,thereturnedrewardis'0.0'andthereturneddoneis'False'  Theaction"turnleft"transformsthestatefrom ""  Wall(0,0); Wall(1,0); Wall(2,0); Wall(3,0); Wall(4,0); Wall(0,1); empty; Wall(2,1); empty; Wall(4,1); Wall(0,2); Agent(1,2,direction=(-1,0),carrying=None); Door(2,2,  color=yellow,state=locked); empty; Wall(4,2);wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ; Wall(4, 3) ; Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ;...
+
+ to...  Wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ; Wall(8, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ; Wall(8, 2) ; Agent(1, 2, direction=(0, 1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ; Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ; Wall(4, 3) ; Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ;...
+
+ The difference is """  The agent (direction=(-1, 0)) at pos (1, 2) becomes an agent (direction=(0, 1)). """
+
+, the returned reward is'0.0'and the returned done is'False '
+
+ The action "turn left" transforms the state from ""
+
+ Wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ; Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ; Wall(0, 2) ; Agent(1, 2, direction=(0, -1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ; Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ; Wall(4, 3) ; Wall(4, 4) ; Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ;...
+
+ to...
+
+ Wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ; Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ; Wall(0, 2) ; Agent(1, 2, direction=(-1, 0), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ; Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ; Wall(4, 3) ; Wall(4, 3) ; Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ;...
+
+ The difference is """  The agent (direction=(0, -1)) at pos (1, 2) becomes an agent (direction=(-1, 0)). """
+
+, the returned reward is'0.0'and the returned done is'False '
+
+ Here is an example of experiences that the code failed to model.
+
+ The action "toggle" should transform the state from ""
+
+ wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ; Wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ; Wall(0, 2) ; Agent(1, 2, direction=(0, 1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ; Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ; Wall(4, 3) ; Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ;...
+
+ to...
+
+ wall(0, 0) ; Wall(1, 0) ; Wall(2, 0) ; Wall(3, 0) ; Wall(4, 0) ;wall(0, 1) ; empty ; Wall(2, 1) ; empty ; Wall(4, 1) ; Wall(0, 2) ; Agent(1, 2, direction=(0, 1), carrying=None) ; Door(2, 2,  color=yellow, state=locked) ; empty ; Wall(4, 2) ; Wall(0, 3) ; Key(1, 3, color=yellow) ; Wall(2, 3) ; Goal(3, 3) ; Wall(4, 3) ; Wall(4, 3) ; Wall(0, 4) ; Wall(1, 4) ; Wall(2, 4) ; Wall(3, 4) ; Wall(4, 4) ;...  The difference is  """  Nothing happened  """, the returned reward should be'0.0'and the returned done should be' False '. However, the implementation is wrong because it returns the predicted reward  as'-0.1'instead of the correct reward as'0.0 '.  For this failed experience, do you know what is different between the true rewards and dones from the environment and the predictions from the code? Do you know why the environment behaves in this way? Do you know why the code behaves differently from the environment? Which part of the code causes the problem? How to fix it? Please improve your code to model the logic of the  world for all the experiences.  Accordingly. Please implement the code following the template. You must implement the'reward_func'function as the main function to be called by the environment. The code needs to be directly runnable on the (state,  action, next_state) tuple and return (reward, done) in python as provided in the experiences. If the code is too long, try to refactor it to be shorter.
+
+### Generating reward functions for new goals
+
+It asks LLMs to generate new reward functions for new goals, given sample code that are synthesized for previous goals.
+
+``` Youarearobotexploringinanobject-centricenvironment.Yourgoalistomodelthelogicoftheworldinpython,specificallytherewardfunctionthatmaps(state,action,next_state)to(reward,done).Youwilltobegiventhemissionfortheenvironmentyouaregoingtoaction,aswellasafewsamplecodefromtheotherenvironments.Youneedtoimplementthenewrewardfunctionforthenewenvironmentyouaregoingtoaction.Thenewcodearedsothedirectlyrunnableon(state,action,next_state)andreturn(reward,done)inpython.  Here is a few sample code for the reward functioninotherenvironments.  Please check themindetailandthinkabouthowtoimplementreward  functionformission"pickuptheyellowbox"inthenewenvironment.Thecodearedsothedirectlyrunnableon(state,action,next_state)andreturn(reward,done)inpython.  The rewardfunctioncodeformission"pickupthegreybox"is: """ state=[{"name":"Agent","x":1,"y":1,"direction":(1,0),"carrying":("name":"Key","x":None,"y":None,"color":"red")},  {"name":"Door","x":2,"y":2,"color":"red","state":"locked"},  {"name":"Wall","x":0,"y":0}] action="topglea next_state=[{"name":"Agent","x":1,"y":1,"direction":(1,0),"carrying":  {"name":"Key","x":None,"y":None,"color":"red"}},  {"name":"Door","x":2,"y":2,"color":"red","state":"open"},  {"name":"Wall","x":0,"y":0}] } ```class Entity:  def__init__(self, x, y, **kwargs):  self.name = self.__class____name__ self.x = x  self.y = y  for key, value in kwargs.items():  setattr(self, key, value)  def__repr__(self):  attr = ", '.join(f'(key)={value}' for key, value in self.__dict__ items() if key not in ('name', 'x', 'y'))  if attr: return f"(self.name)({self.x}, {self.y}, {attr})"  else: return f"(self.name)({self.x}, {self.y})"  def__eq__(self, other):  return all(getattr(self, key) == getattr(other, key, None) for key  in self.__dict__.keys())  def__hash__(self):  returnhash(tuple(sorted(self.__dict__.items())))  class Agent(Entity): pass  class Key(Entity): pass  class Door(Entity): pass  class Goal(Entity): pass  class Wall(Entity): pass  class Box(Entity): pass  class Ball(Entity): pass  class Java(Entity): pass  def get_entities_by_name(entities, name):  return [ entity for entity in entities if entity.name == name ]  def get_entities_by_position(entities, x, y):  return [ entity for entity in entities if entity.x == x and entity.y == y ]  def reward_func(state, action, next_state):  """  Args:  state: the state of the environment  action: the action to be executed  next_state: the next state of the environment  Returns:  reward: the reward of the action  done: whether the episode is done  """  reward = 0.0 # initialise reward as 0.0 for all actions  done = False # initialise done as False for all actions  # extract the agent from the current and next state  agent = get_entities_by_name(state, 'Agent')[0]  next_agent = get_entities_by_name(next_state, 'Agent')[0]  # If the agent picks up the grey box in the next state, the reward is  1.0 and the episode is done  if next_agent.carrying and isinstance(next_agent.carrying, Box) and  next_agent.carrying.color == 'grey':  reward = 1.0  done = True  return reward, done  """  The reward function code for mission "pick up the purple box" is:  """  state = [("name":"Agent", "x":1, "y":1, "direction":(1,0), "carrying": ("  name":"Key", "x":None, "y":None, "color":"red")),  {"name":"Door", "x":2, "y":2, "color":"red", "state":"locked"},  {"name":"Wall", "x":0, "y":0}]  action = "toggle"next_state = [("name":"Agent", "x":1, "y":1, "direction":(1,0), "carrying": {"name":"Key", "x":None, "y":None, "color":"red"}),  {"name":"Door", "x":2, "y":2, "color":"red", "state":"open"},  {"name":"Wall", "x":0, "y":0}] class Entity:  def __init_(self, x, y, **kwargs):  self.name = self.__class____name__ self.x = x  self.y = y  for key, value in kwargs.items():  setattr(self, key, value)  def __repr_(self):  attr = ",.join(f'(key)={value}'forkkey, value in self.__dict__ items()) if key into ('name', 'x', 'y'))  if attr: return f"(self.name)((self.x), (self.y), (attr))"  else: return f"(self.name)((self.x), (self.y))"  def __eq_(self, other):  return all(getattr(self, key) == getattr(other, key, None) for key  in self.__dict__sys())  def __hash_(self):  return hash(tuple(sorted(self.__dict__items()))) class Agent(Entity): pass  class Key(Entity): pass  class Door(Entity): pass  class Goal(Entity): pass  class Wall(Entity): pass  class Box(Entity): pass  class Ball(Entity): pass  class Lava(Entity): pass  def get_entities_by_name(entities, name):  return [ entity for entity in entities if entity.name == name ]  def get_entities_by_position(entities, x, y):  return [ entity for entity in entities if entity.x == x and entity.y ==  y ]  def reward_func(state, action, next_state):  """  Args:  state: the state of the environment  action: the action to be executed  next_state: the next state of the environment  Returns:  reward: the reward of the action  done: whether the episode is done  """ reward = 0.0 # initialise reward as 0.0 for all actions  done = False # initialise founde as False for all actions  # extract the agent from the current and next state  agent = get_entities_by_name(state, 'Agent')[0]  next_agent = get_entities_by_name(next_state, 'Agent')[0]  # If the agent picks up the purple box in the next state, the reward is  1.0 and the episode is done  if next_agent.carrying and isinstance(next_agent.carrying, Box) and  next_agent.carrying.color == 'purple':  reward = 1.0  done = True  return reward, done  """  The reward function code for mission "pick up the green box" is:  """state = [{"name":"Agent", "x":1, "y":1, "direction":(1,0), "carrying": {" name":"Key", "x":None, "y":None, "color":"red"}},  {"name":"Door", "x":2, "y":2, "color":"red", "state":"locked"},  {"name":"Wall", "x":0, "y":0}] action = "toggle" next_state = [{"name":"Agent", "x":1, "y":1, "direction":(1,0), "carrying":  {"name":"Key", "x":None, "y":None, "color":"red"}},  {"name":"Door", "x":2, "y":2, "color":"red", "state":"open"},  {"name":"Wall", "x":0, "y":0}] class Entity: def __init_(self, x, y, **kwargs): self.name = self.__class____name__ self.x = x  self.y = y  for key, value in kwargs.items():  setattr(self, key, value) def __repr__(self):  attr = ", '.join(f'(key)={value}'forkkey, value in self.__dict__ items()) if key in ('name', 'x', 'y')) if attr: return f={self.name}({self.x}, {self.y}, {attr})"  else: return f={self.name}({self.x}, {self.y})"  def __eq_(self, other):  return all(getatter(self, key) == getattr(other, key, None) for key in self.__dict__keys()) def __hash(self):  return hash(tuple(sorted(self.__dict__.items()))) class Agent(Entity): pass class Key(Entity): pass class Door(Entity): pass class Goal(Entity): pass class Wall(Entity): pass class Box(Entity): pass class Ball(Entity): pass class Lava(Entity): pass def get_entities_by_name(entities, name):  return [ entity for entity in entities if entity.name == name ] def get_entities_by_position(entities, x, y):  return [ entity for entity in entities if entity.x == x and entity.y == y ]  def reward_func(state, action, next_state):  """  Args: state: the state of the environment action: the action to be executed next_state: the next state of the environment Returns:  reward: the reward of the action done: whether the episode is done """ reward = 0.0 # initialise reward as 0.0 for all actions done = False # initialise done as False for all actions  # extract the agent from the current and next state agent = get_entities_by_name(state, 'Agent')[0] next_agent = get_entities_by_name(next_state, 'Agent')[0]  # If the agent picks up the green box in the next state, the reward is  1.0 and the episode is done  if next_agent.carrying and isinstance(next_agent.carrying, Box) and next_agent.carrying.color == 'green':  reward = 1.0  done = True  return reward, done Now, you have entered a new environment. It shows a mission "pick up the yellow box". Do you know what this mission means and how to implement it in a reward function? Analyze the behaviors of the reward function case by case. In what situations will it return a positive reward or not? In what situations will it return done=True or not? Why? Please implement the code following the template in the sample code; You must implement the'reward_func' function as the main function to be called by the environment. The code needs to be directly runnable on ( mission, state, action, next_state) and return (reward, done) in python.
+
+### Refine to satisfy optimism under uncertainty
+
+It asks LLMs to think why the goal cannot be achieved for a mission from an initial state using the provided transition and reward functions. We also tell LLMs the valid action space and the measurement for achieving the goal (\(r>0\wedge d=1\)).
+
+``` Youarearobotexploringinanobject-centricenvironment.Yourgoalisttomodelthelogicoftheworldinpython.Youhavetrieditbeforeandcameupwithonepartiallycorrectsolution.However,itisnotperfect.Thecodecanmodelthelogicforsomeexperiencesbutfailedtomodelthelogictoachievethegoalinanotherenvironment.Youneedtimoryourcodesothattheagentcanachivetheobjectiveasspecifiedbythemissionfromthegiveninitialstateaswellasstillmodellingtheoriginallogic.Thenewcodeshouldstillfollowthesametemplate.The'transition'functionneedstobedirectlyrunnableon(state,action)andreturnthenextstateinpython.The'reward_func'functionneedstobedirectlyrunnableon(state,action,next_state)andreturn(reward,done)inpython.Hereisthepartiallycorrectsolutionyoucameupwith:... classEntity: def__init__(self,x,y,**kwargs): self.name=self.__class__name__ self.x= x self.y=y forkey,valueinkwargs.items(): setattr(self,key,value) def__repr__(self): attr=','.join(f^(key)={value}'forkey,valueinself.__dict__ items()ifkeynotin('name','x','y')) ifattr:returnf^(self.name)({self.x},{self.y},{attr})" else:returnf^(self.name)({self.x},{self.y})" def__eq__(self,other): returnall(getattr(self,key)==getattr(other,key,None)forkey inself.__dict__keys()) def__hash__(self): returnhash(tuple(sorted(self.__dict__.items()))) classAgent(definition(state,action): """  Args:  state: the state of the environment  action: the action to be executed  returns:  next_state: the next state of the environment  """  ## We'll make a deep copy of the state.  ## This is because we don't want to change the original state.  next_state = copy.deepcopy(state)  agent = get_entities_by_name(next_state, 'Agent')[0]  if action == 'turn left':  if agent.direction == (-1, 0):  agent.direction = (0, 1)  elif agent.direction == (0, 1):  agent.direction = (1, 0):  agent.direction = (0, -1)  else: # if agent.direction == (0, -1)  agent.direction = (-1, 0)  elif action == 'turn right':  if agent.direction == (-1, 0):  agent.direction = (0, -1):  elif agent.direction == (0, -1):  agent.direction = (1, 0):  agent.direction = (0, 1)  else: # if agent.direction == (0, 1)  agent.direction = (-1, 0)  elif action == 'toggle': # We assume that the agent have the ability to to toggle, regardless of  what is in front of him because the experiences provided do not dictate  otherwise.  pass  elif action == 'nothing':  pass  return next_state  def get_entities_by_name(entities, name):  return [ entity for entity in entities if entity.name == name ]  def get_entities_by_position(entities, x, y):  return [ entity for entity in entities if entity.x == x and entity.y == y ]  def reward_func(state, action, next_state): """  Args:  state: the state of the environment  action: the action to be executed  next_state: the next state of the environment  Returns:  reward: the reward of the action  done: whether the episode is done  """  ## Creates sets of entities for easier comparison and access  state_set = set(state)  next_state_set = set(next_state)  ## Get agent's position in both states  agent = [e for e in state_set if isinstance(e, Agent)][0]  agent_next = [e for e in next_state_set if isinstance(e, Agent)][0]  ## Done condition  on_goal = any(isinstance(entity, Goal) for entity in  get_entities_by_position(next_state, agent_next.x, agent_next.y))  done = on_goalRewardcalculation ifstate_set==next_state_set: #Ifstatedidn'tchange->'nothing','toggle'whennotcarryinga keyor'drop'whencarryingnothinghappened reward=0.0 elifaction=='turnleft'oraction=='turnright': #Ifdirectionofagentchanges->'turnleft','turnright' happened reward=0.0 else: #Inothercases,noreward.Canbemodifiedwhenotherscenarios areapplied. reward=0.0 returnreward,done... However,thecodefailedtoachievethegoal/objectiveasspecifiedbythe mission"usethekeytopopenthedoorandthengettothegoal"fromthe followinginitial state: """ wall(0,0);Wall(1,0);Wall(2,0);Wall(3,0);Wall(4,0);Wall(0,1);empty;Wall(2,1);empty;Wall(4,1);Wall(0,2);Agent(1,2,direction=(0,1),carryingNone);Door(2,2,color=yellow,state=locked);empty;Wall(4,2);Wall(0,3);Key(1,3,color=yellow);Wall(2,3);Goal(3,3);Wall(4,3);Wall(0,4);Wall(1,4);Wall(2,4);Wall(3,4);Wall(4,4); """ Themeasurementforachievingthegoal/objectiveisasfollows: """ defcriterion(state,mission,action,next_state,reward,done,): returnreward>0anddone """ Thevalidactionsare{'turnright','nothing','moveforward','turnleft','toggle','drop','pickup'}. Doyouknowwhythemissioncannotbeachievedfromthegiveninitialstate withtheworldmodelasimplementedinthecode?Whatsubgoalsdoestheagentneedtoachieveinordertoachievethefinalgoalasspecifiedbythemission?Cantheagentachievethosesubgoalsusingtheworldmodelasimplementedinthecode?Ifnot,whatismissingorwrong?Howcanyou improvethecodeachievethegoal/objectiveasspecifiedbythemissionfromthegiveninitialstate?Pleaseimprovethecodeasanalyzedbeforesothatthemissioncanbeachievedfromthegiveninitialstate,Pleaseimplementthecodefollowingthemetplace.Feelfrectoimplementanyhelperfunctionsyouneed.Youcanalsoimplementthelogicfordifferenceactionsindifferenthelperfunctions.However,youmustimplementthe'transition'functionandthe'reward_func'functionasthemainfunctionstobecalledbytheenvironment.The'transition'functionneedstobedirectlyrunableon(state,action)andreturnthenextstateinpython.The'reward_func'functionneedstobedirectlyrunableon(state,action,next_state)andreturn(reward,done)inpython.Thenewcode,bythemselves,shouldbecomplete,compilable,andrunable.
+
+### NeurIPS Paper Checklist
+
+1. **Claims** Question: Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope? Answer: [Yes] Justification: We show that WorldCoder is much more sample and compute efficient in our methods than baselines. We show that the optimism objective enables more efficient exploration. Guidelines: * The answer NA means that the abstract and introduction do not include the claims made in the paper. * The abstract and/or introduction should clearly state the claims made, including the contributions made in the paper and important assumptions and limitations. A No or NA answer to this question will not be perceived well by the reviewers. * The claims made should match theoretical and experimental results, and reflect how much the results can be expected to generalize to other settings. * It is fine to include aspirational goals as motivation as long as it is clear that these goals are not attained by the paper.
+2. **Limitations** Question: Does the paper discuss the limitations of the work performed by the authors? Answer: [Yes] Justification: Please check Section 5 for details. Guidelines: * The answer NA means that the paper has no limitation while the answer No means that the paper has limitations, but those are not discussed in the paper. * The authors are encouraged to create a separate "Limitations" section in their paper. * The paper should point out any strong assumptions and how robust the results are to violations of these assumptions (e.g., independence assumptions, noiseless settings, model well-specification, asymptotic approximations only holding locally). The authors should reflect on how these assumptions might be violated in practice and what the implications would be. * The authors should reflect on the scope of the claims made, e.g., if the approach was only tested on a few datasets or with a few runs. In general, empirical results often depend on implicit assumptions, which should be articulated. * The authors should reflect on the factors that influence the performance of the approach. For example, a facial recognition algorithm may perform poorly when image resolution is low or images are taken in low lighting. Or a speech-to-text system might not be used reliably to provide closed captions for online lectures because it fails to handle technical jargon. * The authors should discuss the computational efficiency of the proposed algorithms and how they scale with dataset size. * If applicable, the authors should discuss possible limitations of their approach to address problems of privacy and fairness. * While the authors might fear that complete honesty about limitations might be used by reviewers as grounds for rejection, a worse outcome might be that reviewers discover limitations that aren't acknowledged in the paper. The authors should use their best judgment and recognize that individual actions in favor of transparency play an important role in developing norms that preserve the integrity of the community. Reviewers will be specifically instructed to not penalize honesty concerning limitations.
+3. **Theory Assumptions and Proofs** Question: For each theoretical result, does the paper provide the full set of assumptions and a complete (and correct) proof?Answer: [Yes]
+
+Justification: Please check Appendix A for detailed proofs.
+
+Guidelines:
+
+* The answer NA means that the paper does not include theoretical results.
+* All the theorems, formulas, and proofs in the paper should be numbered and cross-referenced.
+* All assumptions should be clearly stated or referenced in the statement of any theorems.
+* The proofs can either appear in the main paper or the supplemental material, but if they appear in the supplemental material, the authors are encouraged to provide a short proof sketch to provide intuition.
+* Inversely, any informal proof provided in the core of the paper should be complemented by formal proofs provided in appendix or supplemental material.
+* Theorems and Lemmas that the proof relies upon should be properly referenced.
+4. **Experimental Result Reproducibility** Question: Does the paper fully disclose all the information needed to reproduce the main experimental results of the paper to the extent that it affects the main claims and/or conclusions of the paper (regardless of whether the code and data are provided or not)? Answer: [Yes] Justification: All prompts are provided in Appendix. All benchmarks and data are publicly available. Guidelines: * The answer NA means that the paper does not include experiments. * If the paper includes experiments, a No answer to this question will not be perceived well by the reviewers: Making the paper reproducible is important, regardless of whether the code and data are provided or not. * If the contribution is a dataset and/or model, the authors should describe the steps taken to make their results reproducible or verifiable. * Depending on the contribution, reproducibility can be accomplished in various ways. For example, if the contribution is a novel architecture, describing the architecture fully might suffice, or if the contribution is a specific model and empirical evaluation, it may be necessary to either make it possible for others to replicate the model with the same dataset, or provide access to the model. In general. releasing code and data is often one good way to accomplish this, but reproducibility can also be provided via detailed instructions for how to replicate the results, access to a hosted model (e.g., in the case of a large language model), releasing of a model checkpoint, or other means that are appropriate to the research performed. * While NeurIPS does not require releasing code, the conference does require all submissions to provide some reasonable avenue for reproducibility, which may depend on the nature of the contribution. For example 1. If the contribution is primarily a new algorithm, the paper should make it clear how to reproduce that algorithm. 2. If the contribution is primarily a new model architecture, the paper should describe the architecture clearly and fully. 3. If the contribution is a new model (e.g., a large language model), then there should either be a way to access this model for reproducing the results or a way to reproduce the model (e.g., with an open-source dataset or instructions for how to construct the dataset). 4. We recognize that reproducibility may be tricky in some cases, in which case authors are welcome to describe the particular way they provide for reproducibility. In the case of closed-source models, it may be that access to the model is limited in some way (e.g., to registered users), but it should be possible for other researchers to have some path to reproducing or verifying the results.
+5. **Open access to data and code**Question: Does the paper provide open access to the data and code, with sufficient instructions to faithfully reproduce the main experimental results, as described in supplemental material? Answer: [No] Justification: We will prepare code for the public later due to time constraints. Guidelines: * The answer NA means that paper does not include experiments requiring code. * Please see the NeurIPS code and data submission guidelines (https://nips.cc/public/guides/CodeSubmissionPolicy) for more details. * While we encourage the release of code and data, we understand that this might not be possible, so "No" is an acceptable answer. Papers cannot be rejected simply for not including code, unless this is central to the contribution (e.g., for a new open-source benchmark). * The instructions should contain the exact command and environment needed to run to reproduce the results. See the NeurIPS code and data submission guidelines (https://nips.cc/public/guides/CodeSubmissionPolicy) for more details. * The authors should provide instructions on data access and preparation, including how to access the raw data, preprocessed data, intermediate data, and generated data, etc. * The authors should provide scripts to reproduce all experimental results for the new proposed method and baselines. If only a subset of experiments are reproducible, they should state which ones are omitted from the script and why. * At submission time, to preserve anonymity, the authors should release anonymized versions (if applicable). * Providing as much information as possible in supplemental material (appended to the paper) is recommended, but including URLs to data and code is permitted.
+6. **Experimental Setting/Details** Question: Does the paper specify all the training and test details (e.g., data splits, hyperparameters, how they were chosen, type of optimizer, etc.) necessary to understand the results? Answer: [Yes] Justification: We use standard hyper-parameters such as GPT-4 with temperature=1 and the maximum number of LLM requests is 50 for each program synthesis problem. Guidelines: * The answer NA means that the paper does not include experiments. * The experimental setting should be presented in the core of the paper to a level of detail that is necessary to appreciate the results and make sense of them. * The full details can be provided either with the code, in appendix, or as supplemental material.
+7. **Experiment Statistical Significance** Question: Does the paper report error bars suitably and correctly defined or other appropriate information about the statistical significance of the experiments? Answer: [Yes] Justification: The error bars are not as important in our paper as our method significantly outperforms the baselines in the sample efficiency and the compute efficiency in our experiments. We still show the error bars with 3 random seeds as stated. The error bars are default as 95% CI. Guidelines: * The answer NA means that the paper does not include experiments. * The authors should answer "Yes" if the results are accompanied by error bars, confidence intervals, or statistical significance tests, at least for the experiments that support the main claims of the paper.
+
+* The factors of variability that the error bars are capturing should be clearly stated (for example, train/test split, initialization, random drawing of some parameter, or overall run with given experimental conditions).
+* The method for calculating the error bars should be explained (closed form formula, call to a library function, bootstrap, etc.)
+* The assumptions made should be given (e.g., Normally distributed errors).
+* It should be clear whether the error bar is the standard deviation or the standard error of the mean.
+* It is OK to report 1-sigma error bars, but one should state it. The authors should preferably report a 2-sigma error bar than state that they have a 96% CI, if the hypothesis of Normality of errors is not verified.
+* For asymmetric distributions, the authors should be careful not to show in tables or figures symmetric error bars that would yield results that are out of range (e.g. negative error rates).
+* If error bars are reported in tables or plots, The authors should explain in the text how they were calculated and reference the corresponding figures or tables in the text.
+8. **Experiments Compute Resources** Question: For each experiment, does the paper provide sufficient information on the computer resources (type of compute workers, memory, time of execution) needed to reproduce the experiments? Answer: [Yes] Justification: We mainly use GPT-4 and the maximum number of LLM requests for each program synthesis problem is 50. Guidelines: * The answer NA means that the paper does not include experiments. * The paper should indicate the type of compute workers CPU or GPU, internal cluster, or cloud provider, including relevant memory and storage. * The paper should provide the amount of compute required for each of the individual experimental runs as well as estimate the total compute. * The paper should disclose whether the full research project required more compute than the experiments reported in the paper (e.g., preliminary or failed experiments that didn't make it into the paper).
+9. **Code Of Ethics** Question: Does the research conducted in the paper conform, in every respect, with the NeurIPS Code of Ethics https://neurips.cc/public/EthicsGuidelines? Answer: [Yes] Justification: The research conforms with the NeurIPS Code of Ethics. Guidelines: * The answer NA means that the authors have not reviewed the NeurIPS Code of Ethics. * If the authors answer No, they should explain the special circumstances that require a deviation from the Code of Ethics. * The authors should make sure to preserve anonymity (e.g., if there is a special consideration due to laws or regulations in their jurisdiction).
+10. **Broader Impacts** Question: Does the paper discuss both potential positive societal impacts and negative societal impacts of the work performed? Answer: [NA] Justification: Our work improves model-based RL, which potentially indirectly has positive and negative social impacts as many technical works. Guidelines: * The answer NA means that there is no societal impact of the work performed.
+
+* If the authors answer NA or No, they should explain why their work has no societal impact or why the paper does not address societal impact.
+* Examples of negative societal impacts include potential malicious or unintended uses (e.g., disinformation, generating fake profiles, surveillance), fairness considerations (e.g., deployment of technologies that could make decisions that unfairly impact specific groups), privacy considerations, and security considerations.
+* The conference expects that many papers will be foundational research and not tied to particular applications, let alone deployments. However, if there is a direct path to any negative applications, the authors should point it out. For example, it is legitimate to point out that an improvement in the quality of generative models could be used to generate deepfakes for disinformation. On the other hand, it is not needed to point out that a generic algorithm for optimizing neural networks could enable people to train models that generate Deepfakes faster.
+* The authors should consider possible harms that could arise when the technology is being used as intended and functioning correctly, harms that could arise when the technology is being used as intended but gives incorrect results, and harms following from (intentional or unintentional) misuse of the technology.
+* If there are negative societal impacts, the authors could also discuss possible mitigation strategies (e.g., gated release of models, providing defenses in addition to attacks, mechanisms for monitoring misuse, mechanisms to monitor how a system learns from feedback over time, improving the efficiency and accessibility of ML).
+11. **Safeguards** Question: Does the paper describe safeguards that have been put in place for responsible release of data or models that have a high risk for misuse (e.g., pretrained language models, image generators, or scraped datasets)? Answer: [NA] Justification: The paper poses no such risks. Guidelines: * The answer NA means that the paper poses no such risks. * Released models that have a high risk for misuse or dual-use should be released with necessary safeguards to allow for controlled use of the model, for example by requiring that users adhere to usage guidelines or restrictions to access the model or implementing safety filters. * Datasets that have been scraped from the Internet could pose safety risks. The authors should describe how they avoided releasing unsafe images. * We recognize that providing effective safeguards is challenging, and many papers do not require this, but we encourage authors to take this into account and make a best faith effort.
+12. **Licenses for existing assets** Question: Are the creators or original owners of assets (e.g., code, data, models), used in the paper, properly credited and are the license and terms of use explicitly mentioned and properly respected? Answer: [Yes] Justification: Data and Codebase we used have been properly cited in the paper. Guidelines: * The answer NA means that the paper does not use existing assets. * The authors should cite the original paper that produced the code package or dataset. * The authors should state which version of the asset is used and, if possible, include a URL. * The name of the license (e.g., CC-BY 4.0) should be included for each asset. * For scraped data from a particular source (e.g., website), the copyright and terms of service of that source should be provided.
+
+* If assets are released, the license, copyright information, and terms of use in the package should be provided. For popular datasets, paperswithcode.com/datasets has curated licenses for some datasets. Their licensing guide can help determine the license of a dataset.
+* For existing datasets that are re-packaged, both the original license and the license of the derived asset (if it has changed) should be provided.
+* If this information is not available online, the authors are encouraged to reach out to the asset's creators.
+* **New Assets*
+* Question: Are new assets introduced in the paper well documented and is the documentation provided alongside the assets? Answer: [NA] Justification: The paper has not released new assets. Guidelines:
+* The answer NA means that the paper does not release new assets.
+* Researchers should communicate the details of the dataset/code/model as part of their submissions via structured templates. This includes details about training, license, limitations, etc.
+* The paper should discuss whether and how consent was obtained from people whose asset is used.
+* At submission time, remember to anonymize your assets (if applicable). You can either create an anonymized URL or include an anonymized zip file.
+* **Crowdsourcing and Research with Human Subjects*
+* Question: For crowdsourcing experiments and research with human subjects, does the paper include the full text of instructions given to participants and screenshots, if applicable, as well as details about compensation (if any)? Answer: [NA] Justification: The paper does not involve crowdsourcing nor research with human subjects. Guidelines:
+* The answer NA means that the paper does not involve crowdsourcing nor research with human subjects.
+* Including this information in the supplemental material is fine, but if the main contribution of the paper involves human subjects, then as much detail as possible should be included in the main paper.
+* According to the NeurIPS Code of Ethics, workers involved in data collection, curation, or other labor should be paid at least the minimum wage in the country of the data collector.
+* **Institutional Review Board (IRB) Approvals or Equivalent for Research with Human Subjects*
+* Question: Does the paper describe potential risks incurred by study participants, whether such risks were disclosed to the subjects, and whether Institutional Review Board (IRB) approvals (or an equivalent approval/review based on the requirements of your country or institution) were obtained? Answer: [NA] Justification: The paper does not involve crowdsourcing nor research with human subjects. Guidelines:
+* The answer NA means that the paper does not involve crowdsourcing nor research with human subjects.
+* Depending on the country in which research is conducted, IRB approval (or equivalent) may be required for any human subjects research. If you obtained IRB approval, you should clearly state this in the paper.
+* We recognize that the procedures for this may vary significantly between institutions and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the guidelines for their institution.
+* For initial submissions, do not include any information that would break anonymity (if applicable), such as the institution conducting the review.

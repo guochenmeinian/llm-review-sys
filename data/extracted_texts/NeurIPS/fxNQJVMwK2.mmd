@@ -1,0 +1,182 @@
+# Text-to-Image Diffusion Models
+
+are Zero-Shot Classifiers
+
+ Kevin Clark
+
+Google DeepMind
+
+Toronto
+
+kevclark@google.com
+
+&Priyank Jaini
+
+Google DeepMind
+
+Toronto
+
+pjaini@google.com
+
+equal contribution
+
+###### Abstract
+
+The excellent generative capabilities of text-to-image diffusion models suggest they learn informative representations of image-text data. However, what knowledge their representations capture is not fully understood, and they have not been thoroughly explored on downstream tasks. We investigate diffusion models by proposing a method for evaluating them as zero-shot classifiers. The key idea is using a diffusion model's ability to denoise a noised image given a text description of a label as a proxy for that label's likelihood. We apply our method to Stable Diffusion and Imagen, using it to probe fine-grained aspects of the models' knowledge and comparing them with CLIP's zero-shot abilities. They perform competitively with CLIP on a wide range of zero-shot image classification datasets. Additionally, they achieve state-of-the-art results on shape/texture bias tests and can successfully perform attribute binding while CLIP cannot. Although generative pre-training is prevalent in NLP, visual foundation models often use other methods such as contrastive learning. Based on our findings, we argue that generative pre-training should be explored as a compelling alternative for vision-language tasks.
+
+## 1 Introduction
+
+Large models pre-trained on internet-scale data can adapt effectively to a variety of downstream tasks. Increasingly, they are being used as zero-shot learners with no task-specific training, such as with CLIP (Radford et al., 2021) for images and GPT-3 (Brown et al., 2020) for text. In natural language processing, many successful pre-trained models are generative (i.e., language models). However, generative pre-training is less commonly used for visual tasks. Until recently, the usual practice for vision problems was to pre-train models on labeled datasets such as Imagenet (Deng et al., 2009), or JFT (Sun et al., 2017). Later research in visual and vision-language problems has led to image-text models pre-trained primarily using either contrastive losses (Radford et al., 2021; Jia et al., 2021; Yuan et al., 2021) or autoencoding tasks (Vincent et al., 2010; He et al., 2022).
+
+On the other hand, generative text-to-image models based on denoising diffusion probabilistic models (Ho et al., 2020) such as Imagen (Saharia et al., 2022), Dalle-2 (Ramesh et al., 2022), and Stable Diffusion (Rombach et al., 2022) can generate realistic high-resolution images and generalize to diverse text prompts. Their strong performance suggests that they learn effective representations of image-text data. However, their ability to transfer to downstream discriminative tasks and how they compare to other pre-trained models has not been explored thoroughly.
+
+In this paper, we investigate these questions by transferring Imagen and Stable Diffusion (SD) to discriminative tasks. While previous studies have used representations from diffusion models for downstream tasks (Brempong et al., 2022; Burgert et al., 2022; Zhao et al., 2023), we instead proposea way of using text-to-image diffusion models directly as zero-shot image classifiers. Our method essentially runs the models as generative classifiers (Ng and Jordan, 2001), using a re-weighted version of the variational lower bound to score images since diffusion models do not produce exact likelihoods. More specifically, the method repeatedly noises and denoises the input image while conditioning the model on a different text prompt for each possible class. The class whose text prompt results in the best denoising ability is predicted. This procedure is expensive because it requires denoising many times per class (with different noise levels). To make it usable in practice, we present improvements that increase the method's sample efficiency by up to 1000x, such as pruning obviously-incorrect classes early. While still requiring too much compute to be an easily-deployable classifier, our method allows us to quantitatively study fine-grained aspects of a diffusion model's learned knowledge through evaluation on classification tasks (as opposed to qualitatively examining model generations).
+
+We compare Imagen and SD against CLIP2(Radford et al., 2021), a widely used model for zero-shot image-text tasks trained with contrastive learning. A high-level goal of the experiments is to see the strengths and weaknesses of generative and contrastive pre-training for computer vision. First, we demonstrate that diffusion models have strong zero-shot classification accuracies (competitive with CLIP) on several diverse vision datasets. Next, we show both Imagen and SD performs remarkably well on the Cue-Conflict dataset (Geirhos et al., 2019), where images have been stylized with textures conflicting with their labels. For example, Imagen achieves \(>\)50% error reduction over CLIP and even outperforms the much larger ViT-22B (Dehghani et al., 2023) model. This finding is particularly interesting because, unlike supervised classifiers, humans are known to be much more reliant on shape than texture when identifying images. Lastly, we study attribute binding using the synthetic data from Lewis et al. (2022), and find that, unlike CLIP, diffusion models can successfully bind together attributes in some settings.
+
+The main contributions of this paper are:
+
+* We show text-to-image diffusion models can be used as effective zero-shot classifiers. While using too much compute to be very practical on downstream tasks, the method provides a way of quantitatively studying what the models learn.
+* We develop techniques that hugely lower the compute cost of these zero-shot classifiers, making them usable (although still slow) on datasets with many classes.
+* We demonstrate the strong generalization capabilities of Imagen and Stable Diffusion, resulting in good zero-shot performance on vision datasets (comparable to CLIP).
+* We show that diffusion models are robust to misleading textural cues, achieving state-of-the-art results on Cue-Conflict.
+* We use our framework to study attribute binding in diffusion models and find that they can perform some binding tasks while CLIP cannot.
+
+Figure 1: **Zero-Shot Classification using Diffusion Models. We first compute denoising scores for each label prompt across multiple time-steps to generate a scores matrix. We then classify an image by aggregating the scores for each class using a weighting function over the time-steps. The image is assigned the class with the minimum aggregate score. In Section 3.1, we discuss how efficiency can be improved only computing a subset of the full scores matrix.**
+
+Together, our results suggest that text-to-image diffusion models learn powerful representations that can effectively be transferred to tasks beyond image generation.
+
+## 2 Preliminaries
+
+Diffusion models (Sohl-Dickstein et al., 2015; Ho et al., 2020; Song et al., 2020; Song and Ermon, 2020) are latent variable generative models defined by a forward and reverse Markov chain. Given an unknown data distribution, \(q(_{0})\), over observations, \(_{0}^{d}\), the forward process corrupts the data into a sequence of noisy latent variables, \(_{1:T}:=\{_{1},_{2},,_{T}\}\), by gradually adding Gaussian noise with a fixed schedule defined as:
+
+\[q(_{1:T}|_{0}):=_{t=1}^{T}q(_{t}|_{t-1})\] (1)
+
+where \(q(_{t}|_{t-1}):=(_{t};}_{t-1},_{t})\). The reverse Markov process gradually denoises the latent variables to the data distribution with learned Gaussian transitions starting from \((_{T};0,)\) i.e.
+
+\[p_{}(_{0:T}):=p(_{T})_{t=0}^{T-1}p_{}(_{t-1}|_{t})\]
+
+\(p_{}(_{t-1}|_{t}):=(_{t-1};_{}(_{t},t),_{}(_{t},t))\). The aim of training is for the forward process distribution \(\{_{t}\}_{t=0}^{T}\) to match that of the reverse process \(\{}_{t}\}_{t=0}^{T}\) i.e., the generative model \(p_{}(_{0})\) closely matches the data distribution \(q(_{0})\). Specifically, these models can be trained by optimizing the variational lower bound of the marginal likelihood (Ho et al., 2020; Kingma et al., 2021):
+
+\[- p_{}(_{0})-(_{0}):=_{ }+_{}+_{}\]
+
+\(_{}\) and \(_{}\) are the prior and reconstruction loss that can be estimated using standard techniques in the literature (Kingma and Welling, 2014). The (re-weighted) diffusion loss can be written as:
+
+\[_{}=_{_{0},,t} _{t}\|_{0}-}_{}(_{t},t)\|_{ 2}^{2}\]
+
+with \(_{0} q(_{0})\), \((0,)\), and \(t([0,T])\). Here, \(_{t}\) is a weight assigned to the timestep, and \(}_{}(_{t},t)\) is the model's prediction of the observation \(_{0}\) from the noised observation \(_{t}\). Diffusion models can be conditioned on additional inputs like class labels, text prompts, segmentation masks or low-resolution images, in which case \(}_{}\) also takes a conditioning signal \(\) as input.
+
+## 3 Zero-Shot Classification using Diffusion Models
+
+In this section, we show how to convert the generation process of a text-to-image diffusion model into a zero-shot classifier to facilitate quantitative evaluation on downstream tasks. Figure 1 shows an overview of our method.
+
+**Diffusion Generative Classifier:** We begin with a dataset, \((^{1},y^{1}),,(^{n},y^{n})}^{d_{1} d_{2}}[_{K}]\) of \(n\) images3 where each image belongs to one of \(K\) classes \([_{K}]:=\{_{1},_{2},,_{K}\}\). Given an image \(\), our goal is to predict the most probable class assignment
+
+\[=*{arg\,max}_{_{k}}p(y=_{k}|)= *{arg\,max}_{_{k}}p(|y=_{k}) p(y= _{k})=*{arg\,max}_{_{k}}\  p(|y=_{k}).\]
+
+where we assume a uniform prior \(p(y_{i}=_{k})=\) that can be dropped from the \(*{arg\,max}\).4 A generative classifier (Ng and Jordan, 2001) uses a conditional generative model with parameters \(\) to estimate the likelihood as \(p_{}(|y=_{k})\).
+
+Using a text-to-image diffusion model as a generative classifier requires two modifications. First, the models are conditioned on text prompts rather than class labels. Thus we convert each label, \(_{k}\), to text using a mapping \(\) with a dataset-specific template (e.g. \(_{k}\) photo of a \(_{k}\)). Second,diffusion models do not produce exact log-likelihoods (i.e. we cannot compute \( p_{}(|y=_{k})\) directly). Our key idea for a solution is to use the \(\) (more specifically \(_{}\) as Imagen and SD are not trained with the other losses) as a proxy. Thus we have:
+
+\[ =*{arg\,max}_{_{k}}\  p_{}(|y= _{k})*{arg\,min}_{_{k}}\ _{}(,_{k})\] \[=*{arg\,min}_{_{k}[_{K}]}\ _{ ,t}_{t}\|-}_{}_{t},(_{k}),t\|_{2}^{2}\] (2)
+
+Note that for SD, \(\) and \(}_{}\) are latent representations, with \(\) obtained by encoding the image using a VAE. With Imagen on the other hand, \(\) consists of the raw image pixels.
+
+Estimating the Expectation:We approximate the expectation in Equation (2) using Monte-Carlo estimation. At each step, we sample a \(t()\) and then a \(_{t}\) according to the forward diffusion process (Equation (1)): \(_{t} q(_{t}|_{0})\). Next, we denoise this noisy image using the model (i.e. we use it to predict \(\) from \(_{t}\)), obtaining \(}=}_{}_{t},(_{k}),t\). We call the squared error of the prediction, \(\|-}\|_{2}^{2}\), a _score_ for \((,_{k})\). We score each class \(N\) times, obtaining a \(K N\)_scores matrix5_ for the image. Finally, we weight the scores according to the corresponding \(_{t}\) and take the mean, resulting in an estimate of \(_{}\) for each class.
+
+Choice of Weighting Function:Imagen and SD are trained with the "simple" loss, where \(_{t}=(t)\), the signal-to-noise ratio (Kingma et al., 2021) for timestep \(t\). However, we found other weighting functions can improve results. First, we experimented with learning \(_{t}\) by binning the times into 20 buckets and training a 20-features logistic regression model to learn weights for the buckets that maximize classification accuracy. However, using that weighting is not truly zero-shot since it requires label information to learn. We thus, also handcrafted a weighting function that can be used across datasets. We designed \(_{t}\) by finding a simple function that looked close to our learned weighting function on CIFAR-100 (we did not look at other datasets to preserve zero-shot protocol). Interestingly, we found that the simple function \(_{t}:=(-7t)\) works well for both Imagen an SD across tasks and used it for our experiments. As it is monotonic, \(_{}\) with this weighting can still be viewed as a likelihood-based objective that maximizes-the variational lower bound under simple data augmentations (Kingma & Gao, 2023). We provide details on learning \(_{t}\) and an empirical comparison of different weighting functions in Appendix B.
+
+### Improving Efficiency
+
+Computing \(\) with naive Monte-Carlo estimation can be expensive because \(_{}\) has fairly high variance. Here, we propose techniques that reduce the compute cost of estimating the \(*{arg\,min}\) over classes. The key idea is to leverage the fact that we only need to compute the \(*{arg\,min}\) and do not require good estimates of the actual expectations.
+
+Shared Noise:Differences between individual Monte-Carlo samples from \(_{}\) can of course be due to different \(t\) or forward diffusion samples from \(q(_{t}|_{t-1})\), whereas we are only interested in the effect of the text conditioning \((_{k})\). We find far fewer samples are necessary when we use the _same_\(t\) and \(_{t}\) across different classes, as shown in Figure 1. After sampling a \(t()\) and \(_{t} q(_{t}|_{0})\), we score all classes against this noised image instead of a single one. As a result, the differences between these estimates are only due to the different text conditioning signals.
+
+Candidate Class Pruning:Rather than using the same amount of compute to estimate the expectation for each class, we can further improve efficiency by discarding implausible classes early and dynamically allocating more compute to plausible ones. In particular, we maintain a set of candidate classes for the image being classified. After collecting a new set of scores for each candidate class, we discard classes that are unlikely to become the lowest-scoring (i.e. predicted) class with more samples. Since we are collecting paired samples (with the same \(t\) and \(}_{i,t}\)), we use a paired student's t-test to identify classes that can be pruned. This pruning can be viewed as a succesive elimination algorithm for best-arm identification in a multi-armed bandit setting (Paulson, 1964; Even-Dar et al., 2002). Of course, scores do not exactly follow the standard assumptions of a student's t-test, so we use a small p-value (2e\({}^{-3}\) in our experiments) and ensure each class is scored a minimum number of times (20 in our experiments) to minimize the chance of pruning the correct class. The full procedure is shown in Algorithm 1.
+
+Comparison:Figure 2 compares the number of samples needed to accurately classify CIFAR-100 images for different efficiency strategies. Using shared noise and pruning greatly improves efficiency, requiring up to 1000x less compute than naive scoring. Nevertheless, classifying with a diffusion model still typically takes 10s of scores per class on average, making the diffusion classifier expensive to use for datasets with many classes.
+
+## 4 Empirical Analysis and Results
+
+In this section, we detail our analysis for the diffusion zero-shot classifiers on a variety of tasks. These include classification on various vision datasets to study generalization capabilities on diverse domains, evaluating model robustness to conflicting cues between texture and shape, and studying attribute binding ability through targeted evaluation on synthetic data.
+
+We mainly compare Imagen and SD with CLIP (Radford et al., 2021). We chose CLIP because it is a well-studied and widely-used model, as our primary aim is to study diffusion models rather than push state-of-the-art zero-shot accuracies. Our experiments reveal strengths and weaknesses of image-text representations learned via generative training vs. CLIP's contrastive training.
+
+Model details:Imagen is a cascaded diffusion model (Ho et al., 2022) consisting of a \(64 64\) low-resolution model and two super-resolution models. We only use the \(64 64\) model for our experiments because we found the high-resolution models performed poorly as classifiers. Combining the \(64 64\) model's scores with scores from the higher-resolutions models did not improve results either (see Appendix E for details). The issue is that high-resolution models condition strongly on their low-resolution inputs and are therefore less sensitive to the text prompt. Unlike with Figure 3, high-resolution denoising with different text prompts produces images imperceptibly different to the human eye because they all agree with the same low resolution image.
+
+We use version 1.4 of Stable diffusion for our experiments. It uses a pre-trained text encoder from CLIP to encode the text and a pre-trained variational autoencoder to map images to a latent space.
+
+CLIP consists of vision and text transformers trained with contrastive learning. We use the largest CLIP model (ViT-L/14@224px). We provide more details on all the models in Appendix A.
+
+Figure 2: Comparison of efficiency improvements for Imagen on CIFAR-100. Shared noise improves sample efficiency by roughly 100x and pruning by an additional 8-10x.
+
+Experiment details:For each experiment, we obtain scores using the heuristic timestep weighting function and the efficient scoring method in Algorithm 1. Due to the method's still-substantial compute cost, we use reduced-size datasets (4096 examples) for our experiments. We preprocess each dataset by performing a central crop and then resizing the images to \(64 64\) resolution for Imagen, \(512 512\) for SD, and \(224 224\) for CLIP. We use \(=20\), \(=2000\), and cutoff\(\_=2^{-3}\). These are simply reasonable choices that keep the method efficient to run; changing the values does effect the model behavior in expectation but trades off compute for reduction in variance. We use a single prompt for each image. While we could have used an ensemble of prompts (i.e, made the expectation in Equation (2) also over different prompt templates), we chose not to for the sake of simplicity, as our goal is to better understand models rather than achieve state-of-the-art zero-shot performance. Therefore, our reported results are slightly lower than in the CLIP paper, which uses prompt ensembling. We found in our experiments that diffusion models were quite robust to the choice of prompt. For example, we tried four different prompts from the CLIP templates for CIFAR-100 and found accuracies to all be within 1.5% of each other.
+
+Comparing models:Imagen, SD and CLIP have different model sizes, input resolutions, and are trained on different datasets for different amounts of time, so the comparison is not direct. While ideally we would train models of the same size on the same data, this would be very expensive and challenging in practice; we instead use these strong existing pre-trained models. Our comparisons are geared towards highlighting the strengths and weaknesses of text-image diffusion models.
+
+### Image Classification
+
+Setup:We first evaluate the performance at zero-shot classification. For this purpose, we consider 13 datasets from Radford et al. (2021) as reported in Table 1. We use the prompt templates and class labels used by Radford et al. (2021), which renames some classes that confuse models (e.g. "crane \(\) "crane bird" in Imagenet) (OpenAI, 2021). We use the first prompt from the list, except for Imagenet, where we use "A bad photo of a _label_ " since this is a good prompt for Imagen, SD and CLIP (OpenAI, 2021).
+
+Since we use the low-resolution Imagen model, we obtain results using CLIP under two settings for a more thorough comparison. In the first setting, we resize all the datasets to \(64 64\) which serves as the base low-resolution dataset. Imagen uses this dataset directly. For CLIP, we subsequently upsample the images, resizing them to \(224 224\) resolution. In the second setting, we directly resize all datasets to \(224 224\) resolution to obtain the best results possible using CLIP where it can take advantage of its higher input resolution.
+
+Results:Results are shown in Table 1. The first eight datasets (up through EuroSAT) on the top block of the table are all originally of resolution \(64 64\) or less. On these datasets, Imagen generally outperforms CLIP and Stable Diffusion on classification accuracy under the same evaluation setting i.e., the models are conditioned on the same text prompts, etc. Imagen significantly outperforms CLIP on SVHN and SD on digit recognition datasets like MNIST and SVHN, which requires recognizing text in an image. Saharia et al. (2022) observe that Imagen is particularly good at generating text,
+
+Figure 3: Example predictions from Imagen when denoising the same image with different text prompts. Each set of images shows the original, noised, and denoised images for the two classes. The top two rows use ImageNet images and the bottom row uses Cue-Conflict.
+
+while SD generally performs poorly (see Figure 6 in the appendix). This demonstrates that Imagen's areas of strength in generation carry over to downstream tasks and suggests that classification on OCR datasets could be used as a quantitative metric to study a model's text-generation abilities. SD generally performs poorly on the low-resolution datasets, perhaps because it is only trained on high-resolution images.6 To better understand how much low-resolution is to blame, we evaluated SD on ImageNet after down-sampling the images to \(32 32\) and \(64 64\) resolution. SD's accuracy drops from \(61.9\%\) to 15.5% and 34.6% respectively. The next five datasets use higher-resolution images. For some of these, taking advantage of CLIP's higher input resolution substantially improves results. SD performs comparably to Imagen on all these datasets (although of course it has an advantage in terms of input resolution).
+
+Due to our reduced-size evaluation sets, variances in accuracy on zero-shot classification tasks across different random splits are roughly \( 0.4\%\) for CLIP, \( 0.7\%\) for Imagen, and \( 0.6\%\) for Stable Diffusion. The diffusion models have higher variance due to the inherent randomness in noising images (while CLIP is deterministic). Overall, we are not interested in small accuracy differences anyway, as the comparison between models is non-direct in various ways; instead we are trying go get a broad understanding of the models' abilities.
+
+To our knowledge, these results are the first instance of a generative model achieving classification accuracy competitive with strong transformer-based discriminative methods. Lastly, we note that our method relies on the model being highly sensitive to text prompt, which we observe qualitatively in Figure 3.
+
+### Robustness to Shape-Texture Conflicting Cues
+
+We next study diffusion models' robustness to presence of texture cues in images by evaluating their performance on the Cue-Conflict dataset from Geirhos et al. (2019). The dataset consists of Imagenet images altered to have a shape-texture conflict. While (for example) changing an image of a cat to have the texture of an elephant skin doesn't confuse humans, it could cause a model to classify the image as an elephant. Geirhos et al. (2019) showed that CNNs trained on Imagenet were strongly biased towards recognising textures rather than shapes, which is in stark contrast to human behavioural evidence.
+
+  
+**Model** & CIFAR10 & CIFAR100 & STL10 & MNIST & DTD & Camelyon & SVHN & EuroSAT \\  Imagen & **96.6** & **84.3** & **99.6** & **79.2** & 37.3 & **60.3** & **62.7** & **60.3** \\ Stable Diffusion & 72.1 & 45.3 & 92.8 & 19.1 & **44.6** & 51.3 & 13.4 & 12.4 \\ CLIP/ViT-L/14 & 94.7 & 68.6 & 99.6 & 74.3 & 36.0 & 58.0 & 21.5 & 58.0 \\ 
+**Model** & Stanford Cars & Imagenet & Caltech 101 & Oxford Pets & Food101 \\  Imagen & **81.0** & 62.7 & 68.9 & 66.5 & 68.4 \\ Stable Diffusion & 77.8 & 61.9 & 73.0 & 72.5 & 71.6 \\ CLIP/ViT-L/14 & 62.8/75.8 & 63.4/**75.1** & 70.2/**84.1** & 76.0/**89.9** & 83.9/**93.3** \\   
+
+Table 1: **Percent accuracies for zero-shot image classification. For CLIP where two numbers are reported, the accuracy correspond to two settings: downsize the images to 64x64 and then resizing the images up to 224x224 (so CLIP does not have an advantage in input resolution over the 64x64 Imagen model) and resizing the images directly to 224x224 (so CLIP has the advantage of higher resolution). Variances in accuracy are \(<\)1% across different random seeds. The top set of results are on low-resolution datasets (which is why SD performs poorly).**
+
+  
+**Imagen** & **Stable Diffusion** & **CLIP** & **ViT-22B** & **ResNet50** (supervised) \\ 
+**84.4** & 72.5 & 51.6 & 68.7 & 79 (top-5) \\   
+
+Table 2: Percent shape accuracy for zero-shot classification on the Cue-Conflict Imagenet dataset.
+
+We test Imagen's and Stable Diffusion's robustness to detecting shapes in presence of texture cues by using the same setting for classification as in Section 4.1. We report shape accuracy which is the percentage of images for which the model predicts the image's shape correctly in Table 2. We compare Imagen and SD with CLIP, the recently proposed ViT-22B model (Dehghani et al., 2023) which was trained on JFT (Sun et al., 2017) extended to 4B images (Zhai et al., 2022) and fine-tuned on Imagenet, and a (not zero-shot) supervised ResNet50 model trained on the training set. Imagen and SD comprehensively outperform all previous methods on this dataset. Imagen further achieves an accuracy of 84.4% outperforming SD, CLIP, and ViT-22B by more than 12%, 30% and 15% respectively, and the top-5 accuracy performance of the supervised ResNet50 model by 5%.
+
+We believe that the denoising process of the diffusion model is critical in removing the texture bias commonly observed in supervised models, making it robust to presence of textural cues. These findings are in line with Nie et al. (2022), who achieve state-of-the-art adversarial robustness through denoising adversarial examples with a diffusion model. We further qualitatively confirm this in Figure 3 in the appendix which depicts example images from this dataset and Imagen's result after denoising those images conditioned on text prompts with both the correct and incorrect shape class.
+
+### Evaluating Attribute Binding on Synthetic Data
+
+We have shown that Imagen and SD perform comparably to CLIP at zero-shot classification, and much better than CLIP at disregarding misleading textural cues. Do diffusion models have additional capabilities that are difficult to obtain through contrastive pre-training? We hypothesize that one such area may be in compositional generalization, and specifically compare the models at attribute binding. Text-to-image generative models have shown emergent compositional generalization at large enough scale, being able to combine diverse concepts to handle prompts such as "a chair shaped like an avacado" (Ramesh et al., 2021). Attribute binding is a key piece of compositional reasoning, as it enables the understanding and integration of multiple concepts into a coherent whole. For example in the statement "a yellow sphere and a gray cube" we understand the sphere is yellow and the cube is gray, not the other way around. While previous work has examined attribute binding in text-to-image models by examining model generations (Nichol et al., 2021; Yu et al., 2022; Feng et al., 2023), our diffusion model classifier offers a way of more precisely studying the question quantitatively. We hope in the future, this type of study enabled by our method will be useful for comparing other abilities of generative image models at a fine-grained level.
+
+Dataset Construction:We use synthetic images similar to Lewis et al. (2022), where images are generated based on the CLEVR (Johnson et al., 2017) visual question answering dataset. CLEVR images contain various object (cubes, cylinders, and spheres) with various attributes (different sizes, colors, and materials). A modified version of the CLEVR rendering script is used to generates images containing two objects of different shapes. From these images, we construct binary classification tasks of 1000 examples each; see Figure 4 for more details and examples. We follow the same setup as in the classification evaluation, using the \(64 64\) Imagen model and \(512 512\) Stable Diffusion model with heuristic timestep weighting and largest public CLIP model (with full-resolution inputs).
+
+Figure 4: Examples of the synthetic-data attribute binding tasks. We explored more sophisticated prompts than in the figure (e.g., “A blender rendering of two objects, one of which is a yellow sphere.”), but they didn’t substantially change results.
+
+Results:Scores for Imagen, SD, and CLIP at these tasks is shown in Table 3. On the control tasks, all the models are able to identify shapes and colors that occur in the image with high accuracy. Imagen is slightly worse at shape identification; we find most of these are due to it mixing up "cylinder" and "cube" when the objects are small. Mistakes in color recognition generally occur when the distractor color is similar to the true color or to the color of the other object in the image (e.g. the distractor color is blue and there is a large cyan object in the image).
+
+While CLIP can recognize image attributes, it performs no better than random chance for the attribute binding tasks. This result shows it is unable to connect attributes to objects and is consistent with the prior study from Subramanian et al. (2022). In contrast, Imagen can perform (at least to some extent) the pair binding tasks, and does better than chance on the Shape\(|\)Color and Color\(|\)Shape tasks. SD cannot perform the positional tasks, but can perform shape/color binding.
+
+Part of Imagen's advantage might be in its text encoder, the pre-trained T5 (Raffel et al., 2020) model. Saharia et al. (2022) find that instead using CLIP's text encoder for Imagen decreased its performance on generations involving specific colors or spatial positions. Similarly, Ramesh et al. (2022) find that DALLE-2, which uses a CLIP text encoder, is worse at attribute binding than GLIDE, which uses representations from a jointly-trained transformer processing the text. An advantage of the diffusion models over CLIP is their use of cross attention to allow interaction between textual and visual features. A visual model without completely independent text and image encoders such as LXMERT (Tan and Bansal, 2019) or CMA-Clip (Liu et al., 2021) might perform better, but of course these models come with the added compute cost of having to jointly process all image-text pairs with the model instead of embedding the text and images separately.
+
+One mistake we observed frequently in Color\(|\)Shape with Imagen is it preferring the color of the larger object in the image; e.g. scoring "A gray sphere" over "A yellow sphere" in Figure 4. We hypothesize that it is helpful for denoising at high noise levels when the text conditioning provides the color for a large region of the image, even when the color is associated with the wrong shape. In the pair task, the full color information for both objects is always provided, which avoids this issue, and perhaps explains why accuracies at pair tasks are much higher.
+
+## 5 Conclusion and Future Work
+
+We have proposed a method that enables diffusion models to be used as zero-shot classifiers and developed ways of improving its efficiency to make it usable. Our experiments demonstrate strong results on image classification. Furthermore, we show Imagen and Stable Diffusion are remarkably robust to misleading textures, achieving state-of-the-art results on cue-conflict dataset. While existing analysis of diffusion models usually studies generated images qualitatively, our framework provides a way of quantitatively evaluating text-to-image generative models through evaluating them on controlled classification tasks. We showcase this through our study on attribute binding, where we find that diffusion models are sometimes able to bind attributes while CLIP does not appear to have this ability. Similar experiments could be used in the future to study other properties of pre-trained diffusion models, such as toxicity or bias.
+
+  
+**Tasks** & **Imagen** & **Stable Diffusion** & **CLIP** \\  Shape (control task) & **85** & **91** & **91** \\ Color (control task) & **96** & **85** & **94** \\  Shape\(|\)Color / Shape\(|\)Color / Color\(|\)Shape & **100** / **66** / **73** & **85** / **65** / **59** & 54 / 52 / 53 \\ Shape\(|\)Size / Shape\(|\)Size / Size\(|\)Shape & **99** / 48 / 51 & **63** / 48 / 52 & 52 / 51 / 50 \\ Shape\(|\)Position / Shape\(|\)Position / Position\(|\)Shape & **74** / 51 / 52 & 49 / 50 / 50 & 50 / 48 / 51 \\ Color\(|\)Size / Size\(|\)Color\(|\)Size / Size\(|\)Color & **86** / 54 / 54 & **59** / 52 / 48 & 48 / 51 / 48 \\ Color\(|\)Position / Color\(|\)Position / Position\(|\)Color & **72** / 49 / 49 & 53 / 51 / 49 & 49 / 50 / 49 \\ Size\(|\)Position / Size\(|\)Position / Position\(|\)Size & **69** / 50 / 54 & 54 / 49 / 49 & 51 / 50 / 48 \\   
+
+Table 3: Percent accuracy for models on zero-shot synthetic-data tasks investigating attribute binding. Bold results are significant (\(p<0.01\)) according to a two-sided binomial test. CLIP is unable to bind attributes, while Imagen and SD sometimes can.
+
+Our paper is complementary to concurrent work from Li et al. (2023), who use Stable Diffusion as a zero-shot classifier and explore some different tasks like relational reasoning. While their approach is similar to ours, they perform different analysis, and their results are slightly worse than ours due to them using a simple hand-tuned class pruning method and no timestep weighting.
+
+We hope our findings will inspire future work in using text-to-image diffusion models as foundation models for tasks other than generation. One direction is fine-tuning diffusion models on downstream tasks; given the strong zero-shot performance of Imagen and Stable Diffusion, a natural next step is evaluating them after further supervised training. As models become larger, another key question for further study is how do the scaling laws (Hestness et al., 2017; Kaplan et al., 2020) of contrastive vs generative pre-training compare. Additionally, we are interested in applying our analysis to other generative models to study to what extent our results are a consequence of generative pre-training generally compared to diffusion pre-training specifically.
+
+Ultimately, our method does not produce a practical classifier, as it requires substantial compute when scoring many classes. Instead, we see the main value of this work is in revealing more about the abilities of large pre-trained diffusion models and providing a method for enabling future fine-grained studies of diffusion model abilities. In total, our results suggest that generative pre-training may be a useful alternative to contrastive pre-training for text-image self-supervised learning.

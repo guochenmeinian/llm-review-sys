@@ -1,0 +1,219 @@
+# Latent Plan Transformer for Trajectory Abstraction: Planning as Latent Space Inference
+
+Deqian Kong\({}^{1,}\), Dehong Xu\({}^{1,}\), Minglu Zhao\({}^{1,}\), Bo Pang\({}^{2}\), Jianwen Xie\({}^{3}\),
+
+Andrew Lizarraga\({}^{1}\), Yuhao Huang\({}^{4}\), Sirui Xie\({}^{5,*}\), Ying Nian Wu\({}^{1}\)
+
+Equal Contribution Project page: https://sites.google.com/view/latent-plan-transformer. Code: https://github.com/mingluzhao/Latent-Plan-Transformer.
+
+###### Abstract
+
+In tasks aiming for long-term returns, planning becomes essential. We study generative modeling for planning with datasets repurposed from offline reinforcement learning. Specifically, we identify temporal consistency in the absence of step-wise rewards as one key technical challenge. We introduce the Latent Plan Transformer (LPT), a novel model that leverages a latent variable to connect a Transformer-based trajectory generator and the final return. LPT can be learned with maximum likelihood estimation on trajectory-return pairs. In learning, posterior sampling of the latent variable naturally integrates sub-trajectories to form a consistent abstraction despite the finite context. At test time, the latent variable is inferred from an expected return before policy execution, realizing the idea of _planning as inference_. Our experiments demonstrate that LPT can discover improved decisions from sub-optimal trajectories, achieving competitive performance across several benchmarks, including Gym-Mujoco, Franka Kitchen, Maze2D, and Connect Four. It exhibits capabilities in nuanced credit assignments, trajectory stitching, and adaptation to environmental contingencies. These results validate that latent variable inference can be a strong alternative to step-wise reward prompting.
+
+## 1 Introduction
+
+Decision Transformer (DT) (Chen et al., 2021) and some concurrent work (Janner et al., 2021) have popularized the research agenda of decision-making via generative modeling. The general idea is to consider decision-making as a generative process that takes in a representation of the task objective, e.g. the rewards or returns of a trajectory, and outputs a representation of the trajectory. Intuitively, a purposeful decision-making process should shift the trajectory distribution towards regimes with higher returns. In the classical decision-making literature, this is achieved by two interweaving processes, policy evaluation and policy improvement (Sutton and Barto, 2018). Policy evaluation promotes consistency in the estimated correlations between the trajectories and the returns. In DT, this is realized by the maximum likelihood estimation (MLE) of the joint distribution of sequences consisting of states, actions, and return-to-gos (RTG). Policy improvement shifts the distribution to improve the status quo expectation of the returns. In DT, this is naturally entailed since the policy is a distribution of actions conditioned on step-wise RTGs.
+
+In this work, we are interested in the problem of _planning_. Among various ways to identify _planning_ as a special class of decision-making problems, we pay particular attention to its data specificationand inductive biases. As designing step-wise rewards requires significant effort and domain expertise, we focus on the problem of learning from trajectory-return pairs, where a trajectory is a sequence of states and actions, and the return is its total rewards. This design choice forces the agents to predict into the long-term future and figure out step-wise credits by themselves. A competitive Temporal Difference (TD) learning baseline, CQL (Kumar et al., 2020), was reported to be fragile under this data specification (Chen et al., 2021).
+
+Our design of inductive biases reflects our intuition of a _plan_. While a policy is a factor of the trajectory distribution, a _plan_ is an abstraction lifted from the space of trajectories. As a plan is always made in advance of receiving returns, it implies _significance_, _persistence_, and _contingency_. An agent should plan for more significant returns. It should be persistent in its plan even if the return is assigned in hindsight. It should also be adaptable to the environment's changes during the execution of the plan. We formulate this hierarchy of decision-making with a top-down latent variable model. The latent variable we introduce is effectively a _plan_, for it decouples the trajectory generation from the expected improvement of returns. The autoregressive policy always consults this temporally extended latent variable to be persistent in the plan. The top-down structure enables the agent to disentangle the variations in its plan from the environment's contingencies.
+
+In this work, we introduce the Latent Plan Transformer (LPT), a novel generative model featuring a latent vector modeled by a neural transformation of Gaussian white noise, a Transformer-based policy conditioned on this latent vector and a return estimation model. LPT is learned by maximum likelihood estimation (MLE). Given an expected return, posterior inference of the latent vector in LPT is an explicit process for iterative refinement of the _plan_. The inferred latent variable replaces RTG in the conditioning of the auto-regressive policy, providing richer information about the anticipated future. We further develop a mode-seeking sampling scheme that strongly enforce the temporal consistency for long-range planning, which is particularly effective in _stitch_ trajectory, i.e., to compose parts of sub-optimal trajectories to reach far beyond (Fu et al., 2020). LPT demonstrates competitive performance in Gym-Mujoco locomotion, Franka kitchen, goal-reaching tasks in maze2d and antmaze, and a contingent planning task Connect Four. These empirical results support that latent variable inference can enable and improve planning in the absence of step-wise rewards.
+
+## 2 Background
+
+A sequential decision-making problem can be formulated with a decision process \( S,A,H,Tr,r,\) that contains a set \(S\) of states and a set \(A\) of actions. Horizon \(H\) is the maximum number of steps the agent can execute before the termination of the sequence. We further employ \(S^{+}\) to denote the set of all non-empty state sequences within the horizon and \(A^{+}\) for action sequences likewise. \(Tr:S^{+} A^{+}(S)\) is the transition that returns a distribution over the next state. \(r:S^{+} A^{+}\) specifies the real-valued reward at each step. \(:(S)\) is the initial state distribution that is always uncontrollable to the agent. The agent's decisions follow a policy \(:S^{+} A^{+}(A)\). In each episode, the agent interacts with the transition model to generate a trajectory \(=(s_{1},a_{1},s_{2},a_{2}...,s_{H},a_{H})\).
+
+The objective of sequential decision-making is typically formulated as the expected trajectory return \(y=_{t=0}^{H}r_{t}\), \(Q=_{p()}[y]\). Conventional RL algorithms solve for a policy \((a_{t}|s_{t},*)\), where the conditioning \(*\) denotes the optimal expected return. DT generalizes this policy to \((a_{t}|s_{ t},a_{<t},RTG_{ t})\), by fitting the joint distribution \(p(s_{1},a_{1},RTG_{1},...s_{T},a_{T},RTG_{T})\) with a Transformer. \(RTG_{t}\) is the return-to-go from step \(t\) to the horizon \(H\), \(RTG_{t}=_{k=t}^{H}r(s_{ k},a_{ k})\). It is a useful indication of future rewards, especially when rewards are dense and informative.
+
+However, \(RTG\) becomes less reliable when rewards are sparse or have non-trivial relations with the return. Distributing the return to each step is a credit assignment problem. Consider an example of an ideal credit assignment mechanism: When students receive partial credits for their incomplete answers, it's more fair to give points equal to the full marks minus the expected points for all possible ways to finish the answer, rather than assuming students have no knowledge of the remaining parts. This credit assignment mechanism can be formalized as, \(RTG_{t}^{Q}=_{k=t}^{K}r(s_{ k},a_{ k})+[Q(s_{ K},a_{  K})]\). Here \(Q\) can be estimated using deep TD learning with multi-step returns. Yamagata et al. (2023) instantiate a Markovian version and demonstrate improvement in trajectory _stiching_.
+
+Whatever credit assignment we use, be it \(RTG\) or \(RTG^{Q}\), the purpose is to explicitly model the statistical association between trajectory steps and final returns. This effort is believed to be necessary because of the exponential complexity of the trajectory space. This belief, however, can be re-examined given the success of sequence modeling. We explore an alternative design choice by directly associating the latent vector that generates the trajectory with the return.
+
+## 3 Latent Plan Transformer (LPT)
+
+### Model
+
+Given a variable-length trajectory \(\), \(z^{d}\) is a vector that represents \(\) in the latent space. \(y\) is the return of the trajectory. The joint distribution of the trajectory and its return is defined as \(p(,y)\).
+
+The latent trajectory variable \(z\), conceptualized as a plan, is posited to decouple the autoregressive policy and return estimation. From a statistical standpoint, with \(z\) given, we assume that \(\) and \(y\) are conditionally independent, positioning \(z\) as the information bottleneck. Under this assumption, the Latent Plan Transformer (LPT) can be defined as,
+
+\[p_{}(,y,z)=p_{}(z)p_{}(|z)p_{}(y|z),\] (1)
+
+where \(=(,,)\). LPT approximates the data distribution \(p_{}(,y)\) using the marginal distribution \(p_{}(,y)= p_{}(,y,z)dz\). It also establishes a generation process,
+
+\[z p_{}(z),[|z] p_{}(|z),[y|z] p_{ }(y|z).\] (2)
+
+The prior model \(p_{}(z)\) is an implicit generator, defined as a learnable neural transformation of an isotropic Gaussian, \(z=U_{}(z_{0})\) and \(z_{0}(0,I_{d})\). \(U_{}()\) is an expressive neural network, such as the UNet (Ronneberger et al., 2015). This approach is inspired by, yet contrasts with Pang et al. (2020), wherein the latent space prior is modeled as an Energy-based Model (EBM) (Xie et al., 2016). While EBM offers explicit unnormalized density, its sampling process is complex. Conversely, our model provides an implicit density with simpler sampling.
+
+The trajectory generator \(p_{}(|z)\) is a conditional autoregressive model with finite context \(K\), \(p_{}(|z)=_{t=1}^{H}p_{}(_{(t)}|_{(t-K)},...,_{(t -1)},z)\) where \(_{(t)}=(s_{t},a_{t})\). It can be parameterized by a causal Transformer with parameter \(\), similar to Decision Transformer (Chen et al., 2021). Specifically, the latent variable \(z\) is included in trajectory generation using cross-attention, as shown in Fig. 1 and controls each step of the autoregressive trajectory generation as \(p_{}(a_{t}|s_{t-K:t},a_{t-K:t-1},z)\). The action is assumed to follow a single-mode Gaussian distribution, i.e. \(a_{t}(g_{}(s_{t-K:t},a_{t-K:t-1},z),I_{|A|})\).
+
+The return predictor is a non-linear regression on the latent trajectory variable \(z\), modeled as \(p_{}(y|z)=(r_{}(z),^{2})\). It directly predicts the final return from the latent variable \(z\). The function \(r_{}(z)\) is a small multi-layer perceptron (MLP) that estimates \(y\) based on \(z\). The variance \(^{2}\), is treated as the hyper-parameter in our setting.
+
+Figure 1: _Left_: Overview of Latent Plan Transformer (LPT). \(z^{d}\) is the latent vector. The prior distribution of \(z\) is a neural transformation of \(z_{0}\), i.e., \(z=U_{}(z_{0})\), \(z_{0}(0,I_{d})\). Given \(z\), \(\) and \(y\) are independent. \(p_{}(|z)\) is the trajectory generator. \(p_{}(y|z)\) is the return predictor. _Right_: Illustration of trajectory generator \(p_{}(|z)\).
+
+### Offline Learning
+
+With a set of offline training examples \(\{(_{i},y_{i})\}_{i=1}^{n}\), we aim to learn Latent Plan Transformer (LPT) through maximum likelihood estimation (MLE). The log-likelihood function is defined as \(L()=_{i=1}^{n} p_{}(_{i},y_{i})\). The joint probability of the trajectory and final return is
+
+\[p_{}(,y)= p_{}(|z=U_{}(z_{0}))p_{}(y|z=U_{ }(z_{0}))p_{0}(z_{0})dz_{0},\] (3)
+
+where \(p_{0}(z_{0})=(0,I_{d})\). The learning gradient of log-likelihood can be calculated according to
+
+\[_{} p_{}(,y)=_{p_{}(z_{0}|,y)}[ _{} p_{}(|U_{}(z_{0}))+_{} p_{ }(y|U_{}(z_{0}))].\] (4)
+
+The full derivation of the learning method is in Appendix A.1. Let \(_{},_{},_{}\) represent the expected gradients of \(L()\) with respect to the model parameters \(,,\), respectively. The learning gradients for each component are formulated as follows.
+
+For the prior model \(p_{}(z)\),
+
+\[_{}(,y)=_{p_{}(z_{0}|,y)}[_{} ( p_{}(|z=U_{}(z_{0}))+_{} p_{}(y|z=U_ {}(z_{0}))].\]
+
+For the trajectory generator,
+
+\[_{}(,y)=_{p_{}(z_{0}|,y)}[_{}  p_{}(|z=U_{}(z_{0}))],\]
+
+For the return predictor,
+
+\[_{}(,y)=_{p_{}(z_{0}|,y)}[_{}  p_{}(y|z=U_{}(z_{0}))].\]
+
+Estimating these expectations requires Markov Chain Monte Carlo (MCMC) sampling of the posterior distribution \(p_{}(z_{0}|,y)\). We use the Langevin dynamics (Neal, 2011) for MCMC sampling, iterating as follows for a target distribution \((z)\):
+
+\[z^{k+1}=z^{k}+s_{z}(z^{k})+^{k},\] (5)
+
+where \(k\) indexes the time step of the Langevin dynamics, \(s\) is the step size, and \(^{k}(0,I_{d})\) is the Gaussian white noise. Here, \((z)\) is instantiated as the posterior distribution \(p_{}(z_{0}|,y)\). We have \(p_{}(z_{0}|,y) p_{0}(z_{0})p_{}(y|z)p_{}(|z)\), where \(z=U_{}(z_{0})\), such that the gradient is
+
+\[_{z_{0}} p_{}(z_{0}|,y)=_{z_{0}}(z_{0})}_{}+_{z_{0}}(y|z)}_{ }+^{H}_{z_{0}} p_{}( _{(t)}|_{(t-K:t-1)},z)}_{}.\]
+
+This demonstrates that the posterior inference of \(z\) is an explicit process of optimizing a plan given its likelihood. In the presence of a finite context, \(p_{}(|z)\) parametrized with Transformer can only account for sub-trajectories with a maximum length of \(K\). The latent variable \(z\) serves as an abstraction that integrates information from both the final return and sub-trajectories using gradients.
+
+The sampling process starts by initializing \(z_{0}^{k=0}\) from a standard normal distribution \((0,I_{d})\). We then apply \(N\) steps of Langevin dynamics (e.g., \(N=15\)) to approximate the posterior distribution, making our learning algorithm an approximate MLE. For a theoretical understanding of this noise-initialized finite-step MCMC, see Pang et al. (2020); Nijkamp et al. (2020); Xie et al. (2023). However, for large horizons (e.g.,\(H\)=1000), this method becomes slow and memory-intensive. To mitigate this, we adopt the persistent Markov Chain (PMC) (Tieleman, 2008; Xie et al., 2016; Han et al., 2017), which amortizes sampling across training iterations. During training, \(z_{0}^{k=0}\) is initialized from the previous iteration and the number of updates is reduced to \(N=2\) steps. See Appendix A.2 for training and architecture details.
+
+### Planning as Inference
+
+The MLE learning of LPT gives us an agent that can plan. During testing, we first infer the latent \(z_{0}\) given the desired return \(y\) using Bayes' rule,
+
+\[z_{0} p_{}(z_{0}|y) p_{0}(z_{0})p_{}(y|z=U_{}(z_{0 })).\] (6)This posterior sampling is achieved using Langevin dynamics similar to the training process. Specifically, we replace the target distribution in Eq. (5) with \(p_{}(z_{0}|y)\) and run MCMC for a fixed number of steps. Sampling from \(p_{}(z_{0}|y)\) eliminates the need for expensive back-propagation through the trajectory generator \(p_{}(|z)\).
+
+This posterior sampling of \(p(z_{0}|y)\) is an explicit process that iteratively refines the latent plan \(z\), increasing its likelihood given the desired final return. It aligns with our intuition that planning is an inference process. This inferred \(z\), fixed ahead of the policy execution, effectively serves as a plan. At each step, the agent consults this plan to generate actions conditioned on the current state and recent history, \(a_{t} p_{}(a_{t}|s_{t-K:t-1},a_{t-K:t-1},z=U_{}(z_{0}))\).
+
+Once a decision is made, the environment's (possibly non-Markovian) transition \(s_{t+1} p(s_{t+1}|a_{t},s_{t})\) emits the next state. This sequential decision-making process iterates the sampling of \(s_{t}\) and \(a_{t}\) until termination at the horizon.
+
+Exploitation-inclined Inference (EI)Inspired by the classifier guidance (CG) (Dhariwal and Nichol, 2021; Ho and Salimans, 2022) in conditional diffusion models, we introduce a guidance weight \(w\) to the original posterior in Eq. (6)
+
+\[_{}(z_{0}|y) p_{0}(z_{0})p_{}(y|z)^{w},z=U_{ }(z_{0}),\] (7)
+
+which has the score \(_{z_{0}}_{}(z_{0}|y)=_{z_{0}} p_{0}(z_{0}) +w_{z_{0}} p_{}(y|z)\). This guidance weight \(w\) controls the interpolation between exploration and exploitation. When \(w=1\), the sampled plans collectively represent the posterior density and account for Bayesian uncertainty, resulting in a provably efficient exploration scheme (Osband and Van Roy, 2017). When \(w>1\), the sampled plans are more concentrated around the modes of the posterior distribution, which are plans more likely to the agent. The larger the value of \(w\), the more confident the agent becomes, and the stronger the inclination towards exploitation.
+
+An overview of the algorithms for both offline learning and inference can be found in the following.
+
+``` Input: Learning iterations \(T\), initial parameters \(_{0}=(_{0},_{0},_{0})\), offline training samples \(=\{_{i},y_{i}\}_{i=1}^{n}\), posterior sampling step size \(s\), the number of steps \(N\), and the learning rate \(_{0},_{1},_{2}\). Output:\(_{T}\) for\(t=1\)to\(T\)do 1.Posterior sampling: For each \((_{i},y_{i})\), sample \(z_{0} p_{_{t}}(z_{0}|_{i},y_{i})\) using Eq. (5) with \(N\) steps and step-size \(s\), where the target distribution \(\) is \(p_{_{t}}(z_{0}|_{i},y_{i})\). 2.Learn prior model \(p_{}(z)\), trajectory generator \(p_{}(|z)\) and return predictor \(p_{}(y|z)\): \(_{t+1}=_{t}+_{0}_{i}_{}(_{i},y _{i})\); \(_{t+1}=_{t}+_{1}_{i}_{}(_{i},y_{i})\); \(_{t+1}=_{t}+_{2}_{i}_{}(_{i},y _{i})\) as in Section 3.2. endfor ```
+
+**Algorithm 1** Offline learning
+
+``` Input: Expected return \(y\), a trained model on offline dataset \(\), posterior sampling step size \(s\) and the number of steps \(N\), Horizon \(H\) and an evaluation environment. Output: Trajectory \(\) if Exploitation-inclined Inference (EI)then  Sample \(z_{0}_{}(z_{0}|y)\) as in Eq. (7) using Eq. (5) with \(N\) steps and step size \(s\), where the target distribution \(\) is replaced by \(_{}(z_{0}|y) p_{}(z_{0})p_{}(y|z=U_{}(z_{0} ))^{w}\) and \(z=U_{}(z_{0})\). else  Sample \(z_{0} p_{}(z_{0}|y)\) as in Eq. (6) using Eq. (5) with \(N\) steps and step size \(s\), where \(\) is replaced by \(p_{}(z_{0}|y) p_{0}(z_{0})p_{}(y|z=U_{}(z_{0}))\) and \(z=U_{}(z_{0})\). endif while current time step \(t H\)do  Sample \(a_{t}\) using trajectory generator as \(a_{t} p_{}(a_{t}|s_{t-K:t-1},a_{t-K:t-1},z=U_{}(z_{0}))\).  Once a decision is made, the environment's transition \(s_{t+1} p(s_{t+1}|a_{t},s_{t})\) emits the next state. endwhile ```
+
+**Algorithm 2** Planning as inference
+
+A Sequential Decision-Making Perspective
+
+We approach the sequential decision-making problem with techniques from generative modeling. In particular, our data specification of trajectory-return pairs omits step-wise rewards, based on the belief that the step-wise reward function is only a proxy of the trajectory return. However, step-wise rewards are indispensable input to classical decision-making algorithms. Accumulating the rewards from the current step to the future gives us the \(RTG\), which naturally hints the future progress of the trajectory. How is temporal consistency enforced in our model without the assistance of the \(RTG\)s?
+
+Without loss of generality, consider the trajectory distribution conditioned on a single return value \(y\). The MLE objective is equivalent to minimizing the KL divergence between the data distribution and model distribution, \(D_{}(p_{}^{y}()\|p_{}^{y}())\). Here, \(p_{}\) denotes the data distribution and \(p_{}\) denotes the model distribution. MLE upon autoregressive modeling imposes additional inductive biases by transforming the objective to \(D_{}(p_{,}^{y}()\|p_{,} ^{y}())\), which is reduced to next-token prediction for behavior cloning and transition model estimation:
+
+\[_{t=1}^{H}}(p_{}^{y}(a_{t}|s_{1:t}, a_{1:t-1})\|p_{}^{y}(a_{t}|s_{1:t},a_{1:t-1}))}_{}+_{t=1}^{H}}(p_{}^{y}(s_{t+1}|s_{1:t}, a_{1:t})\|p_{}^{y}(s_{t+1}|s_{1:t},a_{1:t}))}_{}.\]
+
+However, behavior cloning is believed to suffer from drifting errors since it ignores _covariate shifts_ in future steps (Ross and Bagnell, 2010). This concern is unique to sequential decision-making, as the agent cannot control the next state from a stochastic environment, like generating the next text token.
+
+This temporal consistency issue could be alleviated by additionally modeling the sequence of \(RTG\). Denote \(=(RTG_{0},RTG_{1},...RTG_{H})\). Modeling the joint distribution is to minimize
+
+\[D_{}(p_{}^{y}(,)\|p_{}^{y}( ,))=D_{}(p_{}^{y}()\|p_{}^{y}())+D _{}(p_{}^{y}(|)\|p_{}^{y}(|))\] \[= D_{}(p_{,}^{y}()\|p_{,}^{y}())+_{p_{}^{y}()}[_ {t=1}^{H}}(p_{}^{y}(RTG_{t}|)\|p_{ }^{y}(RTG_{t}|))}_{}].\] (8)
+
+Note that the _RTG prediction_ term is conditioned on the entire trajectory, including the future steps. Minimizing this additional KL divergence correlates predicted \(RTG\)s with hindsight trajectory-to-go.
+
+Our modeling of the latent trajectory variable \(z\) provides an alternative solution to the temporal consistency issue. Eq. (4) is minimizing the KL divergence
+
+\[D_{}(p_{}^{y}(,z)\|p_{}^{y}(,z))=D_{}(p_{}^{y}()\|p_{}^{y}())+D_{ }(p_{}^{y}(z|)\|p_{}^{y}(z|))\] \[= D_{}(p_{,}^{y}()\|p_{,}^{y}())+_{p_{}^{y}()}[}(p_{}^{y}(z|)\|p_{}^{y}(z|))}_{}],\] (9)
+
+where \(p_{}^{y}(z|)=p_{}^{y}(,z)/p_{}^{y}()\) and \(=\) highlights these distributions have the same parameterization as \(p_{}^{y}\) but are wrapped with stop_grad() operator when calculating gradients for \(\)(Han et al., 2017). Comparing Eqs. (8) and (9), it is now clear that \(z\) plays a similar role as \(RTG\) in promoting temporal consistency in autoregressive models. Uniquely, \(p_{}^{y}(z|)\) is the temporal abstraction intrinsic to the model, in contrast to step-wise rewards. From a sequential decision-making perspective, \(z\) is effectively a _plan_ that the agent is persistent to. From a generative modeling perspective, \(z\) from different trajectory modes would decompose the density \(p^{y}(a_{t}|s_{0:t},a_{0:t-1})\), relieving the burden of learning the autoregressive policy \(p_{}(a_{t}|s_{0:t},a_{0:t-1},z)\).
+
+One caveat is that the _transition model estimation_ should not be conditioned on \(y\). Mixing up more trajectory regimes could provide additional regularization for its estimation and generalization. Actually, environment stochasticity is a more concerning issue for autoregressive _behavior cloning_, as highlighted by Yang et al. (2022); Paster et al. (2022); Strupl et al. (2022); Brandfonbrener et al. (2022); Villaflor et al. (2022); Eysenbach et al. (2022). Among them, Yang et al. (2022) pinpoints the issue by viewing \(RTG\)s as deterministic latent trajectory variables, closely related to what we present here. Uniquely, the latent variable \(z\) in our model is inherently multi-modal (hence very non-deterministic) and ignorant of step-wise rewards. We postulate that the overfitting issue might be mitigated. This is validated by our empirical study inspired by Paster et al. (2022).
+
+Although _RTG prediction_ and _plan prediction_ both promote temporal consistency, they function very differently when mixing trajectories from multiple return-conditioned regimes. _RTG prediction_ is a supervised learning over the joint distribution \(p_{}(,)\). Simply mixing trajectories from multiple regimes can't encourage generalization to trajectories that are _stitched_ with those in the dataset. Yamagata et al. (2023) propose to resolve this by replacing \(RTG\) with \(RTG^{Q}\). Intuitively, this augments the distribution \(p_{}(,)\) with \(p_{}(^{},^{Q})\), where \(^{}\) denotes trajectories covered by the offline dynamic programming, such as Q learning, and \(^{Q}=(RTG^{Q}_{0},RTG^{Q}_{1},...Q_{H})\). It significantly improves tasks requiring trajectory _stitching_. Conversely, _plan prediction_ is an unsupervised learning as it samples from \(p_{}(,y)p_{}(z|,y)\). As \(z\) contains more trajectory-related information than step-wise \(RTG\)s, trajectories lying outside of \(p_{}(,)\) may be in-distribution for \(p_{}(,y)p_{}(z|,y)\). The return prediction training further shapes the representation of \(z\), which can be benefited from denser coverage of \(y\). With more return values covered, we may count on neural networks' strong interpolation capability to shift the trajectory distribution with \(y\)-conditioning.
+
+## 5 Related work
+
+**Decision-Making via Sequence Modeling**Chen et al. (2021) propose Decision Transformer (DT), pioneering this paradigm shift. Concurrently, Janner et al. (2021) explore beam search upon the learned Transformer for model-based planning and inspired later work that searches over the latent state space (Zhang et al., 2022). Lee et al. (2022) report DT's capability in multi-task setting. Zheng et al. (2022) explore the online extension of DT. Yamagata et al. (2023) augment the Monte Carlo RTG in DT with a Q function and show improvement in tasks requiring trajectory _stitching_. Janner et al. (2022) explore diffusion models (Ho et al., 2020) as an alternative generative model family for decision-making. Our model differentiates from all above in data specification and model formulation.
+
+**Latent Trajectory Variables in Behavior Cloning**Yang et al. (2022); Paster et al. (2022) investigate the DT's overfitting to environment contingencies and propose latent variable solutions. Our model is closely related to theirs but unique in an EM-style algorithm for MLE. Ajay et al. (2021); Lynch et al. (2020) propose latent variable models to make Markovian policies temporally extended. Their models are more related to VAE (Kingma and Welling, 2014).
+
+**Offline Reinforcement Learning** Since the offline static datasets only partially cover the state transition spaces, efforts from a conventional RL perspective focus on imposing pessimistic biases to value iteration (Kumar et al., 2020; Kostrikov et al., 2021; Uehara and Sun, 2021; Xie et al., 2021; Cheng et al., 2022). Fujimoto and Gu (2021) show that simply augmenting value-based methods with behavior cloning achieves impressive performance. Emmons et al. (2021) report that supervised learning on return-conditioned policies is competitive to value-based methods in offline RL. Our MLE objective is more related to the supervised learning methods. The latent variable inference further imposes temporal consistency, acting as a replacement of value iteration.
+
+**Hierarchical RL** Methods like OPAL (Ajay et al., 2021), OPOSM (Freed et al., 2023) address TD-learning's limitations in long-range credit assignment using a two-stage approach: discovering skills from shorter subsequences to reduce the planning horizon, then applying skill-level CQL or online model-based planning on the reduced horizons. This paper focuses on comparing various methods for long-range credit assignment on the original horizon. Future work includes first discovering skills and then modeling them with a skill-level LPT to further extend the effective horizon.
+
+## 6 Experiments
+
+The data specification of trajectory-return pairs distinguishes our empirical study from most existing works in offline RL. Omitting step-wise rewards naturally increases the challenges in decision-making.
+
+### Overview
+
+Our empirical study adopts the convention from offline RL. We first train our model with the offline data and then test it as an agent in the corresponding task. More training details and ablation studies of LPT can be found in Appendices A.2 and A.4.
+
+**OpenAI Gym-Mujoco** The D4RL offline RL dataset (Fu et al., 2020) features densely-rewarded locomotion tasks including _Halfcheetah_, _Hopper_, and _Walker2D_. We test for _medium_ and _medium-replay_. It also includes _Antmaze_, a locomotion and goal-reaching task with extremely sparse reward.
+
+The agent will only receive a reward of 1 if hitting the target location and 0 otherwise. We use its _umaze_ and _umaze-diverse_ variants.
+
+**Franka Kitchen** Franka Kitchen is a multitask environment where a Franka robot with nine degrees of freedom operates within a kitchen setting, interacting with household objects to achieve specific configurations. Our experiments focus on two datasets of the environment: _mixed_, and _partial_, which consists of non-task-directed demonstrations and partially task-directed demonstrations respectively.
+
+**Maze2D** Maze2D is a navigation task in which the agent reaches a fixed goal location from random starting positions. The agent is rewarded 1 point when it is around the goal. Experiments are conducted on three layouts: _umaze, medium_, and _large_, with increasing complexity. The training data of the Maze2D task contains only suboptimal trajectories from and to randomly selected locations.
+
+**Connect Four** This is a tile-based game, where the agent plays against a stochastic opponent (Paster et al., 2022), receiving at the end of an episode 1 reward for winning, 0 for a draw, and -1 for losing.
+
+**Baselines** We compare the performance of LPT with several representative baselines including CQL (Kumar et al., 2020), DT (Chen et al., 2021) and QDT (Yamagata et al., 2023). CQL baseline results are obtained from Kumar et al. (2020). QDT baseline results are from Yamagata et al. (2023). The DT results for Gym-Mujoco and Maze2D tasks are from Yamagata et al. (2023), Antmaze from Zheng et al. (2022), and Kitchen implemented based on the published source code. CQL and DT results in the Connect Four experiments are from Paster et al. (2022). The mean and standard deviation of our model, shown as LPT and LPT-EI, are reported over 5 seeds.
+
+### Credit assignment
+
+When resolving the temporal consistency issue, our model doesn't have an explicit credit assignment mechanism that accounts for the actual contribution of each step. It is not aware of the step-wise rewards either. We are therefore curious about whether the inferred latent variable \(z\) can effectively assign fair credits to resolve compounding errors.
+
+Distributing sparse rewards to high-dimensional actionsThe Gym-Mujoco environment was a standard testbed for high-dimensional continuous control during the development of modern RL algorithms (Lillicrap et al., 2015). In this environment, step-wise rewards were believed to be critical for TD learning methods. In the setup of offline RL, Chen et al. (2021) reported the failure of the competitive CQL baseline when delaying step-wise rewards until the end of the trajectories. DT and QDT are reported to be robust to this alternation. As shown in Table 1, the proposed model, LPT, outperforms these baselines when the data specifications are the same. Notably, LPT even excels in most of the control tasks when compared with the baselines with step-wise rewards.
+
+Distributing delayed rewards to long-range sequencesMaze navigation tasks with fully delayed rewards align with our intuition of a planning problem, for it involves decision-making at certain critical states absent of instantaneous feedback. An ideal planner would take in the expected total return and calculate the sequential decisions, automatically distributing credits from the extremely sparse and fully delayed rewards. According to Yamagata et al. (2023), DT fails in these tasks. Our
+
+   } &  &  \\  & CQL & DT & QDT & CQL & DT & QDT & LPT (Ours) & LPT-EI (Ours) \\  halfcneetah-medium & **44.4** & \(42.1\) & \(42.3\) & \(1.0\) & \(42.4\) & \(43.13 0.38\) & \( 0.08\) \\ halfcneetah-medium-replay & \(\) & \(34.1\) & \(35.6\) & \(7.8\) & \(33.0\) & \(32.8\) & \(39.64 0.83\) & \( 0.12\) \\ hopper-medium & \(58.0\) & \(60.3\) & \(66.5\) & \(23.3\) & \(57.3\) & \(50.7\) & \(58.52 1.92\) & \( 1.47\) \\ hopper-medium-replay & \(48.6\) & \(63.7\) & \(52.1\) & \(7.7\) & \(50.8\) & \(38.7\) & \(82.29 1.26\) & \( 0.61\) \\ walker2d-medium & \(79.2\) & \(73.3\) & \(67.1\) & \(0.0\) & \(69.9\) & \(63.7\) & \(77.85 3.18\) & \( 0.33\) \\ walker2d-medium-replay & \(26.7\) & \(60.2\) & \(58.2\) & \(3.2\) & \(51.6\) & \(29.6\) & \(72.31 1.92\) & \( 0.34\) \\  kitchen-mixed & \(51.0\) & \(22.3\) & - & - & \(17.2\) & - & \(61.9 1.22\) & \( 0.51\) \\ kitchen-partial & \(49.8\) & \(20.4\) & - & - & \(10.5\) & - & \(61.2 1.75\) & \( 0.62\) \\   
+
+Table 1: Evaluation results of offline OpenAI Gym MuJoCo tasks. We provide results for data specification with step-wise reward (left) and final return (right). **Bold** highlighting indicates top scores. LPT outperforms all final-return baselines and most step-wise-reward baselines.
+
+proposed model LPT outperforms QDT by a large margin in all three variants of the maze task. These results validate our hypothesis that the additional plan prediction KL imposes temporal consistency on autoregressive policies.
+
+### Trajectory _stitching_
+
+In addition to credit assignment, the setup of offline RL further presents a challenge, trajectory _stitching_Fu et al. (2020), which articulates the problem of shifting the trajectory distribution towards sparsely covered regimes with higher returns. In the Franka Kitchen environment, both the _mixed_, and _partial_ datasets contain undirected data where the robot executes subtasks that do not necessarily achieve the goal configuration. The "mixed" dataset contains no complete solution trajectories, necessitating that the agent learn to piece together relevant sub-trajectories. A similar setting happens in Maze2D domain. Taking Maze2D-medium as an example, in the training set, the average return of all trajectories is \(3.98\) with a standard deviation of \(10.44\), where the max return is \(47\). DT's score is only marginally above the average return. Yamagata et al. (2023) attribute DT's failure in Maze2D to its difficulty with trajectory _stitching_.
+
+Fig. 2 visualizes samples from the training data and successful trajectories in testing. The left panels show that trajectories in training are sub-optimal in terms of (1) being short in length and (2) containing very few goal-reaching instances. Trajectories on the right are generated by \(10\) random runs with LPT, where the agent successfully navigates to the end goal from random starting positions in an effective manner. This indicates that the agent can discover the correlation between different \(y\)s to facilitate such stitching.
+
+To probe into the agent's understanding of trajectories' returns, we visualize the representation
+
+   Dataset & CQL & DT & QDT & LPT & LPT-EI \\  Maze2D-umaze & \(5.7\) & \(31.0 21.3\) & \(57.3 8.2\) & \(65.43 2.91\) & \( 1.39\) \\ Maze2D-medium & \(5.0\) & \(8.2 4.4\) & \(13.3 5.6\) & \(20.62 1.81\) & \( 0.74\) \\ Maze2D-large & \(12.5\) & \(2.3 0.9\) & \(31.0 19.8\) & \(37.21 2.05\) & \( 2.98\) \\   
+
+Table 2: Evaluation results of Maze2D tasks. **Bold** highlighting indicates top scores.
+
+Figure 3: t-SNE plot of latent variables in the Maze2D-medium. Left: Training \(z_{0}\) from aggregated posterior \(_{p_{}(,y)}[p_{}(z_{0}|,y)]\). Testing \(z_{0}\) from \(p_{}(z_{0}|y)\), disjoint from training population. Right: Distribution of \(z=U_{}(z_{0})\).
+
+   Dataset & CQL & DT & LPT & LPT-EI \\  Antmaze-umaze & \(74.0\) & \(53.3 5.52\) & \(80.8 4.83\) & \( 0.80\) \\ Antmaze-umaze-diverse & \(84.0\) & \(52.5 5.89\) & \(78.5 1.66\) & \( 1.96\) \\   
+
+Table 3: Evaluation results of Antmaze tasks. **Bold** highlighting indicates top scores.
+
+Figure 2: (a) Maze2D-medium environment (b) Maze2D-large environment. Left panels show example trajectories from the training set and right panels show LPT generations. Yellow stars represent the goal states.
+
+space of the latent variables. The left of Fig. 3 is the aggregated posterior distribution of \(z_{0}\). We can see that \(z_{0}\) infered from \(p_{}(z_{0}|y)\) are distant away from the training population. The agent understands they are not very likely in the training set. The right of Fig. 3 is the distribution of \(z\), which is transformed from \(z_{0}\) with the UNet, \(z=U_{}(z_{0})\). We observe that \(z\)s from the generated trajectories become "in-distribution" in the sense that some of them are mingled into the training population and the remaining lie inside a region coverable through linear interpolation of training samples. The agent understands what trajectories to generate even if they are unlikely among what it has seen.
+
+### Environment contingencies
+
+To live in a stochastic world, contingent planning that is adaptable to unforeseen noises is desirable. Paster et al. (2022); Yang et al. (2022) discover that DT's performance would degrade in stochastic environments due to inevitable overfitting towards contingencies. We examine LPT and other baselines in Connect Four from Paster et al. (2022). Connect Four is a two-player game, where the opponent will make adversarial moves to deliberately disturb an agent's plan. According to the empirical study from Paster et al. (2022), the degradation of DT is more significant than in stochastic Gym tasks from Yang et al. (2022). As shown in Table 4, LPT achieves the highest score with minimal variance. The ESPER baseline is from Paster et al. (2022), which is very relevant to LPT as it is also a latent variable model. ESPER learns the latent variable model with an adversarial loss. It further adds a clustering loss in the latent space. LPT's on-par performance may justify that MLE upon a more flexible prior can play an equal role.
+
+## 7 Limitation
+
+We omit the Antmaze-large experiment from the main text and included potential reasons for LPT's unsatisfactory performance in Appendix A.3. Another interesting direction is to study LPT's continual learning potential. During planning, LPT explores with provably efficient posterior sampling (Osband et al., 2013; Osband and Van Roy, 2017).
+
+## 8 Summary
+
+We study generative modeling for planning in the absence of step-wise rewards. We propose LPT which generates trajectory and return from a latent variable. In learning, posterior sampling of the latent variable naturally gathers sub-trajectories to form an episode-wise abstraction despite finite context in training. In inference, the posterior sampling given the target final return explores the optimal regime of the latent space. It produces a latent variable that guides the autoregressive policy to execute consistently. Across diverse evaluations, LPT demonstrates competitive capacities of nuanced credit assignments, trajectory stitching, and adaptation to environmental contingencies. Contemporary work extends LPT's application to online molecule design (Kong et al., 2024). Future research directions include studying online and multi-agent variants of this model, exploring its application in real-world robotics, and investigating its potential in embodied agents.

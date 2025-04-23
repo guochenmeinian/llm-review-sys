@@ -1,0 +1,212 @@
+# Thinking Forward: Memory-Efficient Federated Finetuning of Language Models
+
+Kunjal Panchal
+
+University of Massachusetts
+
+Amherst, MA 01003-9264
+
+kpanchal@umass.edu
+
+&Nisarg Parikh
+
+University of Massachusetts
+
+Amherst, MA 01003-9264
+
+nkparikh@umass.edu
+
+&Sunav Choudhary
+
+Adobe Research
+
+Bangalore, India 560103
+
+schoudha@adobe.com
+
+Lijun Zhang
+
+University of Massachusetts
+
+Amherst, MA 01003-9264
+
+lijunzhang@cs.umass.edu
+
+&Yuriy Brun
+
+University of Massachusetts
+
+Amherst, MA 01003-9264
+
+brun@cs.umass.edu
+
+&Hui Guan
+
+University of Massachusetts
+
+Amherst, MA 01003-9264
+
+huiguan@cs.umass.edu
+
+###### Abstract
+
+Finetuning large language models (LLMs) in federated learning (FL) settings has become increasingly important as it allows resource-constrained devices to finetune a model using private data. However, finetuning LLMs using backpropagation requires excessive memory (especially from intermediate activations) for resource-constrained devices. While Forward-mode Auto-Differentiation (AD) can significantly reduce memory footprint from activations, we observe that directly applying it to LLM finetuning results in slow convergence and poor accuracy. In this paper, we introduce Spry, an FL algorithm that splits trainable weights of an LLM among participating clients, such that each client computes gradients using Forward-mode AD that are closer estimations of the true gradients. Spry achieves a low memory footprint, high accuracy, and fast convergence. We formally prove that the global gradients in Spry are unbiased estimators of true global gradients for homogeneous data distributions across clients, while heterogeneity increases bias of the estimates. We also derive Spry's convergence rate, showing that the gradients decrease inversely proportional to the number of FL rounds, indicating the convergence up to the limits of heterogeneity. Empirically, Spry reduces the memory footprint during training by 1.4-7.1\(\) in contrast to backpropagation, while reaching comparable accuracy, across a wide range of language tasks, models, and FL settings. Spry reduces the convergence time by 1.2-20.3\(\) and achieves 5.2-13.5% higher accuracy against state-of-the-art zero-order methods. When finetuning LLama2-7B with LoRA, compared to the peak memory consumption of 33.9GB of backpropagation, Spry only consumes 6.2GB of peak memory. For OPT13B, the reduction is from 76.5GB to 10.8GB. Spry makes feasible previously impossible FL deployments on commodity mobile and edge devices. Our source code is available for replication at https://github.com/Astuary/Spy.
+
+## 1 Introduction
+
+In cross-device federated learning (FL), thousands of edge devices (called _clients_) collaborate through an orchestrator (called _server_) to jointly train a machine learning (ML) model . In each round of FL, the server sends an ML model to participating clients, who then update the model weights for several epochs on their individual data and send the new weights back to the server. The server aggregates the weights to update the model and initiates the next round of FL training. Due to theinherent privacy-preserving nature of FL, it has been adopted in many privacy-sensitive domains, such as healthcare , IoT [4; 5], and e-commerce .
+
+In parallel, large language models (LLMs) have demonstrated impressive performance on natural language processing tasks [7; 8], creating a surge of interest in finetuning LLMs in FL settings [9; 10]. However, the problem is challenging in practice because of the memory requirements in finetuning LLMs. LLMs can have billions of weights, and finetuning them with backpropagation requires dozens of GBs of memory. These requirements easily overwhelm edge devices, particularly mobile phones with limited memory. The memory footprint of finetuning LLMs mainly comes from model weights and their gradients, optimizer states, and intermediate activations.
+
+There are three categories of existing algorithms that reduce the memory footprint of finetuning LLMs: parameter-efficient finetuning (PEFT) [11; 12; 13; 14; 15; 16], quantization , and zero-order gradient estimation methods [18; 19; 20]. Although PEFT and quantization can reduce the memory consumption from parameters and optimizer states, the memory consumed by intermediate activations remains a significant bottleneck because these methods still use backpropagation to finetune LLMs. Backpropagation requires storing all intermediate activations during the forward pass to estimate gradients in the backward pass. For example, finetuning a 4-bit quantized Llama2-7B model  with LoRA techniques  requires \(\)33.9GB of RAM, with 83.8% used for intermediate activations. Zero-order methods leverage finite difference  to estimate gradients and thus reduce the memory consumption from intermediate activations [19; 20; 23]. However, these methods suffer from slow convergence and poor model quality because the accumulation of truncation and round-off errors , a fundamental issue of finite difference, leads to noisy estimation of weight gradients.
+
+_Forward-mode Auto-Differentiation (AD)_[24; 23] has the potential to address the memory consumption problems of backpropagation without introducing the round-off errors of finite difference. It estimates gradients by computing a Jacobian-vector product (jvp) based on random perturbations of weights during the forward pass, alleviating the need to store all intermediate activations, similar to zero-order methods. jvp represents how much changing the weights in the direction of a random perturbation affects the outputs. However, simply replacing backpropagation with Forward-mode AD in FL settings does not produce convergence speed and accuracy performance comparable to established federated optimizers based on backpropagation, such as FedAvg, FedYogi, FedSgD. Forward gradients are _computationally inefficient_ and _inaccurate_ in estimating true gradients when the number of trainable weights is large. We empirically observed that, for LLMs finetuned with the LoRA technique, Forward-mode AD suffers from 8.3-57.2% accuracy loss and is 1.4-3.9\(\) slower to converge for models whose number of trainable weights exceed approximately 1.15M (see Appendix G).
+
+In this paper, we propose Spry1, an FL algorithm for finetuning LLMs using Forward-mode AD while achieving low memory footprint, high accuracy, and fast convergence. Spry tackles the shortcomings of Forward-mode AD by splitting the trainable weights among participating clients per FL round. Spry improves computation efficiency as each client only needs to perturb a small fraction of trainable weights to derive their gradients, reducing the number of computations in each forward pass. Spry achieves higher accuracy and faster convergence because the smaller number of trainable weights for each participating client allows computing gradients that are closer estimations of the true gradients. In contrast to zero-order methods where one training iteration requires 20-100 forward passes, each with a different perturbation [20; 19] to estimate weight gradients well, Spry allows computing weight gradients from only one forward pass per iteration for each client. Unlike split learning , Spry does not need to transfer intermediate activations among clients. The union of the partial weights trained from each participating client in an FL round updates all the trainable weights of the language model. Since only a subset of weights is finetuned per client, Spry also saves client-to-server communication bandwidth.
+
+We formally prove that the global gradients aggregated on the server side in Spry are unbiased estimators of the true global gradients in case of homogeneous data distributions across clients, while the heterogeneity increases the bias of the estimations. We also derive the convergence rate of Spry, showing that the norm of global gradients decreases linearly with the inverse of the number of FL rounds. We further discuss how configurations in Spry affect the convergence behavior of the algorithm and empirically validate the theoretical analysis.
+
+We empirically evaluate Spry's memory efficiency, accuracy, computation efficiency, and communication efficiency through experiments on a wide range of language tasks, models, and FL settings. Spry achieves within 0.6-6.2% of the accuracy of the best-performing FL backpropagation, with 1.4-7.1\(\) less memory consumption for each client and comparable time to convergence. Spry also outperforms zero-order-based baselines with 5.2-13.5% higher accuracy, an average of 1.5-28.6\(\) faster per-round computation time, and 1.2-20.3\(\) faster convergence. We also compare Spry's communication efficiency to that of FedAvg (per-epoch communication) and FedSgd (per-iteration communication). For communication frequency of per-epoch, Spry reduces the number of model weights sent from a client to the server by \(M\) times, where \(M\) is the number of participating clients per round. For per-iteration communication frequency, each client of Spry only needs to send back a scalar to the server, fixing the client-to-server total communication cost to \(M\) scalar values.
+
+We make the following contributions:
+
+1. Spry, the first work that demonstrate the potential of Forward-mode AD for finetuning language models (with 18M to 13B parameters) in FL settings with low memory footprint, high accuracy, and fast convergence.
+2. A federated optimization strategy that only requires a single forward pass per batch on each client to finetune a language model.
+3. A theoretical analysis of how Spry's global gradients estimate true gradients based on the heterogeneity of FL clients, and a proof that Spry's convergence is linearly dependent on the number of FL rounds when a client's learning rate is inversely proportional to the size of perturbations and client data heterogeneity.
+4. An empirical evaluation shows that Spry consumes 1.4-7.1\(\) less memory than its backpropagation-based counterparts, and converges 1.2-20.3\(\) faster with 5.2-13.5% higher accuracy compared to its zero-order counterparts.
+
+## 2 Forward-mode Automatic Differentiation
+
+This section presents the background on Forward-mode Auto-Differentiation (AD) necessary to follow the work. Related works on zero-order optimization methods, Forward-mode AD, and FL for LLMs are discussed in detail in Appendix A.
+
+Forward-mode AD computes gradients by measuring how changes in model weights, in the direction of a random perturbation, affect the loss. Since these gradients are derived from a forward pass, they are referred to as _forward gradients_. In contrast, backpropagation (also Reverse-mode AD) calculates a direction to adjust weights in, to decrease the loss. Formally, for each training iteration, given the trainable weights \(\), Forward-mode AD generates a random perturbation \(\) whose size is the same as \(\). In one forward pass, given training data \(\), Forward-mode AD computes the value of the objective function \(f(;)\) and the Jacobian-vector product (jvp) as follows:
+
+\[_{f}=_{}(;)=[;)}{ w_{1}};)}{ w_{d}}][v_{1} v_{d} ]^{T}.\] (1)
+
+This jvp is a scalar for neural networks since the output of the objective function \(f\) is a scalar. Multiplying jvp with the perturbation \(\) gives us the unbiased estimate of true gradients ,
+
+\[ F() =_{}[_{f}] =_{,}[(; )}{ w_{1}}; )}{ w_{d}}]^{T})]\] (2) \[=_{}[;)}{ w_{1}};)}{  w_{d}}]=_{}[ f(;)].\] (3)
+
+The partial derivative \( f(;)/\) is computed by chain rule on intermediate activations in the forward pass . Unlike backpropagation where all the intermediate activations need to be stored during the forward pass, Forward-mode AD only stores the previous layer's activations in the forward pass for the chain rule derivatives. Hence, the memory overhead of deriving gradients would be the size of the largest activation in the forward pass.
+
+## 3 Spry: Memory-Efficient Federated Finetuning of Language Models
+
+While Forward-mode AD can decrease memory usage during model finetuning, merely substituting backpropagation with Forward-mode AD in FL scenarios often results in poor accuracy and computational inefficiency. To address this challenge, Spry recognizes that Forward-mode AD operates more efficiently and yields better gradient estimations when the trainable weight count is minimized. Therefore, Spry optimizes performance by distributing trainable weights among participating clients, assigning each client a responsibility to compute gradients for only a subset of trainable weights. Spry is compatible with PEFT methods such as IA3 , Adapter-based methods , BitFit , and LoRA , which mitigate the memory consumption from gradients and optimizer states. In this work, we focus on LoRA due to its demonstrated superiority, as highlighted in Appendix G.
+
+Figure 1 gives an overview of Spry. It includes 5 main steps: **(1)** At the beginning of each FL round, the server assigns a few trainable layers to each of the participating clients of that round. **(2)** Each client is sent (i) the trainable weights of the layers assigned to it, (ii) frozen weights of the remaining layers if not previously received, and (iii) a scalar seed value. **(3)** On the client side, weight perturbations for the allocated layers are generated based on the received seed. These perturbations are utilized to update the assigned weights through computation of the forward gradients. **(4)** Clients only transmit the updated weights back to the server. **(5)** The server aggregates all the trained layer weights and updates the language model for the subsequent round.
+
+Next, we discuss the two key steps of Spry in detail: Step (1), where the server assigns trainable weights to the participating clients and Step (3), where each client finetunes the assigned trainable weights using Forward-mode AD.
+
+### Assigning Trainable Layers to Clients at the Server-side
+
+To enable closer gradient estimations through forward gradients, the server reduces the number of trainable weights per client by selecting a layer and assigning it to a client in a cyclic manner. With LoRA, the server selects a LoRA layer, which consists of a pair of weights (\(w_{A}\) and \(w_{B}\) matrices) for each client. When # trainable layers \(>\) # participating clients, each client will be assigned more than one layer. Otherwise, each layer will be assigned to more than one client. The server aggregates the trained weights from each client and updates the model using adaptive optimizers such as FedYogi. Adaptive optimizers are shown to be less prone to noisy updates compared to FedAvg in the literature [25; 29]. The server keeps a mapping of layer names to client IDs, hence it can gather updated layer weights from all clients and update the model.
+
+FL often faces the data heterogeneity issue, where the data distribution of one client differs from another, leading to poor model accuracy. While the primary aim of Spry does not directly tackle this issue, it seamlessly integrates with existing finetuning-based personalization techniques  to mitigate it. Spry distributes trainable classifier layers to all participating clients, enabling each client to finetune these layers to personalize the jointly trained model.
+
+### Finetuning Weights with Forward Gradients on the Client-side
+
+Clients update the assigned trainable weights with gradients estimated through Forward-mode AD. Specifically, each participating client will get a copy of the trainable weights assigned to it and a
+
+Figure 1: Overview of Spry, a federated learning framework to finetune language models with low memory footprint. The term “PEFT” stands for parameter-efficient fine-tuning.
+
+[MISSING_PAGE_FAIL:5]
+
+_(Asmp I.2), and bound on gradient magnitude \(G\) (Asmp I.3); and the following conditions on the local learning rate \(_{}\),_
+
+\[_{}=\{(}{ GL}})^{},(}G }),(}{(1-_{2})G^{2}}} )^{},.\] \[.(K}{_{2}G(3d+K-1) _{m[M]}_{c[C]}_{m,c}^{2}})\};\] (5)
+
+_The global true gradients of Spry satisfies the following bound,_
+
+\[_{0 r R}_{r}|| f(w^{(r)})||^{2} )-_{R}[f(w^{(R)})]}{ R}\] \[+(2+L}{2^{2}}+}G_{}}{^{3}})(^{2}(1-s)(3d+K- 1)}{K})_{m}_{c[C]}_{m,c}^{2},\] (6)
+
+_where \(R\) is the total number of FL rounds, \(w^{d}\) are trainable weights, \(v^{d}\) are random perturbation, \(K\) is count of random perturbations per iteration, \(\) is global learning rate, \(\) is adaptability constant, and \(s\) is client sampling rate. Rest of the symbols are defined in Theorem 4.1._
+
+**Discussion.** We focus on analyzing how different configurations in Spry affect its convergence. **(a)**_The number of FL rounds (\(R\)):_ The upper bounds of the norm of the global forward gradient in Eq. 6 decrease in proportion to the inverse of \(R\), indicating the convergence of the algorithm up to the limits of data heterogeneity. **(b)**_Dimension of perturbations (\(d\)):_\(_{}\) shows that as the number of weights to be perturbed increases, the learning rate must decrease. A lower learning rate can make convergence slower, or worse, as our empirical experiments in Appendix G will show, not converge at all. **(c)**_The number of perturbations per iteration (\(K\)):_ We observe \(K\) both in nominator and denominator, which indicates that increasing \(K\) brings little advantage in convergence speed. Results in Appendix G confirm the above statement. **(d)**_Data heterogeneity:_\(_{}^{2}}\) shows that more homogeneous data distributions across clients allow higher learning rate, and hence faster error reduction. This observation is corroborated by the comparison of convergence speeds between homogeneous and heterogeneous clients in Appendix H. **(e)**_The number of clients training same subset of weights: \(_{}\)_ shows that more clients training the same subset of weights is beneficial for faster convergence, similar observation is shown in Appendix G.
+
+The theorem also sheds light on the accuracy performance gap between Forward-mode AD and backpropagation in FL settings. The upper bounds on the global forward gradient norm includes a second term that increases with \(_{m,c}^{2}\) and variance \(_{g}^{2}\), but does not decrease with \(R\). This results in a gap between estimation errors of backpropagation-based methods like FedAvg and Spry.
+
+## 5 Empirical Evaluation
+
+We empirically evaluate Spry on 8 language tasks, 5 medium, and 3 large language models, under various FL settings. Our evaluation measures Spry's prediction performance, peak memory consumption, and time-to-convergence. We also ablate Spry's components to study the impact of communication frequency, the number of trainable parameters, the number of perturbations per iteration, the number of participating clients, and the importance of splitting layers on performance.
+
+**Datasets, Tasks, and Models.** Our evaluation uses 8 datasets: **AG News** (4-class classification), **SST2** (2-class classification), **Yelp** (2-class classification), **Yahoo** (10-class classification), **SNLI** (3-class classification), **MNLI** (3-class classification), **SquADv2** (Closed-book question answering), and **MultiRC** (2-class classification). We chose these datasets because they allow us to generate heterogeneous splits in FL settings using Dirichlet distribution . The default dataset split is across 1,000 clients, except the smallest datasets **SST2** and **MultiRC**, where there are 100 clients. **SquADv2** has 500 total clients. Each dataset has two versions: **(i)** Dirichlet \(=1.0\) (Homogeneous split), and **(ii)** Dirichlet \(=0.1\) (Heterogeneous split).
+
+Our evaluation uses the following language models: **OPT13B**, **Llama2-7B**, **OPT6.7B**, **RoBERTa Large** (355M) , **BERT Large** (336M) , **BERT Base** (110M) , **DistilBERT Base** (67M) , and **Albert Large V2** (17.9M) . For the billion-sized models, we use 4-bit quantization. For all the models, we use LoRA as the PEFT method. Appendix B describes the datasets and hyperparameters in more detail.
+
+**Comparison Counterparts and Metrics.** We compare Spry to (a) Backpropagation-based federated optimizers FedAvg, FedYogi, FedSgd (Variant of FedAvg with per-iteration communication) , (b) Zero-order federated methods FedMeZO (federated version of MeZO ), Baffle, FwdLLM, all based on finite difference. MeZO uses prompt-based finetuning to improve the performance of finite differences. FwdLLM generates a random perturbation that has a high cosine similarity to the global gradients of the previous rounds. Baffle generates \(\)100-500 perturbations per iteration. More details of these methods are in Appendix A. The original implementations of FwdLLM and Baffle had excessive memory usage in their implementations. We improve their codebase to be memory-efficient by perturbing only the trainable weights, similar to Spry. We refer to our implementation as FwdLLM+ and Baffle+.
+
+Evaluation of Spry and its counterparts for classification tasks is on **generalized accuracy**\(Acc_{g}\) and **personalized accuracy**\(Acc_{p}\), which are metrics measured on server-side aggregated model and client-side locally updated model, respectively. Similarly, for question-answering tasks, we measure **Exact Matches** and **F1 Score**. We also measure **time to convergence** and **peak memory consumption** during training. Our convergence criterion is the absence of change in the variance of a performance metric, assessed at intervals of 50 rounds.
+
+Spry is implemented in Flower  library. Quantization is done using AutoGPTQ . For the zero-order methods, we used their respective client-side implementations with the server simulation structure of Flower. We utilized two Nvidia 1080ti to conduct all experiments of sub-billion sized models and billion-sized models for Spry and its zero-order methods. We used two RTX8000s and two A100s for Llama2-7B and OPT models on backpropagation-based methods respectively. Each experiment was run thrice with 0, 1, and 2 as seeds.
+
+### Accuracy Performance Comparison
+
+Table 1 reports the accuracy performance of Spry and its backpropagation- and zero-order-based counterparts on heterogeneous datasets for million-sized RoBERTa Large, and billion-sized Llama2-7B, OPT6.7B, and OPT13B. Similar results on personalized performance is shown in Appendix H, Figure 5. Results on MultiRC for FedMeZO are absent since the prompt-based finetuning variant of Llama2-7B was unavailable. Results on more model architectures and dataset combinations are available in Appendix G. Details on the learning curves, homogeneous dataset splits, and variance across 3 runs are in Appendix H.
+
+Overall, Spry achieves 5.15-13.50% higher generalized accuracy and 4.87-12.79% higher personalized accuracy over the best-performing zero-order-based methods across all datasets. FwdLLM+, the best-performing zero-order counterpart, attempts to reduce the effect of numeric instability of finite differences by (a) Sampling \(K\) perturbations (default \(K=10\)) per batch for each client and picking 1 perturbation per batch that has the highest cosine similarity with the previous round's aggregated gradients and (b) Only picking trained weights from clients whose computed gradients have variance lower than a set threshold. However, we posit that this strategy leads to some clients getting excluded due to a low variance threshold or outlying clients getting included due to a high
+
+    &  &  &  &  \\  & Methods \(\) &  &  &  \\   & FedAvg & FedYogi & FwdLLM+ & FedMeZO & Baffle+ & Spry & best-performing best-performing backpropagation zero-order method \(\) & method \(\) \\  AG News & 93.07\% & 92.77\% & 76.94\% & 70.56\% & 57.69\% & 87.89\% & \(-\)5.18\% & 10.95\% \\ SST2 & 88.00\% & 92.14\% & 84.41\% & 72.17\% & 61.57\% & 91.54\% & \(-\)0.60\% & 7.13\% \\ SNLI & 86.45\% & 79.31\% & 74.30\% & 69.57\% & 62.10\% & 82.66\% & \(-\)3.79\% & 8.36\% \\ MNLI & 84.29\% & 84.98\% & 72.66\% & 66.66\% & 62.85\% & 80.32\% & \(-\)4.66\% & 7.66\% \\ Yahoo & 67.37\% & 63.08\% & 56.06\% & 44.69\% & 37.81\% & 61.21\% & \(-\)6.16\% & 5.15\% \\ Yelp & 90.48\% & 79.10\% & 71.83\% & 65.10\% & 55.99\% & 85.33\% & \(-\)5.15\% & 13.50\% \\ MultiRC \(\) & 47.56\% & 72.53\% & 64.58\% & N/A & 85.12\% & 68.65\% & \(-\)3.88\% & 4.07\% \\ SQuADv2 \(\) & 19.06 & 19.91 & 13.46 & 13.09 & 11.09 & 16.75 & \(-\)3.16 & 3.29 \\ SQuADv2 \(\) & 11.88 & 11.30 & 7.85 & 8.07 & 6.92 & 8.84 & \(-\)3.04 & 0.77 \\   
+
+Table 1: Generalized accuracy for Spry and its backpropagation- and zero-order-based counterparts on RoBERTa Large and LLMs. SQuADv2 uses F1 score. \(\) shows that higher values are better. The datasets are split with Dir \(=0.1\). \(\) = Llama2-7B. \(\) = OPT6.7B. \(\) = OPT13B. Spry outperforms the best-performing zero-order-based methods by 5.15-13.50% and approaches the performance of backpropagation-based methods, with a difference of 0.60–6.16%.
+
+variance threshold. Besides, picking new perturbations based on the previous round's aggregated gradients in the initial rounds can damage the learning trajectory. While Baffle+ samples more perturbation for each batch to make zero-order finite differences more tractable, the scale of language models demands perturbations on the scale of 500-1000 per batch, which becomes computationally infeasible. FedMeZO manages to outperform Baffle+ due to its prompt-based finetuning trick but still falls short due to only using 1 perturbation per batch for finite differences on each client. In contrast, Forward-mode AD used in Spry avoids the numerical instability from finite differences and improves accuracy by reducing trainable weights assigned to each client.
+
+Compared to backpropagation-based methods, FedAvg and FedYogi, Spry manages to come as close as 0.60-6.16% of generalized accuracy and 2.50-14.12% of personalized accuracy. The performance gap between backpropagation and Forward-mode AD arises because in backpropagation, weight updates are more accurate as all gradients are computed directly using the error signal of the objective function. In contrast, Forward-mode AD relies on random perturbations, which is relatively less accurate for gradient estimation. Nonetheless, the advantages of Spry become evident when we see the peak memory consumption of Forward-more AD compared to backpropagation, which we will discuss next.
+
+### Peak Memory Consumption Comparison
+
+Figure 2 shows peak memory consumption of backpropagation (used in FedAvg, FedYogi), zero-order finite differences (used in FwdLLM+, Baffle+, FedMeZO), and first-order forward mode AD (used in Spry). The methods are profiled for a single client.
+
+Compared to backpropagation, Forward-mode AD reduces peak memory usage of RoBERTa Large by 27.90%, Llama2-7B by 81.73%, OPT6.7B by 86.26% and OPT13B by 85.93%. The sizes of trainable parameter (colored ) and gradient + optimizer state (colored ) are consistent across the 3 modes of computing gradients for all 4 models. Hence the savings come from the reduced memory footprint related to activations (colored ) in Forward-mode AD. Compared to backpropagation-based methods, the memory cost related to activations is decreased by 12.12-49.25\(\) in Spry. Unlike storing all the intermediate activations in backpropagation, Forward-mode AD only has to store the previous layer's activation in a forward pass. The activation footprint of Forward-mode AD is equal to the size of the largest activation.
+
+Against zero-order methods, Forward-mode AD activations cost 1.96\(\), 1.95\(\), 1.83\(\), and 1.54\(\) more for RoBERTa Large, Llama2-7B, OPT6.7B, and OPT13B respectively. The increasing cost comes from parallel evaluations of (a) the objective function on the original weights and (b) jvp computation on the perturbations in a single forward pass. However, as discussed in SS 5.1, the increased memory cost is offset by a boost of up to 13.50% in accuracy performance. And as SS 5.3 will discuss, Forward-mode AD reaches convergence faster than zero-order methods since it takes fewer steps to compute a closer gradient estimation.
+
+### Time to Convergence Comparison
+
+Figure 3 shows wallclock time-to-convergence for Spry and its counterparts. We observe that Spry is 1.15-1.59\(\), 6.16-20.28\(\), and 1.34-2.98\(\) faster than the zero-order methods FwdLLM+, Baffle+, and FedMeZO respectively. For a client in each round, Spry achieves a faster per-round computation time of 1.46\(\), 28.57\(\), and 1.80\(\) on average, against FwdLLM+, Baffle+, and FedMeZO. Forward-mode AD achieves faster convergence and faster per-round computation by providing a more accurate gradient estimation through a single perturbation per batch, leading to fewer steps needed to reach convergence. Since each client in Spry only trains partial weights,
+
+Figure 2: Peak memory consumption of Spry’s Forward-mode AD versus backpropagation- and zero-order-based methods. RoBERTa Large, Llama2-7B, and OPT6.7B are profiled with a batch size of 8, and OPT13B with a batch size of 4. Spry reduces total memory usage by 27.90–86.26% compared to backpropagation-based methods. The 1.54–1.96\(\) additional memory Spry uses, compared to zero-order-based methods, is offset by the accuracy gains (§ 5.1).
+
+it gains a speedup of 1.14\(\) over backpropagation-based FedAvg, FedYogi, and FedSGD for RoBERTa Large. However, compared to the backpropagation-based methods, Spry slows down for billion-sized LMs. We attribute this loss of speedup to the way jvp is computed in Forward-mode AD. jvp is computed column-wise, while its counterpart vjp in backpropagation are computed row-wise. The column-wise computation incurs time overhead.
+
+### Ablation Studies
+
+We summarize the ablation experiments on various components of Spry. Further discussions are in Appendix G.
+
+**Spry can generalize to other language model architectures.** Similar to the observations from Table 1, we see a trend of Spry outperforming the best performing zero-order method FwdLLM+ by 3.15-10.25% for generalized accuracy, demonstrating that Spry can generalize to other language model architectures.
+
+**Spry is compatible with other PEFT methods.** We integrate Spry with different PEFT methods like IA3, BitFit, and Classifier-Only Finetuning. Results shows that LoRA with Spry performs the best, with accuracy improvements of 10.60-16.53%.
+
+**Effects of the number of trainable weights.** We change the number of trainable weights by controlling the rank \(r\) and scale \(\) hyperparameters in LoRA. Results show that Spry achieves the highest accuracy with (\(r\)=1, \(\)=1) setting, which has the smallest trainable weight count. The result is consistent with our theoretical analysis in SS4.
+
+**Effects of communication frequency.** Per-iteration communication in Spry has been shown to boost accuracy by 4.47% compared to per-epoch communication. This improvement brings the accuracy within 0.92% and 0.96% of FedAvg and FedSGD, respectively.
+
+**Effects of perturbation count per batch.** We observe that increasing the number of perturbations per batch (\(K\)) for Forward-mode AD has little to no impact on the end prediction performance of Spry, with \(K=100\) improving the generalized test accuracy by 1.1% over \(K=1\). The benefits of increasing \(K\) are however seen in the convergence speed. Setting \(K=10\) achieves a steady state (of accuracy \(\)86%) around the 200th round, while the setting with \(K=1\) takes 500 rounds.
+
+**Effects of participating client count.** Increasing the client count increases the prediction performance of Spry. For the SST2 dataset, with the total client count fixed to 100, the three settings \(C=10\), \(C=50\), and \(C=100\) produce accuracies of \(85.14\%\), \(86.56\%\), and \(88.08\%\), respectively. We also see an improvement in the convergence speed as the participating client count increases. To achieve an accuracy of \(\)85%; \(C=10\), \(C=50\), \(C=100\) require 500, 450, and 150 rounds, respectively.
+
+**Importance of splitting weights.** To understand the effects of splitting, we conduct the following two experiments: (a) With FedAvgSplit, we apply the strategy of splitting trainable layers across clients (see SS 3.1) to backpropagation-based FedAvg, and (b) With FedGD, we omit the splitting strategy of Spry for FL with Forward-mode AD. We observe that FedAvgSplit fails to achieve similar accuracy to FedAvg with a drop of 2.60-10.00%. FedFed fails to converge as the size of trainable weights increases, e.g., with RoBERTa Large with LoRA, that has 1.15M trainable weights. This proves the necessity of splitting trainable weights for Forward-mode AD in Spry.
+
+### Communication and Computation Costs
+
+Tables 2 and 3 in Appendix F shows the communication and computation overhead of Spry against all its baselines. We summarize the main observations here:
+
+**Spry has lower communication cost due to the splitting strategy and scalar** jvp.** Suppose \(w_{g}\) is the total trainable parameter count of a model to be trained in federated setting. The
+
+Figure 3: Time to convergence for Spry and its counterparts. Spry achieves faster convergence than zero-order methods due to more accurate gradient estimations in a single perturbation.
+
+backpropagation-based baselines; FedAvg (per-epoch communication), FedSgd (per-iteration communication), and FedYogi (per-epoch communication) transmit the entire set of trainable parameters to each participating client, and receives the same from each participating client. That results in "client to server" communication cost of \(w_{g}\) and "server to client" communication cost of \(w_{g} M\). The per-epoch versions of the zero-order baselines (FedMeZO, Baffle, FwdLLM) follow a similar logic due to all the parameters needing to be transmitted to each client, with "client to server" communication costing \(w_{g}\), and "server to client" communication taking the cost of \(w_{g} M\). However, the per-iteration versions of the zero-order baselines fare better, with "client to server" communication only requiring each client sending a scalar finite difference (cost of 1), and "server to client" communication accruing \((w_{g}+1) M\) cost, due to the server also needing to send a scalar seed to each client now.
+
+Meanwhile, Spry only needs to send \((,1)\) layers (where \(L\) is the total layer count of a model, and \(M\) is the participating count of clients for a round), each layer of size \(w_{}\). Hence, for per-epoch "client to server" communication accrues \(w_{}(,1)\), which is smaller than \(w_{g}\). Similarly, per-epoch "server to client" communication costs \(w_{}M(,1)\), which is also smaller than the cost of \(w_{g}M\) related to the baselines. For per-iteration communication, clients only need to send a scalar jvp (cost of 1) to the server; this matches the communication cost of per-iteration zero-order methods. Server needs to send a total of \(w_{}M(L,M)\) (derivation given in Table 2), which is a smaller cost than the costs of backpropagation and zero-order methods.
+
+Spry accrues lower computation cost due to lower trainable parameter count.Spry's client-side computation cost is traded off by a faster convergence to higher accuracy through better gradient approximations compared to finite difference-based methods. And Spry is the least computationally expensive on the server side due to needing to aggregate fewer parameters from the clients.
+
+Let's assume that matrix multiplication costs \(c\) for each layer, resulting in a forward pass cost of \(c\). The cost of backpropagation is \(2c\) because the computation of the current layer's weight gradient is \(c\), and the cost of computing the previous layer's activation gradient is another \(c\). jvp computation in Spry takes additional cost of \(c\) for each layer. Moreover, since jvp calculation happens through column-by-column vector multiplications, the related overhead is quantified by \(v\).
+
+Hence backpropagation-based methods FedAvg, FedSgd, and FedYogi computationally costs \(3Lc\) at client, and costs \(w_{g}(M-1)\) at server (due to additions). Note that \(L\) amounts to all layers in the model here. FedMeZO costs \(L(2c+3w_{})\) at client through two forward passes, and generating perturbations three times. FwdLLM and Baffle costs \(KL(2c+w_{})\) due to \(K\) perturbations for all \(L\) layers, with two forward passes and generation perturbations once. Against that, Spry costs \(2(,1)(c+v)+w_{}L\) for a smaller count of \(L\), traded-off by the jvp computation cost of \(v\).
+
+On the server side, Spry is the least computationally demanding. Spry needs to aggregate a subset of layer weights from only the clients that were assigned to those layers. Computation cost on the server-side changes based on the communication frequency per-iteration communication incurs an additional overhead of \(w_{}L(+1)\) and \(w_{}L(M+1)\) (generation of perturbations at the server-side, and multiplying those perturbations with aggregate of the jvp values received from the clients) for Spry and its zero-order counterparts respectively.
+
+## 6 Conclusion
+
+Spry enables finetuning medium and large language models in cross-device FL. It introduces a training strategy where trainable weights are split across federated clients, so each client only applies Forward-mode AD to a fraction of the weights. This approach significantly reduces the memory footprint compared to backpropagation and achieves better gradient estimation, resulting in higher accuracy and faster convergence than zero-order methods. Experiments on various language tasks and models demonstrate Spry's effectiveness in reducing memory usage while maintaining accuracy comparable to backpropagation. We formally prove that the estimation bias of the global forward gradients in Spry depends on data heterogeneity across clients. We also analyzed how the convergence rate of Spry relates to the configurations of Spry and FL settings including properties of weight perturbations, data heterogeneity, and the number of clients and FL rounds.

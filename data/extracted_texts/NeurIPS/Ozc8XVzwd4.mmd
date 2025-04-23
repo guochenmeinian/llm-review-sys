@@ -1,0 +1,259 @@
+# VCC: Scaling Transformers to 128K Tokens or More by Prioritizing Important Tokens
+
+Zhanpeng Zeng
+
+University of Wisconsin, Madison
+
+zzeng38@wisc.edu
+
+&Cole Hawkins
+
+AWS AI
+
+colehawk@amazon.com
+
+Mingyi Hong
+
+University of Minnesota, Minneapolis & AWS AI
+
+mhong@umn.edu
+
+&Aston Zhang
+
+AWS AI
+
+astonz@amazon.com
+
+Nikolaos Pappas
+
+AWS AI
+
+npappa@amazon.com
+
+&Vikas Singh
+
+University of Wisconsin, Madison
+
+vsingh@biostat.wisc.edu
+
+&Shuai Zheng
+
+AWS AI
+
+shzheng@amazon.com
+
+###### Abstract
+
+Transformers are central in modern natural language processing and computer vision applications. Despite recent works devoted to reducing the quadratic cost of such models with respect to sequence length, dealing with ultra long sequences (e.g., \(>\)16K tokens) remains challenging. Applications such as answering questions based on a book or summarizing a scientific article are inefficient or infeasible. Here, we propose to significantly improve the efficiency of Transformers for ultra long sequences, by compressing the sequence into a much smaller representation at each layer. Specifically, by exploiting the fact that in many tasks, only a small subset of special tokens, which we call VIP-tokens, are most relevant to the final prediction, we propose a VIP-token centric compression (VCC) scheme which selectively compresses the sequence based on their impact on approximating the representation of the VIP-tokens. Compared with competitive baselines, our algorithm is not only efficient (achieving more than \(3\) compute efficiency gain compared to baselines on 4K and 16K lengths), but also offers competitive/better performance on a large number of tasks. Further, we show that our algorithm scales to 128K tokens (or more) while consistently offering accuracy improvement. Code is available at https://github.com/mlpen/VCC.
+
+## 1 Introduction
+
+The Transformer  is a fundamental/foundational architecture for natural language processing (NLP) and computer vision. It has shown remarkable performance across NLP applications including machine translation , language inference , and summarization . Transformers have also been successfully applied to various visual recognition tasks and achieve impressive results . Unfortunately, the runtime/memory needs of Transformers involve an unfavorable dependence on the input sequence length, making the use of Transformers for ultra-long sequence applications difficult. Therefore, many studies on Transformers make use of strategies such as truncation to ensure that the input sentence length is at most \(512\), e.g., BERT, T5, and other Transformer-based language models . Unfortunately, such a truncation, and other related strategies, inevitably results in loss of accuracy, the extent of which can vary from one task/dataset to another. Consequently, improving the efficiency for longer input sequence length is a key focus of many proposals. These developments areimportant milestones, and they have reduced the quadratic dependency on sequence lengths to linear [6; 25; 35; 2; 38; 40; 39]. Currently, many Transformer models can process samples with sequence lengths of up to 4K (and even 16K). Very recently, results of newer models being able to handle much longer sequences have appeared .
+
+**Rationale.** It is natural to ask whether the ability to process longer sequences is worth the trouble. The short answer is yes. Improved accuracy has been reported on long sequence tasks [2; 38; 14]. So, what is stopping us from harvesting even stronger gains in accuracy by feeding even longer sequences to such models? Models such as Longformer  and Big Bird  become slow and consume an excessive amount of memory as the sequence length keeps increasing. See Fig. 1 for illustration. Why? The representation update of every token involves computing efficient attention and feed-forward network at each layer. This incurs a linear cost relative to the sequence length and is expensive for sequences much longer than 4K (or 16K) tokens. To endow the models the ability to learn ultra-long range dependency, we need to lower this cost. What we describe in this paper is a concrete step forward - based on certain task-specific assumptions which appear to generally hold, we outline a formulation that works and delivers the expected improvements.
+
+**(1) Focus on what we need for a task: VIP-token centric compression (VCC).** We hypothesize/find that in many tasks where Transformers are effective, only a small subset of tokens, which we refer to as VIP-tokens, are relevant to the final output (and accuracy) of a Transformer. If these tokens had been identified somehow, we could preserve this information in its entirety and only incur a moderate loss in performance. Now, _conditioned_ on _these_ specific VIP-tokens, an aggressive compression on the other _non-VIP-tokens_, can serve to reduce (and often, fully recover) the loss in performance while dramatically decreasing the sequence length. This compression must leverage information regarding the VIP-tokens, with the goal of improving the approximation of the representation of the VIP-tokens. In other words, a high-fidelity approximation of the entire sequence is unnecessary. Once this "selectively compressed" input passes through a Transformer layer, the output sequence is decompressed to the original full sequence allowing the subsequent layers to access the full sequence.
+
+**(2) Specialized data structure for compression/decompression.** A secondary, but important practical issue, is reducing the overhead when compressing/decompressing the input/output sequences internally in the network. Ignoring this problem will impact efficiency. We give a simple but specialized data structure to maintain the hidden states of the intermediate layers, where the compression can be easily accessed from the data structure, and explicit decompression can be avoid by updating the data structure: the sequence is never fully materialized in intermediate layers.
+
+**Practical contributions.** Apart from the algorithmic modules above, we show that despite an aggressive compression of the input sequences, we achieve better/competitive performance on a broad basket of long sequence experiments. Compared to baselines, we get much better runtime/memory efficiency. We show that it is now practical to run **standard** Transformer models on sequences of \(128\)K token lengths, with consistent performance benefits (and **no** complicated architecture changes).
+
+## 2 Preliminaries
+
+We review the Transformer layer, related work on efficient Transformers and define notations/simplifications. **BOLD** uppercase letters denote matrices, **bold** lower case letters denote vectors, and regular lower case letters denote scalars or functions.
+
+**Brief review of the Transformer Model.** Fix \(n\) to be the sequence length and let \(d\) be the embedding dimension. Define an embedding matrix \(^{n d}\) which gives the \(n\) feature vector inputs for a Transformer layer. The output of this Transformer layer, \(_{new}\), is defined as
+
+\[_{new}=(()+)+()+ \] (1)
+
+using \(()\) as shorthand for \((,,)\), which is a multi-head attention (MHA) with \(\) as input for queries, keys, and values, described shortly. Here, \(()\) is a feed-forward network (FFN). Layer
+
+Figure 1: Model efficiency of processing one sequence on a NVIDIA A100 as sequence length increases (note logarithm \(x\) axis).
+
+norms  are omitted to reduce clutter. Let the inputs to \((,,)\) be \(,,^{n d}\) for queries, keys, and values. MHA is defined as:
+
+\[(,,):=_{i=1}^{i=g}[(_{Q,i}_{K,i}^{}^{}) _{V,i}]\] (2)
+
+where \(g\) is the number of attention heads, \(\{_{Q,i},_{K,i},_{V,i}\}\) are trainable projections, and the 'cat' concatenates the outputs of multiple self-attention modules. We omit the biases for notational simplicity. For ease of discussion, let us further simplify the above notation by assuming that \(g=1\), and suppress \(_{Q,1},_{K,1},_{V,1},\) as well as the normalization in softmax: they will _still_ be estimated within the model (i.e., this module remains unchanged) but are tangential to the description of our idea. With these simplifications, the \((,,)\) can be expressed as:
+
+\[(,,):=(^{}) .\] (3)
+
+Let \(()\) be a placeholder for all heavy computations in the Transformer layer above:
+
+\[():=(()+)+().\] (4)
+
+We can verify that the output of a Transformer block (parameters are suppressed to reduce clutter) is,
+
+\[_{new}=()+.\] (5)
+
+A Transformer model consists of many such layers: the input of each layer is the output \(_{new}\) from the previous layer. Let \(l\) be the number of layers, then the overall complexity is \((ln^{2}d+lnd^{2})\).
+
+**Efficient Transformers.** Many efficient self-attention methods are available to reduce the \((ln^{2}d)\) cost. We list a few models noting that this list is not exhaustive. Performer , Random Feature Attention , and Nystromformer  propose different low rank approximations of the self-attention matrices. Longformer  and Big Bird  describe global + local sparse attention. Redformer  and YOSO  exploit locality sensitive hashing for approximating the self-attention matrix. MRA attention  gives a multi-resolution approximation of the self-attention matrices. Memorizing Transformers  and RMT  follow a recurrent design and store the past context in an external memory module. By sequentially processing one segment of input sequences at one time, they avoid blowing up the memory when processing long sequences.
+
+**Efficient Transformers do not scale well to ultra-long sequences**. Existing self-attention mechanisms often reduce the quadratic cost of MHA to linear. But so far, most experiments report sequence lengths of up to 4K, with some exceptions . Beyond 4K, the linear cost (on \(n\)) for both computing efficient attentions and FFN makes the cost prohibitive, especially for large models. For example, although LongT5  can train on sequence lengths of up to 16K tokens with an efficient self-attention and shows promising results for longer sequences, it is slower and needs a sizable amount of compute (for example, see Fig. 1). Similar to efficient self-attention with linear cost attention,  and  do not try to reduce the linear cost (on sequence length) for FFN, so the computation might still be expensive for processing ultra long sequences. On the other hand, our method seeks to reduce the overall cost (both self-attention and FFN) of processing ultra long sequences and processes the entire sequence simultaneously.
+
+**Other alternatives for sequence compression?** Compressing input sequences for efficiency reasons in Transformers is not a new idea. For example,  and  propose pyramid Transformer variants that progressively compress the sequence as the layers grow deeper via pooling or core-set selection.  proposes adaptively compressing the sequence based on the predicted semantic boundaries within the sequence.  proposes compressing the fine-grained past activations to coarser memories. There are **three** key differences with our approach. First, all methods listed above are _task agnostic_. They seek compressed/smaller representations to represent the _original_ sequence well. Our formulation places no emphasis on representing the original sequence, as long as information pertinent to the VIP-tokens is preserved as much as possible. Second, once these methods compress the sequence, the residual information is lost (for the deeper layers or the later time steps). Our entire approach is predicated on avoiding this loss - we maintain access to the full sequence at each layer (via residual connection at least). Lastly, some of these ideas often involve an \(n^{2}\) dependence on the sequence length in the initial stages of their formulation, making long sequence experiments problematic.
+
+## 3 VIP-Token Centric Compression (VCC)
+
+Our main goal is to reduce the dependency on \(n\) (but _not_ by modifying Transformer internals). To do this, we describe a scheme that compresses the input sequence of a Transformer layer and decompresses the output sequence, resulting in a model whose complexity is \((lrd^{2}+lr^{2}d+lr(n_{c})d+lrn_{p}d+nd)\). Here, \(r\) is the length of the compressed sequence, \(n_{p}\) is the number of VIP-tokens described shortly, and \(n_{c}\) is the size of non-VIP/remaining tokens. So, we have \(n_{p}+n_{c}=n\) and assume \(n_{p} r n\). (complexity analysis is provided in the Appendix.)
+
+**Parsing the complexity term:** Let us unpack the term to assess its relevance. The first two terms \((lrd^{2}+lr^{2}d)\) pertain to the cost for a Transformer, while the remaining terms are the overhead of compression and decompression. The term \((lr(n_{c})d+lrn_{p}d)\) is the overhead of compression and updating our data structure at each layer. The \((nd)\) term corresponds to pre-processing involving converting the hidden states into our data structure and post-processing to recover the hidden states from the data structure. Note that unlike the dependence on \(n\) for vanilla Transformers, this \((nd)\) is incurred only at the input/output stage of the Transformer, but **not** at any intermediate layers.
+
+**High level design choices.** We use the _standard_ Transformer layers with a _standard_ feed-forward network (which results in \(d^{2}\) in the first term) and _standard_ quadratic cost self-attention (which gives the \(r^{2}\) factor in the second term). Why? These choices help isolate the effect of incorporating their efficient counterparts. The proposed algorithm operates on the _input/output of each Transformer layer_ leaving the Transformer module itself unchanged. Therefore, our goals are distinct from the literature investigating efficient self-attentions and efficient feed-forward networks. This is because one can replace these two vanilla modules with _any other_ efficient alternatives to further reduce the \(r^{2}\) and \(d^{2}\) terms directly. Despite these quadratic terms, our approach is faster than baselines (SS4).
+
+We will first describe our general idea, as shown in Fig. 2, which uses VIP-tokens to guide the compression/decompression of the input/output of a Transformer layer so that it only needs to process the compressed sequence (SS3.1, SS3.2). Then, we will discuss an instantiation of the compression process, by adapting a multi-resolution analysis technique (SS3.3). Lastly, we will introduce a data structure which allows more efficient compression/decompression (SS3.4).
+
+### Elevating the Importance of a Few Tokens: VIP-Tokens
+
+Let us start with the simplest compression, which identifies a linear transformation \(^{r n}\) which acts on the input, resulting in a smaller representation \(^{r d}\). Of course, a smaller \(r\) implies that more information about \(\) is lost. But we find that in many tasks, only the embedding representations of _a few_ tokens drive the final prediction: we refer to these tokens as _VIP-tokens_.
+
+**Examples of VIP-tokens:** Observe that only the embedding outputs of masked tokens in masked language modeling  and the CLS token in sequence classification  are/is used for prediction. In question answering, only the questions and possible answers associated with the questions are used for prediction. It is important to note that the masked tokens, CLS tokens, and question tokens are **(1)** defined by the tasks and **(2)**_known_ to the model (although the embedding representation of these tokens are unknown). These VIP-tokens can be viewed as a task or question that is given to the model. The model can process the sequence with a specific goal in mind so that the model can skip/skim less relevant segments. Our general principle involves choosing _a set of tokens_ as the VIP-tokens that **(1)** are important to the specific task goals and **(2)** easily pre-identifiable by the user.
+
+_Caveats._ Not all important tokens can be pre-identified. For example, the tokens in the correct answer span in answer span prediction are also important to the specific goals, but are difficult to pre-identify, so only the question tokens (and not the answer tokens) are used as VIP-tokens. We assume that any other tokens that are relevant for prediction should have high dependency with these VIP-tokens. For example, the answer tokens should have high dependency (in self-attention) to the question tokens.
+
+**VIP-tokens occupy the front seats.** VIP-tokens can occur anywhere within a sequence. But we can re-order the sequence as well as the positional encodings so that VIP-tokens are always at the _head of sequence_ to make analysis/implementation easier. With this layout, let \(^{n_{p} d}\) be the VIP-tokens and \(^{n_{e} d}\) be the non-VIP/remaining tokens, \(\) can be expressed as
+
+\[=\\ \] (6)
+
+This is possible since Transformer is permutation invariant when permuting positional encodings (embeddings or IDs) along with tokens. This re-ordering is performed only once for the input of the Transformer model, then the outputs generated by the model are rearranged to their original positions.
+
+Re-ordering makes the analysis, implementation and presentation of our method much clearer and simpler. In fact, placing VIP tokens at the end of the sequence can also serve the same purpose.
+
+From the above discussion, it is clear that one needs to make sure that after compressing the input tokens \(\), the VIP-tokens must still stay (more or less) the same, and the compression matrix \(\) must be _VIP-token dependent_. We hypothesize that such _VIP-token dependent_ compression matrices require a much smaller dimension \(r\), compared to _VIP-token agnostic_ compression matrices.
+
+### VIP-Token Centric Compression (VCC): An Initial Proposal
+
+For a Transformer layer, let \(\) denote its input matrix. Express the output of this layer as follows:
+
+\[_{new}=^{}()+\] (7)
+
+where \(^{r n}\) is a _compression_ matrix compressing \(\) to a smaller representation and \(^{}\) is the pseudo inverse for _decompression_. With the layout in (6), we can write (7) as
+
+\[_{new}\\ _{new}=^{}( \\ )+\\ \] (8)
+
+where \(_{new}\) and \(_{new}\) are the new embeddings for \(\) and \(\).
+
+**Always reserve seats for VIP-tokens.** What is a useful structure of \(\)? Since \(_{new}\) is the embedding output for the VIP-tokens \(\), we want them to be fully preserved. To achieve this, we impose the following structure on \(\) and \(^{}\):
+
+\[=_{n_{p}}&0\\ 0&_{c}^{}= _{n_{p}}&0\\ 0&_{c}^{}.\] (9)
+
+The rearrangement simply says that we will avoid compressing \(\). But rewriting it in this way helps us easily unpack (8) to check the desired functionality of \(_{c}\).
+
+**Prioritize information in VIP-tokens.** Our goal is to ensure \(_{new}\) generated from the compressed sequence in (8) will be similar to its counterpart from the uncompressed sequence. Let us check (8) using the compression matrix \(\) defined in (9) first. We see that
+
+\[_{n_{p} n_{p}}&0\\ 0&_{c}^{}( \\ _{c})=(( ,,)+)+( ,,)\\ _{c}^{}((_{c}, ,)+_{c})+_{c}^{ }(_{c},, ).\] (10)
+
+The \(\) color identifies terms where \(_{new}\) interacts with other compression-related terms \(\) and/or \(_{c}\). We primarily care about \(_{new}\) in (8), so the first (\(\)) row in (10) is the main concern. We see that \(_{new}\) only depends on the compressed \(\) via \((,,)\). We can further unpack,
+
+\[(,,)=( ^{}^{})=( ^{})+(^{}_{c}^{ })_{c}.\] (11)
+
+Again, \((,,)\) depends on \(\) and \(_{c}\) via the second (\(\)) term. Normalization in softmax is omitted for simplicity of discussion. This helps us focus on the key term that matters: \((^{}_{c}^{})_{c}\). As long as the following approximation using \(_{c}\) is good
+
+\[(^{}_{c}^{})_{c} (^{}),\] (12)
+
+we will obtain a good approximation of \(_{new}\). Our remaining task is to outline a scheme of finding a compression matrix \(_{c}\) such that this criterion can be assured.
+
+### A Specific Instantiation via Multi-Resolution Compression
+
+What should be the mechanics of our compression such that (12) holds? In general, to get \(_{c}\), we can use any sensible data driven sketching idea which minimizes the error of (12). Doing so efficiently needs a bit of work; we describe the high level idea below and the low-level details are provided in Appendix.
+
+Figure 2: Diagram that illustrates a Transformer layer with VIP-token centric sequence compression.
+
+**High level idea.** Ideally, an efficient scheme for constructing \(_{c}\) should operate as follows. If some regions of the sequence \(\) have a negligible impact on (12) (via the orange terms above), the procedure should compress the regions aggressively. If other regions are identified to have a higher impact on (12) (again due to the orange terms above), the procedure should scan these regions more carefully for a more delicate compression. This suggests that procedurally a coarse-to-fine strategy may work. For example, multi-resolution analysis does help in approximating self-attention matrices in Transformers , but the formulation in  cannot be easily written in a form similar to (12), making it incompatible with our design. Nonetheless, we derive an analogous form (details in Appendix) that can be represented in a similar form as (12) and gives a strategy for obtaining \(_{c}\).
+
+Specifically, let us define a compressed representation (via averaging) of the \(x\)-th \(s\)-length segment of sequence \(\): \(_{x}^{s}^{d}\)
+
+\[_{x}^{s}:=_{sx-s<i sx}[]_{i}\] (13)
+
+where \(s\{k^{0},k^{1},k^{2},,n_{c}\}\) assuming \(n_{c}\) is a power of \(k\) and \(x\{1,2,,n_{c}/s\}\). \([]_{i}\) refers to the \(i\)-th row of the input matrix. We fix the increment ratio \(k=2\) for simplicity of discussion. The \(s\) represents the resolution of the approximation: it represents the number of non-VIP token embeddings being averaged into a vector \(_{x}^{s}\). Higher \(s\) (e.g., \(s=8\) in \(_{1}^{8}\) in Fig. 3) means lower resolution and heavier compression of the corresponding segment. The \(x\) represents the location of the \(s\)-length segment within the sequence \(\). In our scheme, we compress the sequence \(\) and use a set of \(_{x}^{s}\) for some selected \(s\)'s and \(x\)'s as the rows of the compressed \(_{c}\) as seen in Fig. 3. The sequence \(\) is broken into multiple segments of different lengths, then each segment is compressed into a vector \(_{x}^{s}\).
+
+Procedurally, as shown in Fig. 3, our scheme starts with the heaviest compression and progressively refines certain segments of \(\) guided by the VIP-tokens \(\). The scheme starts with the heaviest compression that treats \(\) as a \(n_{c}\)-length segment and compresses it to a single \(_{1}^{n_{c}}\). Then, starting with \(s=n_{c}\) (root node), the procedure **(1)** computes the averaged attention scores between VIP-tokens \(\) and \(_{x}^{s}\)'s for different \(x\)'s (averaged over all attention heads and all VIP-tokens; only one \(_{1}^{n_{c}}\) at level \(s=n_{c}\)). We note that the attention scores are obtained by extracting attention matrices from MHA module (2) of the current Transformer layer when using \(\) as queries and \(_{x}^{s}\)'s as keys. Then, it **(2)** splits the \(s\)-length segments corresponding \(_{x}^{s}\)'s with higher averaged attention scores (one segment is split in Fig. 3 but we might split more segments, again only one \(_{1}^{n_{c}}\) at level \(s=n_{c}\)) into \((s/2)\)-length sub-segments: the corresponding \(_{x}^{s/2}\) (13) of each sub-segment is computed for finer representation. Then, at next level for \(s=n_{c}/2\), the same procedure proceeds. This process continues until the sub-segments have length \(1\). We note that this procedure is guided by the VIP-tokens \(\) and designed to maximally reduce the error of approximating (12). No additional learnable parameters are introduced for this scheme. The technical details of this algorithm are less relevant for our overall approach, but for interested readers, the details are discussed in the Appendix.
+
+**How good is this approximation?** The output \(_{new}\) (8) is well approximated since the approach preserves the relevant components of \(\) that have a high impact on the output \(_{new}\). Further, if the VIP-tokens \(\) have high attention weights for some rows of \(\), then the corresponding row in \(\) will be approximated with higher frequencies (less compressed). So, the output in \(_{new}\) (8) for a subset of non-VIP tokens that have a higher dependency with the VIP-tokens will have a better approximation than the others, as desired. This property is useful since some tokens with unknown locations but manifesting a high dependency with the VIP-tokens can also relevant
+
+Figure 4: Proposed data structure \(()\)
+
+Figure 3: Illustration of multi-resolution compression. \(n_{c}=8\). Purple line: compute attention scores between \(\) and different segments. Green arrow: segment with higher attention score is split into two sub-segments. Accordingly, \(_{c}=_{1}^{2}&_{3}^{1}& _{4}^{1}&_{2}^{4}^{}\) is constructed.
+
+to the final prediction of a Transformer model in some tasks. The answer in span-based question answering tasks is one example, and our construction ensures that they will be approximated well too.
+
+### Efficient Data Structure for Compression/Decompression
+
+By employing the procedure in SS3.3 illustrated in Fig. 3, we can find the compressed \(_{c}\) with an \((n_{c}d+rn_{p}d)\) cost at each layer. The main cost \((n_{c}d)\) is due to computing \(_{x}^{s}\) defined in (13) for all resolution \(s\) and location \(x\) by using recursive relation from the bottom up:
+
+\[_{x}^{2s}=_{2x-1}^{s}+_{2 x}^{s}_{x}^{1}=[]_{x}\] (14)
+
+We find that these steps could introduce a large overhead. Further, note that if we decompress (apply \(^{}\) to) the output of \(\) for compressed sequence as in (8), the cost is \((nd)\) since the number of nonzero entries in \(^{}\) is \(n\) (more details in Appendix). As a solution, we now introduce a data structure \(()\) for storing \(\) and \(_{new}\), as shown in 4, which enables efficient computation of \(_{x}^{s}\) and eliminates explicit decompression. We note that this data structure is only possible due to the specific structure of \(_{c}\) constructed in SS3.3. Specifically, \(()\) stores \(_{1}^{n_{c}}\) and \(_{x}^{s}\) defined as
+
+\[_{x}^{s}:=_{[x/2]}^{2s}-_{x}^{s}\] (15)
+
+for every resolution \(s n_{c}\) and location \(x\). Similarly, \((_{new})\) stores \((_{new})_{1}^{n_{c}}\) and \((_{new})_{x}^{s}\) where \((_{new})_{x}^{s}\) and \((_{new})_{x}^{s}\) are defined similar to (13) and (15) but using \(_{new}\) instead of \(\).
+
+Then, given \(()\), any \(_{x}^{s}\) can be retrieved efficiently in \(((n_{c}d))\) cost via recursion:
+
+\[_{x}^{s}=_{[x/2]}^{2s}-_{x}^{s} =_{[x/4]}^{4s}-_{[x/2]}^{2s}- _{x}^{s}=\] (16)
+
+The only reason we need decompression \(^{}\) is that we need to obtain new representation \(_{new}\) (no decompression for \(_{new}\) since \(\) is uncompressed). Suppose we have \((_{new})\), then we have an alternative way of getting \(_{new}\) similar to (16) (note \((_{new})_{x}^{1}=[_{new}]_{x}\)) without explicit decompression. The key benefit of this data structure is that we can obtain \((_{new})\) by changing some nodes in \(()\). This only needs updating \((r)\) nodes, and each update takes \((d)\) cost.
+
+**An example.** We show a \(()\) for \(n_{c}=8\) in Fig. 4. Let \(_{c}=[_{1}^{2}_{3}^{1} _{4}^{1}_{4}^{2}]^{}\) as in Fig. 3. Since the segment \(_{1}^{2}\) is not split into sub-segments \(_{1}^{1}\) and \(_{2}^{1}\), we have (details in Appendix):
+
+\[(_{new})_{1}^{1}-_{1}^{1}=(_{new})_{2}^{1}- _{2}^{1}=(_{new})_{1}^{2}-_{1}^{2}\] (17)
+
+By rearranging (17), we can verify that \((_{new})_{1}^{1},(_{new})_{2}^{1}\) in \((_{new})\) stays the same as \(_{1}^{1},_{2}^{1}\) in \(()\) and thus do not need to be updated:
+
+\[(_{new})_{1}^{1} =(_{new})_{1}^{2}-(_{new})_{1}^{1}= _{1}^{2}-_{1}^{1}=_{1}^{1}\] (18) \[(_{new})_{2}^{1} =(_{new})_{1}^{2}-(_{new})_{2}^{1}= _{1}^{2}-_{2}^{1}=_{2}^{1}\]
+
+Further, we can verify that only the green nodes in Fig. 4 will be updated. These nodes correspond to the nodes in Fig. 3 that have been traversed. In summary, for each row \(_{x}^{s}\) of \(_{c}\) (a leaf node in Fig. 3), only the node storing \((_{x})^{s}\) and its ancestor nodes in \(()\) must be updated, so the total number of nodes (including their ancestors) being updated is \((r)\). Next, we can update the nodes as follows: first, we get representations \((_{new})_{1}^{2},(_{new})_{1}^{3},(_{new})_{1}^{4 },(_{new})_{2}^{4}\) by feeding \(_{c}\) into Transformer layer (details in Appendix). At level \(s=1\), given \((_{new})_{1}^{3}\) and \((_{new})_{1}^{4}\), we **(1)** compute \((_{new})_{2}^{2}\) via (14), and then **(2)** compute \((_{new})_{1}^{1}\) and \((_{new})_{1}^{4}\) via (15). The last two values are the new values for \(_{3}^{1}\) and \(_{4}^{1}\) in \(()\). At level \(s=2\), given \((_{new})_{2}^{1}\) and \((_{new})_{2}^{2}\) computed at previous level, we apply similar procedure to obtain \((_{new})_{1}^{4},(_{new})_{2}^{1},(_{ new})_{2}^{2}\), and the last two values are used to update two nodes in \(()\). It becomes apparent that each node update takes \((d)\) cost. Putting it together: the complexity of modifying \(()\) to \((_{new})\) is \((rd)\). The detailed algorithm and complexity analysis are described in Appendix.
+
+By maintaining this data structure, we never need to materialize the entire \(\) or \(_{new}\) in any intermediate layer, but instead we use (16) to construct the rows of \(_{c}\) and perform updates to \(()\) to obtain \(_{new}\) (represented as \((_{new})\)) at each intermediate layer. At the output of a Transformer, \(_{new}\) is materialized from \((_{new})\) at a \((n_{c}d)\) cost via the recursion (16) from the bottom up.
+
+Experiments
+
+We perform a broad set of experiments to empirically evaluate the performance of our proposed compression. (See hyperparameters/dataset statistics in Appendix.) We evaluate our method on both encoder-only and encoder-decoder architecture types. We compare our method with baselines on a large list of question answering and summarization tasks, where we found long sequences occur most frequently. Then, we study the model performance of scaling to ultra long sequences enabled by our method. Since efficiency is the focus of the efficient baselines and our work, we include runtime efficiency (of a single sequence) in millisecond in each table. (See the procedure for runtime measurement in Appendix.) We also include a discussion on FLOP efficiency in Appendix.
+
+For ease of implementation and hyperparameter selection, we restrict the rows of \(_{c}\) to have exactly two resolutions for experiments. Specifically, for a pre-defined increment ratio \(k\), we split and refine all segments \(_{x}^{s}\) with \(s>k\) to \(k\)-length sub-segments, and select \(h\) (pre-defined) \(k\)-length segments to further split to \(1\)-length sub-segments. So, the rows of \(_{c}\) would consist of \((n_{c}/k-h)\) of \(_{x}^{k}\) and \(hk\) of \(_{x}^{1}\) for some \(x\). To simplify the implementation, we only use the proposed compression in the encoder, and use the vanilla computation in the decoder of encoder-decoder models. We note that our method might be applied to the decoder (more details in Appendix).
+
+Further, we found a few layers of standard Transformer layers to pre-process tokens helps the performance. Therefore, in the initial stage of a Transformer, we segment input sequence into multiple \(512\)-length segments. For each segment, we use vanilla computation in the first 4 layers (for base models and 6 layers for larger models) of a Transformer. Then, for the remaining layers, segments are concatenated back into one sequence and processed using our proposed compression. There is _no communication_ among any segments, so the downstream tasks cannot be solved by these first 4 transformer layers alone, and the initial stage is used just for getting a reasonable representation for the compression to operate on.
+
+**Approximation Quality of VIP-Tokens.** We empirical measured the approximation quality of our VIP centric strategy compared to random strategy (the tree growth in Fig. 3 is not guided by VIP-tokens, but is random) and lazy strategy (each k-length segment is compressed to a token). \(_{new}\) is the approximated representation of VIP tokens computed with compression and let \(_{new}^{*}\) be the ground truth representation of VIP tokens computed without compression. We measure the relative error (defined as \(||_{new}^{*}-_{new}^{*}||_{F}/||_{new}^{*}||_{F}\)) and correlation coefficient between \(_{new}\) and \(_{new}^{*}\). As shown in Tab. 1, we can verify that the proposed procedure indeed improve the approximation quality of VIP-tokens.
+
+**Encoder-Only Models**. For encoder-only architecture, we compare our method with RoBERTa  and three strong baselines: Longformer , Big Bird , and MRA Attention . We first pretrain a RoBERTa model using masked language modeling task, then for each method, we perform continuous pretraining from the RoBERTa checkpoint to expand the positional embeddings to 4K length and adjust model parameters to adapt approximations used in efficient baselines and our method. We verify that our proposed method can be integrated into a pretrained Transformer with some continuous pretraining. But we note that the amount of reduction in log perplexity for our method (\(-0.114\)) during pre-training is much larger than Longformer (\(-0.017\)) and Big Bird (\(-0.025\)) from 50K steps to 250K steps. The continuous pretraining for these baselines might have saturated since only the self-attention is approximated while our method might require more pretraining to adjust the parameters for more aggressive approximation. So, we run a larger scale pretraining for our method; downstream results are in Tab. 2 and Fig. 5, denoted with *. We use HotpotQA , QuALITY , and WikiHop  to assess the language models. HotpotQA is an answer span extraction task, while QuALITY and WikiHop are multi-choice question answering tasks. We set questions and multi-choice answers (for QuALITY and WikiHop) as VIP-tokens.
+
+As shown in Tab. 2, we verify that our method is consistently better compared to Longformer and Big Bird. Our method obtains better accuracy in QuALITY and WikiHop compared to 4K length
+
+     } &   } &   } &   } \\  Random & 0.403 & 0.919 \\ Lazy & 0.528 & 0.869 \\ VIPGener & 0.137 & 0.991 \\   
+
+Table 1: Approx quality.
+
+    &   } &   } &   } &   } &   } &   } \\  RoBERTa & base & 512 & 19.9 & 35.1 & 44.9 & 21.2 & 39.0 & 19.6 & 67.6 \\ RoBERTa & base & 4K & 422.3 & 62.2 & 76.1 & 40.2 & 39.5 & 41.4 & 75.2 \\ Big Bird & base & 4K & 297.9 & 59.5 & 32.7 & 30.0 & 85.5 & 29.3 & 74.5 \\ Longformer & base & 4K & 371.9 & 59.9 & 73.6 & 18.0 & 27.3 & 39.0 & 77.4 \\ MRA Attention & base & 4K & 203.5 & 63.4 & 77.0 & 20.5 & 38.7 & 19.2 & 76.1 \\ MRA & base & 4K & 116.6 & 609.7 & 74.6 & 126.4 & 39.6 & 108.0 & 75.9 \\ Ours* & base & 4K & 114.6 & 61.4 & 75.0 & 125.7 & 39.5 & 108.0 & 76.1 \\   
+
+Table 2: Dev set results for encoder-only models.
+
+[MISSING_PAGE_FAIL:9]
+
+to much longer sequences. We note that NarrativeQA  is an ideal testbed as shown in dataset statistics in Appendix. The results are shown in Tab. 4. The left / middle / right values of runtime column are for the entire model / the encoder / the last 8 layers (out of 12 layers) that uses our compression. The performance monotonically increases as sequence length increases. We note that for sequence length 64K, the performance of model with \(k=64\) is lower than the model with \(k=16\). We suspect that since the results are finetuned from the same model that is pretrained with \(k=16\), the large gap between the two different \(k\)'s may have a negative impact on finetuning performance. Nevertheless, the performance is still higher than 32K length models.
+
+**Why focus on 4K - 128K lengths?** We believe that the computation required by standard Transformers for processing shorter sequences is not an efficiency bottleneck. As a result, we do not profile the performance of our method for smaller length sequences, since the standard Transformers are sufficiently fast in this case. Further, while our model can be applied to shorter sequences, we suspect that for shorter sequences, there may be less irrelevant information for VIP-tokens. So compressing the irrelevant information will not offer a meaningful speed up. This is a limitation as the compression works better when there is more compressible information. We have only pushed the sequence lengths to 128K since this length was sufficient to cover a majority of sequence lengths encountered in long sequence tasks (for example, our model is able to process an entire book at once).
+
+## 5 Limitations
+
+Our method assumes that in many tasks, a subset of tokens are disproportionately responsible for the model prediction, the remaining non-VIP-tokens may play a role but are less critical. Our method excels specifically on such tasks by selectively locating relevant information in the sequence for given VIP-tokens. As the experiments show, this choice is effective in many cases but this behavior is not universal. Occasionally, an embedding is pre-computed which must then serve multiple tasks concurrently, e.g., _both_ text retrieval and natural language inference. In this case, if we do not know the tasks beforehand, VIP-token selection cannot be meaningfully performed. Further, VIP-token selection requires some understanding of the tasks. However, we believe that a reasonable selection can be made with some generic knowledge for most tasks or use cases. Please see Appendix for VIP-token selection guidelines.
+
+To reduce the complexity of our implementation, the method is currently setup for the encoder module of the Transformer that assumes full access to the entire sequence. The proposed compression might be extended to approximate the computation in the decoder, but it needs more implementation work, so we leave it as future work. Consequently, the current implementation is less useful for decoder-only models (but in the appendix, we discuss some strategies).
+
+## 6 Conclusions
+
+We propose a VIP-token centric sequence compression method to compress/decompress the input/output sequences of Transformer layers thereby reducing the complexity dependency on the sequence length \(n\) without sacrificing the model accuracy. Our empirical evaluation shows that our method can be directly incorporated into existing pretrained models with some additional training. Also, it often has much higher efficiency compared to baselines with the same sequence length while offering better or competitive model accuracy. For future work, we believe that extending our method to the decoder of the encoder-decoder and decoder-only models will further boost the efficiency of Transformers while maintaining similar model performance.
+
+Acknowledgments.Zeng and Singh were supported in part by funding from the Vilas Board of Trustees and UW-Madison Office of the Vice Chancellor for Research and Graduate Education.
+
+   Length & Runtime (ms) & \(k\) & \(h\) & EM & F1 \\ 
+16K & 518.2 / 394.4 / 162.4 & 16 & 90 & 5.9 & 16.6 \\
+32K & 946.8 / 671.6 / 2126.0 & 32 & 55 & 6.6 & 17.5 \\
+32K & 1027.9 / 751.0 / 298.0 & 16 & 90 & 6.4 & 17.5 \\
+64K & 1848.7 / 1177.2 / 254.8 & 64 & 30 & 7.2 & 18.4 \\
+64K & 2244.8 / 1574.2 / 559.4 & 16 & 90 & 7.5 & 19.3 \\
+128K & 6267.8 / 5125.9 / 1902.2 & 16 & 90 & 8.0 & 19.6 \\   
+
+Table 4: Dev results of NarrativeQA on base model when scaling sequence length from 16K to 128K.

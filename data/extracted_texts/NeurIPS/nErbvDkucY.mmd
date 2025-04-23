@@ -1,0 +1,186 @@
+# Training and inference of large language models
+
+using 8-bit floating point
+
+ Sergio P. Perez, Yan Zhang, James Briggs, Charlie Blake,
+
+Josh Levy-Kramer, Paul Balanca, Carlo Luschi, Stephen Barlow, Andrew Fitzgibbon
+
+Graphcore, United Kingdom
+
+Corresponding authors: {sergiop, yanz, jamesbr}@graphcore.ai
+
+###### Abstract
+
+FP8 formats are gaining popularity to boost the computational efficiency for training and inference of large deep learning models. Their main challenge is that a careful choice of scaling is needed to prevent degradation due to the reduced dynamic range compared to higher-precision formats. Although there exists ample literature about selecting such scalings for INT formats, this critical aspect has yet to be addressed for FP8. This paper presents a methodology to select the scalings for FP8 linear layers, based on dynamically updating per-tensor scales for the weights, gradients and activations. We apply this methodology to train and validate large language models of the type of GPT and Llama 2 using FP8, for model sizes ranging from 111M to 70B. To facilitate the understanding of the FP8 dynamics, our results are accompanied by plots of the per-tensor scale distribution for weights, activations and gradients during both training and inference.
+
+## 1 Introduction
+
+Reducing the number of bits used by numerical formats offers significant efficiency gains for the training and inference of deep learning models. Inference latency is typically bottlenecked by the memory and communication bandwidth of a system (Pope et al., 2023), model-size by the total available memory, and throughput and training-time are often limited by the rate at which operations can be executed. All of these factors are improved substantially if we are able to represent values using fewer bits, with costs typically scaling linearly in the number of bits per value.
+
+These benefits motivated the adoption of 16-bit floating-point formats -- FP16 (Micikevicius et al., 2017) and BF16 (Kalamkar et al., 2019) -- over the FP32 format used to represent continuous values for early deep learning models. More recently, 8-bit floating-point (FP8) formats have been proposed alongside hardware with dedicated support for FP8 arithmetic (Noune et al., 2022, Micikevicius et al., 2022), offering further efficiency gains. The standardisation of the FP8 format is under active development by the IEEE working group P3109 (2023). The reader can find an introduction of floating-point formats for deep learning in Appendix A, and a description of the different FP8 formats in Appendix B. In this work, we assume the formats of Noune et al. (2022) when referring to FP8, denoting as FP8 E4 the weight and activation format and as FP8 E5 the gradient format.
+
+These initial studies indicate that FP8 inference and training (that is, mixed-precision with matrix multiplications in FP8) are indeed possible, but come with a range of associated difficulties. Removing mantissa bits from a format limits numerical accuracy, while removing exponent bits limits the range of values that can be represented. The latter problem poses a particular challenge to practitioners: how to ensure that the set of values generated when performing model training and inference is withinthe set of representable values. Overflowing or underflowing this range can rapidly degrade model accuracy.
+
+To combat this for FP16 training, the standard approach is to globally shift gradients by a single _loss scale_, though this is not always sufficient . For inference, a popular technique is quantisation to the 8-bit _integer_ format (INT8). Previous generations of AI hardware have offered accelerated arithmetic for INT8 but not FP8, limiting FP8 uptake despite its potential as a more broadly-applicable 8-bit format in the context of machine learning (see Appendix C for further discussion). More complex group-quantisation schemes have also been proposed for inference which enable some values to be stored in fewer than 8 bits . However, this introduces additional complexity and compute must still be done in higher-precision.
+
+Figure 1: Training phase of a linear layer quantised to FP8. The forward and backward pass illustrate how the scaling biases are computed and applied to the weights, activations and gradients.
+
+Figure 2: Inference phase of a linear layer quantised to FP8. Post-training quantisation is applied to a checkpoint. Scaling biases are computed and applied to the weights and activations.
+
+To address the issue of substantially reduced range for FP8 formats, it has been proposed to rely on the exponent bias associated with FP8 tensors. The exponent bias is part of the definition of every floating-point format. By adding or subtracting an integer to the exponent bias, one can effectively shift the representable range on a per-tensor basis, giving more granular scaling than standard _loss scaling_ and applying to both forward and backward passes. This integer, denoted as _scaling bias_, is supplied by the user and can be supported either in software or directly in hardware.
+
+The process by which these scales are determined and how they are practically applied is essential to leveraging the benefits of FP8 for training and inference. Existing FP8 literature has not covered this topic extensively, leaving users reliant on scaling decisions taken in software implementations that may not be clearly justified (Nvidia, 2022b). We seek to support this important design aspect through the following contributions:
+
+1. We present a methodology to select the per-tensor scaling biases in the linear layers present in large language models of the type of GPT (Brown et al., 2020) and Llama (Touvron et al., 2023). Such methodology is illustrated in Figure 1 for the training phase and in Figure 2 for the inference phase. These specific details are useful for practitioners aiming to leverage FP8 and have been missing from the FP8 literature, which has either employed sweeps of values (Noune et al., 2022) or not specified how the scaling biases are computed (Micikevicius et al., 2022).
+2. We showcase how our FP8 methodology leads to convergence of GPT and Llama models from 111M to 70B parameters, for both inference and training.
+3. For inference, we detail how our methodology can be employed as post-training quantisation to cast a high-precision checkpoint to FP8 and perform inference without degradation.
+4. For training, we prove that our methodology is able to dynamically update the per-tensor scaling biases and prevent degradation using FP8 in large language models. We provide plots of how the scaling biases evolve and extract insights from them.
+
+## 2 The linear layer adapted to FP8
+
+Performing the matrix multiplication operation in FP8 requires the use of _scalings_ to prevent underflow and overflow. By _scalings_ we mean factors that, when multiplied times a tensor, result in a scaled tensor representable in the FP8 dynamic range. Without such scale, the tensor underflows or overflows. Such scalings are needed for the matrix multiplications found in both the forward pass (to compute the activations) and in the backward pass (to compute weight and activation gradients). Using scalings for lower precision is not new and has been a popular strategy for FP16 training, with the loss scaling method (Noune et al., 2022; Perez, 2022; Micikevicius et al., 2017) consisting of multiplying the loss function with a constant to prevent underflow of the gradients. Although loss scaling works fine for reasonably sized FP16 models, as the number of parameters increases the limited range of FP16 becomes an issue. Models of more than 100 billion parameters like Bloom (Scao et al., 2022) or OPT (Zhang et al., 2022) struggled to find a stable loss scaling for FP16 and ended up employing BF16. Consequently, it's uncertain whether even for FP16 it is enough to have a common scaling for all the gradients. The same question has been explored for FP8: it is not clear whether one scaling is enough (Noune et al., 2022) or a per-tensor scaling is needed (Micikevicius et al., 2022). In addition, for FP8 E4 weights and activations also need scalings due to the reduced dynamic range compared to FP16.
+
+Figure 3 illustrates how the scalings are implemented for the forward pass of a FP8 linear layer. Firstly, focusing on the full FP16 precision, Figure 2(a) displays both weights and activations in FP16 and no scaling is needed before the matrix multiplication, whose accumulation can be performed in FP16 too. This scenario is identical for other formats like FP32 or BF16. In comparison, Figure 2(b) shows how different scaling and casting blocks are needed to leverage FP8 matrix multiplication in mixed precision. The inputs are FP8 but the output is FP16: this dichotomy comes from the need of accumulating the partial results of the FP8 operations in FP16 to prevent overflows. Since the accumulation is in FP16, hardware providers (Graphcore, 2022b; Nvidia, 2022a) output the internal FP16 result and let the user decide whether to cast back down to FP8.
+
+WeightsFor training and inference, the linear layer needs to be modified to include a cast to FP8 E4 from a higher-precision format like FP16. In training, this cast is necessary after every weight update, which takes place in a higher-precision format like FP16 or FP32. In inference, if the weights are stored in FP8 then no cast is needed. Conversely, if the weights are in a higher-precision format like FP16, BF16 or FP32, a cast to FP8 E4 is needed just once before using those weights in the matrix multiplication. For both cases, before the cast to FP8 E4, a scaling of the weights is needed to prevent underflow or overflow when performing such cast. The scaling shifts the weight distribution and makes it overlap as much as possible with the dynamic range of FP8 E4. The optimal scalings may change during training so there's the need to recompute the scaling again after a certain number of steps. During inference, the scalings don't change since the weights are not updated.
+
+ActivationsDue to the matrix multiplication accumulation being done in higher precision, it is necessary to cast back to FP8 E4 before the next matrix multiplication. When casting to FP8 E4, we need a scaling factor to minimize the underflow/overflow since the dynamic range of FP8 E4 is narrower compared to higher-precision formats like FP16. After the matrix multiplication is performed, the output activations are unscaled taking into account the scaling factors computed for the weights and activations before the matrix multiplication.
+
+### Applying a scaling bias before casting to FP8
+
+Casting the weights and activations from FP16 to FP8 E4 results in a narrower dynamic range that may lead to underflow or overflow. To prevent it, we introduce per-tensor scalings that shift the FP16 distributions before casting to FP8 E4. The type of scaling employed in this work is a _scaling bias_. Starting from the floating point representation defined in Equation 4, we add an integer scaling bias \(b_{}\) to the exponent such that
+
+\[=b_{}-+b_{},\] (1)
+
+Figure 3: Comparison of the forward pass for a FP16 vs FP8 linear layer.
+
+which is equivalent to multiplying the FP16 number times \(2^{b_{ scale}}\). Both the weights and activations in Figure 2(b) require a scaling bias before being cast from FP16 to FP8 E4. Let's denote as \(b_{ w,scale}\) and \(b_{ x,scale}\) the scaling biases for the weights and activations, respectively. Then, once the matrix multiplication is performed in a higher-precision accumulation like FP16, the resulting activations need to be unscaled by applying a scaling bias equal to \(-(b_{ w,scale}+b_{ x,scale})\):
+
+\[ unscaled\ exponent=b_{ exp}-bias-(b_{ w,scale}+b_{ x,scale}).\] (2)
+
+We refer the reader to the scale and unscale functions in Figure 1, which are employed in the code for the training and inference phases in Figures 1 and 2.
+
+### FP8 for gradients during training
+
+The backward pass for the linear layer contains two matrix multiplications: one to compute the weight gradients and another for the input activation gradients. Both matrix multiplications can be accelerated with FP8. The process is similar to the matrix multiplication in the forward pass: the inputs of the matrix multiplication need to be scaled and then cast to FP8 before being passed to the matrix multiplication. Subsequently, the matrix multiplication output (i.e the weight gradients or activation gradients) are unscaled taking into account the scales of the FP8 matrix multiplication inputs. It's important to recall that the FP8 type is different for weights and activations versus gradients: whereas the weights and activations are cast to FP8 E4, the gradients need to be cast to FP8 E5 to preserve a wider dynamic range (see Appendix B for the differences between the two formats). We refer the reader to the pseudocode in Figure 1 for details about the backward pass in FP8.
+
+### Choosing the appropriate scaling bias
+
+There are various methods to quantise from a higher-precision format into a lower one. Some popular approaches to cast from a floating point format like FP32 into a fixed-point format like INT8 consist of mapping the largest absolute value to \( 127\), which is the maximum representable integer in INT8. This ensures that the outliers fit within the dynamic range of INT8, but may underutilise the dynamic range if the outliers are much larger than the other values. Other approaches consider a percentile or the full distribution of values and compute the mean square error or KL divergence to minimise the information loss between the higher-precision distribution and the quantised one (Settle et al., 2018).
+
+In this work we propose a methodology based on setting dynamic per-tensor scalings, computed via the absolute maximum approach. Our strategy has similarities to the Nvidia (2022b) library; however some of the fine-grained details and justifications of this implementation are not made explicit. We hope that by opening up our methodology and testing it in the experiments in Section 4, other FP8 researchers can build on top of it.
+
+Our methodology depends on the maximum representable number of the FP8 format, which is different for the FP8 E4 and FP8 E5 formats (see Appendix B). Denoting that maximum as \( max_{num}\), the calculation of the scaling bias per \( tensor\) follows
+
+\[&=max(|tensor|),\\ &=floor(log_{2}(max_{num}/amax) ),\] (3)
+
+where \( floor(a)\) returns the largest integer not greater than \( a\). The function compute_bias in Figure 1 translates this algorithm into code. For training (see Figure 1), three scaling biases are computed in each linear layer, corresponding to the weights, input activations and output activation gradients. For inference(see Figure 2), only the weight and input activation need scaling biases.
+
+### Loss scaling in addition to scaling bias when accumulating in FP16
+
+Loss scaling is a popular technique to enable FP16 training (Noune et al., 2022; Perez, 2022; Micikevicius et al., 2017). Loss scaling is necessary in FP16 because the gradients underflow due to the narrower dynamic range of FP16, compared to other formats like FP32 or BF16. The reason because of which loss scaling is also relevant for FP8 quantisation is related to the higher-precision accumulation of the FP8 matrix multiplication. Such accumulation is usually performed in FP16, BF16 or FP32 (Graphcore, 2022b; Nvidia, 2022a). If it was done in FP8, it wouldn't work due to the limited dynamic range for FP8 E4 or the lack of precision in FP8 E5. As a result, the linear layer quantisation to FP8 described in this section is actually mixed-precision quantisation.
+
+When the accumulation is performed in BF16 or FP32, loss scaling is not necessary and just the scaling biases explained in Subsection 2.3 are enough to prevent underflow or overflow after casting to FP8. However, when the accumulation is performed in FP16, loss scaling is needed to better represent the gradients after they are output by the FP8 matrix multiplication and unscaled. The method to tune the loss scaling for mixed FP8-FP16 training is identical to the full FP16 training. There are several approaches in the literature: run a sweep of loss scalings (Micikevicius et al., 2017), inspect the gradient histogram to adapt the loss scaling during training (Perez, 2022), back off to skip weight updates when an overflow is produced, or scale the loss such that its mean plus standard deviation times a constant equals \(log_{2}\) of the maximum representable value in FP16 (Kuchaiev et al., 2018). We refer the reader to section 4 of (Noune et al., 2022) for an analysis about how these loss scaling methods impact mixed FP8-FP16 training. In our experiments in Section 4, we use a constant loss scaling, using the same values for the full FP16 training and mixed FP8-FP16 training.
+
+## 3 Details to perform training and inference in FP8
+
+We follow two different strategies to compute the scaling bias for training and inference:
+
+* FP8-AMAX: this is the absolute maximum method detailed in Section 2.3 and in the compute_bias function of Figure 1. The calculation takes place per linear layer for every micro batch and every data or tensor replica, following the diagram in Figure 2(b).
+* FP8-CSCALE: a simpler strategy based on having the same scaling bias for all weights, activations and gradients. The scaling bias remains constant throughout the training and inference. We run sweeps of scaling bias values to find the ones that don't degrade accuracy.
+
+Even though in this paper we focus on the numerical differences, it is worth pointing out that the relative throughput and memory cost of FP8-AMAX versus FP8-CSCALE depends on the hardware employed. When using FP8-AMAX in hardware with limited SRAM, FP16 tensors in L2-cache incur the overhead of a second round-trip to memory: the first to calculate the tensor's absolute max, and the second to apply the scaling. This cost could cancel out the speedup from the FP8 matmuls. A remedy could be to rely on the past history of absolute max instead of using the just-in-time absolute max Nvidia (2022). On the contrary, hardware with enough SRAM can calculate the scaling biases just-in-time and perform FP8 as detailed in this work.
+
+### Inference with FP8
+
+When performing inference, the weights come from a checkpoint that is either in a higher-precision format like FP16, BF16 or FP32, or directly in FP8 E4. In the former case, quantising the weights to FP8 is simpler compared to fixed-point representations like INT8, which may need quantisation-aware training (QAT) in addition to post-training quantisation (PTQ) (van Baalen et al., 2023). For FP8, it is enough to employ PTQ consisting of applying a scaling bias to each tensor and subsequently casting to FP8, as described in Section 2.3. The scaling bias calculation for the weights is performed only once when loading the checkpoint (see Figure 2). In the latter case, when the checkpoint comes from training in FP8, the weights can be used directly without any quantisation.
+
+### Training with FP8
+
+For pre-training or fine-tuning, we need different FP8 formats for the weights/activations and gradients (see Appendix B and Noune et al. (2022)). For both formats, we compute the scaling bias following either the FP8-AMAX or the FP8-CSCALE, as stated in each of the experiments in Section 4. We perform the weight update in FP16 and keep master weights in FP16. The calculation of the scaling bias for the weights and the weight cast to FP8 E4 takes place just after the weight update. When accumulating in FP16, there's a risk of overflowing when performing the two matrix multiplications of the backward pass, which have inputs FP8 E4 and FP8 E5: this is due to the fact that FP8 E5 and FP16 have a similar dynamic range (see Table 7), and when employing FP8-AMAX the resulting FP8 E5 input to the matmul gets values closer to the maximum representable number in FP16. Consequently, we set a _margin_ to reduce the scaling bias resulting from FP8-AMAX method. Empirically we observe that a value of \(3\) is enough to prevent overflow. The optimal value for this margin is related to the square root of the batch size (Blake et al., 2023; Yang et al., 2021), which in our fine-tuningexperiments is 512 (see Appendix H). This results in a optimal margin of \(log_{2}()=4.5\), which is close to our empirical value of \(3\).
+
+## 4 Experiments
+
+### Model architecture used for the experiments
+
+We employ two varieties of language transformer decoder models in our experiments. The first one is a GPT-3-like architecture (Brown et al., 2020) with the sole difference of using dense attention in all decoder blocks, instead of dense and sparse-banded attention. For this model we test five different model sizes (see Table 1). In our fine-tuning experiments, we employ the pre-trained checkpoints provided by Dey et al. (2023). In our inference experiments, we start from an already fine-tuned checkpoint in FP16 for each specific task. We focus on three GLUE tasks (Wang et al., 2018): the inference task MNLI, the single-sentence task SST-2 and the similarity and paraphrase task QQP.
+
+The second variety of decoder language model is the Llama 2 model detailed in Touvron et al. (2023). The main changes with respect to the GPT-3-like architecture are the pre-normalization using RMSNorm, SwiGLU as activation function and rotary positional embeddings. In addition, the 70-billion-parameter version employs grouped-query attention. We employ the open-source checkpoints from the pre-trained models that are not fine-tuned for dialogue use cases. The details of the 2 sizes tested in our experiments are shown in Table 1. We focus on six benchmarks included in Touvron et al. (2023): MMLU, HellaSwag, ARC-e, ARC-c, PIQA and WinoGrande.
+
+For both architectures, we quantise to FP8 the linear layers in all the decoder layers. Details about such linear layers are shown in Appendix E. Figure 4 displays the main components of the GPT and Llama decoder layers and indicates the ones quantised to FP8. Further details about hyperparameters and hardware to run the experiments are contained in Appendix H.
+
+### FP8 inference for the GPT model
+
+We compare the validation results using the FP8-AMAX and FP8-CSCALE methods versus the FP16 benchmark, for a GPT model with sizes from 111M to 13B. The results are displayed in Table 2. With both approaches we manage to match the FP16 validation accuracy for all sizes.
+
+For the FP8-CSCALE method, we run sweeps of scaling biases. Not all the scaling biases reach the FP16 accuracy, and in Table 2 we report the average accuracy obtained with only the values that reach a final accuracy greater than 99.5% of the FP16 value. The interval containing the convergent values is displayed in Table 3. For the scaling bias values outside the intervals in Table 3, the validation accuracy degrades significantly. In Figure 5 in Appendix F we show a comparison of the accuracy obtained with each of the scaling bias in the sweep, for the MNLI task. As soon as the chosen scaling bias is not within the interval, it quickly degrades. On average we observe that the interval of convergent scaling bias values contains five integers centred around zero.
+
+For the FP8-AMAX method, there's a different scaling bias for each weight and activation tensor. To understand how the different scaling biases vary depending on the decoder layer and type of linear layer, we plot their distributions in Figure 6 for the 111M, 1.3B and 6.7B parameter models. The
+
+ Parameters & \(d_{}\) & \(n_{}\) & \(n_{}\) & \(d_{}\) & \(d_{}\) \\  GPT 111M & 768 & 10 & 12 & 64 & 3072 \\ GPT 590M & 1536 & 18 & 12 & 128 & 6144 \\ GPT 1.3B & 2048 & 24 & 16 & 128 & 8192 \\ GPT 6.7B & 4096 & 32 & 32 & 128 & 16384 \\ GPT 13B & 5120 & 40 & 40 & 128 & 20480 \\ Llama 2 7B & 4096 & 32 & 32 & 128 & 11008 \\ Llama 2 70B & 8192 & 80 & 64 & 128 & 28672 \\ 
+
+Table 1: Hierarchy of GPT and Llama 2 model sizes used in the training and validation experiments.
+
+reader can find details about how Figure 6 is produced in Appendix G, together with some insights about the scaling bias distribution.
+
+### FP8 few-shot inference for the Llama 2 model
+
+We run six of the evaluation benchmarks in Touvron et al. (2023) with both FP16 and FP8-AMAX, for the model sizes of 7B and 70B parameters. For the benchmarks we employ Eleuther's Evaluation Harness Library (Gao et al., 2021). The results are displayed in Table 4. We find that the FP16 and FP8-AMAX quantisations give comparable results. For some benchmarks like HellaSwag there is some difference with respect to the result published in Touvron et al. (2023), which we attribute to the fact that the authors employ an internal evaluation library different from Gao et al. (2021). We checked this by comparing the harness' benchmark results in FP32 running on CPU to those obtained with FP16 and confirmed that the metrics obtained are identical.
+
+### Is FP8-CSCALE enough to train in FP8?
+
+Running sweeps of loss scaling values is a common practice to train models in FP16. As the size of the model increases, one typically needs to increase the loss scaling value. Even though there exists
+
+ 
+**Model** & **Quantisation** & **MMLU** & **HellaSwag** & **ARC-e** & **ARC-c** & **PIQA** & **WinoGrande** \\   & Llama 2 paper & 45.3 & 77.2 & 75.2 & 45.9 & 78.8 & 69.2 \\  & FP16 & 46.6 & 76.0 & 74.6 & 46.3 & 79.1 & 69.1 \\  & FP8-AMAX & 46.3 & 75.8 & 74.5 & 45.7 & 78.7 & 69.1 \\   & Llama 2 paper & 68.9 & 85.3 & 80.2 & 57.4 & 82.8 & 80.2 \\  & FP16 & 69.6 & 83.8 & 81.1 & 57.3 & 82.8 & 78.0 \\   & FP8-AMAX & 69.3 & 83.8 & 80.9 & 57.7 & 82.6 & 78.5 \\  
+
+Table 4: Inference results of Llama 2. For the evaluation we follow Touvron et al. (2023), performing 5-shot evaluation for MMLU and 0-shot evaluation for HellaSwag, ARC-e, ARC-c, PIQA and WinoGrande. For WinoGrande we report the accuracy and for MMLU, HellaSwag, ARC-e, ARC-c and PIQA the normalized accuracy, which takes into account the lenght of each possible answer.
+
+ 
+**Model** & **Quantisation** & **MNLI** & **QQP** & **SST-2** \\   & FP16 & 72.61 & 85.76 & 84.26 \\  & FP8-AMAX & 72.39 & 85.78 & 84.38 \\  & FP8-CSCALE & 72.49 & 85.73 & 84.59 \\   & FP16 & 78.59 & 88.40 & 90.63 \\  & FP8-AMAX & 78.44 & 88.37 & 90.63 \\  & FP8-CSCALE & 78.56 & 88.40 & 90.54 \\   & FP16 & 82.82 & 89.43 & 91.55 \\  & FP8-AMAX & 82.68 & 89.42 & 91.44 \\  & FP8-CSCALE & 82.72 & 89.36 & 91.42 \\   & FP16 & 87.17 & 91.19 & 94.50 \\  & FP8-AMAX & 87.15 & 91.22 & 94.38 \\  & FP8-CSCALE & 87.18 & 91.18 & 94.48 \\   & FP16 & 88.26 & 91.22 & 94.61 \\  & FP8-AMAX & 88.27 & 91.21 & 94.61 \\   & FP8-CSCALE & 88.26 & 91.20 & 94.50 \\  
+
+Table 2: Inference results: validation accuracy comparing FP16 with FP8-AMAX and FP8-CSCALE, for the different GPT model sizes.
+
+ 
+**Model** & **MNLI** & **QQP** & **SST-2** \\   & [-3, 2] & [-4, 2] & [-4, 2] \\  & [-3, 2] & [-4, 2] & [-1, 2] \\   & [-3, 3] & [-4, 2] & [-3, 2] \\   & [-3, 2] & [-3, 2] \\   & [-3, 2] & [-4, 2] & [-4, 2] \\   & [-3, 3] & [-4, 2] & [-3, 2] \\   & [-3, 2] & [-4, 2] & [-4, 2] \\  
+
+Table 3: Inference results with FP8-CSCALE: range of the scaling bias that reaches a validation accuracy greater than 99.5% of the FP16 value, when performing FP8 validation with FP8-CSCALE. Both weights and activations in all decoder layers share the same scaling bias.
+
+more sophisticated approaches to update the loss scaling during training (Perez, 2022; Kuchaiev et al., 2018), practitioners still run sweeps of loss scaling values until finding the one that converges.
+
+Inspired by this practice, we aim to understand if the FP8-CSCALE approach is able to converge to the required accuracy. For that we run sweeps of values and let the fine-tuning for the MNLI task complete three epochs for the smaller models up to 1.3B and 1 epoch for the 6.7B and 13B. Then we check if the validation accuracy matches the reference FP16 fine-tuning.
+
+Our results are summarised in Table 6. We are able to converge to a validation accuracy of at least 99.5% of the FP16 reference for all the model sizes, but as the size increases the range of converging scaling biases gets reduced. For the larger model sizes of 6.7B and 13B, we observe that convergence is not always guaranteed even within the intervals in Table 6: for example, a different seed can lead to divergence. These results suggest that FP8-AMAX is a more robust strategy when fine-tuning in FP8 compared to FP8-CSCALE, even though convergence with FP8-CSCALE may be possible.
+
+### FP8 fine-tuning results for the GPT model
+
+After testing FP8-CSCALE, we employ the FP8-AMAX method to fine-tune the GPT models for the sizes from 111M to 13B. With FP8-AMAX we are able to converge fine for all the sizes tested and the three different GLUE tasks of MNLI, QQP and SST-2, when compared to the validation accuracy reached in FP16. The results are displayed in Table 5. The loss function evolution also converges similarly when comparing FP8-AMAX and FP16. The loss function plots for the MNLI task are shown in Figure 10 within the Appendix J.
+
+In Appendix I we provide plots and analysis about how the scaling biases evolve as the fine-tuning progresses, for the model sizes of 111M, 1.3B and 6.7B. Inspecting the per-tensor scalings resulting from FP8-AMAX is helpful to elucidate why the FP8-CSCALE strategy in Subsection 4.4 is not robust for large models. It also gives insights about the update frequency needed if one is interested in saving some of the extra computations needed to update the scaling bias with FP8-AMAX.
+
+## 5 Conclusion
+
+We provide the technical details for practitioners interested in leveraging FP8 quantisation to effectively employ it for inference and training. We show that our methodology is able to adapt the scaling biases to prevent underflow or overflow from the FP8 format and match the reference results obtained in higher precision, for large language models like GPT and Llama up to 70B parameters.
+
+In this work we have focused on quantising the linear layers to FP8, but there are other layers ubiquitous in most transformer architectures that may benefit from FP8 quantisation, like the dot-product attention. We'll explore those in future works, as well as the application of FP8 in other models that don't belong to the transformer family of architectures, such as graph neural networks or computer vision models based on convolutional layers.
+
+ 
+**Model** & **MNLI** \\ 
+111M & [-3, 2] \\
+590M & [-2, 2] \\
+1.3B & [-2, 1] \\
+6.7B & [-1, 1] \\
+13B & [-1, 0] \\  
+
+Table 6: Fine-tuning results with FP8-CSCALE: range of the scaling bias that reaches a validation accuracy greater than 99.5% of the FP16 value, when performing FP8 fine-tuning with FP8-CSCALE. Weights, activations and gradients in all decoder layers share the same scaling bias.
+
+ 
+**Model** & **Quantisation** & **MNLI** & **QQP** & **SST-2** \\ 
+111M & FP16 & 72.61 & 85.32 & 85.07 \\  & FP8-AMAX & 72.50 & 85.84 & 85.57 \\ 
+590M & FP16 & 78.59 & 88.25 & 89.27 \\  & FP8-AMAX & 79.12 & 88.31 & 89.00 \\ 
+1.3B & FP16 & 82.82 & 89.32 & 91.36 \\  & FP8-AMAX & 82.58 & 89.32 & 91.28 \\ 
+6.7B & FP16 & 87.17 & 91.19 & 94.53 \\  & FP8-AMAX & 87.26 & 91.06 & 94.84 \\ 
+13B & FP16 & 88.26 & 91.22 & 94.61 \\  & FP8-AMAX & 88.28 & 91.53 & 94.50 \\  
+
+Table 5: Fine-tuning results: validation accuracy after fine-tuning in FP16 and FP8-AMAX for 3 epochs.

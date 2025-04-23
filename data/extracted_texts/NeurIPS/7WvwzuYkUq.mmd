@@ -1,0 +1,252 @@
+# Progressive Entropic Optimal Transport Solvers
+
+Parnian Kassraie
+
+ETH Zurich, Apple
+
+pkassraie@ethz.ch &Aram-Alexandre Pooladian
+
+New York University
+
+aram-alexandre.pooladian@nyu.edu &Michal Klein
+
+Apple
+
+michalk@apple.com &James Thornton
+
+Apple
+
+jamesthornton@apple.com &Jonathan Niles-Weed
+
+New York University
+
+jnv@cims.nyu.edu &Marco Cuturi
+
+Apple
+
+cuturi@apple.com
+
+###### Abstract
+
+Optimal transport (OT) has profoundly impacted machine learning by providing theoretical and computational tools to realign datasets. In this context, given two large point clouds of sizes \(n\) and \(m\) in \(^{d}\), entropic OT (EOT) solvers have emerged as the most reliable tool to either solve the Kantorovitch problem and output a \(n m\) coupling matrix, or to solve the Monge problem and learn a vector-valued push-forward map. While the robustness of EOT couplings/maps makes them a go-to choice in practical applications, EOT solvers remain difficult to tune because of a small but influential set of hyperparameters, notably the omnipresent entropic regularization strength \(\). Setting \(\) can be difficult, as it simultaneously impacts various performance metrics, such as compute speed, statistical performance, generalization, and bias. In this work, we propose a new class of EOT solvers (ProgOT), that can estimate both plans and transport maps. We take advantage of several opportunities to optimize the computation of EOT solutions by _dividing_ mass displacement using a time discretization, borrowing inspiration from dynamic OT formulations (McCann, 1997), and _conquering_ each of these steps using EOT with properly scheduled parameters. We provide experimental evidence demonstrating that ProgOT is a faster and more robust alternative to EOT solvers when computing couplings and maps at large scales, even outperforming neural network-based approaches. We also prove the statistical consistency of ProgOT when estimating OT maps.
+
+## 1 Introduction
+
+Many problems in generative machine learning and natural sciences--notably biology (Schiebinger et al., 2019; Bunne et al., 2023), astronomy (Metivier et al., 2016) or quantum chemistry (Buttazzo et al., 2012)--require aligning datasets or learning to map data points from a source to a target distribution. These problems stand at the core of optimal transport theory (Santambrogio, 2015) and have spurred the proposal of various solvers (Peyre et al., 2019) to perform these tasks reliably. In these tasks, we are given \(n\) and \(m\) points respectively sampled from source and target probability distributions on \(^{d}\), with the goal of either returning a coupling _matrix_ of size \(n m\) (which solves the so-called Kantorovitch problem), or a vector-valued _map estimator_ that extends to out-of-sample data (solving the Monge problem).
+
+In modern applications, where \(n,m 10^{4}\), a popular approach to estimating either coupling or maps is to rely on a regularization of the original Kantorovitch linear OT formulation using neg-entropy. This technique, referred to as _entropic OT_, can be traced back to Schrodinger and was popularized for ML applications in (Cuturi, 2013) (see Section 2). Crucially, EOT can be solved efficiently with Sinkhorn's algorithm (Algorithm 1), with favorable computational (Altschuler et al., 2017; Lin et al., 2022) and statistical properties (Genevay, 2019; Mena and Niles-Weed, 2019) compared to linear programs. Most couplings computed nowadays on large point clouds within ML applicationsare obtained using EOT solvers that rely on variants of the Sinkhorn algorithm, whether explicitly, or as a lower-level subroutine (Scethon et al., 2021, 2022). The widespread adoption of EOT has spurred many modifications of Sinkhorn's original algorithm (e.g., through acceleration (Thibault et al., 2021) or initialization (Thornton and Cuturi, 2023)), and encouraged its incorporation within neural-network OT approaches (Pooladian et al., 2023; Tong et al., 2023; Uscidda and Cuturi, 2023).
+
+Though incredibly popular, Sinkhorn's algorithm is not without its drawbacks. While a popular tool due its scalability and simplicity, its numerical behavior is deeply impacted by the amount of neg-entropy regularization, driven by the hyperparameter \(\). Some practitioners suggest to have the parameter nearly vanish (Xie et al., 2020; Schmitzer, 2019), others consider the case where it diverges, highlighting links with the maximum mean discrepancy (Ramdas et al., 2017; Genevay et al., 2019).
+
+Several years after its introduction to the machine learning community (Cuturi, 2013), choosing a suitable regularization term for EOT remains a thorny pain point. Common approaches are setting \(>0\) to a default value (e.g., the max (Flamary et al., 2021) or mean (Cuturi et al., 2022) normalization of the transport cost matrix), incorporating a form of cross-validation or an unsupervised criterion (Vacher and Vialard, 2022; Van Assel et al., 2023), or scheduling \(\)(Lehmann et al., 2022; Feydy, 2020). When \(\) is too large, the algorithm converges quickly, but yields severely biased maps (Figure 1, left), or blurry, uninformative couplings (Figure 2). Even theoretically and numerically _debiasing_ the Sinkhorn solver (Figure 1, middle) does not seem to fully resolve the issue (Feydy et al., 2019; Pooladian et al., 2022). To conclude, while strategies exist to alleviate this bias, there currently exists no one-size-fits-all solution to this problem.
+
+**Our contribution: an EOT solver with a dynamic lens.** Recent years have witnessed an explosion in neural-network approaches based on the so-called Benamou and Brenier dynamic formulation of OT (Lipman et al., 2022; Liu, 2022; Tong et al., 2023; Pooladian et al., 2023). A benefit of this perspective is the ability to split the OT problem into simpler sub-problems that are likely better conditioned than the initial transport problem. With this observation, we propose a novel family of _progressive_ EOT solvers, called ProgOT, that are meant to be sturdier and easier to parameterize than existing solvers. Our key idea is to exploit the dynamic nature of the problem, and vary parameters _dynamically_, such as \(\) and convergence thresholds, along the transport. We show that ProgOT
+
+* can be used to recover both Kantorovitch couplings and Monge map estimators,
+* gives rise to a novel, provably statistically consistent map estimator under standard assumptions.
+* strikes the right balance between computational and statistical tradeoffs,
+* can outperform other (including neural-based) approaches on real datasets,
+
+Figure 1: _(left)_ EOT solvers collapse when the value of \(\) is not properly chosen. This typically results in biased map estimators and in blurry couplings (see Fig. 2 for the coupling matrix obtained between \(_{}\) and \(_{}\)). _(middle)_ Debiasing the output of EOT solvers can prevent a collapse to the mean seen in EOT estimators, but computes the same coupling. ProgOT _(right)_ ameliorates these problems in various ways: by decomposing the resolution of the OT problem into multiple time steps, and using various forms of progressive scheduling, we recover _both_ a coupling whose entropy can be _tuned_ automatically and a map estimator that is fast and reliable.
+
+Figure 2: Coupling matrices between train points in Fig. 1. Comparison of EOT with a fairly large \(\), and ProgOT which automatically tunes the entropy of its coupling according to the target point cloud’s dispersion.
+
+## 2 Background
+
+**Optimal transport.** For domain \(^{d}\), let \(_{2}()\) denote the space of probability measures over \(\) with a finite second moment, and let \(_{2,}()\) be those with densities. Let \(,_{2}()\), and let \((,)\) be the set of joint probability measures with left-marginal \(\) and right-marginal \(\). We consider a translation invariant cost function \(c(x,y):=h(x-y)\), with \(h\) a strictly convex function, and define the Wasserstein distance, parameterized by \(h\), between \(\) and \(\)
+
+\[W(,)_{(,)} h(x-y)(x,y)\,.\] (1)
+
+This formulation is due to Kantorovitch (1942), and we call the minimizers to (1) _OT couplings_ or OT plans, and denote it as \(_{0}\). A subclass of couplings are those induced by _pushforward maps_. We say that \(T:^{d}^{d}\) pushes \(\) forward to \(\) if \(T(X)\) for \(X\), and write \(T_{\#}=\). Given a choice of cost, we can define the Monge (1781) formulation of OT
+
+\[T_{0}*{arg\,min}_{T:T_{\#}=} h(x-T(x))(x)\] (2)
+
+where the minimizers are referred to as _Monge maps_, or OT maps from \(\) to \(\). Unlike OT couplings, OT maps are not always guaranteed to exist. Though, if \(\) has a density, we obtain significantly more structure on the OT map:
+
+**Theorem 1** (Brenier's Theorem (1991)).: _Suppose \(_{2,}()\) and \(_{2}()\). Then there exists a unique solution to (2) that is of the form \(T_{0}=- h^{*} f_{0}\), where \(h^{*}\) is the convex-conjugate of \(h\), i.e. \(h^{*}(y)_{x} x,y-h(x)\), and_
+
+\[(f_{0},g_{0})*{arg\,max}_{(f,g)} f+ g\,,\] (3)
+
+_where \(\{(f,g) L^{1}() L^{1}():\,f(x)+g(y) h(x- y),\, x,y.\}\). Moreover, the OT plan is given by \(_{0}(x,y)=_{T_{0}(x)}(y)(x)\)._
+
+Importantly, (3) is the _dual_ problem to (1) and the pair of functions \((f_{0},g_{0})\) are referred to as the _optimal Kantorovich potentials_. Lastly, we recall the notion of geodesics with respect to the Wasserstein distance. For a pair of measures \(\) and \(\) with OT map \(T_{0}\), the McCann interpolation between \(\) and \(\) is defined as
+
+\[_{}((1-)+ T_{0})_{\#}\,,\] (4)
+
+where \(\). Equivalently, \(_{}\) is the law of \(X_{}=(1-)X+ T_{0}(X)\), where \(X\). In the case where \(h=\|\|^{p}\) for \(p>1\), the McCann interpolation is in fact a _geodesic_ in the Wasserstein space (Ambrosio et al., 2005). While this equivalence may not hold for general costs, the McCann interpolation still provides a natural path of measures between \(\) and \(\)(Liu, 2022).
+
+Entropic OT.Entropic regularization has become the de-facto approach to estimate all three variables \(_{0}\), \(f_{0}\) and \(T_{0}\) using samples \((_{1},,_{n})\) and \((_{1},,_{m})\), both weighted by probability weight vectors \(_{+}^{n},_{+}^{m}\) summing to \(1\), to form approximations \(_{n}=_{i=1}^{n}_{i}_{_{i}}\) and \(_{m}=_{i=1}^{m}_{j}_{_{j}}\). A common formulation of the EOT problem is the following \(\)-strongly concave program:
+
+\[^{},^{}=*{arg\,max}_{ ^{n},^{m}} ,+,\\ - e^{/},e^{ /}\,,\] (5)
+
+where \(>0\) and \(_{i,j}=[(-(_{i}-_{j})/)]_{i,j} _{+}^{n m}\). We can verify that (5) is a regularized version of (3) when applied to empirical measures (Peyre et al., 2019, Proposition 4.4). Sinkhorn's algorithm presents an iterative scheme for obtaining \((^{},^{})\), and we recall it in Algorithm 1, where for a matrix \(=[_{i,j}]\) we use the notation \(_{}()[-(^{ }e^{-_{i,\,\,/}})]_{i}\), and \(\) is the tensorsum of two vectors, i.e. \(:=[_{i}+_{j}]_{ij}\). Note that solving (5) also outputs a valid coupling \(_{i,j}^{}=_{i,j}(-(_{i}^{}+_{j}^{})/)\), which approximately solves the finite-sample counterpart of (1). Additionally, the optimal potential \(f_{0}\) can be approximated by the _entropic potential_
+
+\[_{}(x)_{}([_{j}^{}-h (x-_{j})]_{j}),\] (6)
+
+where an analogous expression can be written for \(_{}\) in terms of \(^{}\). Using the entropic potential, we can also approximate the optimal transport map \(T_{0}\) by the _entropic map_
+
+\[_{}(x)=x- h^{}_{}( x)\,.\] (7)
+
+This connection is shown in Podalian and Niles-Weed (2021, Proposition 2) for \(h=\|\|^{2}\) and (Cuturi et al., 2023) for more general functions.
+
+## 3 Progressive Estimation of Optimal Transport
+
+We consider the problem of estimating the OT solutions \(_{0}\) and \(T_{0}\), given empirical measures \(\) and \(\) from \(n\) i.i.d. samples. Our goal is to design an algorithm which is numerically stable, computationally light, and yields a consistent estimator. The entropic map (7) is an attractive option to estimate OT maps compared to other consistent estimators (e.g., Hutter and Rigollet, 2021, Manole et al., 2021). In contrast to these methods, the entropic map is tractable since it is the output of Sinkhorn's algorithm. While Pooladian and Niles-Weed (2021) show that the entropic map is a _bona fide_ estimator of the optimal transport map, it hides the caveat that the estimator is always _biased_. For any pre-set \(>0\), the estimator is never a valid pushforward map i.e., \((_{})_{\#}\), and this holds true as the number of samples tends to infinity. In practice, the presence of this bias implies that the performance of \(_{}\) is sensitive to the choice of \(\), e.g. as in Figure 1. Instead of having Sinkhorn as the end-all solver, we propose to use it as a _subroutine_. Our approach is to _iteratively_ move the source closer to the target, thereby creating a sequence of matching problems that are _increasingly easier_ to solve. As a consequence, the algorithm is less sensitive to the choice of \(\) for the earlier EOT problems, since it has time to correct itself at later steps. To move the source closer to the target, we construct a McCann-type interpolator which uses the entropic map \(_{}\) of the previous iterate, as outlined in the next section.
+
+### Method
+
+As a warm-up, consider \(T_{0}\) the optimal transport map from \(\) to \(\). We let \(T^{(0)} T_{0}\) and define \(S^{(0)}(1-_{0})+_{0}T^{(0)}\). This gives rise to the measure \(^{(1)}=S^{(0)}_{\#}\), which traces out the McCann interpolation between \((,)\) as \(\) varies in the interval \((0,1)\). Then, letting \(T^{(1)}\) be the optimal transport map for the pair \((^{(1)},)\), it is straightforward to show that \(T^{(1)} S^{(0)}=T^{(0)}\). In other words, in the idealized setting, composing the output of a progressive sequence of Monge problems along the McCann interpolation path recovers the solution to the original Monge problem.
+
+Building on this observation, we set up a progressive sequence of _entropic_ optimal transport problems, along an _estimated_ interpolation path, between the _empirical_ counterparts of \((,)\). We show that, as long as we remain close to the true interpolation path (by not allowing \(\) to be too large), the final output is close to \(\). Moreover, as the algorithm progresses, choosing the parameters \(_{i}\) becomes a less arduous task, and computation of \(_{}\) becomes a more stable numerical problem.
+
+At step zero, we set \(_{}^{(0)}=\) and calculate the entropic map \(^{(0)}_{_{0}}\) from samples \((_{}^{(0)},)\) with a regularization parameter \(_{0}>0\). To set up the next EOT problem, we create an intermediate distribution via the McCann-type interpolation
+
+\[_{}^{(1)}^{(0)}_{\#}_{ }^{(0)},\ ^{(0)}(1-_{0})+_{0} ^{(0)}\,,\]
+
+with \(_{0}(0,1)\). In doing so, we are mimicking a step along the interpolation path for the pair \((,)\). In fact, we can show that \(_{}^{(1)}\) is close to \(_{_{0}}\) as defined in (4) (see Lemma 12). For the next iteration of the algorithm, we choose \(_{1}\) and \(_{1}\), compute \(^{(1)}\) the entropic map for the pair \((_{}^{(1)},)\) with regularization \(_{1}\), and move along the estimated interpolation path by computing the distribution \(_{}^{(2)}\). We repeat the same process for \(K\) steps. The algorithm then outputs the _progressive entropic_ map
+
+\[^{(K)}_{}^{(K)}^{ (K-1)}^{(0)}\,,\]
+
+Figure 3: Intuition of ProgOT: By iteratively fitting to the interpolation path, the final transport step is less likely to collapse, resulting in more stable solver.
+
+where \(^{(k)}=(1-_{k})+_{k}^{(k)}\) is the McCann-type interpolator at step \(k\). Figure 3 visualizes the one-step algorithm, and Definition 2 formalizes the construction of our progressive estimators.
+
+**Definition 2** (ProgOT).: _For two empirical measures \(,\), and given step and regularization schedules \((_{k})_{k=0}^{K}\) and \((_{k})_{k=0}^{K}\), the ProgOT map estimator \(_{}^{(K)}\) is defined as the composition_
+
+\[_{}^{(K)}^{(K)} ^{(K-1)}^{(0)}\]
+
+_where these maps are defined recursively, starting from \(_{}^{(0)}\), and then at each iteration:_
+
+* \(^{(k)}\) _is the entropic map_ \(_{_{k}}\)_, computed between samples_ \((_{}^{(k)},)\) _with regularization_ \(_{k}\)_._
+* \(^{(k)}:=(1-_{k})+_{k}^{(k)}\)_, is a McCann-type interpolating map at time_ \(_{k}\)_._
+* \(_{}^{(k+1)}:=_{\#}^{(k)}_{ }^{(k)}\) _the updated measure used in the next iteration._
+
+_Additionally, the ProgOT coupling matrix \(\) between \(\) and \(\) is identified with the matrix solving the discrete EOT problem between \(_{}^{(K)}\) and \(\)._
+
+The sequence of \((_{k})_{k=0}^{K}\) characterizes the speed of movement along the path. By choosing \(_{k}=(k)\) we can recover a constant-speed curve, or an accelerating curve which initially takes large steps and as it gets closer to the target, the steps become finer, or a decelerating curve which does the opposite. This is discussed in more detail in Section 4 and visualized in Figure (4-C). Though our theoretical guarantee requires a particular choice for the sequence \((_{k})_{k=0}^{K}\) and \((_{k})_{k=0}^{K}\), our experimental results reveal that the performance of our estimators is not sensitive to this choice. We hypothesize that this behavior is due to the fact that ProgOT is "self-correcting"--by steering close to the interpolation path, later steps in the trajectory can correct the biases introduced in earlier steps.
+
+### Theoretical Guarantees
+
+By running ProgOT, we are solving a sequence of EOT problems, each building on the outcome of the previous one. Since error can potentially accumulate across iterations, it leads us to ask if the algorithm diverges from the interpolation path and whether the ultimate progressive map estimator \(T_{}^{(K)}\) is consistent, focusing on the squared-Euclidean cost of transport, i.e., \(h=\|\|^{2}\).. To answer this question, we assume
+
+* \(,_{2,}()\) with \(^{d}\) convex and compact, with \(0<_{}()_{}\) and \(()_{}\),
+* **(A2)** the inverse mapping \(x(T_{0}(x))^{-1}\) has at least three continuous derivatives,
+* there exists \(,>0\) such that \( I DT_{0}(x) I\), for all \(x\) (\(D\) denotes Jacobian)
+
+and prove that ProgOT yields a consistent map estimator. Our error bound depends on the number of iterations \(K\), via a constant multiplicative factor. Implying that \(T_{}^{(K)}\) is consistent as long as \(K\) does not grow too quickly as a function of \(n\) the number of samples. In experiments, we set \(K n\).
+
+**Theorem 3** (Consistency of Progressive Entropic Maps).: _Let \(h=\|\|^{2}\). Suppose \(,\) and their optimal transport map \(T_{0}\) satisfy **(A1)**-**(A3)**, and further suppose we have \(n\) i.i.d. samples from both \(\) and \(\). Let \(_{}^{(k)}\) be as defined in Definition 2, with parameters \(_{k} n^{-},_{k} n^{}\) for all \(k[K]\). Then, the progressive entropic map is consistent and converges to the optimal transport map as_
+
+\[_{}^{(K)}-T_{0}_{L^{2 }()}^{2}_{(n),K}n^{-}\]
+
+_where the notation implies that the inequality ignores terms of rate \(((n),K)\)._
+
+The rate of convergence for ProgOT is slower than the convergence of entropic maps shown by Pooladian and Niles-Weed (2021) under the same assumptions, with the exception of convexity of \(\). However, the rates that Theorem 3 suggests for the parameters \(_{k}\) and \(_{k}\) are set merely to demonstrate convergence and do not reflect how each parameter should be chosen as a function of \(k\) when executing the algorithm. We will present practical schedules for \((_{k})_{k=1}^{K}\) and \((_{k})_{k=1}^{K}\) in Section 4. The proof is deferred to Appendix C; here we present a brief sketch.
+
+Proof sketch.: In Lemma 11, we show that
+
+\[_{}^{(K)}-T_{0}_{L^{2}()}^{2 }_{k=0}^{K}_{k}_{k=0}^{K}\| ^{(k)}-T^{(k)}\|_{L^{2}(^{(k)})}^{2}\,,\]
+
+where \(^{(k)}\) is a point on the true interpolation path, and \(T^{(k)}\) is the optimal transport map emanating from it. Here, \(^{(k)}\) is the entropic map estimator between the final target points and the data that has been pushed forward by earlier entropic maps. It suffices to control the term \(_{k}\). Since \(^{(k)}\) and \(T^{(k)}\) are calculated for _different_ measures, we prove a novel stability property (Proposition 4) to show that along the interpolation path, these intermediate maps remain close to their unregularized population counterparts, if \(_{k}\) and \(_{k}\) are chosen as prescribed. This result is based off the recent work by Divol et al. (2024) and allows us to recursively relate the estimation at the \(k\)-th iterate to the estimation at the previous ones, down to \(_{0}\). Thus, Lemma 12 tells us that, under our assumptions and parameter choices \(_{k} n^{-1/d}\) and \(_{k} n^{-1/2d}\), it holds that for all \(k 0\)
+
+\[_{k}_{(n)}n^{-1/d}\,.\]
+
+Since the stability bound allows us to relate \(_{k}\) to \(_{0}\), combined with the above, we have that
+
+\[_{k}_{(n)}_{0}_{(n)}n^{-1/d}\,,\]
+
+where the penultimate inequality uses the existing estimation rates from Pooladian and Niles-Weed (2021), with our parameter choice for \(_{0}\). 
+
+**Proposition 4** (Stability of entropic maps with variations in the source measure).: _Let \(h=\|\|^{2}\). Let \(,^{},\) be probability measures over a compact domain with radius \(R\). Suppose \(T_{},T_{}^{}\) are, respectively, the entropic maps from \(\) to \(\) and \(^{}\) to \(\), both with the parameter \(>0\). Then_
+
+\[\|T_{}-T_{}^{}\|_{L^{2}()}^{2} 3 R^{2}^{-1}W_{2}^{2}(,^{})\,.\]
+
+## 4 Computing Couplings and Map Estimators with ProgOT
+
+Following the presentation and motivation of ProgOT in Section 3, here we outline a practical implementation. Recall that \(_{n}=_{i=1}^{n}_{i}_{_{i}}\) and \(_{m}=_{j=1}^{m}_{j}_{_{j}}\), and we summarize the locations of these measures to the matrices \(=(_{1},,_{n})\) and \(=(_{1},,_{m})\), which are of size \(n d\) and \(m d\), respectively. Our ProgOT solver, concretely summarized in Algorithm 2, takes as input two weighted point clouds, step-lengths \((_{k})_{k}\), regularization parameters \((_{k})_{k}\), and threshold parameters \((_{k})_{k}\), to output two objects of interest: the final coupling matrix \(\) of size \(n m\), as illustrated in Figure 2, and the entities needed to instantiate the \(_{}\) map estimator, where an implementation is detailed in Algorithm 3. We highlight that Algorithm 2 incorporates a warm-starting method when instantiating \(\) solvers (Line 3). This step may be added to improve the runtime.
+
+```
+1:\(=_{n},^{(-1)}=_{m}\).
+2:for\(k=0,,K\)do
+3:\(_{},_{}(1-_{k})\, ,(1-_{k})\,^{(k-1)}\)
+4:\(,^{(k)},(, ,,,_{k},_{k},_{},_{})\)
+5:\((1/_{m})\)
+6:\([ h^{*}(_{j}_{} h( _{i}-_{j}))]_{i}^{n d}\)
+7:\(-_{k}\,\)
+8:endfor
+9:return: Coupling matrix \(\),
+10: Map estimator \(_{}[,,(^{(k)},_ {k},_{k})_{k}]()\) ```
+
+**Algorithm 2**ProgOT\((,,,,(_{k},_{k},_{k})_{k})\)
+
+```
+1:input: Source point \(^{d}\)
+2:initialize:\(=\), \(_{K}\) reset to \(1\).
+3:for\(k=0, K\)do
+4:\([_{j}(^{(k)}-h(- _{j})}{})]_{j}\)
+5:\(/_{m}^{T}^{m^{ }_{k}}\)
+6:\([ h(-_{j})]_{j} ^{m d}\)
+7:\( h^{*}(^{T}) ^{d}\)
+8:\(-_{k}\).
+9:endfor
+10:return:\(\) ```
+
+**Algorithm 3**\(_{}[,,(^{(k)},_ {k},_{k})_{k}]\)
+
+**Setting step lengths.** We propose three scheduling schemes for \((_{k})_{k}\): decelerated, constant-speed and accelerated. Let \(t_{k}\) denote the progress along the interpolation path at iterate \(k\). At step zero, \(t_{0}=_{0}\). Then at the next step, we progress by a fraction \(_{1}\) of the remainder, and therefore \(t_{1}=t_{0}+_{1}(1-_{0})\). It is straightforward to show that \(t_{k}=1-_{=1}^{k}(1-_{})\). We call a schedule constant speed, if \(t_{k+1}-t_{k}\) is a constant function of \(k\), whereas an accelerated (resp. decelerated)schedule has \(t_{k+1}-t_{k}\) increasing (resp. decreasing) with \(k\). Table 6 presents the specific choices of \(_{k}\) for each of these schedules. By convention, we set the last step to be a complete step, i.e., \(_{K}=1\).
+
+**Setting regularization schedule.** To set the regularization parameters \((_{k})_{k=0}^{K}\), we propose Algorithm 4. To set \(_{0}\), we use the average of the values in the cost matrix \([h(_{i}-_{j})]_{ij}\) between source and target, multiplied by a small factor, as implemented in (Cuturi et al., 2022). Then for \(_{K}\), we make the following key observation. As the last iteration, the algorithm is computing \(^{(k)}\), an entropic map roughly between the target measure and _itself_. For this problem, we know trivially that the OT map should be the identity. Therefore, given a set of values to choose from, we pick \(_{K}\) to be that which minimizes this error over a hold-out evaluation set of \(_{}=(}_{j})_{j=1}^{m}\)
+
+\[(;Y_{})_{j=1}^{m}\| }_{j}-^{(K)}(}_{j})\|_{2} ^{2}.\]
+
+The intermediate values are then set by interpolating between \(_{0}_{0}\) and \(_{K}\), according to the times \(t_{k}\). Figure 4-C visualizes the effect of applying Algorithm 4 for scheduling, as opposed to choosing default values for \(_{k}\).
+
+**Setting threshold schedule.** By setting the \(\) stopping threshold \(_{k}\) as a function of time \(k\), one can modulate the amount of compute effort spent by the \(\) subroutine at each step. This can be achieved by decreasing \(_{k}\) linearly w.r.t. the iteration number, from a loose initial value, e.g., \(0.1\), to a final target value \(_{K} 1\). Doing so results naturally in sub-optimal couplings \(\) and dual variables \(g^{(k)}\) at each step \(k\), which might hurt performance. However, two comments are in order: _(i)_ Because the _last_ threshold \(_{K}\) can be set independently, the final coupling matrix \(\) returned by \(\) can be arbitrarily feasible, in the sense that its marginals can be made arbitrarily close to \(\), \(\) by setting \(_{K}\) to a small value. This makes it possible to compare in a fair way to a direct application of the \(\) algorithm. _(ii)_ Because the coupling is normalized by its own marginal in line (5) of Algorithm 2, we ensure that the barycentric projection computed at each step remains valid, i.e., the matrix \(\) is a transition kernel, with line vectors in the probability simplex.
+
+## 5 Experiments
+
+We run experiments to evaluate the performance of \(\) across various datasets, on its ability to act as a map estimator, and to produce couplings between the source and target points. The code for \(\), is included in the OTT-JAX package (Cuturi et al., 2022).
+
+### \(\) as a Map Estimator
+
+In map experiments, unless mentioned otherwise, we run \(\) for \(K=16\) steps, with a constant-speed schedule for \(_{k}\), and the regularization schedule set via Algorithm 4 with \(_{0}=5\) and \(s_{p}\{2^{-3},,2^{3}\}\). In these experiments, we fit the estimators on training data using the \(_{2}^{2}\) transport cost, and report their performance on test data in Figure 4 and Table 1. To this end, we quantify the distance between two test point clouds (\(,\)) with the _Sinkhorn divergence_(Genevay et al., 2018; Feydy et al., 2019), always using the \(_{2}^{2}\) transport cost. Writing \(_{}(,)\) for the objective value of Equation (5), the Sinkhorn divergence reads
+
+\[D_{_{D}}(,)_{ _{D}}(,)-_{ _{D}}(,)+_{_{D}}( ,)\,,\] (8)
+
+where \(_{D}\) is 5% of the mean (intra) cost seen within the target distribution (see Appendix B).
+
+**Exploratory Experiments on Synthetic Data.** We consider a synthetic dataset where \(\) is a \(d\)-dimensional point cloud sampled from a 3-component Gaussian mixture. The ground-truth \(T_{0}\) is the gradient of an input convex neural network (ICNN) previously fitted to push roughly \(\) to a mixture of \(10\) Gaussians (Korotin et al., 2021). From this map, we generate the target point cloud \(\). Unless stated otherwise, we use \(n_{}=7000\) samples to train a progressive map between the source and target point clouds and visualize some of its properties in Figure 4 using \(n_{}=500\) test points.
+
+[MISSING_PAGE_FAIL:8]
+
+in Section 4, both approaches are guaranteed to output couplings that satisfy the same threshold for criterion _(iii)_, leaving us only three quantities to monitor: compute effort here quantified as total number of \(\) iterations, summed over all \(K\) steps for \(\), transport cost and entropy. While compute effort and transport cost should, ideally, be as small as possible, certain applications requiring, e.g., differentiability (Cuturi et al., 2019) or better sample complexity (Genevay et al., 2019), may prefer higher entropies.
+
+To monitor these three quantities, and cover an interesting space of solutions that, we run \(\)'s algorithm for a logarithmic grid of \(=_{0}\) values (here \(_{0}\) is defined in Line 2 of Algorithm 4), and compare it to constant-speed \(\) with \(K=\{2,4,8\}\). Because one cannot directly compare regularizations, we explore many choices to schedule \(\) within \(\). Following the default strategy used in OTT-JAX (Cuturi et al., 2022), we set at every iterate \(k\), \(_{k}=_{k}\), where \(_{k}\) is 5% of the the mean of the cost matrix at that iteration, as detailed in Appendix B. We do not use Algorithm 4 since it returns a regularization schedule that is tuned for map estimation, while the goal here is to recover couplings that are comparable to those outputted by \(\). We set the threshold for marginal constraint satisfaction for both algorithms as \(_{K}==0.001\) and run all algorithms to convergence, with infinite iteration budget. For the coupling experiments, we use the single-cell multiplex data of Bunne et al. (2023), reflecting morphological features and protein intensities of melanoma tumor cells. The data describes \(d=47\) features for \(n 11,000\) control cells, and \(m 2,800\) treated cells, for each of 34 drugs, of which we use only 6 at random. To align the cell populations, we consider two ground costs: the squared-Euclidean norm \(\|\|^{2}\) as well as \(h=\|\|_{p}^{p}\), with \(p=1.5\).
+
+Results for \(6\) drugs are displayed in Figure 5. The _area_ of the marker reflects the total number of \(\) iterations needed for either algorithm to converge to a coupling with a threshold \(=10^{-3}\). The values for \(\) and \(K\) displayed in the legend are encoded using _colors_. The global scaling parameter for \(\) is set to \(=2^{-4}\). Figure 10 and 11 visualize other choices for \(\). These results prove that \(\) provides a competitive alternative to \(\), to compute couplings that yield a small entropy and cost at a low computational effort, while satisfying the same level of marginal constraints.
+
+  Drug &  &  &  &  \\  \(d_{}\) & 16 & 64 & 256 & 16 & 64 & 256 & 16 & 64 & 256 & rank \\  \(\) & 2.9\(\)0.1 & **8.8**\(\)0.1 & **20.8**\(\)0.2 & 3.3\(\)0.2 & **9.0**\(\)0.3 & **21.9**\(\)0.3 & **3.7**\(\)0.4 & **10.1**\(\)0.4 & **23.1**\(\)0.4 & **1** \\  EOT & **2.5**\(\)0.1 & 9.6\(\)0.1 & 22.8\(\)0.2 & 3.9\(\)0.4 & 10.0\(\)0.1 & 24.7\(\)0.9 & 4.1\(\)0.4 & 10.4\(\)0.5 & 26\(\)1.3 & 2 \\  Debiased EOT & 3.2\(\)0.1 & 14.3\(\)0.1 & 39.8\(\)0.4 & 3.7\(\)0.2 & 14.7\(\)0.1 & 42.4\(\)0.8 & 4.0\(\)0.5 & 15.2\(\)0.6 & 41\(\)1.1 & 4 \\  Monge Gap & 3.1\(\)0.1 & 10.3\(\)0.1 & 34.4\(\)0.3 & **2.8**\(\)0.2 & 9.9\(\)0.2 & 34.9\(\)0.3 & 3.7\(\)0.5 & 11.0\(\)0.5 & 36\(\)1.1 & 3 \\  \(\) & 5.0\(\)0.1 & 14.7\(\)0.1 & 42\(\)1 & 5.1\(\)0.1 & 14.8\(\)0.2 & 40.3\(\)0.1 & 4.0\(\)0.4 & 14.4\(\)0.5 & 46\(\)2.1 & 5 \\  
+
+Table 1: Performance of \(\) compared to baselines, w.r.t \(_{_{D}}\) between source and target of the sci-Plex dataset. Reported numbers are the average of 5 runs, together with the standard error.
+
+Figure 5: Performance as a coupling solver on the 4i dataset. \(\) returns better couplings, in terms of the OT cost and the entropy, for a fraction of \(\) iterations, while still returning a coupling that has the same deviation to the original marginals. The _(top)_ row is computed using \(h=\|.\|_{2}^{2}\), the _(bottom)_ row shows results for the cost \(h=\|\|_{p}^{p}\) where \(p=1.5\).
+
+### Scalability of ProgOT
+
+Real-world experiments on pre-processed single-cell data are often run with limited sample sizes (\(n 10^{3}\)) and medium data dimensionality (\(d 200\)). As a result they are not suitable to benchmark OT solvers at larger scale. To address this limitation, we design a challenging large-scale (large \(n\), large \(d\)) OT problem on real data, for which the ground-truth is known. We believe our approach can be replicated to create benchmarks for OT solvers. We consider the entire grayscale CIFAR10 dataset (Krizhevsky et al., 2009) for which \(n=60,000\) and \(d=32 32=1024\). We consider the task of matching these \(n\) images to their blurred counterparts, using Gaussian blurs of varying width. To blur an image \(U^{N N}\) we use the isotropic Gaussian kernel \(K=[/( N^{2}))}]_{ij}\) for \(i,j N\)(c.f. Remark 4.17, Peyre et al., 2019), and define the Gaussian blur operator as \(G(U) KUK^{N N}\). The crucial observation we make in Proposition 5 is that, when using the squared Euclidean ground cost \(_{2}^{2}\), the optimal matching is necessarily equal to the _identity_ (i.e. each image must be necessarily matched to its blurred counterpart), as pictured in (Figure 6).
+
+**Proposition 5**.: _Let \(=_{s<}_{U}\), be the empirical distribution over \(n\) images and define \( G_{\#}\) where \(G\) is the Gaussian blur operator with \(<\). Then \(^{}\) the optimal coupling between \((,)\) with the \(h=\|\|_{2}^{2}\) cost is the normalized \(n\)-dimensional identity matrix \(/n\)._
+
+In light of Proposition 5, we generate two blurred datasets using a Gaussian kernel with \(=2\) and \(=4\) (see Figure 7). We then use ProgOT with and Sinkhorn's Algorithm to match the blurred dataset back to the original CIFAR10 (de-blurring). The hyper-parameter configurations are the same as Section 5.2, with \(==2^{-4}\). We evaluate the performance of the OT solvers by checking how close the trace of the recovered coupling \((})\) is to \(1.0\), or with the KL divergence from the ground-truth, that is, \((^{}||})=- n-n_{i n}( }_{ii})\).
+
+Table 2 compares the performance of ProgOT and Sinkhorn, along with the number of iterations needed to achieve this performance. Both algorithms scale well and show high accuracy, while requiring a similar amount of computation. We highlight that at this scale, simply storing the cost or coupling matrices would require about 30Gb. The experiment has to happen across multiple GPUs. Thanks to its integration in JAX and OTT-JAX (Cuturi et al., 2022b), ProgOT supports sharding by simply changing a few lines of code. The algorithms scales seamlessly and each run takes about 15 minutes, on a single node of 8 A100 GPUs. This experiment sets a convincing example on how ProgOT scales to much larger (in \(n\) and \(d\)) problems than considered previously.
+
+## Conclusion
+
+In this work, we proposed ProgOT, a new family of EOT solvers that blend dynamic and static formulations of OT by using the Sinkhorn algorithm as a subroutine within a progressive scheme. ProgOT aims to provide practitioners with an alternative to the Sinkhorn algorithm that _(i)_ does not fail when instantiated with uninformed or ill-informed \(\) regularization, thanks to its self-correcting behavior and our simple \(\)-scheduling scheme that is informed by the dispersion of the _target distribution_, _(ii)_ performs at least as fast as Sinkhorn when used to compute couplings between point clouds, and _(iii)_ provides a reliable out-of-the-box OT map estimator that comes with a non-asymptotic convergence guarantee. We believe ProgOT can be used as a strong baseline to estimate Monge maps.
+
+   &  &  \\   &  & 0.9999 & 0.9954 \\   & \(\) & 0.00008 & 0.02724 \\   & \(\#\)iters & 10 & 2379 \\   & \(\) & 1.000 & 0.9989 \\   & \(\) & 0.00000 & 0.00219 \\   & \(\#\)iters & 40 & 1590 \\  
+
+Table 2: Coupling recovery, quantified as trace, and KL divergence from identity matrix, for coupling matrices obtained with ProgOT and Sinkhorn, and blur strengths \(=2,4\). ProgOT is run for \(K=4\) and with the constant-speed schedule.
+
+Figure 6: We consider the optimal assignment problem between all CIFAR images and their blurry CIFAR counterparts using the \(_{2}^{2}\) loss. A small subset of 3 original images on the left can be compared with their blurred counterpart on the right, with \(=4\). The optimal coupling for this task is the identity, which we compare with couplings recovered by our methods at large scales.

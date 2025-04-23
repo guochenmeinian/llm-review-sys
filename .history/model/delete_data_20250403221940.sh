@@ -1,1 +1,0 @@
-rm /Users/arist/Documents/llm-review-sys/model/llama_factory_dataset/*.json

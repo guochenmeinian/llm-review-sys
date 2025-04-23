@@ -1,0 +1,155 @@
+# MemoryFormer: Minimize Transformer
+
+Computation by Removing Fully-Connected Layers
+
+ Ning Ding\({}^{1*}\), Yehui Tang\({}^{2*}\), Haochen Qin\({}^{2}\), Zhenli Zhou\({}^{1}\), Chao Xu\({}^{1}\), Lin Li\({}^{3}\),
+
+**Kai Han\({}^{2}\), Heng Liao\({}^{3}\), Yunhe Wang\({}^{2}\)**
+
+\({}^{1}\) State Key Lab of General AI, School of Intelligence Science and Technology, Peking University
+
+\({}^{2}\) Huawei Noah's Ark Lab.
+
+\({}^{3}\) Huawei HiSilicon
+
+dingning@stu.pku.edu.cn xuchao@cis.pku.edu.cn {yehui.tang, yunhe.wang}@huawei.com
+
+Equal Contribution. \({}^{}\)Corresponding Author.
+
+###### Abstract
+
+In order to reduce the computational complexity of large language models, great efforts have been made to to improve the efficiency of transformer models such as linear attention and flash-attention. However, the model size and corresponding computational complexity are constantly scaled up in pursuit of higher performance. In this work, we present **MemoryFormer**, a novel transformer architecture which significantly reduces the computational complexity (FLOPs) from a new perspective. We eliminate nearly all the computations of the transformer model except for the necessary computation required by the multi-head attention operation. This is made possible by utilizing an alternative method for feature transformation to replace the linear projection of fully-connected layers. Specifically, we first construct a group of in-memory lookup tables that store a large amount of discrete vectors to replace the weight matrix used in linear projection. We then use a hash algorithm to retrieve a correlated subset of vectors dynamically based on the input embedding. The retrieved vectors combined together will form the output embedding, which provides an estimation of the result of matrix multiplication operation in a fully-connected layer. Compared to conducting matrix multiplication, retrieving data blocks from memory is a much cheaper operation which requires little computations. We train MemoryFormer from scratch and conduct extensive experiments on various benchmarks to demonstrate the effectiveness of the proposed model.
+
+## 1 Introduction
+
+The Transformer model has made magnificent achievement in deep learning community since it was made public. The Transformer not only successfully leads the revolution in the field of natural language processing due to its excellent performance, but also motivates the innovation in model architecture in other fields such as computer vision and speech recognition. Recently, large language models (LLMs), transformers that are extremely scaled up in size, have drawn remarkable attention of both researchers and non-researchers across the globe. The unprecedented emergent abilities that LLMs demonstrate attract an increasing number of investments and researches, which point out a potential pathway for the artificial general intelligence.
+
+However, what comes along with the scaling lay is not only more intelligence, but also greater consumption of computing resources. The ever-increasing computational complexity is currently the main obstacle hindering the application and popularization of LLMs. In response to this situation,great efforts have been made towards optimizing the architecture of transformer model by the research community. Some works using traditional methods such as model pruning and weight quantization are able to lower the computational complexity of LLMs to some degree. Another line of works that are specialized for transformer re-design the self-attention mechanism, which is the key to sequence modeling. They use sliding-windows or kernel function to reduce the complexity from quadratic to sub-quadratic or even linear with respect to the sequence length, while maintaining a comparable performance.
+
+According to our observation, in most application scenarios, only a small proportion of the computational complexity comes from the multi-head attention (MHA) operation, while the majority of the computation comes from the fully-connected (FC) layers in the transformer model. Specifically, given a standard transformer model with the hidden size being \(d\) and the length of input sequence being \(s\), the amount of floating-point computation of the MHA operation is \(2s^{2}d\), and the computation in all the FC layers is \(12sd^{2}\). The computation required by the MHA becomes dominant only when \(s>6d\). That's to say, for an LLM with hidden size \(d=4096\), the sequence length \(s\) needs to be larger than 24K.
+
+Another observation we have is that, at present, the inference stage of deep neural network relies on the parallel-computing cores of the graphics processing unit (GPU), while the CPU and the random-access memory (RAM) resources in the computer system are left almost unused, despite the fact that the size of the RAM easily reaches terabytes and the CPU has hundreds of cores (_e.g._ NVIDIA DGX A100 has 2TB RAM and 128 CPU cores ). What's more, CPU manufacturers have started developing tensor core to accelerate parallel-computing, which might make the low-latency CPU inference feasible in the future.
+
+Based on the above observations, we present a novel transformer architecture in this work, named **MemoryFormer**, to minimize the required computational complexity from a new perspective. Instead of the fully-connected layers used in a standard transformer, MemoryFormer uses the Memory Layer to process the feature vector (the embedding of token). Specifically, the Memory Layer contains a group of in-memory hash tables which store a large amount of discrete vectors. It uses locality-sensitive hashing (LSH) algorithm to retrieve a subset of vectors from the hash tables that are correlated with the input token embedding. These retrieved vectors are then aggregated with different weights to form the output of the Memory Layer. The result of hashing-and-aggregating operation performed by the Memory Layer provides an estimation of the matrix multiplication of the fully-connected layer. We also design a method to make all the vectors stored in hash tables learnable via the back-propagation of gradients. Therefore, the MemoryFormercan be trained from scratch in an end-to-end manner.
+
+Since the amount of computation produced by the hash operation is negligible, the absolute majority of the computations now results from the matrix-multiplications within the multi-head attention. Figure 1 demonstrates the comparison of the computational complexity of one block between the proposed MemoryFormer (red) and the baseline transformer (blue). The MemoryFormer block only requires \(\)19% of the FLOPs compared with the baseline transformer block when sequence length \(s=2048\) and hidden size \(d=2048\). The effect of FLOPs-reduction is going to be more significant as the model size is scaled up. Replacing all fully-connected layers with Memory Layers allows us to trade the memory resources for less computational complexity.
+
+This work not only proposes a new FLOPs-reduction strategy that is different from existing approaches, but also provides guiding significance for the hardware design (_e.g._ bigger bus width and higher cache hit rate) of the next-generation parallel-computing platform. We train a series of MemoryFormers of different sizes and validate the effectiveness of these models on multiple public benchmarks. The experiment results show that our method can achieve performance comparable to the baseline Transformer with significantly less computation.
+
+Figure 1: FLOPs with different model hidden size and sequence lengths.
+
+MemoryFormer
+
+### Background
+
+In the standard Transformer model, there are two main types of operations to perform feature transformation on the sequence of token embeddings. One is the multi-head attention (MHA), the most important operation in a transformer block which captures the long-range inter-relationships among different tokens within the sequence. The other is the ubiquitous fully-connected (FC) layer that performs linear projection on each token in the sequence separately. In addition to the projections of \(\{_{Q},_{K},_{V}\}\) prior to the MHA, the feed-forward network (FFN) is also composed of multiple FC layers.
+
+Let \(^{d}\) be a row vector representing any token embedding, a fully-connected layer parameterized by weight matrix \(^{d h}\) applies a linear projection to \(\) formulated as \(=\), where \(^{h}\) is the output token embedding. For a sequence composed of \(s\) tokens, this would become a matrix multiplication in Eq. (1) with computational complexity of \((sdh)\).
+
+\[=,\ \ ^{s d},\ ^{s h}.\] (1)
+
+In finite-dimensional vector space, the fully-connected layer is a continuous linear operator, which means, for two adjacent input feature vector \(_{1}\) and \(_{2}\), given the same weight matrix \(\), the projected vectors \(_{1}=_{1}\) and \(_{2}=_{2}\) are most likely to be similar as well. In this work, we want to find an alternative mapping function which has much less computational complexity than \((sdh)\) yet generally in accord with the properties of the linear projection. If this is achieved, we can use this alternative method to replace all the FC layers to perform feature transformation while reducing computation.
+
+In this paper, we use normal-font lowercase letters to denote scalars (_e.g._\(d\) and \(h\)), bold-font lowercase letters to denote vectors (_e.g._\(\) and \(\)), and bold-font uppercase letters to denote matrices (_e.g._\(\)). We use the notation \([]_{i}\) to represent the \(i\)-th row of a matrix, and also use \([]_{i}\) to represent the \(i\)-th entry of a vector.
+
+### Compute-less Locality-Sensitive Hashing
+
+Unlike ordinary hash functions that are designed to avoid collisions for different encoded items, the aim of locality-sensitive hashing (LSH) is to map similar items to the same hash bucket (memory location) in the hash table. For example, in the text-to-image search system, several different descriptions for the same image are expected to have an identical hash code after encoded by the LSH function, and thus retrieve the same image.
+
+We decide to apply LSH function in the embedding space to encode any input feature vectors. Assuming \(\) is hashed to a specific bucket that stores a vector \(}\) by the LSH function, then the hashing result for some adjacent neighbor vectors of \(\) will correspond to the same hash bucket and retrieve \(}\) as well. If the value \(}\) in the hash table is an approximation of the result of linear operation \(=\) for the input vector \(\), we can use this method, that is to find an estimated result in a hash table, to replace the fully-connected layer, while only using the FLOPs of the hashing operation.
+
+Firstly, we construct an in-memory hash table parameterized by the matrix \(^{2^{d} h}\) which stores \(2^{d}\) vectors \([]_{i}^{h}\). Traditional LSH functions, such as Hyperplane-LSH , incorporate multiple linear projections to generate the hash code for table indexing. To avoid any unnecessary computations, we utilize a much simpler LSH function to generate the hash code \(h()\). Specifically, the process of hashing and retrieving the result from table \(\) is formulated as:
+
+\[h()=(()),\] (2) \[([]_{i})=\{-1,\ \ [ ]_{i}<0,\\ 1,\ \ []_{i} 0,.\] (3) \[()=_{i=0}^{d-1}]_{i} +1}{2} 2^{i},\] (4) \[}=[]_{h()},\] (5)where \(^{d}\) is the input vector, \(=()\{-1,1\}^{d}\) is the corresponding binary representation (hash code), integer\(()\) function converts the binary representation \(\) to the corresponding non-negative integer used as the index number of the hash table, \(h()\{0,1,2,,2^{d}-1\}\). Notably, the space complexity of such a hash table is \((2^{d}h)\). The required memory space would be \( 10^{145}\) terabytes (TB) when using float16 datatype with \(d=h=512\), which is impractical for any modern computer system.
+
+To tackle this problem, we propose to evenly split \(^{d}\) into \(K\) non-overlapping chunks and handle them separately:
+
+\[_{k}=(,\;=K),\;\;k=1,2, ,K,\] (6)
+
+where \(_{k}^{}\), \(=\), and \(d\) is evenly divisible by \(K\). We then set up a hash table \(_{k}^{2^{} h}\) for each sub-vector \(_{k}\), respectively. Therefore, the output result is
+
+\[}=_{k=1}^{K}\;[\;_{k}]_{h(_{k})},\] (7)
+
+Since \(_{k}\) has a smaller bit width after binarization and thus the corresponding hash table \(_{k}\) would consume less memory space for storage. The space complexity of Eq. (7) is \((K2^{}h)\). When \(d=h=512,=8,K=64\) and data type is float16, the storage required by all \(K\) hash tables is \( 16\) MegaBytes(MB). Figure 2 is a simple demonstration of the proposed locality-sensitive hashing.
+
+### Memory Layer
+
+So far, the above-mentioned formulation is able to simulate the forward pass of fully-connected layer. And the values store in the hash tables can be updated via back-propagation. The derivative of the loss function \(L\) with respect to the hash table is \(_{k}]_{h(_{k})}}=}}}{[ _{k}]_{h(_{k})}}\). However, the input vector \(\) is unable to have gradient since it's hashed to multiple integers \(h(_{k})\) used as the index number for retrieval, which is a non-differentiable operation. If we can reformulate Eq. (7) as \(}=_{k=1}^{K}\;p(_{k})[_{k}]_{h( _{k})}\) to add a coefficient \(p(_{k})\) to weight each retrieved item, where \(p(_{k})\) is a function of the variable \(_{k}\), the gradients can be back-propagated to the input \(\) via \([_{k}]_{h(_{k})}\).
+
+As we can observe from Figure 2, many sub-vectors with various directions and amplitudes can still be hashed to the same bucket as long as their signs are identical, but the angle between the bucket's representative binary vector (each entry is either 1 or -1) and these sub-vectors are different, which is defined by the cosine value \((_{k},(_{k}))\). We use a scaled cosine similarity, which takes into account both the direction and amplitude of \(_{k}\), to measure the relevance between \(_{k}\) and its corresponding hash bucket \(h(_{k})\):
+
+\[(_{k},h(_{k}))=\|_{k}\|_{2}\| (_{k})\|_{2}(_{k},( _{k}))=_{k},(_{k}),\] (8)
+
+where \(,\) computes the inner-product of two vectors. Considering all the \(2^{}\) buckets that \(_{k}\) is possibly hashed to in the lookup table \(_{k}\) simultaneously, we define the probability that \(_{k}\) is specifically mapped to the \(h(_{k})\)-th hash bucket:
+
+\[p(_{k})=(_{k},h(_{k}))/t\;] }{_{i=0}^{2^{}-1}exp[(_{k},i)/t\;]}=_{k},(_{k})/t\;]}{_{i=0}^{2^ {}-1}exp[_{k},_{}^{-1}(i)/t\;]},\] (9)
+
+where \(t\) is the temperature hyper-parameter, integer\({}_{}^{-1}(i)\{-1,1\}^{}\) is a function that maps an non-negative integer \(0 i<2^{}\) to the corresponding \(\)-bit binary representation. Note that \(,_{}^{-1}(i)\) operator takes the summation after elementwise selective sign-flipping over any \(\)-dimensional vector, therefore we have \[&_{k},(_{k}) =_{i=0}^{-1}|[_{k}]_{i}|\;,\\ &_{i=0}^{2^{}-1}exp[_{k},_{ }^{-1}(i)]=_{i=0}^{-1}[exp([_{k}]_{i})+exp(-[ _{k}]_{i})]\;,\\ & p(_{k})=^{-1}|[_{ k}]_{i}|/t\;)}{_{i=0}^{-1}[exp([_{k}]_{i}/t\;)+exp(-[ _{k}]_{i}/t\;)]}=^{-1}[1+exp(-2[_{ k}]_{i}|/t\;)]}.\] (10)
+
+This way, we can formulated the Memory Layer as
+
+\[=_{k=1}^{K}\;p(_{k})[_{k}]_{h(_{k})}=_{k=1}^{K}\;_{k}]_{h(_{k})}}{_{i=0}^{ -1}[1+exp(-2|[_{k}]_{i}|/t\;)]}.\] (11)
+
+The left part of Figure 3 illustrates the schematic of the Memory Layer. For a sequence composed of \(s\)\(d\)-dimensional tokens, and the dimensionality of output embeddings is \(h\), the computation complexity of a Memory Layer in Eq. (11) is \((s(+h)K)()\). This is one order of magnitude smaller than the fully-connected layer which is \((sdh)\) when \(=10\).
+
+According to Eq. (11), we can compute the derivative of the loss function \(L\) with respect to both the hash tables and the input vector as follows:
+
+\[&_{k}]_{i}}= \{p(_{k})},&h(_{k})=i,\\ 0,&h(_{k}) i,.\;i\{0,1, ,2^{}-1\},\\ &}=(\;[ [_{k}]_{h(_{k})}^{}_{k})}{_{k}}k(1,K+1)\;]\;). \] (12)
+
+### Architecture of MemoryFormer
+
+We follow the generic design paradigm of the standard transformer architecture  using N stacked blocks to build the MemoryFormer. The right part of Figure 3 depicts one building block.
+
+Multi-Head AttentionGiven an input sequence \(=(_{1},_{2},,_{s})^{} ^{s d}\), a Norm(\(\)) layer first normalizes the input. There Memory Layers transform the normalized \(\) into \(\), \(\), \(^{s d}\), respectively. The tokens in \(\), \(\), \(\) are then evenly split into multiple sub-vectors for multi-head purpose. The calculation of multi-head attention remains untouched as in . Therefore, any other efficiiet self-attention techniques such as Flash Attention , Linear Attention  and KV-Cache can be seamlessly incorporated into MemoryFormer to further increase the forward-time efficiency.
+
+Memory BlockIn MemoryFormer we use the Memory Block to replace the Feed-Forward Network used in standard transformers. The Memory Block is composed of 2 consecutive Memory Layers, each of which is preceded by a Norm(\(\)) layer. The norm layer is vital by setting a zero-mean distribution for the input embedding before the hashing operation, and thus the sign function in Eq. (3)
+
+Figure 3: **Left**: The schematic diagram of the Memory Layer. **Right**: One building block of the MemoryFormer.
+
+can generate -1 and +1 evenly. Therefore, the output of Eq. (4) can have an uniform distribution so that every bucket in the hash table will be retrieved with equiprobability.
+
+Another detail about the Memory Block is that we omit the intermediate activation function (_e.g._ ReLU, GELU). The hashing operation is a non-linear operation itself. An extra nonlinear function is thus redundant. We have verified through experiments that discarding the non-linear function between the two Memory Layers has no effect on the performance.
+
+In a traditional FFN module, in order to increase the model capacity and performance, the dimensionality of the output token embeddings of the first FC layer is expanded by 4 times, and then restored to hidden size \(d\) by the second FC layer. To keep aligned with this design pattern, we set the output dimensionality of the first Memory Layer to be \((+2) K\). Remeber that \(d= K\), that is, the size of each hash table is \(_{k}^{1}^{2^{}(+2) K}\) in the first Memory Layer of the Memory Block. Therefore, the bit width of \(K\) sub-vectors \(_{k}\) in the second Memory Layer is 2 bits larger than that of the sub-vectors in the first layer. The size of hash tables in the second layer is \(_{k}^{2}^{2^{(+2)} d}\), which leads to a capacity 4 times larger than the first layer while restores the dimensionality of the output embeddings back to \(d\).
+
+Computational Complexity.So far, the above computing process of one MemoryFormer block is formulated as follows:
+
+\[&=(), \\ &=_{Q}(), \ \ =_{K}(),\ \ =_{V}(),\\ &=+( ,,),\\ &=+_{2}( (_{1}(()))).\] (13)
+
+The amount of floating-point computation of a standard transformer block is \(2s^{2}d+12sd^{2}\), while the amount of computation of a MemoryFormer block is only about \(2s^{2}d+sd^{2}=2s^{2}d+6Ksd\). The computations originating from FC layers in standard transformer are eliminated by an order of magnitude. The absolute majority of the computational workload now comes from the MultiHeadAttention.
+
+## 3 Experiment
+
+In this section, we conduct thorough experiments on multiple NLP benchmarks to validate the efficiency and effectiveness of the MemoryFormer across different scales. We also compare our model with existing efficient transformer methods.
+
+Given the fact that most large language models only open-source the checkpoint without providing detailed training information, reproducing them is unachievable. Therefore, we employ Pythia , a well-developed LLM training framework with completely available dataset and detailed model hyper-parameters, to implement our method. As for training data, the Pile  dataset contains 825 GiB corpus with 22 diverse high-quality subsets, which either pre-exists or is constructed from professional and academic fields. We use exactly the same optimizer, scheduler and other hyper-parameters following the setting of Pythia to conduct fair comparisons.
+
+We choose six widely-used evaluation task for our approach: PIQA , WinoGrande , WSC , ARC-E, ARC-C , and LogiQA. These tasks range from knowledge to reasoning, forming a comprehensive benchmark for evaluating the all-round capability of large language models.
+
+### Evaluation Across Different Scales
+
+We choose Pythia-70M, Pythia-160M, Pythia-410M as the baseline models upon which we build our MemoryFormers. Specifically, MemoryFormer-tiny has the same hidden size and number of layers as Phythia-70M, MemoryFormer-small has the same hidden size and number of layers as Phythia-160M and MemoryFormer-base has the same hidden size and number of layers as Phythia-410M. As for the hyper-parameter of Memory Layer, we fix the value of \(\) to be 8, while the number of hash tables \(K\) is 64, 96 and 128 respectively for MemoryFormer-tiny, -small and -base model. Notably, considering the sparsity of gradients of the hash tables, we set the learning rate to be 3 times of the baseline learning rate used by the corresponding Pythia model. This is ablated in Sec. 3.3. It's worth noting that, the only one fully-connected layer in the MemoryFormer is the classifier head.
+
+Tab. 1 reports both the computational complexity and the evaluation results of our models compared to baseline. The FLOPs is calculated for one transformer block with the input sequence length of 
+
+[MISSING_PAGE_FAIL:7]
+
+[MISSING_PAGE_EMPTY:8]
+
+K, V projection layers and the two layers in the FFN module from the first building block of the MemoryFormer-tiny model. As shown in Figure 4, the number of times each bucket is hashed to by \(\) is generally uniform.
+
+## 4 Related Works
+
+Locality Sensitive Hashing.Locality sensitive hashing [5; 11; 1] (LSH) is a special kind of hash function which is designed to maximize the collision probability for similar input items. It's wildly adopted in deep learning-based applications. Large scale image retrieval system [18; 15; 2; 30] uses LSH to locate the similar images. Reformer and YOSO  both use LSH algorithm to reduce the memory consumption and improve the computational efficiency of the self-attention module. LookupFFN  adopt the LSH to accelerate the inference speed of the Feed-Forward Network. SLIDE  and MONGOOSE  improve the converging speed of neural network training process with the help of locality sensitive hashing algorithms.
+
+Efficient Transformers.Minimizing the computational complexity of the transformer model has always been a center task for the deep learning community. Many previous works are dedicated to reducing the complexity of multi-head attention module to sub-quadratic, such as CosFormer , PerFormer , LinFormer  and so on.  uses a sliding window to constrain the attention map within a local range. Besides, there are some researches [13; 20; 27] exploiting the sparsity of the intermediate activation in the FFN (MLP) module to reduce the computation. Recently, with the development of large language models, practical engineering method like FlashAttention  brings substantial optimization for the self-attention mechanism.
+
+## 5 Conclusion
+
+In this work, we propose MemoryFormer, a novel transformer architecture that significantly reduces the computational complexity (FLOPs) of transformer model from a new perspective. Unlike existing methods that opt to optimize the computation of the multi-head attention operation, this work provides a new solution from a new perspective. We observe that, in most scenarios the vast majority of computations originates from the fully-connected layers in the transformer model. Thus we focus on removing them. The MemoryFormeruses Memory Layer, which uses locality-sensitive hashing algorithm to perform feature transformation in the embedding space, to replace all the FC layers. It achieves a similar function as the computation-heavy matrix multiplication operation but with much less FLOPs. We successfully eliminate nearly all the computations of the transformer model except for the necessary ones required by the self-attention operation. We validate the efficiency and the effectiveness of MemoryFormer via extensive experiments on public NLP benchmarks.
+
+   Model & PIQA & WinoGrande & WSC & ARC-E & ARC-C & LogiQA & Avg. \\  MemoryFormer-tiny & 0.602 & 0.522 & 0.375 & 0.437 & 0.228 & 0.26 & 0.404 \\ MemoryFormer-tiny + GeLU & 0.595 & 0.522 & 0.375 & 0.441 & 0.211 & 0.265 & 0.402 \\   
+
+Table 6: Ablation study on whether to use the non-linearity in the Memory Block.
+
+Figure 4: The frequency at which each bucket in the hash table is retrieved.

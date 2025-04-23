@@ -1,0 +1,237 @@
+# Monarch Mixer: A Simple Sub-Quadratic GEMM-Based Architecture
+
+Daniel Y. Fu\({}^{1}\), Simran Arora\({}^{*,}\)\({}^{,}\)1, Jessica Grogan\({}^{*,}\)\({}^{,}\)2, Isys Johnson\({}^{*,}\)\({}^{,}\)2, Sabri Eyuboglu\({}^{*,}\)\({}^{,}\)1,
+
+Armin W. Thomas\({}^{*,}\)\({}^{,}\)3, Benjamin Spector\({}^{1}\), Michael Poli\({}^{1}\), Atri Rudra\({}^{2}\), Christopher Re\({}^{1}\)
+
+\({}^{*}\)Equal Contribution. \({}^{1}\)Department of Computer Science, Stanford University.
+
+\({}^{2}\)Department of Computer Science and Engineering, University at Buffalo, SUNY.
+
+\({}^{3}\)Department of Psychology, Stanford University.
+
+danfu@cs.stanford.edu, simarora@stanford.edu, {jrgrogan,isysjohn}@buffalo.edu, {eyuboglu,athms,bfs,poli}@stanford.edu,
+
+atri@buffalo.edu, chrismre@cs.stanford.edu
+
+###### Abstract
+
+Machine learning models are increasingly being scaled in both sequence length and model dimension to reach longer contexts and better performance. However, existing architectures such as Transformers scale quadratically along both these axes. We ask: are there performant architectures that can scale _sub-quadratically_ along sequence length and model dimension? We introduce Monarch Mixer (M2), a new architecture that uses the same sub-quadratic primitive along both sequence length and model dimension: Monarch matrices, a simple class of expressive structured matrices that captures many linear transforms, achieves high hardware efficiency on GPUs, and scales sub-quadratically. As a proof of concept, we explore the performance of M2 in three domains: non-causal BERT-style language modeling, ViT-style image classification, and causal GPT-style language modeling. For non-causal BERT-style modeling, M2 matches BERT-base and BERT-large in downstream GLUE quality with up to 27% fewer parameters, and achieves up to 9.1\(\) higher throughput at sequence length 4K. On ImageNet, M2 outperforms ViT-b by 1% in accuracy, with only half the parameters. Causal GPT-style models introduce a technical challenge: enforcing causality via masking introduces a quadratic bottleneck. To alleviate this bottleneck, we develop a novel theoretical view of Monarch matrices based on multivariate polynomial evaluation and interpolation, which lets us parameterize M2 to be causal while remaining sub-quadratic. Using this parameterization, M2 matches GPT-style Transformers at 360M parameters in pretraining perplexity on The PILE--showing for the first time that it may be possible to match Transformer quality without attention or MLPs.1
+
+## 1 Introduction
+
+Machine learning models in natural language processing and computer vision are being stretched to longer sequences and higher-dimensional representations to enable longer context and higher quality, respectively . However, existing architectures exhibit time and space complexities that grow quadratically in sequence length and/or model dimension--which limits context length and makes scaling expensive. For example, attention and MLP in Transformers scale quadratically in sequence length and model dimension . In this paper, we explore a natural question: _can we find a performant architecture that is sub-quadratic in both sequence length and model dimension?_In our exploration, we seek a sub-quadratic primitive for both the sequence length and model dimension. Our framing takes inspiration from work such as MLP-mixer  and ConvMixer , which observed that many machine learning models operate by repeatedly _mixing_ information along the sequence and model dimension axes, and used a single operator for both axes. Finding mixing operators that are expressive, sub-quadratic, and hardware-efficient is challenging. For example, the MLPs in MLP-mixer and convolutions in ConvMixer are expressive, but they both scale quadratically in their input dimension . Several recent studies have proposed sub-quadratic sequence mixing with long convolutions or state space models --both computed using the FFT--but these models have poor FLOP utilization (3-5% ) and maintain quadratic scaling in model dimension. Meanwhile, there has been promising work in sparsifying dense MLP layers without losing quality, but some of the models can actually be _slower_ than their dense counterparts, due to low hardware utilization .
+
+We turn to an expressive class of sub-quadratic structured matrices called _Monarch matrices_ (Figure 1 left) to propose Monarch Mixer (M2). Monarch matrices are a family of structured matrices that generalize the fast Fourier transform (FFT) and have been shown to capture a wide class of linear transforms including Hadamard transforms, Toeplitz matrices , AFDF matrices , and convolutions. They are parameterized as the products of block-diagonal matrices, called _monarch factors_, interleaved with permutation. Their compute scales sub-quadratically: setting the number of factors to \(p\) results in computational complexity of \(O(pN^{(p+1)/p})\) in input length \(N\), allowing the complexity to interpolate between \(O(N N)\) at \(p= N\) and \(O(N^{3/2})\) at \(p=2\).2
+
+M2 uses Monarch matrices to mix information along the sequence and model dimension axes. It is both simple to implement and hardware-efficient: the block-diagonal Monarch factors can be computed efficiently on modern hardware using GEMMs (generalized matrix multiply algorithms). Our proof-of-concept implementation of an M2 layer, written in less than 40 lines of pure PyTorch (including imports), relies only on matrix multiplication, transpose, reshape, and elementwise products (see pseudocode in Figure 1 middle) and achieves 25.6% FLOP utilization3 for inputs of size 64K on an A100 GPU. On newer architectures such as the RTX 4090, a simple CUDA implementation achieves 41.4% FLOP utilization at the same size.
+
+Non-Causal SettingsAs a first proof of concept of M2, we evaluate how it compares to Transformers in terms of speed and quality in non-causal settings such as BERT-style masked language modeling  and ImageNet classification. We introduce M2-BERT, which replaces the attention blocks in BERT with bidirectional gated convolutions implemented using Monarch matrices and replaces the dense matrices in the MLP with Monarch matrices. M2-BERT reduces parameter count but maintains quality--matching BERT-base and BERT-large in downstream GLUE quality with 27% and 24% fewer parameters, respectively. Sub-quadratic scaling in sequence length enables high throughput at longer sequences--up to 9.1\(\) higher throughput at sequence length 4K than
+
+Figure 1: Monarch matrices are a simple, expressive, and hardware-efficient class of sub-quadratic structured matrices. Monarch Mixer (M2) uses Monarch matrices to mix inputs first along the sequence dimension and then along the model dimension. See the Appendix for PyTorch implementation of an M2 layer.
+
+HuggingFace BERT, and 3.1\(\) higher throughput at sequence length 8K than BERT optimized with FlashAttention .
+
+For image classification, we adapt HyenaViT-b , an attention-free vision transformer based on gated convolutions. We replace the convolution operation with M2 primitives and replace the MLP layers with an M2 block as well. These changes reduce the parameter count compared to a ViT-b  model with the same model width and depth by a factor of 2. Surprisingly, despite this parameter reduction, we find that M2 slightly outperforms ViT-b and HyenaViT-b baselines, achieving 1% higher accuracy on ImageNet .
+
+Causal SettingsCausal settings such as GPT-style  auto-regressive language modeling present a technical challenge: masking out the upper triangular elements in an attention matrix (or equivalent structure) introduces a quadratic bottleneck. To alleviate this quadratic bottleneck with Monarch matrices, we develop new theory to characterize which parameterizations of Monarch matrices maintain causality. To do so, we take a view of \(p\)-order Monarch matrix multiplication as \(p\)-variate polynomial evaluation and interpolation (e.g., \(p=2\) factors corresponds to bivariate polynomials, Figure 2 left). Using this view, we show that the M2 convolution shown in Figure 1 (middle) can be viewed as manipulation of modular polynomial multiplication. This result allows us to develop conditions (Theorem 3) under which M2 is causal. We can use this causal parameterization to outperform GPT-style language models on causal language modeling by 0.2 PPL points on the PILE at model size 360M-without using either attention or MLP blocks.
+
+SummaryOverall, our results present a potential path to building machine learning models with sub-quadratic primitives. We hope our work can serve as a starting point to explore models that are more efficient in both sequence length and model dimension.
+
+## 2 Preliminaries
+
+In this section, we provide some background on the key components behind the cost of operations on GPUs, and then discuss the scaling characteristics of some common primitives used to mix information across the sequence dimension and model dimension in modern machine learning models.
+
+GPU Accelerator Cost ModelWe provide a brief discussion of relevant factors affecting runtime performance of deep learning operations on GPUs. Depending on the balance of computation and memory accesses, operations can be classified as either compute-bound or memory-bound . In compute-bound operations, the time accessing GPU memory is relatively small compared to the time spent doing arithmetic operations. Typical examples are matrix multiply with large inner dimension, and short convolution kernels with a large number of channels.
+
+The speed of these operations is determined by the FLOP/s available on compute units, and the number of FLOPs necessary to complete the operation. In our paper, we exploit fast matrix multiply units such as tensor cores. On the A100, tensor cores can achieve 312 TFLOP/s in half-precision matrix multiply operations, while non-matrix multiply operations are limited to 19 TFLOP/s . This trend began with tensor cores in the V100 , and is continuing into the next-generation H100 chips .
+
+In memory-bound operations, the time taken by the operation is determined by the number of memory accesses, while time spent in computation is much smaller. Examples include most elementwise operations (e.g., activation, dropout) and reductions (e.g., sum, softmax, batch norm, layer norm).
+
+The runtime of memory-bound operations is determined by the memory bandwidth of different layers of the _memory hierarchy_. GPU memory is large but relatively slow--up to 80 GB on A100, but with bandwidth of 2 TB/s . Higher levels of the memory hierarchy such as caches are much smaller (20 MB) but an order of magnitude faster (19 TB/s).
+
+   Layer & FLOP Cost & Util \\  MLP & \(N^{2}\) & 95.5\% \\ FlashAttn & \(N^{2}\) & 24.0\% \\ FFT & \(N N\) & 3.0\% \\  M2 Conv & \(N^{3/2}\) & 41.4\% \\   
+
+Table 1: FLOP cost and utilization of various mixer layers, input dimension 64K on an RTX 4090.
+
+Common Mixer PrimitivesTo help contextualize our work, we provide scaling and hardware utilization characteristics for a few common operations that are used to mix information in machine learning models, summarized in Table 1.
+
+Transformers  use attention to mix information across the sequence dimension, and MLP blocks to mix information across the model dimension. Both of these blocks scale quadratically in input length. MLP layers are compute-bound, so they have high FLOP utilization out of the box. Attention blocks are memory-bound, so even the most optimized implementations such as FlashAttention  have relatively lower FLOP utilization.
+
+Recent work has made progress towards attention-free models by replacing attention layers with long convolution layers, interleaved with elementwise gating . These layers are computed using FFT operations using the FFT convolution theorem: \(y=*=FFT^{-1}(FFT()*FFT())\). While the FFT scales asymptotically well in \(O(N N)\), it is often memory-bound and thus has low FLOP utilization. In our work, we aim to construct a mixer that has both sub-quadratic scaling and high FLOP utilization.
+
+## 3 Monarch Mixer
+
+In this section, we recall Monarch matrices, introduce how M2 uses Monarch matrices to mix along the sequence and model dimensions, and benchmark a M2 convolution in terms of hardware utilization.
+
+### Monarch Matrices
+
+Monarch matrices  are a sub-quadratic class of structured matrices that are hardware-efficient and expressive. They can represent many linear transforms, including convolutions, Toeplitz-like transforms, low-displacement rank transforms, and orthogonal polynomials. Directly implementing these different structured transforms on GPUs as dense matrices can be inefficient. In contrast, their Monarch decompositions can be computed by interleaving matrix multiplications with tensor permutations.
+
+A Monarch matrix \(^{N N}\) of order \(p\) is defined by the following:
+
+\[=(_{i=1}^{p}_{i}_{i}) _{0},\] (1)
+
+where each \(_{i}\) is related to the 'base \([p]{N}\)' variant of the bit-reversal permutation, and \(_{i}\) is a block-diagonal matrix with block size \(b\). Setting \(b=[p]{N}\) achieves _sub-quadratic_ compute cost. For example, for \(p=2\), \(b=\), Monarch matrices require \(O(N^{3/2})\) compute in sequence length \(N\).
+
+In this paper, we use Monarch matrices to construct architectures that are sub-quadratic in both sequence length \(N\) and model dimension \(d\). We will often parameterize order-\(2\) Monarch matrices, written as \(=\), where \(\) and \(\) are block-diagonal matrices (for "left" and "right"), and \(=_{2}=_{1}=_{0}\) is a permutation that reshapes the input to 2D, transposes it, and flattens it to 1D. A common case is to set \(==(_{}_{})\), where \(_{}\) is a \(\) DFT matrix, and \(\) is the Kronecker product.
+
+### Monarch Mixer Architecture
+
+We describe how Monarch Mixer uses Monarch matrices and elementwise operations to construct sub-quadratic architectures (Figure 1 middle). We take a mixer view of model architectures, where each layer is a sequence of mixing operations across the sequence and the model dimension axes. Each layer takes as input a sequence of embeddings \(^{N d}\), and outputs a sequence \(^{N d}\), where \(N\) is the sequence length, and \(d\) is the model dimension. For simplicity, we show the order-2 case here, though we can use higher-order blocks to scale to longer sequences and larger model dimensions.
+
+Let \(_{1},_{2}^{N N}\) and \(_{3},_{4}^{d d}\) be order-2 Monarch matrices, let \(_{1}^{N d}\), let \(\) be an optional point-wise non-linearity (_e.g._ ReLU), and let \(\) be elementwise multiplication. M2uses Monarch matrices to construct expressive architectures. For example, a convolutional block with a sparse MLP can be expressed as follows:
+
+1. Mix along **sequence** axis: \[}=_{2}(_{1}_{1})\] (2)
+2. Mix along **embedding** axis: \[^{}=_{4}(_{3}}^{})\] (3)
+
+When \(_{1}\) is set to the DFT and \(_{2}\) is set to the inverse DFT, Equation 2 exactly corresponds to a convolution with kernel \(_{1}\) parameterized in frequency space. Equation 3 corresponds to an MLP with the dense matrices replaced by Monarch matrices. More expressive layers are also easily expressible; for example, replacing Equation 2 with \(_{2}(_{1}_{1}( ))\), where \(,,\) are linear projections of \(\), reproduces a gated convolution block, as in .
+
+The basic M2 layer is simple to implement; pseudocode is shown in Figure 1 (middle), and the Appendix gives an efficient implementation of M2 in under 40 lines of pure PyTorch (including imports). The convolution case with Monarch matrices fixed to DFT and inverse DFT matrices also admits implementations based on FFT algorithms .
+
+### Architecture Benchmarks
+
+We benchmark the efficiency of the \(()\) convolution operator (Equation 2) implemented in a simple CUDA kernel (calling standard cuBLAS sub-routines ), as the dimension \(N\) increases. Equation 3 scales similarly, as dimension \(d\) increases. We keep the block size \(b\) fixed to \(\).
+
+Table 2 shows the FLOP cost and utilization of a M2 operator as a function of the input size on an A100 as well as on an RTX 4090. On the A100, the operator is more dominated by the data movement costs of the permutation operations (see the Appendix for a roofline analysis). For longer inputs, the sub-quadratic scaling allows Monarch Mixer to outperform dense matrix multiplication. On the RTX 4090, which has a larger and faster L2 cache than the A100, we can manually optimize an implementation to amortize data movement costs.
+
+## 4 Theoretical Analysis: M2 as Polynomial Multiplication
+
+In this section, we develop theory to make the M2 layer causal in the input \(\)--e.g., ensure that an output \(Y_{i}\) of the M2 should only depend on \(X_{1}\),..., \(X_{i}\). Our approach involves interpreting Monarch matrix multiplication as multivariate polynomial evaluation and interpolation. We then show that an M2 convolution is equivalent to modular polynomial manipulation in a univariate basis.
+
+The challenge is controlling the degrees of the resulting univariate polynomials, to prevent "underflow" under modular multiplication (see Figure 2 for an overview). Our key result is deriving sufficient conditions on the degrees of the bivariate polynomials defining the Monarch factors to prevent such underflow. We focus on the bivariate case (order \(p\) = 2) in the body, and give the general multivariate case in the Appendix. We present proof sketches in the main body, and leave proofs and additional results for the Appendix.
+
+   \(N\) & 4K & 16K & 64K & 256K \\  Dense Matmul  & 0.025 & 0.412 & 6.60 & 106.0 \\ M2 TFLOP Cost & 0.002 & 0.013 & 0.103 & 0.824 \\  Dense FLOP Utilization (A100) & 63.0\% & 78.0\% & 80.0\% & OOM \\ M2 FLOP Utilization (A100) & 4.78\% & 12.7\% & 25.6\% & 42.8\% \\ Wall-Clock Speedup (A100) & 1.2\(\) & 5.1\(\) & 20.6\(\) & \(>\)55.0\(\) \\  Dense FLOP Utilization (4090) & 74.6\% & 96.7\% & 98.0\% & OOM \\ M2 FLOP Utilization (4090) & 11.1\% & 32.1\% & 41.4\% & 53.7\% \\ Wall-Clock Speedup (4090) & 2.2\(\) & 10.5\(\) & 27.0\(\) & \(>\)69.1\(\) \\   
+
+Table 2: FLOP cost and utilization of M2 compared to dense MLP at different input sizes \(N\), with block size \(\), on an A100 and RTX 4090.
+
+Monarch Multiplication as Polynomial EvaluationFirst, we show that order-2 Monarch matrix-vector multiplication \(\) is equivalent to bivariate polynomial evaluation.
+
+Fix a Monarch matrix \(^{N N}=\), for two block-diagonal matrices \(\) and \(\) with blocks of size \(b=\). We can interpret Monarch matrices as bivariate polynomial evaluation by setting \(A=\{_{0},,_{b-1}\}\) as a set of evaluation points (e.g., the \(b\)th roots of unity), and letting \(\{_{0}(X,Y),,_{b-1}(X,Y)\},\{r_{0}(Y),,r_{N-1}(Y)\}\) be sets of basis polynomials with individual degrees of \(X,Y\) being \(<\). The values of \(\{_{0}(X,Y),,_{b-1}(X,Y)\}\) evaluated on \(A^{2}\) determine the entries of \(\), and the values of \(\{r_{0}(Y),,r_{N-1}(Y)\}\) evaluated on \(A\) determine the entries of \(\). We give the mapping from \(,r,\) and \(A\) to \(\) and \(\) in the Appendix.
+
+Then, matrix-vector multiplication between \(\) and a vector \(\) is equivalent to polynomial evaluation of the basis functions \(,r\) on the evaluation points \(A^{2}\):
+
+**Theorem 1**.: _Let \(m(j)=j\). For any vector \(^{N}\), \(\) is a bivariate polynomial \(u(X,Y)\) evaluated at \(A^{2}\), with \(u(X,Y)=_{j=0}^{N-1}u_{j}f_{j}(X,Y),\) where \(f_{j}(X,Y)=_{m(j)}(X,Y)r_{j}(Y)\)._
+
+Monarch Inverse as Polynomial InterpolationNext, we exploit the fact that Monarch inverse multiplication \(^{-1}\) is equivalent to polynomial interpolation in the basis polynomials of \(\).
+
+**Theorem 2**.: _Let \(_{0},_{1},_{2}\) be Monarch matrices, and let \(A\) be the set of \(\) roots of unity. Then, the operation_
+
+\[=_{0}^{-1}((_{1})(_{2})).\] (4)
+
+_is equivalent to representing the polynomial_
+
+\[h(X,Y)=k(X,Y)u(X,Y)(X^{}-1,Y^{}-1)\]
+
+_in terms of the basis polynomials \(,r\) corresponding to \(_{0}\), and where \(k(X,Y)\) and \(u(X,Y)\) are the polynomials corresponding to \(_{1}\) and \(_{2}\), respectively._
+
+The above follows from Theorem 1 and the fact that Monarch matrix-vector multiplication with an inverse Monarch matrix is equivalent to polynomial interpolation in a given basis. The \(\) part comes from the fact that \(A\) is the set of roots of the polynomial \(Z^{}-1\).
+
+Causal Monarch MapsNow, we give a class of Monarch matrices from which we can build a causal map. First, we define a polynomial with _minimum_ degree \(j\):
+
+**Definition 1**.: _A polynomial of minimum degree \(j\) (and maximum degree \(N-1\)) is defined as \(_{j}(Z)=_{a=j}^{N-1}_{j}[a]Z^{a}\)._
+
+To ensure causality, we first convert the bivariate polynomial basis into a univariate basis, and then we expand the degree of the univariate polynomial. The resulting univariate polynomial multiplication is naturally causal (exploiting similar properties as the causal FFT convolution).
+
+We use the Kronecker substitution \((X Z,Y Z^{})\) to convert the bivariate polynomial basis into a univariate basis:
+
+\[q_{j}(Z)=_{m(j)}(Z)r_{j}(Z^{}),\] (5)
+
+Figure 2: Monarch multiplication can be interpreted as polynomial evaluation and interpolation. We derive sufficient conditions on the polynomial formulation of Monarch matrices for M2 to be causal.
+
+where \(m(j)\) is defined as in Theorem 1.
+
+Then, the following class of Monarch matrices (with the conversion to univariate polynomial basis as above) forms a causal map:
+
+**Theorem 3**.: _Let \(,^{n}\), where \(n<N/2\). Let \(m(j)\) be as in Theorem 1, and \(k(j)= j/\). Then define the basis polynomials \(_{m(j)}\) to have minimum degree \(m(j)\), basis polynomials \(r_{j}\) to have minimum degree \(k(j)\), and all polynomials \(q_{j}(Z)\) to have maximum degree \(<N/2\) for all \(j<N/2\) and for \(N/2 j<N\) have maximum degree \(N-1\). Let \(_{N}\) be defined by such basis polynomials via (5) where the evaluation points are now the \(N\)th roots of unity. Then, we have that_
+
+\[(_{N}^{-1}(_{N}(,_{N-n})_{N}(,_{N-n})))[0:n-1]\] (6)
+
+_gives a causal map in \(\)._
+
+Theorem 3 gives a causal map that can be computed entirely using Monarch matrices - enforcing causality with sub-quadratic scaling. The main technical ingredient in proving the above result is that the product \(q_{j}(Z)q_{j^{}}(Z)\) can be written as a linear combination of \(q_{a}(Z)\) for \(j+j^{} a<N\) (this uses the above specified properties on the minimum and maximum degrees of \(q_{j}(Z)\)). This in turn implies that the term \(k_{j^{}}u_{j}q_{j}(Z)q_{j^{}}(Z)\) only contributes to the coefficients of "higher order" basis polynomials \(q_{a}(Z)\) for \(a j+j^{}\) in the product \(k(Z)u(Z)\), which is needed for causality. Figure 2 gives an example of restricted polynomials generating a causal map.
+
+## 5 Experiments
+
+We compare Monarch Mixer to Transformers on three tasks where Transformers have been dominant: BERT-style non-causal masked language modeling, ViT-style image classification, and GPT-style causal language modeling. In each, we show that we can match Transformers in quality using neither attention nor MLPs. We additionally evaluate wall-clock speedups against strong Transformer baselines in the BERT setting. Additional experiments on speech and alternative architectures are given in Appendix B, and experimental details are given in Appendix C.
+
+### Non-Causal Language Modeling
+
+We introduce M2-BERT, an M2-based architecture for non-causal language modeling. M2-BERT acts as a drop-in replacement for BERT-style language models , which are a workhorse application of the Transformer architecture . We train M2-BERT using masked language modeling over C4  with the bert-base-uncased tokenizer.
+
+M2-BERT starts with a Transformer backbone and replaces the attention and MLPs with M2 layers, shown in Figure 3. In the sequence mixer, we replace attention with bidirectional gated convolutions with a residual convolution (Figure 3 left). To recover convolutions, we set the Monarch matrices to DFT and inverse DFT matrices. Following , we also add short depthwise convolutions after the projections. In the dimension mixer, we replace the two dense matrices in MLPs with learned block-diagonal matrices (Monarch matrix of order 1, \(b=4\)). We pretrain two M2-BERT-base models, at 80M and 110M, and two M2-BERT-large models, at 260M and 341M. These are equivalent to BERT-base and BERT-large, respectively.
+
+Downstream GLUE ScoresFirst, we evaluate M2-BERT models on downstream fine-tuning compared to BERT-base and BERT-large from . We take the pretrained models and fine-tune them on BERT, following the procedure in . Table 3 shows performance for BERT-base equivalent models, and Table 4 shows performance for BERT-large equivalent models. M2-BERT-base can
+
+Figure 3: M2-BERT uses Monarch matrices to create a bidirectional gated long convolution in the sequence mixer, and uses Monarch matrices to replace the linear layers in the dimension mixer.
+
+match BERT-base in GLUE quality with 27% fewer parameters--or outperform BERT-base in quality by 1.3 points when parameter matched. M2-BERT-large matches BERT-large with 24% fewer parameters, and outperforms by 0.7 points when parameter matched.
+
+GPU Throughput by Sequence LengthNext, we evaluate throughput of M2-BERT models by sequence length, compared to HuggingFace implementations of BERT, as well as optimized implementations of BERT running FlashAttention . Table 5 shows forward throughput for BERT-base equivalent models, and the appendix shows throughput for BERT-large (where the performance trends are similar). Inference times are reported in tokens/ms on an A100-40GB GPU. M2-BERT-base achieves higher throughput than even highly-optimized BERT models, and up to 9.1\(\) faster throughput than a standard HuggingFace implementation at sequence length 4K.
+
+CPU Inference LatencyFinally, we report CPU inference latency for M2-BERT-base (80M) compared to BERT-base, running direct PyTorch implementations for both. In short sequences, the impacts of data locality still dominate the FLOP reduction, and operations such as filter generation (which are not present in BERT) pay a higher cost. Starting at sequences 1K and longer, M2-BERT-base starts to have speedup over BERT-base, up to 6.5\(\) at sequence length 8K. We believe further optimization and applying IO-aware principles can further improve CPU performance.
+
+### Image Classification
+
+To validate that our methods generalize to images as well as language for non-causal modeling, we next evaluate M2 on image classification. We compare M2 to ViT-style models and recent work, HyenaViT-b , which uses gated long convolutions to replace the attention layers in ViT-b. In our work, M2-ViT builds off HyenaViT-b and replaces the long convolutions with the M2 operator in Equation 2 (again setting the Monarch matrices to the DFT and inverse DFT). We replace the MLP blocks in HyenaViT-b with block-diagonal matrices, similarly to M2-BERT. Appendix B additionally compares M2 to the Swin-family of architectures [50; 51].
+
+Table 7 shows the performance of Monarch Mixer against ViT-b, HyenaViT-b, and ViT-b-Monarch (which replaces the MLP blocks of standard ViT-b with Monarch matrices) on ImageNet-1k. Monarch Mixer outperforms the other models with only half the parameters of the original ViT-s model. Surprisingly, Monarch Mixer also outperforms ResNet-152, with fewer parameters--even though the latter was explicitly designed for ImageNet performance.
+
+### Causal Language Modeling
+
+GPT-style causal language modeling is a critical application for Transformers [6; 31; 43]. We introduce M2-GPT, a M2-based architecture for causal language modeling. For the sequence mixer, M2-GPT combines the convolutional filter from Hyena , the state-of-the-art attention-free
+
+  
+**Model** & **GLUE Score** & \(\)**Params** & \(\)**GLUE Score** \\  BERT-large (340M) & 82.1 & -0\% & +0.0 \\  M2-BERT-large (260M) & 82.2 & -24\% & +0.1 \\ M2-BERT-large (341M) & **82.8** & +0.2\% & +0.7 \\   
+
+Table 4: Average GLUE Score for M2-BERT-large compared to BERT-large , along with change in parameters and GLUE score.
+
+  
+**Model** & **GLUE Score** & \(\)**Params** & \(\)**GLUE Score** \\  BERT-base (110M) & 79.6 & -0\% & +0.0 \\  M2-BERT-base (80M) & 79.9 & -27\% & +0.3 \\ M2-BERT-base (110M) & **80.9** & -0\% & +1.3 \\   
+
+Table 3: Average GLUE Score for M2-BERT-base compared to BERT-base , along with change in parameters and GLUE score.
+
+language model, with parameter sharing across multiple heads from H3 . We use the causal parameterization of Equation 2 to replace the FFT in these architectures, and we remove the MLP layers entirely. The resulting architecture is entirely attention- and MLP-free.
+
+We pretrain M2-GPT on the PILE, a standard dataset for causal language modeling. Following prior work , we train models at two model sizes, with varying amounts of training data--decaying the learning rate appropriately for each experiment. Table 8 shows the results. Even though our model is attention- and MLP-free, it outperforms both Transformers and Hyena in perplexity on pretraining. These results suggest that radically different architectures than Transformers may be performant on causal language modeling.
+
+## 6 Related Work
+
+Long ConvolutionsRecent work proposes to use long convolution layers as a replacement for the Transformer attention layers in sequence modeling . Many of these models rely on the FFT convolution theorem to compute the long convolutions. We build on the insights in many of these architectures in constructing our M2 architectures, and additionally replaces the FFT operations with Monarch matrices.
+
+Our work is also related to a rich literature in convolutions in other bases, such as Chebyshev bases  or orthogonal polynomial bases . These approaches have analogues in our multivariate analysis; replacing the basis polynomials of the Monarch matrices in Monarch Mixer may be able to approximate some of these operations. An interesting question for future work would be to study how well our techniques and concerns about causality and hardware utilization translate to these alternative convolution bases.
+
+Optimization of deep learning primitivesThere is a rich history of the optimization of deep learning primitives, as accelerating their performance can yield substantial savings in compute and cost for large models. There are many approaches to speed up these operations, but they usually either reduce data movement or compute.
+
+Reducing data movement: In many applications, the major bottleneck is the storage and movement of large amounts of memory. One popular approach to reducing data movement is checkpointing, wherein one stores fewer intermediate results and recomputes the others on-the-fly where they are needed, trading additional compute for memory . Another approach is kernel fusion, wherein algorithms initially described as sequential steps can often be fused in ways that improve their properties. For example, it is generally faster to implement a dot-product through a multiply
+
+   Model & 512 & 1024 & 2048 & 4096 & 8192 \\  BERT-base (110M) & **182** & 389 & 918 & 2660 & 11820 \\ M2-BERT-base (80M) & 289 & **361** & **651** & **948** & **1820** \\  Speedup & 0.6\(\) & 1.1\(\) & 1.4\(\) & 2.8\(\) & 6.5\(\) \\   
+
+Table 6: CPU inference latency in milliseconds with a batch size of 1 at varied input sequence lengths. Measurements averaged over 10 examples on a 48 vCPU, 96 GB RAM instance from the GCP n2-standard-48 series, which runs Intel Cascade Lake processors. This is based on the protocol in .
+
+  
+**Model** & **512** & **1024** & **2048** & **4096** & **8192** \\  HF BERT-base (110M) & 206.1 & 130.8 & 71.3 & 39.0 & OOM \\ FlashAttention BERT-base (110M) & 367.4 & 350.1 & 257.2 & 179.1 & 102.4 \\ M2-BERT-base (80M) & **386.3** & **380.7** & **378.9** & **353.9** & **320.1** \\  M2 Speedup over HF BERT-base (110M) & 1.9\(\) & 2.9\(\) & 5.2\(\) & 9.1\(\) & \(-\) \\   
+
+Table 5: Throughput in tokens/ms by context length for M2-BERT-base (80M) compared to BERT-base.
+
+accumulate rather than first multiplying and then accumulating. Recently, libraries such as PyTorch 2.0  have added kernel fusion capabilities, although the very best performance usually still arises from handwritten kernels. Third, in order to better exploit memory locality, it is often fastest to load small blocks of memory, do intensive computation on them, and then write the results a tile at a time . Finally, many algorithms also have hand-optimizations that can remove unnecessary computation or memory accesses .
+
+Efficient algorithms usually make use of a combination of these techniques. For example, FlashAttention  uses all four to dramatically decrease both the latency and memory consumption of multi-head attention. Though we have made a modest effort to implement Monarch Mixer efficiently, we think it likely that Monarch Mixer could be further optimized by these techniques.
+
+Reducing flops: A first target for optimization is the multi-layer perceptron (MLP), owing to its ubiquity. A variety of structured sparse factorizations exist, many of which we draw on in this work . Attention is also a popular target for optimization. Recently, a plethora of sub-quadratic approximations of attention have emerged, that aim to approximate attention to reduce its quadratic complexity. Some methods rely on sparsification, relying on the fact that the attention matrix is extremely sparse at long sequence lengths . Others use low-rank approximations of the attention matrix  or kernel methods instead . A subset use a combination of these techniques, such as . Finally, a third category of methods  aim to replace attention entirely, relying on state-space models .
+
+## 7 Discussion and Conclusion
+
+We explore Monarch Mixer (M2), a new architecture that is sub-quadratic in both sequence length and model dimension and is hardware-efficient on modern accelerators. We motivate M2 from both theoretical and systems performance perspectives and conduct a preliminary proof-of-concept investigation into performance on masked language modeling, image classification, and causal language modeling.
+
+While our initial results are promising, our work is only a first step in this direction. The M2 layer can likely be further optimized with systems optimization techniques such as kernel fusion. Our work has also not been optimized for inference like more well-established models such as Transformers, or even more recent models such as state space models. It also remains to be seen whether M2 layers can have as widespread applicability as Transformers. We hope that these can be fruitful directions for future work.
+
+A discussion of broader impacts can be found in the Appendix.
+
+   Model & Top-1\% & Top-5\% & Description \\  ResNet-152 (60M) & 78.6 & 94.3 & ConvNet, MLP \\  ViT-b (87M) & 78.5 & 93.6 & Attention, MLP \\ ViT-b + Monarch (33M) & 78.9 & 94.2 & Attention, MLP-Free \\ HyenaViT-b (88M) & 78.5 & 93.6 & Attention-Free, MLP \\  M2-ViT-b (45M) & **79.5** & **94.5** & Attention-Free, MLP-Free \\   
+
+Table 7: Accuracy on ImageNet-1k. ResNet-152 provided for reference.
+
+   Model & 5B & 10B & 15B & Description \\  Transformer (125M) & 13.3 & 11.9 & 11.2 & Attention, MLP \\ Hyena (155M) & 13.1 & 11.8 & 11.1 & Attention-Free, MLP \\ M2-GPT (145M) & **12.9** & **11.6** & **10.9** & Attention-Free, MLP-Free \\  Transformer (355M) & 11.4 & 9.8 & 9.1 & Attention, MLP \\ Hyena (360M) & 11.3 & 9.8 & 9.2 & Attention-Free, MLP \\ M2-GPT (360M) & **11.0** & **9.6** & **9.0** & Attention-Free, MLP-Free \\   
+
+Table 8: Perplexity on the PILE when trained for different numbers of tokens.

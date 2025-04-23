@@ -1,0 +1,230 @@
+# Model Tells You What to Discard:
+
+Adaptive KV Cache Compression for LLMs
+
+ Suyu Ge\({}^{1}\), Yunan Zhang\({}^{1}\), Liyuan Liu\({}^{2}\), Minjia Zhang\({}^{2}\), Jiawei Han\({}^{1}\), Jianfeng Gao\({}^{2}\)
+
+\({}^{1}\)University of Illinois Urbana-Champaign, \({}^{2}\)Microsoft
+
+{suyuge2,yunanz2,hanj}@illinois.edu
+
+{lucliu,minjiaz,jfgao}@microsoft.com
+
+Authors contributed equally to this research.
+
+###### Abstract
+
+In this study, we introduce adaptive KV cache compression, a plug-and-play method that reduces the memory footprint of generative inference for Large Language Models (LLMs). Different from the conventional KV cache that retains key and value vectors for all context tokens, we conduct targeted profiling to discern the intrinsic structure of attention modules. Based on the recognized structure, we then construct the KV cache in an adaptive manner: evicting long-range contexts on attention heads emphasizing local contexts, discarding non-special tokens on attention heads centered on special tokens, and only employing the standard KV cache for attention heads that broadly attend to all tokens. Moreover, with the lightweight attention profiling used to guide the construction of the adaptive KV cache, FastGen can be deployed without resource-intensive fine-tuning or re-training. In our experiments across various asks, FastGen demonstrates substantial GPU memory reduction with negligible generation quality loss2.
+
+Footnote 2: We will release code and the compatible CUDA kernel for reproducibility
+
+## 1 Introduction
+
+Autoregressive language models have attracted extensive attention (OpenAI, 2023; Touvron et al., 2023). Along with the remarkable success achieved by these models, their computational complexity and GPU memory consumption present significant challenges (Shazeer et al., 2017), underscoring an imperative need for serving these models in an economically feasible manner.
+
+The generative inference of LLMs usually involves using the _KV Cache_ mechanism to enhance the generation speed. KV cache stores previously computed Key/Value vectors in attention calculation and reuses those values for the current token generation. As such, it avoids recalculations of previous tokens at each token generation step at the cost of extra memory consumption. Despite being a prominent technique, the memory consumption of KV cache increases rapidly as the model size and generation length increase, drastically increasing the pressure of on-device memory.
+
+When memory usage exceeds GPU capacity, the generative inference of LLMs typically resorts to offloading (Aminabadi et al., 2022; Sheng et al., 2023). However, offloading KV cache to CPU/NVMe adds non-trivial overheads, due to the limited PCIe bandwidth between the GPU and CPU on many devices. Therefore, it is crucial to reduce the memory footprint of KV cache.
+
+Our study starts from the observation that there are abundant structures observed in attention modules (Michel et al., 2019; Voita et al., 2019; Clark et al., 2019; Wang et al., 2020; Child et al., 2019), and as in Figure 1, not all attention modules need to attend to all tokens (Liu et al., 2023; Zhang et al., 2023; Liu et al., 2023). Intuitively, harvesting such structures could substantially reduce memory consumption and accelerate text generation.
+
+Based on this intuition, we propose FastGen to _accelerate the generative inference by adaptively compressing the KV cache on the fly_. First, we employ an efficient profiling algorithm to recognize the structural patterns for attention modules. Under the guidance of this profiling, we then construct the KV cache for various modules adaptively. Specifically, FastGen recognizes five fundamental attention structures: some attention heads mostly attend to local contexts, for which we construct a KV cache that evicts long-range contexts; some primarily attend to specific tokens/puncutations, for which we create a KV cache that retains only special tokens/puncutations; some have attention maps that are column-wise sparse, for which we discard the least frequently attended tokens; and some broadly attend to all tokens, for which we employ the standard KV cache and store all tokens.
+
+In this way, FastGen is able to compress the KV cache while retaining the original functionality of attention modules, thus does not require any fine-tuning and can be applied in a plug-and-play manner. With a suite of major benchmarks covering generative tasks in math, code, knowledge, and common sense reasoning, we evaluate FastGen on LLaMa (Touvron et al., 2023b) and observe FastGen brings significant improvements over nonadaptive KV cache compression baselines.
+
+``` Input: Feasible Policy Set (\(\mathcal{C}\)), Prompt Output: Adaptive KV Cache
+1forAttention Head \(H_{i}\) in LLMdo
+2\(\bm{K}^{i},\bm{Q}^{i},\bm{V}^{i}\gets H_{i}(\text{Prompt})\)
+3\(\bm{A}^{i}\leftarrow\text{softmax}(\bm{Q}^{i}\bm{K}^{i^{T}})\)
+4\(\bm{C}^{i}\leftarrow\text{apply Equation 1 to }\bm{A}^{i}\) /* \(\bm{\mathbb{C}}^{i}\): optimal policy
+5\(\bm{K}^{i}_{\bm{C}^{i}},\bm{V}^{i}_{\bm{C}^{i}}\gets f(\bm{K}^{i},\bm{V} ^{i},\bm{C}^{i})\)
+6\(\hat{\bm{K}}^{i},\hat{\bm{V}}^{i}\leftarrow\bm{K}^{i}_{\bm{C}^{i}},\bm{V}^{i} _{\bm{C}^{i}}\)
+7return\(\{\bm{C}^{i},\hat{\bm{K}}^{i},\hat{\bm{V}}^{i}\}\) ```
+
+**Algorithm 1**FastGen-Prompt Encoding.
+
+Figure 1: Different attention heads usually have different structures. Left: Four common attention structures. Right: Attention map compositions of three attention heads that are in the same layer.
+
+Figure 2: Performance of Adaptive KV Cache (FastGen) and Nonadaptive KV Cache (Frequency, Local, and Frequency+Local; Zhang et al., 2023 and Liu et al., 2023a) on AlpacaEval.
+
+Related Work
+
+**Token Dropping and KV Cache Compression.** Many efforts have been made to improve the model efficiency for LLMs. For recurrent neural networks, one method is to skip multiple tokens at a given time step (Campos et al., 2017; Seo et al., 2017; Hansen et al., 2019). Since Transformer models quickly attracted lots of attention, Goyal et al. (2020) proposes to eliminate redundant words in BERT (Devlin et al., 2019) based on their attention scores, while Dai et al. (2020) compresses the input sequence by adding pooling layers to the encoding modules of the transformer architecture. Recently, Huang et al. (2022) adds a token selection task to the original BERT model that learns to select performance-crucial tokens, and Kim et al. (2022) designs a learnable threshold to detect unimportant tokens to prune. Meanwhile, many efforts have been made to explore the possibility of compressing the hidden state of tokens rather than explicitly reducing the sequence length (Guan et al., 2022; Sun et al., 2022; Zhou et al., 2020).
+
+Nevertheless, these methods can only be applied to non-autoregressive models and typically require an additional re-training phrase, making them less suitable for large LLMs like ChatGPT and LLaMa. Recognizing this gap, researchers started examining the potential of pruning tokens within the KV cache of autogressive LLMs. Mu et al. (2023) learns to compress the prompts into a few special tokens to reduce memory pressure during caching. However, the token prediction requires training and could be an expensive overhead during inference. Meanwhile, several concurrent methods propose to leverage accumulated attention score as the criteria to identify important tokens in the KV cache (Sheng et al., 2023; Zhang et al., 2023; Liu et al., 2023). Our work, instead of investigating a specific eviction policy, aims to synergistically coordinate diverse eviction policies, adapting them to align more closely with model-specific attributes.
+
+**Underlying Structure of Attention.** Inspired by the success of Transformer, extensive studies have been conducted to explore the underlying mechanism of different self-attention heads. Voita et al. (2019) analyzed the self-attention heads in BERT (Devlin et al., 2019) using LRF (Bach et al., 2015) and characterized them into interepretable roles, one of which is attending adjacent tokens all the time. Michel et al. (2019) demonstrated that even heads in the same layer could have different impact on the performance while the importance of each head change across tasks. Clark et al. (2019) and Kovaleva et al. (2019) identified the patterns that some heads primarily attend to separator tokens, adjacent tokens and a combination of these. We observe consistent patterns in decoder-only models, despite previous studies are mainly done on encoder models. Our work shares similar spirits with these studies but focus on characterizing the KV cache of different attention heads.
+
+## 3 Adaptive KV Cache Compression
+
+Typical generative inference involves two stages. In **prompt encoding**, LLMs encode prompt inputs.For autoregressive transformers, when generating the \(i\)-th token, the attention module will reference information from all the preceding \(i-1\) tokens. To convey such contextual information, the attention module processes both key and value vectors of the preceding \(i-1\) tokens. To circumvent redundant KV vectors computations when generating succeeding tokens, all key and value vectors are retained once encoded, collectively termed as the KV cache. In **token generation**, LLMs conduct incremental token generation. In the process, the associated key and value vectors of newly generated tokens are appended to the KV cache.
+
+As highlighted in Appendix 2, various efforts have sought to compress the KV cache to minimize memory usage and boost generation speed. Yet, these methods often overlook the intricate attention structure in LLMs. As detailed in Appendix 4, attention heads in these models often function distinctively, indicating the need for tailoring compression strategies to each attention head.
+
+In this study, we introduce FastGen: a dual-phase algorithm for crafting an adaptive KV cache.
+
+### Model Profiling
+
+FastGenconducts model profiling based on the result of prompt encoding. Specifically, for a compression policy \(\bm{C}\), we mark the corresponding KV cache compression as \(\bm{K_{C}},\bm{V_{C}}=f(\bm{K},\bm{V},\bm{C})\), where \(\bm{K_{C}}\) and \(\bm{V_{C}}\) are the compressed KV cache. Then, for attention map \(\bm{A}=\text{softmax}(\bm{Q}\bm{K}^{T})\)we pick the optimal policy based on the following objective.
+
+\[\bm{C}^{*}=\operatorname*{arg\,min}_{\bm{C}\in\mathcal{C}}\text{ CacheMemoryCost}(\bm{C})\text{ s.t. }\quad|\bm{A}-\text{softmax}(\bm{Q}\bm{K}_{\bm{C}}^{T})|\leq 1-T,\] (1)
+
+where \(\mathcal{C}\) is the set of all feasible compression policies, \(\text{CacheMemoryCost}(\bm{C})\) is the target KV cache budget of the compression policy \(\bm{C}\), and \(T\) is a predefined hyper-parameter representing how much we want the policy to recover \(\bm{A}\). The final profiling algorithm is outlined as Algorithm 1.
+
+Intrinsically, our method assumes that, for all attention heads, the structure of the attention map is stable at different positions, i.e., it is sufficient to use only the encoded prompt for picking the proper compression policy. It is worth mentioning that, existing literature has provided theoretical justification for using only the encoded prompts to capture attention structures for the full contexts (Zhang et al., 2023; Liu et al., 2023). In our study, we also have provided empirical verification for this assumption (elaborated in Appendix 4).
+
+### KV Cache Compression Policies
+
+We observe that a large number of attention heads closely followed certain patterns (elaborated in Appendix 4). While FastGen's design accommodates an expansion to incorporate other strategies, we consider four KV cache compression policies besides the conventional full KV cache (\(\bm{C}_{\text{full}}\)):
+
+* \(\bm{C}_{\text{special}}\) only keeps special tokens, e.g., begin-of-sentence token \(<\)s\(>\), instruction token [INST].
+* \(\bm{C}_{\text{punct.}}\) exclusively preserves punctuation tokens including "\(\cdot\)", "\(\cdot\)", "?", etc.
+* \(\bm{C}_{\text{local}}\) evicts long-range contexts, i.e., once the relative distance between the context token and the current token exceeds a threshold, the KV cache of the context token will be evicted. The length budget of local context over the current sequence length is controlled by a ratio \(r_{l}\).
+* \(\bm{C}_{\text{frequent}}\) was proposed in multiple studies (Sheng et al., 2023; Zhang et al., 2023; Liu et al., 2023). It operates like a least-frequently-used cache by equating the cumulative attention score to a token's frequency. The cache budget over the sequence length is controlled by a ratio \(r_{f}\).
+
+Naive Strategy Combination.In practice, we noticed that it is necessary to combine those above-mentioned strategies. However, the total number of the resulting hybrid policy grows at a combinatorial speed. Here, we employed a naive strategy to construct hybrid-policies. Specifically, together with the conventional full KV cache, we consider the following feasible compression policies:
+
+\[\mathcal{C}=\{\bm{C}_{\text{special}},\bm{C}_{\text{special+punct}},\bm{C}_{ \text{special+punct.+frequent}},\bm{C}_{\text{special+punct.+frequent+local}}, \bm{C}_{\text{full}}\},\] (2)
+
+where the sum of two compression strategies is to compute the union of their compressed KV cache. More discussions on the strategy priorities are included in Appendix 5.5. The final algorithm for token generation is outlined as Algorithm 2.
+
+## 4 Diversity and Stability of Attention Structures
+
+In this section, we present empirical verifications on our intuition that KV cache compression can and should be conducted adaptively. Specifically, we aim to first demonstrate that different attention heads typically possess distinct structures; and then, to show that these attention head structures remain relatively consistent. For this purpose, we analyze the attention scores of LLaMa 65B using random samples from GSM8k (Cobbe et al., 2021) as our case study.
+
+### Head Distinctive Attention Structure
+
+**Setting.** We apply our proposed profiling method (with a recover threshold of \(0.95\)) and compute the distribution of profiling results for \(\{1,10,20,30,40,50,60,70,80\}\) layers. The resulting distribution is visualized in Figure As in Figure 3.
+
+**Observation.** As in Figure 3, attention heads in different layers have vastly different structures. Specifically, for the initial and final layers, they have more attention heads assigned to the full KV cache, indicating more attention heads of these layers broadly attend to all tokens. Meanwhile, for middle layers, the attention map focuses more on special tokens, indicating most attention heads of these layers primarily attend to special tokens (i.e., the accumulated attention score on special tokens is higher than \(0.95\) for these attention heads). As in Figure 1, we also provide a case study to illustrate the structure of different attention heads in the same layer, which demonstrates that the attention structure differs across different layers and different heads.
+
+Correspondingly, it is suboptimal to follow the same pattern and apply the same KV cache to all layers without adaptation. Also, it could be beneficial to first diagnose the cache of each attention head before deciding how to construct the cache. We'll further discuss the benefit of this diagnose-to-compress strategy in the experiment section.
+
+### Profile Tends to Be Consistent in One Sequence
+
+The previous section demonstrates the great potential for constructing an adaptive KV cache in accordance with the structure of different attention heads. Here, we aim to demonstrate that, it is sufficient to leverage only the user-provided prompts and conduct one-shot profiling, as outlined in Section 3. Specifically, we aim to illustrate that user-provided prompts share the same attention structure in the generation process.
+
+Figure 4: Accumulated Attention Score at 1st (prompt encoding), 10th, 20th, 30th decoding steps.
+
+Figure 3: Attention Profiling Result Distribution across different layers.
+
+Setting.Following Figure 1, we compute the accumulated attention score for attention heads in different layers of LLaMa 65B at multiple decoding steps (i.e., 1st, 10th, 20th, 30th). We visualized the resulting accumulated score in Figure 4.
+
+Observation.Despite some fluctuations in the exact accumulated attention scores across time steps, the pattern of the attention maps remains relatively stable. For example, Layer 33 Head 0 and Layer 23 Head 2 almost only attend to the special token, while the locality and punctuation plays an important role in Layer 23 Head 0. As to Layer 23 Head 3, more than 10 percent of the attention score is allocated to the Others portion, making it suitable for the uncompressed KV cache \(\bm{C}_{\text{full}}\).
+
+Also, we observe that a large part of attention scores focuses on special tokens in all cases, which matches our intuition for conducting the naive strategy combinations in Section 3.
+
+## 5 Experiment
+
+We conduct comprehensive experiments to demonstrate the effectiveness of FastGen on memory footprint reduction and generation quality preserving. First, we report the trade-off between memory reduction and end-to-end generation quality in Section 5.1, and discuss the compression ratio of FastGen in Section 5.2. Finally, we present ablation studies and discussions in Section 5.5.
+
+### Trade-off between performance and memory reduction
+
+Backbones.We conduct experiments with both LLaMa1 (Touvron et al., 2023) and its fine-tuned variants, with model sizes ranging from 7B to 65B. For fined-tuned variants, we do not choose the open-sourced ChatLLaMa2 (Touvron et al., 2023) model due to its grouped-query attention tech
+
+Figure 5: Performance of Adaptive KV Cache (FastGen) and Fixed KV Cache (Frequency+Local; Zhang et al., 2023 and Liu et al., 2023) of LLaMa on GSM8k, Human Eval, NQ, and TQA.
+
+[MISSING_PAGE_FAIL:7]
+
+### Memory Footprint Reduction Analysis
+
+We report the KV cache memory footprint reduction in Table 1. For all the evaluated 7B-65B models, we evaluate the memory consumption with a fixed batch size of 16, sequence length of 512, and model weights in fp16 format. We observe that FastGen substantially reduces the KV cache memory footprint across all model sizes, with more significant reductions for larger models. Taking a win rate over 45% as no quality regression, FastGen can achieve \(\sim\)50% memory reduction in LLaMa-65B, \(\sim\)30% in LLaMa-30B, \(\sim\)20% in LLaMa-13B and LLaMa-7B.
+
+### End-to-end Latency Improvement
+
+To analyze the end-to-end speedup of FastGen, we present the end-to-end latency improvement in Table 2. In the experiment, we record the total duration in seconds, measured from the start of prompt encoding, until the end of generation as the end-to-end latency. For the Full-cache baseline, we use the widely used Hugging Face Accelerate (HF). For FastGen, we implemented a customized kernel to handle the KV cache pruning operation. Specifically, we adapt the kernel from Deepspeed Aminabadi et al. (2022) by adding the KV cache sparsity operation. We include the Deepspeed performance for fair comparison. All methods are tested on the same Nvidia V100 GPUs.
+
+As shown in Table 2, we can observe that FastGen achieves significant end-to-end speed-up across all the generation settings. For the least significant case, Fastgen can have a decent \(16.04\%\) latency improvement over the full-cache baseline on a short generation length of 512. In the best cases, we can achieve up to \(55.0\%\) latency reduction with Fastgen at a generation length of 16k. We can also observe that the relative speedup is greater with longer generation length. For example, given batch size = 1, FastGen's relative speed-up rises from \(16.04\%\) to \(55.0\%\), as the generation length grows from 512 to 16k. When comparing FastGen to DeepSpeed, we can still observe significant speed-up that gets bigger with batch size and generation length. Considering DeepSpeed is a full-stack optimized inference system, there is still much room to further improvement FastGen by polishing the sparsity kernel. We leave this unique research and engineering challenge to future works.
+
+### Profiling Cost
+
+To better understand the overhead of the profiling step, we compare the profiling time with the total generation time across different generation lengths. We present the result in Table 3.
+
+We can observe that the profiling time only accounts for a very small percentage of the total generation duration, up to \(0.35\%\) in our tested cases. Also, the overhead decreases as the generation length increases, dropping to \(0.07\%\) when the generation length comes to 1024.
+
+In terms of extra memory usage, it's mainly introduced by one of the compression strategies, \(\bm{C}_{\text{frequent}}\), which needs to store an extra cumulative sum of attention scores for each attention head. To provide a detailed analysis, for each layer, the dimension of the KV cache is
+
+\begin{table}
+\begin{tabular}{l r r r r r r r r} \hline \hline Batch size & \multicolumn{4}{c}{1} & \multicolumn{4}{c}{2} & \multicolumn{4}{c}{8} & \multicolumn{2}{c}{16} \\ \hline \{[compact len, gen len] & [32,512] & [32,2048] & [32,5192] & [32,16384] & [512,32] & [512,512] & [409,4096] & [512,512] & [419,4096] & [512,512] \\ \hline Pati-cache & 13.35 & 57.37 & 299 & 799.14 & 1.12 & 19.16 & 167.64 & 23.44 & OOM & OOM \\ DeepSpeed & 11.58 & 47.12 & 201.23 & 435.74 & 0.79 & 10.45 & 90.14 & 12.93 & 127.94 & OOM \\ FastGen & 11.21 & 44.65 & 179.43 & 359.83 & 0.73 & 9.71 & 15.93 & 10.57 & 82.16 & OOM \\ Speed-up (s) over Full-cache & 16.03\% & 22.30\% & 40.69\% & 35.00\% & 34.80\% & 49.80\% & 54.00\% & 54.00\% & OOM \\ Speed-up(s) over DeepSpeed & 3.20\% & 5.35\% & 10.83\% & 17.42\% & 7.59\% & 7.08\% & 15.00\% & 18.25\% & 35.78\% & OOM \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: End-to-end latency comparison on LLaMA7b.
+
+\begin{table}
+\begin{tabular}{l r r r r} \hline \hline Generation Length & Overall Generation Duration (s) & Profiling Duration (s) & Decoding Time Per Token (s) & ProfilingOverall (\%) \\ \hline
+128 & 30.98 & 0.11 & 0.1 & 0.35\% \\
+256 & 50.1 & 0.11 & 0.1 & 0.21\% \\
+512 & 94.98 & 0.11 & 0.1 & 0.12\% \\
+1024 & 157.43 & 0.11 & 0.1 & 0.07\% \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: Profiling time of LLaMA65b. The Overall Generation Duration is measured from the start of decoding to the end of the generation length. The Profiling Duration is measured from the start of the decoding until Fastgen finishes the policy search.
+
+(batch_size, num_of_head, sequence_len, hidden_dimension), while the dimension of extra memory for the cumulative attention scores is (batch_size, num_of_head, equence_len). Considering hidden_dimension = 128 for all model sizes, the memory overhead is 1/128=\(0.78\%\) compared to storing KV cache only, which is a negligible cost.
+
+### Ablations
+
+For all the ablations, we use a fixed targeted recovery ratio \(\text{T}=0.98\).
+
+How one policy affect all the other policies?We study the complementary effects of each policy on the combination of all other policies in our framework. We examine changes in pruned KV cache and win rate while fixing the targeted recovery ratio \(T\). We take the full policy set as our control set \(\mathcal{C}\). For each ablation, we remove one of the policies from all policy combination in \(\mathcal{C}\). We summarized the results in Table 4, which suggests the \(\bm{C}_{\text{frequent}}\), and the \(\bm{C}_{\text{special}}\) are the most important policies. Removing them will incur a \(3.67\%\) and a \(2.11\%\) win rate drop respectively. We can also observe from the pruned cache ratio that \(\bm{C}_{\text{frequent}}\) and \(\bm{C}_{\text{local}}\) reduce more KV caches than the others. However, their standalone non-adaptive deployment yields suboptimal performance, as depicted in Figure 2, further verifying the importance of adapting different compression policies.
+
+Which policy should we add first (and last)?As in Section 3.2, we use a greed method to construct adaptive KV cache. Here, we examine how the order of introducing each policy affects the performance. Similar to the previous study, we fix the targeted recovery ratio to 0.98, and keep allocating cache budget until the constructed cache hit the recovery ratio. For simplicity, we make every examined order opt-in the \(\bm{C}_{\text{special}}\) first, as it's typically the most important tokens and of super-low memory cost, as suggested in Figure 1. We summarize the results in Table 5. Our current order (as in Equation 2) achieves the highest win-rates and the highest pruned ratios. Meanwhile, using alternative orders leads to a different trade-off between KV cache compression and generation quality. For example, using \(\bm{C}_{\text{frequent}}\rightarrow\bm{C}_{\text{local}}\rightarrow\bm{C}_{ \text{punct.}}\) leads to an improved KV cache compression ratio at the cost of generation quality.
+
+\begin{table}
+\begin{tabular}{l c c} \hline \hline
+**Feasible Policy Set** & **Pruned KV Ratio** & **Win Rate** \\ \hline \(\mathcal{C}\) & 36.04\% & 49.75\% \\ \hline \(\{\mathcal{C}_{\text{punct.}},C_{\text{punct.+frequent}},C_{\text{punct.+frequent +local}},C_{\text{full}}\}\) & 31.16\% & 47.64\% \\ \hline \(\{\bm{C}_{\text{special}},C_{\text{special+frequent}},C_{\text{special+frequent +local}},C_{\text{full}}\}\) & 34.23\% & 49.56\% \\ \hline \(\{\bm{C}_{\text{special}},C_{\text{special+punct.}},C_{\text{special+punct.+frequent }},C_{\text{full}}\}\) & 30.18\% & 49.06\% \\ \hline \(\{\bm{C}_{\text{special}},C_{\text{special+punct.}},C_{\text{special+punct.+local }},C_{\text{full}}\}\) & 21.26\% & 46.08\% \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: Complementary effects of each policy. We display the win rate of each method over full cache setting. We evaluate the fine-tuned LLaMa 65B on AlpacaEval with the same parameters.
+
+\begin{table}
+\begin{tabular}{l|c c} \hline \hline
+**Cache Order** & **Pruned KV Ratio** & **Win Rate** \\ \hline \(C_{\text{special}}\to C_{\text{punct.}}\to C_{\text{frequent}} \to C_{\text{local}}\) & 36.04\% & 49.75\% \\ \hline \(C_{\text{special}}\to C_{\text{frequent}}\to C_{\text{local}}\to C_{\text{punct.}}\) & 36.40\% & 47.64\% \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: Policy order ablation on fine-tuned LLaMa 65B with AlpacaEval.
+
+Figure 6: Hyper-parameter ablation on fine-tuned LLaMa 65B with AlpacaEval.
+
+Sensitivity Study.We analyze the sensitivity of selecting different hyper-parameters for FastGen, as illustrated in Figure 6. We observe that altering these hyper-parameters does not have a visible impact on the generation quality, as the model maintains a winrate over 45% in all situations. Meanwhile, it leads to a relative large change on the compression ratio. For example, changing the ratio for the frequency policy from 0.3 to 0.1 leads to +10% more KV cache. In our experiments, we set the ratio to 0.3 for both \(r_{l}\) and \(r_{f}\).
+
+## 6 Conclusion
+
+In this work, we introduce FastGen, a novel method that improves the efficiency of large language models through lightweight attention profiling and adaptive key-value caching. Our approach enables more efficient deployment across diverse models and datasets without loss of generation quality. Further work includes combining FastGen with other optimization techniques like quantization and distillation. Meanwhile, another direction could be accommodating other efficient attention architecture, such as grouped-query attention. We hope our initial results will spur further developments in efficient and deployable LLM technologies.
+
+## References
+
+* Aminabadi et al. (2022) Reza Yazdani Aminabadi, Samyam Rajbhandari, Minjia Zhang, Ammar Ahmad Awan, Cheng Li, Du Li, Elton Zheng, Jeff Rasley, Shaden Smith, Olatunji Ruwase, and Yuxiong He. Deepspeed-inference: Enabling efficient inference of transformer models at unprecedented scale. _SC22: International Conference for High Performance Computing, Networking, Storage and Analysis_, pp. 1-15, 2022.
+* Bach et al. (2015) Sebastian Bach, Alexander Binder, Gregoire Montavon, Frederick Klauschen, Klaus-Robert Muller, and Wojciech Samek. On pixel-wise explanations for non-linear classifier decisions by layer-wise relevance propagation. _PLoS ONE_, 10, 2015. URL https://api.semanticscholar.org/CorpusID:9327892.
+* Campos et al. (2017) Victor Campos, Brendan Jou, Xavier Giro i Nieto, Jordi Torres, and Shih-Fu Chang. Skip rnn: Learning to skip state updates in recurrent neural networks. _ArXiv_, abs/1708.06834, 2017. URL https://api.semanticscholar.org/CorpusID:1859294.
+* Chen et al. (2021) Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, et al. Evaluating large language models trained on code. _arXiv preprint arXiv:2107.03374_, 2021.
+* Child et al. (2019) Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating long sequences with sparse transformers. _CoRR_, abs/1904.10509, 2019. URL http://arxiv.org/abs/1904.10509.
+* Clark et al. (2019) Kevin Clark, Urvashi Khandelwal, Omer Levy, and Christopher D. Manning. What does BERT look at? an analysis of BERT's attention. In _Proceedings of the 2019 ACL Workshop BlackboxNLP: Analyzing and Interpreting Neural Networks for NLP_, pp. 276-286, Florence, Italy, August 2019. Association for Computational Linguistics. doi: 10.18653/v1/W19-4828. URL https://aclanthology.org/W19-4828.
+* Cobbe et al. (2021) Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers to solve math word problems. _arXiv preprint arXiv:2110.14168_, 2021.
+* Dai et al. (2020) Zihang Dai, Guokun Lai, Yiming Yang, and Quoc Le. Funnel-transformer: Filtering out sequential redundancy for efficient language processing. In Hugo Larochelle, Marc'Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, and Hsuan-Tien Lin (eds.), _Advances in Neural Information Processing Systems 33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual_, 2020. URL https://proceedings.neurips.cc/paper/2020/hash/2cd2915e69546904e4e5d4a2ac9e1652-Abstract.html.
+* Devlin et al. (2019) Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. BERT: pre-training of deep bidirectional transformers for language understanding. In Jill Burstein, Christy Doran, and Thamar Solorio (eds.), _Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, NAACL-HLT 2019, Minneapolis, MN, USA, June 2-7, 2019, Volume 1 (Long and Short Papers)_, pp. 4171-4186. Association for Computational Linguistics, 2019. doi: 10.18653/v1/n19-1423. URL https://doi.org/10.18653/v1/n19-1423.
+* Goyal et al. (2020) Saurabh Goyal, Anamitra R. Choudhury, Saurabh Raje, Venkatesan T. Chakaravarthy, Yogish Sabharwal, and Ashish Verma. Power-bert: Accelerating bert inference via progressive word-vector elimination. In _International Conference on Machine Learning_, 2020. URL https://api.semanticscholar.org/CorpusID:219792793.
+* Guan et al. (2022) Yue Guan, Zhengyi Li, Jingwen Leng, Zhouhan Lin, and Minyi Guo. Transkimmer: Transformer learns to layer-wise skim. In Smaranda Muresan, Preslav Nakov, and Aline Villavicencio (eds.), _Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), ACL 2022, Dublin, Ireland, May 22-27, 2022_, pp. 7275-7286. Association for Computational Linguistics, 2022. doi: 10.18653/v1/2022.acl-long.502. URL https://doi.org/10.18653/v1/2022.acl-long.502.
+* Hansen et al. (2019) Christian Hansen, Casper Hansen, Stephen Alstrup, Jakob Grue Simonsen, and Christina Lioma. Neural speed reading with structural-jump-lstm. _ArXiv_, abs/1904.00761, 2019. URL https://api.semanticscholar.org/CorpusID:90258012.
+* Hadsell et al. (2019)Ari Holtzman, Jan Buys, Li Du, Maxwell Forbes, and Yejin Choi. The curious case of neural text degeneration. _arXiv preprint arXiv:1904.09751_, 2019.
+* Huang et al. (2022) Xin Huang, Ashish Khetan, Rene Bidart, and Zohar Karnin. Pyramid-bert: Reducing complexity via successive core-set based token selection. In Smaranda Muresan, Preslav Nakov, and Aline Villavicencio (eds.), _Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), ACL 2022, Dublin, Ireland, May 22-27, 2022_, pp. 8798-8817. Association for Computational Linguistics, 2022. doi: 10.18653/v1/2022.acl-long.602. URL https://doi.org/10.18653/v1/2022.acl-long.602.
+* Kembhavi et al. (2017) Aniruddha Kembhavi, Minjoon Seo, Dustin Schwenk, Jonghyun Choi, Ali Farhadi, and Hannaneh Hajishirzi. Are you smarter than a sixth grader? textbook question answering for multimodal machine comprehension. _2017 IEEE Conference on Computer Vision and Pattern Recognition (CVPR)_, pp. 5376-5384, 2017. URL https://api.semanticscholar.org/CorpusID:1310550.
+* 18, 2022_, pp. 784-794. ACM, 2022. doi: 10.1145/3534678.3539260. URL https://doi.org/10.1145/3534678.3539260.
+* democratizing large language model alignment. _CoRR_, abs/2304.07327, 2023. doi: 10.48550/arXiv.2304.07327. URL https://doi.org/10.48550/arXiv.2304.07327.
+* Kovaleva et al. (2019) Olga Kovaleva, Alexey Romanov, Anna Rogers, and Anna Rumshisky. Revealing the dark secrets of BERT. In Kentaro Inui, Jing Jiang, Vincent Ng, and Xiaojun Wan (eds.), _Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing, EMNLP-IJCNLP 2019, Hong Kong, China, November 3-7, 2019_, pp. 4364-4373. Association for Computational Linguistics, 2019. doi: 10.18653/v1/D19-1445. URL https://doi.org/10.18653/v1/D19-1445.
+* Kwiatkowski et al. (2019) Tom Kwiatkowski, Jennimaria Palomaki, Olivia Redfield, Michael Collins, Ankur Parikh, Chris Alberti, Danielle Epstein, Illia Polosukhin, Matthew Kelcey, Jacob Devlin, Kenton Lee, Kristina N. Toutanova, Llion Jones, Ming-Wei Chang, Andrew Dai, Jakob Uszkoreit, Quoc Le, and Slav Petrov. Natural questions: a benchmark for question answering research. _Transactions of the Association of Computational Linguistics_, 2019.
+* Li et al. (2023) Xuechen Li, Tianyi Zhang, Yann Dubois, Rohan Taori, Ishaan Gulrajani, Carlos Guestrin, Percy Liang, and Tatsunori B. Hashimoto. Alpaceaval: An automatic evaluator of instruction-following models. https://github.com/tatsu-lab/alpaca_eval, 2023.
+* Liu et al. (2023) Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios Kyrillidis, and Anshumal Shrivastava. Scissorhands: Exploiting the persistence of importance hypothesis for LLM KV cache compression at test time. _CoRR_, abs/2305.17118, 2023a. doi: 10.48550/arXiv.2305.17118. URL https://doi.org/10.48550/arXiv.2305.17118.
+* Liu et al. (2022) Zichang Liu, Jue Wang, Tri Dao, Tianyi Zhou, Binhang Yuan, Zhao Song, Anshumali Shrivastava, Ce Zhang, Yuandong Tian, Christopher Re, and Beidi Chen. Deja vu: Contextual sparsity for efficient llms at inference time. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, and Jonathan Scarlett (eds.), _International Conference on Machine Learning, ICML 2023, 23-29 July 2023, Honolulu, Hawaii, USA_, volume 202 of _Proceedings of Machine Learning Research_, pp. 22137-22176. PMLR, 2023b. URL https://proceedings.mlr.press/v202/liu23am.html.
+* Michel et al. (2018) Paul Michel, Omer Levy, and Graham Neubig. Are sixteen heads really better than one? In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alche-Buc, E. Fox, and R. Garnett (eds.), _Advances in Neural Information Processing Systems_, volume 32. Curran Associates,Inc., 2019. URL https://proceedings.neurips.cc/paper_files/paper/2019/file/2c601ad9d2ff9bc8b282670cdd54f69f-Paper.pdf.
+* Mu et al. (2023) Jesse Mu, Xiang Lisa Li, and Noah D. Goodman. Learning to compress prompts with gist tokens. _CoRR_, abs/2304.08467, 2023. doi: 10.48550/arXiv.2304.08467. URL https://doi.org/10.48550/arXiv.2304.08467.
+* OpenAI (2023) OpenAI. Gpt-4 technical report, 2023.
+* Seo et al. (2017) Minjoon Seo, Sewon Min, Ali Farhadi, and Hannaneh Hajishirzi. Neural speed reading via skimrnn. _ArXiv_, abs/1711.02085, 2017. URL https://api.semanticscholar.org/CorpusID:3140413.
+* Shazeer et al. (2017) Noam M. Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc V. Le, Geoffrey E. Hinton, and Jeff Dean. Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. _ArXiv_, abs/1701.06538, 2017. URL https://api.semanticscholar.org/CorpusID:12462234.
+* Sheng et al. (2023) Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Daniel Y. Fu, Zhiqiang Xie, Beidi Chen, Clark W. Barrett, Joseph Gonzalez, Percy Liang, Christopher Re, Ioan Cristian Stoica, and Ce Zhang. High-throughput generative inference of large language models with a single gpu. In _International Conference on Machine Learning_, 2023. URL https://api.semanticscholar.org/CorpusID:257495837.
+* Sun et al. (2022) Tianxiang Sun, Xiangyang Liu, Wei Zhu, Zhichao Geng, Lingling Wu, Yilong He, Yuan Ni, Guotong Xie, Xuanjing Huang, and Xipeng Qiu. A simple hash-based early exiting approach for language understanding and generation. In Smaranda Muresan, Preslav Nakov, and Aline Villavicencio (eds.), _Findings of the Association for Computational Linguistics: ACL 2022, Dublin, Ireland, May 22-27, 2022_, pp. 2409-2421. Association for Computational Linguistics, 2022. doi: 10.18653/v1/2022.findings-acl.189. URL https://doi.org/10.18653/v1/2022.findings-acl.189.
+* Touvron et al. (2023a) Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothee Lacroix, Baptiste Roziere, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and efficient foundation language models. _arXiv preprint arXiv:2302.13971_, 2023a.
+* Touvron et al. (2021) Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajijwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas Blecher, Cristian Canton Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes, Jeremy Fu, Wenyin Fu, Brian Fuller, Cynthia Gao, Vedanuj Goswami, Naman Goyal, Anthony Hartshorn, Saghar Hosseini, Rui Hou, Hakan Inanc, Marcin Kardas, Viktor Kerkez, Madian Khabsa, Isabel Kloumann, Artem Korenev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier Martinet, Todor Mihaylov, Pushkar Mishra, Igor Molybog, Yixin Nie, Andrew Poulton, Jeremy Reizenstein, Rashi Rungta, Kalyan Saladi, Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian, Xiaoqing Ellen Tan, Binh Tang, Ross Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng Yan, Iliyan Zarov, Yuchen Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien Rodriguez, Robert Stojnic, Sergey Edunov, and Thomas Scialom. Llama 2: Open foundation and fine-tuned chat models, 2023b.
+* Voita et al. (2019) Elena Voita, David Talbot, Fedor Moiseev, Rico Sennrich, and Ivan Titov. Analyzing multi-head self-attention: Specialized heads do the heavy lifting, the rest can be pruned, July 2019. URL https://aclanthology.org/P19-1580.
+* Wang et al. (2020) Ziheng Wang, Jeremy Wohlwend, and Tao Lei. Structured pruning of large language models. In Bonnie Webber, Trevor Cohn, Yulan He, and Yang Liu (eds.), _Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing, EMNLP 2020, Online, November 16-20, 2020_, pp. 6151-6162. Association for Computational Linguistics, 2020. doi: 10.18653/v1/2020.emnlp-main.496. URL https://doi.org/10.18653/v1/2020.emnlp-main.496.
+* Zhang et al. (2019) Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Re, Clark W. Barrett, Zhangyang Wang, and Beidi Chen.
+
+H2O: Heavy-hitter oracle for efficient generative inference of large language models. _CoRR_, abs/2306.14048, 2023. doi: 10.48550/arXiv.2306.14048. URL https://doi.org/10.48550/arXiv.2306.14048.
+* Zhou et al. (2023) Chunting Zhou, Pengfei Liu, Puxin Xu, Srini Iyer, Jiao Sun, Yuning Mao, Xuezhe Ma, Avia Efrat, Ping Yu, Lili Yu, Susan Zhang, Gargi Ghosh, Mike Lewis, Luke Zettlemoyer, and Omer Levy. LIMA: less is more for alignment. _CoRR_, abs/2305.11206, 2023. doi: 10.48550/arXiv.2305.11206. URL https://doi.org/10.48550/arXiv.2305.11206.
+* Zhou et al. (2020) Wangchunshu Zhou, Canwen Xu, Tao Ge, Julian J. McAuley, Ke Xu, and Furu Wei. BERT loses patience: Fast and robust inference with early exit. In Hugo Larochelle, Marc'Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, and Hsuan-Tien Lin (eds.), _Advances in Neural Information Processing Systems 33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual_, 2020. URL https://proceedings.neurips.cc/paper/2020/hash/d4dd111a4fd973394238aca5c05bebe3-Abstract.html.

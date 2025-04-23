@@ -1,0 +1,182 @@
+# Learn To be Efficient: Build Structured Sparsity in Large Language Models
+
+Haizhong Zheng \({}^{}\) &Xiaoyan Bai\({}^{}\) &Xueshen Liu\({}^{}\) &Z. Morley Mao\({}^{}\) &Beidi Chen\({}^{}\) &Fan Lai\({}^{@sectionsign}\) &Atul Prakash \({}^{}\)\({}^{}\)University of Michigan \({}^{}\)Carnegie Mellon University
+
+\({}^{@sectionsign}\) University of Illinois Urbana-Champaign
+
+{hzzheng, smallyan, liuxs, zmao, aprakash}@umich.edu,
+
+beidic@andrew.cmu.edu, fanlai@illinois.edu
+
+###### Abstract
+
+Large Language Models (LLMs) have achieved remarkable success with their billion-level parameters, yet they incur high inference overheads. The emergence of activation sparsity in LLMs provides a natural approach to reduce this cost by involving only parts of the parameters for inference. However, existing methods only focus on utilizing this naturally formed activation sparsity in a post-training setting, overlooking the potential for further amplifying this inherent sparsity. In this paper, we hypothesize that LLMs can _learn to be efficient_ by achieving more structured activation sparsity. To achieve this, we introduce a novel training algorithm, Learn-To-be-Efficient (LTE), designed to train efficiency-aware LLMs to learn to activate fewer neurons and achieve a better trade-off between sparsity and performance. Furthermore, unlike SOTA MoEfication methods, which mainly focus on ReLU-based models, LTE can also be applied to LLMs like LLaMA using non-ReLU activations. Extensive evaluation on language understanding, language generation, and instruction tuning tasks show that LTE consistently outperforms SOTA baselines. Along with our hardware-aware custom kernel implementation, LTE reduces LLaMA2-7B inference latency by 25% at 50% sparsity. We make our code publicly available at GitHub1.
+
+## 1 Introduction
+
+The exponential growth in data volumes and model sizes has catalyzed significant breakthroughs in large-scale models, enabling a wide range of applications . Among them, large language models (LLMs), like GPT-3 , OPT , and LLaMA , have demonstrated impressive natural language ability. However, the skyrocketing number of model parameters  and dataset size  has introduced challenges in further scaling those models. The exponential growth in model size has not only inflated the deployment costs of LLMs, due to their significant computational and
+
+Figure 1: Learn-To-be-Efficient (LTE) performs efficiency-aware training to construct structured model contextual sparsity for fast inference. Activated neurons are in orange.
+
+memory demands during inference, but also affected the user experience in many latency-sensitive applications, such as chatbots  and autonomous driving [17; 35]. Recent advances have been leveraging sparsity to improve LLM inference efficiency, including model weight quantization  and pruning , token sparsity [50; 46], and activation sparsity [21; 49].
+
+During LLM inference, Feed Forward Network (FFN) layers are the primary efficiency bottleneck, accounting for over 60% of the FLOPs and I/O operations , but they exhibit high activation sparsity, especially in ReLU-based LLMs . For example, in a 175B OPT model, more than 95% of activations in FFN layers are zeros . Recent advances leverage this activation sparsity via _MoEfication_[49; 25]: they convert FFN layers to MoE layers by grouping neurons in the FFN intermediate layer into \(n\) experts and then applying a router to select \(k\) most important experts for each input token. Unlike training the MoE model from scratch, MoEfication converts FFN layers in pretrained LLMs into MoE layers with relatively small training resources.
+
+However, existing advances only focus on manipulating the pre-trained activation sparsity of neurons, overlooking the potential for further increasing this inherent sparsity. Moreover, they are limited to the historically ReLU-based LLMs, whereas emerging advanced models use soft activation functions for better model quality (e.g., SwiGLU in LLaMA  and GeGLU in Gemma ), exhibiting much lower natural activation sparsity. While existing works suggest replacing the model activation with ReLU to enable sparsity [49; 25], we show that this can hurt model performance (Section 5.2).
+
+In this paper, we hypothesize that LLMs can learn to be efficient and achieve more structured activation sparsity. As shown in Figure 1, our key insight is that, without compromising model quality, _we can also train LLMs to be efficiency-aware by developing more structured sparsity, which is more friendly for achieving hardware speedup_. However, creating structured sparsity in pretrained LLMs is non-trivial due to two practical challenges:
+
+1. _How to train routers more stably?_ The widely-used Top-k Softmax routing can lead to a severe accuracy drop (Section3.2). How to jointly train the model and routers in a MoEfication setting is still open-ended.
+2. _How to select the right experts in serving?_ The number of experts needed in MoE layers depends on specific inputs and layers, implying a trade-off between model efficiency and quality.
+
+To address these challenges, we introduce Learn-To-be-Efficient (LTE), a novel training algorithm to train efficiency-aware models. LTE integrates an efficiency loss penalty, encouraging models to activate fewer neurons in their FFN layers while keeping good task performance. Additionally, LTE adopts a threshold-based Sigmoid routing strategy to select experts and employs a two-stage training mechanism to improve training stability. LTE achieves a more flexible selection of experts instead of selecting a fixed number of experts for all layers and inputs. Same as Deja Vu  and moccitation , LTE provides very structured sparsity. We further develop a custom CUDA kernel with Triton, a Python-like CUDA programming language, to enable wall-clock time speedup from such structured sparsity (Section 4.3).
+
+We evaluate LTE on both encoder-based models (RoBERTabase, RoBERTalarge ) and decoder-based models (GPT-Medium , LLaMA2-7B ) with the HuggingFace's transformers. Our extensive experiments on Natural Language Understanding (NLU) tasks, downstream Natural Language Generation (NLG) tasks, and instruction tuning tasks, show that LTE consistently outperforms state-of-the-art designs. For instance, LLaMA with LTE provides a 1.83x - 2.59x FLOPs speed-up on NLG tasks without compromising model quality. After integrating our hardware-efficient implementation of sparse matrix multiplication kernel, LTE reduces LLaMA2-7B 25% wall-clock time latency at around 50% sparsity. Our evaluation results demonstrate that LTE effectively builds more structured sparsity even on LLMs with soft activation functions.
+
+## 2 Related Work
+
+**Mixture of Experts (MoE).** MoE was proposed by  a few decades ago to build an integral system with subset networks. Recently, MoE layers have been used in the Transformer architecture as a substitute for the MLP block [32; 7], with the recent Mistral-7B model  as a prominent example. In MLP blocks of MoE transformers, instead of using an FFN layer for calculating output, MoE layers construct multiple smaller FFN layers and employ a router to choose a subset of experts to do conditional computation. Even though transformers can have billions of parameters, only a subset of experts are activated for each token, thus effectively increasing model activation sparsity (i.e., the number of skipped neurons in execution).
+
+**LLM Contextual Sparsity.** Recent studies [18; 21] show that trained ReLU-based transformers naturally show a great sparsity in the activation of FFN layers. For example, in a 175B OPT model, more than 95% activations in FFN layers are zeros . While SOTA models are increasingly using diverse soft activations, like GeLU and SwiGLU, existing work shows that replacing soft activations with ReLU and fine-tuning the model can increase the activation sparsity without greatly hurting model quality [49; 25; 18]. Yet, we find that this benefit is not consistent for all datasets (Section 5.2). This emerging sparsity indicates that a large portion of neurons are unnecessary in LLM inference (i.e., sparsity), which we can leverage to improve LLM inference efficiency like using MoEfication . Recent papers [21; 49] show that a single FFN layer in pretrained LLMs can be converted to an MoE layer, by splitting the matrices of FFN layers into exclusive sub-matrices and employing a router to activate only neurons in a subset of experts. Similar to MoE models, MoEfication can effectively accelerate LLM inference by only using part of the parameters [49; 21].
+
+**Model Weight Sparsity.** Another orthogonal direction regarding model sparsity is static model weight sparsity [8; 36], which often prunes the model weights and keeps them static during inference. For instance, Wanda  estimates model weight importance and prunes unimportant weights, so all inputs will use the same subset of weights. In contrast, contextual sparse models select a different subset of weights for different inputs. Nonetheless, model pruning can be applied to contextual sparse models too, meaning a complementary optimization to contextual sparsity.
+
+## 3 Background and Motivation
+
+In this section, we first briefly introduce the MoEfication of FFN layers in transformers. Then, we present a study on the limitation of applying noisy top-K Softmax routing in the Moefication setting.
+
+### Background: MoEfication
+
+MoEfication  is a way to group neurons in FFN layers, thereby converting FFN layers to MoE layers for better execution speedup. For a transformer whose hidden states and FFN intermediate dimension are \(d_{model}\) and \(d_{FFN}\), respectively, the FFN layers process the input as follows:
+
+\[h=xW_{1}+b_{2}\]
+
+\[FFN(x)=(h)W_{2}+b_{2}\]
+
+where \(x^{d_{model}}\), \(W_{1},W_{2}\) are weight metrics, \(b_{1},b_{2}\) are biased term and \(\) is an activation function. MoEfication aims to group \(d_{FFN}\) neurons in the FFN intermediate layer into \(n\) experts. Then, a router is trained for each FFN layer to select \(k\) experts (k < n), thus reducing activation load, to speed up inference. A recent work, Deja Vu , uses a similar setting but treats each neuron as an expert.
+
+However, SOTA MoEfication methods overlook the potential for further optimizing the activation sparsity of LLMs. Besides, for LLMs employing soft activations such as GeLU  and SwiGLU , MoEfication  proposes to replace soft activations with ReLU and fine-tune the model to improve activation sparsity. Although recent works [49; 25] show that this replacement has a marginal impact on model performance, we notice that this hypothesis is not widely applicable (Section 5.2).
+
+### Limitations of Noisy Top-K Softmax Routing
+
+One potential solution to train and convert the model into MoE layers is noisy top-K Softmax routing [7; 33]. It selects \(k\) experts based on the highest router outputs and then calculates Softmax values for these selected outputs. The output of the MoE layer is determined by summing the products of these softmax values with their corresponding experts' outputs. Additionally, a small Gaussian noise is added to the router's outputs during training to encourage exploration across different experts, which addresses the issue of unselected experts being non-differentiable.
+
+Figure 2: Models trained with noisy top-K Softmax routing experience severe accuracy drops, even at very low levels of sparsity.
+
+To study the effectiveness of noisy top-K Softmax routing, we follow the standard MoEfication setting  to form experts in FFN layers: we fine-tune a model on a downstream dataset and group neurons into experts via parameter clustering. Subsequently, we integrate Softmax routers into models and jointly train both the model and routers. As shown in Figure 2, we observe noticeable accuracy drops even at very low sparsity levels. When diving into the expert scores produced by routers, we observe a very biased expert score allocation: only one expert in an MoE layer has an expert score close to 1, while other experts receive nearly 0 scores. This results in only one expert contributing to the inference in each MoE layer, leading to performance drops.
+
+A potential reason behind this biased allocation is that the sum of expert scores in Softmax routing is constrained to 1. Unlike traditional MoE models, which typically select 1-2 experts [32; 7], MoEfied models need to select a much larger number of experts [21; 49], but the sum of experts score is still 1; this can complicate the allocation of the Softmax budget and cause a biased allocation.
+
+## 4 Methodology: Learn To be Efficient
+
+In this section, we present LTE (Learn To be Efficient) to learn more structured MoE in FFN layers for fast inference. Specifically, we tackle two key challenges toward practical MoEfication for diverse LLMs: (1) How to train routers more stably? (Section 4.2); and (2) How to select the right experts in serving? (Section 4.2.2).
+
+### Experts Grouping
+
+The first step of LTE is to group neurons in FFN layers to form experts. Expert grouping aims to group neurons that are often activated together, thereby improving efficiency by reducing the total number of activated neurons. Here, constructing too many experts (e.g., each neuron as an expert) can significantly increase the cost, while too few can lead to poor model quality. Moreover, we need to group neurons without a significant performance drop on the pre-trained model.
+
+Following the previous work , we group 32 neurons as an expert in FFN layers, and use parameter clustering to group MLP neurons into different experts. Fundamentally, in FFN layers, each neuron is associated with a column of \(W_{1}\) (which is a \(d_{model}\) vector). Parameter clustering first treats the corresponding vector in \(W_{1}\) as the feature for a neuron, then applies the balanced K-Means algorithm  to cluster neurons into \(n\) clusters. Each cluster has \(32\) neurons by default and will be treated as an individual MoE expert.2 We also conduct an ablation study on other alternative grouping strategies in Section 5.5.
+
+### Adaptive Expert Routing
+
+#### 4.2.1 Router Design
+
+After constructing the experts, we need to decide on the right routing strategy. Similar to existing MoE designs, we use a fully-connected layer as the router network. The input to the router is the output of the preceding self-attention block, and the router output is the expert score for each expert.
+
+**Routing function.** To address the biased expert score issue (Section 3.2), we employ the Sigmoid function on router outputs to get expert scores. Unlike the Softmax function, the Sigmoid function computes each expert score independently, which circumvents the biased expert score due to the constraint on the sum of outputs in the Softmax function:
+
+\[G(x)_{i}=Sigmoid(x W_{g,i})=}},\] (1)
+
+where \(x\) is the input to the corresponding FFN layer, \(i\) is the index for the expert, and \(W_{g,i}\) is the router network weight for the \(i\)-th expert.
+
+**Threshold-based experts selection.** SOTA methods [49; 7] select a fixed number of experts for all layers and inputs. However, the necessary number of experts may differ depending on inputs and layers. Here, we propose to select experts more adaptively for different inputs and layers for a better trade-off between model sparsity and quality, by leveraging a threshold-based method to enable adaptive selection. The MoEfied FFN layers become:
+
+\[FFN(x)=_{i=1}^{n}_{\{G(x)_{i}>\}}(x)E(x)_{i},\] (2)
+
+where \(E(x)_{i}\) is the output for the \(i\)-th expert, \(()\) is the indicator function, and \(\) is a predefined threshold. Only experts with score larger than \(\) will be activated. Consequently, within the same MoE layer, as the router generates larger expert scores, more experts are selected.
+
+#### 4.2.2 Two-stage LTE Training
+
+Training the router poses three practical challenges. Firstly, as we consider training experts independently to mitigate bias (e.g., using a Sigmoid routing function), it is difficult to tease apart important experts from the rest. Secondly, the non-differentiability of threshold-based expert selection further complicates router training. Lastly, setting thresholds for each MoE layer is non-trivial.
+
+To tackle these challenges, we next propose a novel two-stage training algorithm with an efficiency loss penalty to MoEfy LLMs. Our training algorithm consists of two training stages: _a) model-router training stage_ and _b) model adaption stage_.
+
+**Stage 1: Model-router training.** In this stage, we jointly train routers and model parameters to capture the importance of experts for given inputs in the Sigmoid routers. To address the non-differentiability issue, we switch the expert selection to a "soft" mode:
+
+\[FFN_{soft}(x)=_{i=1}^{n}G(x)_{i}E(x)_{i}.\] (3)
+
+Instead of selecting a subset of experts, we always select all experts and multiply expert outputs \(E(x)_{i}\) with the corresponding expert score \(G(x)_{i}\) to make both router and model differentiable. Since there is no discrete selection in MoE layers, all parameters are trained for each iteration.
+
+Compared to Softmax routers, Sigmoid routers score each expert independently and do not introduce any competition on expert scores among experts. This makes Sigmoid routers alone cannot identify more important experts in MoE layers. As such, we design an efficiency loss penalty, \(_{efficiency}\), to introduce competition among experts for Sigmoid routers:
+
+\[_{efficiency}=_{l=1}^{L}_{i=1}^{N}|G_{l}(x)_{i}| ^{2},\] (4)
+
+where \(L\) is the number of layers, and \(N\) is the number of experts in each layer. The efficiency loss calculates the mean of expert scores across all layers. This efficiency loss penalizes the output magnitudes of routers, driving routers to selectively allocate lower expert scores to less important experts, which helps distinguish experts with different importance. Moreover, instead of assigning the same sparsity for all layers, the efficiency loss also induces inter-layer orchestration, allowing LTE-trained models to allocate adaptive sparsity for different layers. We show that LTE models are capable of adaptively allocating sparsity across different layers (Figure 16).
+
+For the threshold in Equation 2, instead of choosing a threshold for each router, we propose to select a predetermined fixed threshold and then train models to fit this threshold, i.e., train models to be threshold-aware. Specifically, we use a threshold separability regularizer to drive models to make expert scores more separable for this given threshold:
+
+\[_{separability}=_{l=1}^{L}_{i=1}^{N}(x)_{i}-)^{2}},\] (5)
+
+Figure 3: Expert distribution w/ and w/o separability loss. The expert scores in the model trained with the separability loss are much more separable than the model trained without the separability loss.
+
+where \(\) is a predefined threshold for all routers (we set \(=0.5\) for all experiments). The separability loss encourages router outputs to diverge from the threshold \(\), which makes the router outputs more separable. An example is illustrated in Figure 3. The only difference between the models in the two figures is if the model is trained with a separability loss. We find that the expert scores are not separable when training without the separability loss, making it hard to decide the threshold. However, training with the separability loss markedly improves the separability of expert scores, allowing us to choose experts with the predefined threshold.
+
+Combined with the task performance loss \(L_{task}\), our training loss in model-router training stage is:
+
+\[_{s1}=L_{task}+ L_{efficiency}+ L_{separability}.\] (6)
+
+The efficiency coefficient, \(\), is used to control the trade-off between inference efficiency and task performance, and \(\) can be used to control the sparsity of trained models. A higher \(\) indicates a larger inference cost penalty, leading to a more sparse model. \(\) is the separability loss, we set \(=0.5\) for our evaluation. We conduct an ablation study on both hyperparameters in Section 5.5.
+
+**Stage 2: Model Adaptation.** To accelerate model inference, we need to switch routers to discrete selection mode (Equation 2), and the model trained in Stage 1 needs further training to adapt to the changes in router outputs. In the model adaptation stage, we freeze the router parameters, switch routers to discrete selection mode (Equation 2), and fine-tune the model to adapt to the discrete routing with the task performance loss: \(_{s2}=L_{task}\).
+
+### Hardware-efficient Implementation
+
+As illustrated in Figure 4, same as Deja Vu  and moefication , LTE provides very structured sparsity. After selecting neurons in intermediate layers, a CUDA kernel needs only to load the relevant columns and rows of \(W_{up}\) and \(W_{down}\) from GPU global memory to SRAM to compute dot product, thus reducing memory-I/O as well as computational overheads. Thanks to the structured sparsity provided by LTE, the kernel avoids non-coalesced memory access by storing column-major \(W_{up}\) and row-major \(W_{down}\). In this paper, we use Triton 2.3.0 to implement a customized MLP layer to translate the sparsity to wall-clock time latency reduction. The evaluation of our custom kernel is presented in Section 5.3.
+
+## 5 Experiment
+
+In this section, we conduct extensive evaluationS to verify the effectiveness of LTE. For instance, in Section 5.2, LLaMA with LTE provides a 1.83x - 2.59x FLOPs speed-up on NLG tasks. Along with our hardware-aware custom kernel, LTE reduces 25% LLaMA2-7B inference latency at 50% sparsity.
+
+### Experimental Setting
+
+**Models.** We implement LTE on both encoder-based models (RoBERTabase, RoBERTalarge) and decoder-based models (GPT2-Medium, and LLaMA-7B) with the HuggingFace's transformers. Following previous work , we set each expert to contain 32 neurons in FFN layers for all models.
+
+**Datasets: 1) Natural Language Understanding (NLU)**: we evaluate on eight tasks from the GLUE dataset  SST-2 , RTE , CoLA , MNLI , QNLI , QQP , STS-B , and MPRC . We report the Pearson correlation coefficient for STS-B, the Matthews correlation coefficient for CoLA, and the accuracy for the other six datasets. **2) Natural Language Generation (NLG)**: we evaluate LTE on E2E , XSum , and Wikitext103 . For both E2E and XSum, we report the ROUGE-L  to measure the generation text quality and report the perplexity performance for the Wikitext dataset. **3) Instruction Tuning**: besides downstream tasks, we also
+
+Figure 4: Structural sparsity provided by LTE in FFN layer. After selecting neurons, unselected rows and columns won’t be loaded and used.
+
+[MISSING_PAGE_FAIL:7]
+
+**LTE Outperforms SOTA on instruction tuning.** To further evaluate the effectiveness of LTE, we evaluate LTE as a chatbot and verify model performance in a few-shot learning scenario. We fine-tune LTE on the Tulu instruction tunning dataset , and then evaluate the few-shot performance on MMLU benchmark . We use LLaMA2-7B as the base model for LTE training. For a fair comparison, we also fine-tune base models with the Tulu dataset for other baselines. Specifically, for Deja Vu, we use Tulu-fine-tuned LLaMA2-7B as the base model. For Moetification, we use Tulu-fine-tuned ReLULLaMA-7B as the base model to ensure the best possible baseline performance. We present the 5-shot MMLU accuracy comparison in Figure 7. The evaluation results show that LTE outperforms other baselines across all sparsity levels. Yet, LTE shows a weaker sparsity-performance trade-off compared to downstream tasks. Our hypothesis is that LTE routers change the structure of the original LLaMA model, which influences general language patterns learned by models in pretraining. Instruction tuning alone is not enough to fully recover this ability (considering instruction tuning has much smaller datasets). We believe that training with a wider variety of data (like pretraining data) will further improve LTE performance.
+
+### Translate Sparsity to Wall-clock Time Speedup
+
+**25% wall-clock time latency reduction.** As discussed in Section 4.3, the sparsity introduced by LTE is highly structured and can be easily translated to latency reduction. This section demonstrates that our custom Triton kernel effectively translates the LTE sparsity to wall-clock time speed up. We evaluate wall-clock time speed up using LLaMA2-7B on a single 3090Ti. We also reported vanilla Pytorch indexed matrix multiplication. Due to the requirement for
+
+Figure 8: Wall-clock time latency comparison on dense FFN blocks and our custom Triton kernel (Left). End-to-end generation latency comparison between dense model and LTE with 50% sparsity (Right).
+
+Figure 6: Performance comparison across three NLG datasets (each column). We compare LTE (Ours) with other baselines on two decoder-based models: GPT2-M and LLaMA-7B (each row).
+
+Figure 7: LTE outperforms other baselines on 5-shot MMLU benchmark.
+
+new memory allocations, slicing in Pytorch is very time-consuming. This makes indexed matrix multiplication even slower than dense matrix multiplication at most sparsity levels. We report the wall-clock time latency comparison in Figure 8 (noting that the router inference latency is already included in LTE latency). Compared to a dense FFN block, our custom Triton kernel achieves nearly linear speed-up with respect to sparsity (Left). At around 50% sparsity, LTE reduces end-to-end generation latency by approximately 25%.
+
+### Additional Comparison
+
+**Model pruning.** As discussed in Section 2, besides dynamic contextual sparsity provided by LTE, static sparsity provided by model pruning is also a common method to accelerate model inference. In this section, we present a performance comparison between Wanda  and LTE in Table 2. The sparsity reported here is the overall sparsity of the entire model, which is different from the FFN sparsity reported in Seciton 5.2. For LTE, we recalculate the overall sparsity based on the FFN sparsity. The evaluation results show that LTE achieves a lower perplexity than Wanda. The evaluation results show that, given a similar sparsity, LTE achieves better perplexity.
+
+### Ablation Study
+
+**Experts grouping algorithms.** Three different expert grouping algorithms are explored in : random grouping, parameter K-means clustering, and co-activation graph split. The co-activation graph split algorithm constructs a graph where each neuron represents a node and the edges denote the frequency of co-activation between neuron pairs. This graph is subsequently divided into subgraphs using the graph split algorithm , with each subgraph representing a group of neurons. To study the effectiveness of these grouping algorithms, we compare their LTE performance by fine-tuning GPT2 on the WikiText-103 dataset. As shown in Figure 9, both co-activation graph split and parameter K-means grouping have very similar performance (similar to finding in ) and outperform random grouping. Given that parameter K-means grouping is simpler to implement, as co-activation graph split requires collecting activation data, we use K-means grouping in our paper.
+
+**The relation between efficiency loss hyperparameter \(\) and sparsity.** As discussed in Section 4.2.2, efficiency loss hyperparameter \(\) is used to balance the trade-off between task performance and sparsity (efficiency). We illustrate the relation between \(\) and sparsity across different models and tasks in Figure 10. For a given task and model, increasing \(\) results in greater sparsity.
+
+**Ablation study on separability loss.** Another hyperparameter in LTE training, \(\), is used to encourage the separability of router outputs, which facilitates us to choose the threshold to pick neurons (as shown in Figure 3). We compare models trained with different lambda in Figure 11. When increasing \(\) from \(0\) (i.e., no separability loss) to \(0.5\), we observe a constant perplexity drop for all sparsity. However, if we keep increasing \(\), perplexity does not further decrease.
+
+**Effectiveness of LTE-trained routers.** We next demonstrate the effectiveness of LTE's first training stage, the model-router training stage, in helping LLMs gain better sparsity. To build a baseline, instead of using routers trained in the model-router training stage, we use randomly initialized networks as routers and train LLMs to adapt to random routers. Since we cannot control the sparsity of LLMs with a threshold in a random router, we decide the sparsity for MoE layers by picking K top experts: we first fix a K to decide the sparsity and then start to train the model. Figure 12 compares the performance of models with different routers. We observe that routers trained with LTE significantly contribute to achieving a better trade-off between sparsity and model performance, which proves the effectiveness of the model-router training stage.
+
+**Other baselines with further fine-tuning.** A key distinction between LTE and other baselines is that LTE requires additional fine-tuning to make the model efficiency-aware. In this section, we assess whether further fine-tuning can enhance the performance of other baselines, aiming to understand the contribution of additional training to LTE's effectiveness. Specifically, we fine-tune two baselines on GPT2-Medium using the WikiText103 dataset: 1) we first fine-tune GPT2-M with Wikitext and apply Deja Vu on the fine-tuned models. Then, we further fine-tune MoEfied models with WikiText103. 2) We implement \(\)-MoE  on GPT2-Medium model and fine-tune models with the WikiText103 dataset. For both baselines, we train models for the same training time as we train LTE models. The evaluation results shown in Figure 13 show that LTE outperforms the other two baselines across different sparsity levels.
+
+## 6 Conclusion
+
+In this paper, we explore how to enable better activation sparsity for fast LLM inference. We introduce a novel algorithm, LTE, for the model to automatically learn to activate fewer neurons, by grouping neurons into different experts and then adaptively selecting important ones for specific inputs and layers. Our extensive evaluations, spanning four LLMs and eleven datasets, show that LTE can achieve 1.83x - 2.59x FLOPs speed-up on LLaMA, thus execution efficiency, outperforming state-of-the-art designs. We believe that our work can inspire more research on designing more efficiency-aware training methods, making LLMs more accessible to the broad community.

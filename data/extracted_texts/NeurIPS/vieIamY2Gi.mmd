@@ -1,0 +1,314 @@
+# Improved off-policy training of diffusion samplers
+
+Marcin Sendera
+
+Mila, Universite de Montreal
+
+Jagiellonian University
+
+&Minsu Kim
+
+Mila, Universite de Montreal
+
+KAIST
+
+&Sarthak Mittal
+
+Mila, Universite de Montreal
+
+Pablo Lemos
+
+Mila, Universite de Montreal
+
+Ciela Institute
+
+Dreamfold
+
+&Luca Scimeca
+
+Mila, Universite de Montreal
+
+Dreamfold
+
+&Jarrid Rector-Brooks
+
+Mila, Universite de Montreal
+
+Dreamfold
+
+&Alexandre Adam
+
+Mila, Universite de Montreal
+
+Ciela Institute
+
+&Yoshua Bengio
+
+Mila, Universite de Montreal
+
+CIFAR
+
+&Nikolay Malkin
+
+Mila, Universite de Montreal
+
+University of Edinburgh
+
+{marcin.sendera,...,nikolay.malkin}@mila.quebec
+
+###### Abstract
+
+We study the problem of training diffusion models to sample from a distribution with a given unnormalized density or energy function. We benchmark several diffusion-structured inference methods, including simulation-based variational approaches and off-policy methods (continuous generative flow networks). Our results shed light on the relative advantages of existing algorithms while bringing into question some claims from past work. We also propose a novel exploration strategy for off-policy methods, based on local search in the target space with the use of a replay buffer, and show that it improves the quality of samples on a variety of target distributions. Our code for the sampling methods and benchmarks studied is made public at (link) as a base for future work on diffusion models for amortized inference.
+
+## 1 Introduction
+
+Approximating and sampling from complex multivariate distributions is a fundamental problem in probabilistic deep learning [_e.g._, 27; 35; 26; 48; 57] and in scientific applications [3; 52; 38; 1; 32]. The problem of drawing samples from a distribution given only an unnormalized probability density or energy is particularly challenging in high-dimensional spaces and when the distribution of interest has many separated modes . Sampling methods based on Markov chain Monte Carlo (MCMC) - such as Metropolis-adjusted Langevin [MALA; 24; 65; 64] and Hamiltonian MC [HMC; 20; 31] - may be slow to mix between modes and have a high cost per sample. While variants such as sequential MC [SMC; 25; 13; 16] and nested sampling [69; 10; 43] have better mode coverage, their cost may grow prohibitively with the dimensionality of the problem. This motivates the use of amortized variational inference, _i.e._, fitting parametric models that sample the target distribution.
+
+Diffusion models, continuous-time stochastic processes that gradually evolve a simple distribution to a complex target, are powerful density estimators with proven mode-mixing properties ; as such, they have been widely used in the setting of generative models learned from data [70; 72; 28; 50; 66]. However, the problem of training diffusion models to sample from a distribution with a given black-box density or energy function has attracted less attention. Recent work has drawn connections between diffusion (learning the denoising process) and stochastic control (learning the Follmerdrift ), leading to approaches such as the path integral sampler [PIS; 88], denoising diffusion sampler [DDS; 78], and time-reversed diffusion sampler [DIS; 8]; such approaches were recently unified by  and . Another line of work [42; 86] is based on continuous generative flow networks (GFlowNets), which are deep reinforcement learning algorithms adapted to variational inference that offer stable off-policy training and thus flexible exploration .
+
+Despite the advances in sampling methods and attempts to unify them theoretically [63; 79], the field suffers from some failures in benchmarking and reproducibility, with the works differing in the choice of model architectures, using unstated hyperparameters, and even disagreeing in their definitions of the same target densities (see SSB.1). The **first main contribution** of this paper is a unified library for diffusion-structured samplers. The library has a focus on off-policy methods (continuous GFlowNets) but also includes simulation-based variational objectives such as PIS. Using this codebase, we are able to benchmark methods from past work under comparable conditions and confirm claims about exploration strategies and desirable inductive biases, while calling into question other claims on robustness and sample efficiency. Our library also includes several new modeling and training techniques, and we provide preliminary evidence of their utility in possible future work (SS5.3).
+
+Our **second contribution** is a study of methods for improving exploration and credit assignment - the propagation of learning signals from the target density to the parameters of earlier sampling steps - in diffusion-structured samplers (SS4). First, our results (SS5.2) suggest that the technique of utilizing partial trajectory information [44; 55], as done in the diffusion setting by , offers little benefit, and a higher training cost, over on-policy  or off-policy  trajectory-based optimization. Second, we examine the utility of a gradient-based variant which parametrizes the denoising distribution as a correction to a Langevin process . We show that this inductive bias is also beneficial in the off-policy (GFlowNet) setting despite higher computational cost. Finally, motivated by recent approaches in discrete sampling, we propose an efficient exploration technique based on local search in the target space with the use of a replay buffer, which improves sample quality across various target distributions.
+
+## 2 Prior work
+
+**Amortized variational inference** approaches use a parametric model \(q_{\,}\) to approximate a given target density \(p_{}\), typically through stochastic optimization [30; 58; 2]. Notably, explicit density models like autoregressive models and normalizing flows have been extensively utilized in density estimation [60; 19; 81; 22; 51]. However, these models impose structural constraints, thereby limiting their expressive power [14; 23; 87]. The adoption of **diffusion processes** in generative models has stimulated a renewed interest in hierarchical models as density estimators [80; 28; 76]. Approaches like PIS  leverage stochastic optimal control for sampling from unnormalized densities, albeit still struggling with scalability in high-dimensional spaces.
+
+**Generative flow networks**, originally defined in the discrete case by [6; 7], view hierarchical sampling (_i.e._, stepwise generation) as a sequential decision-making process and represent a synthesis of reinforcement learning and variational inference approaches [46; 90; 73; 18], expanding from specific scientific domains (_e.g._, 36; 4; 89) to amortized inference over a broader array of latent structures (_e.g._, 77; 34). Their ability to efficiently navigate trajectory spaces via off-policy exploration has been crucial, yet they encounter challenges in training dynamics, such as credit assignment and exploration efficiency [45; 44; 55; 59; 68; 39; 37]. These challenges have repercussions in the scalability of these methods in more complex scenarios, which this paper addresses in the continuous case.
+
+## 3 Setting: Diffusion-structured sampling
+
+Let \(:^{d}\) be a differentiable _energy function_ and define \(R()=(-())\), the _reward_ or _unnormalized target density_. Assuming the integral \(Z:=_{^{d}}R()\,d\) exists, \(\) defines a _Boltzmann density_\(p_{}()=R()/Z\) on \(^{d}\). We are interested in the problems of sampling from \(p_{}\) and approximating the _partition function_\(Z\) given access only to \(\) and possibly to its gradient \(\).
+
+We describe two closely related perspectives on this problem: via neural SDEs and stochastic control (SS3.1) and via continuous generative flow networks (SS3.2).
+
+### Euler-Maruyama hierarchical samplers
+
+**Generative modeling with SDEs.** Diffusion models assume a continuous-time generative process given by a neural stochastic differential equation [SDE; 75; 54; 67]:
+
+\[d_{t}=u(_{t},t;)\;dt+g(_{t},t;)\;d _{t},\] (1)
+
+where \(_{0}\) follows a fixed tractable distribution \(_{0}\) (such as a Gaussian or a point mass). The initial distribution \(_{0}\) and the stochastic dynamics specified by (1) induce marginal densities \(p_{t}\) on \(^{d}\) for each \(t>0\). The functions \(u\) and \(g\) have learnable parameters that we wish to optimize, using some objective, so as to make the terminal density \(p_{1}\) close to \(p_{}\). Samples can be drawn from \(p_{1}\) by sampling \(_{0}_{0}\) and simulating the SDE (1) to time \(t=1\).
+
+The SDE driving \(_{0}\) to \(p_{}\) is not unique. However, if one fixes a reverse-time SDE, or _noising process_, that pushes \(p_{}\) at \(t=1\) to \(_{0}\) at \(t=0\), then its reverse, the forward SDE (1), is uniquely determined under mild conditions and is called the _denoising process_. For usual choices of the noising process, there are stochastic regression objectives for learning the drift \(u\) of the denoising process _given samples from \(p_{}\)_, and the diffusion rate \(g\) is available in closed form [72; 28].
+
+**Time discretization.** In practice, the integration of the SDE (1) is approximated by a discrete-time scheme, the simplest of which is Euler-Maruyama integration. The process (1) is replaced by a discrete-time Markov chain \(_{0}_{ t}_{2  t}_{1}\), where \( t=\) is the time increment and and \(T\) is the number of steps:
+
+\[_{0}_{0},_{t+ t}=_{t}+u( _{t},t;) t+g(_{t},t;)\; _{t}_{t}(,_{d}).\] (2)
+
+The density of the transition kernel from \(_{t}\) to \(_{t+ t}\) can explicitly be written as
+
+\[p_{F}(_{t+ t}_{t})=(_{t+  t};_{t}+u(_{t},t;) t,g(_{t},t ;)^{2} t_{d}),\] (3)
+
+where \(p_{F}\) denotes the transition density of the discretized forward SDE. This density defines a joint distribution over trajectories starting at \(_{0}\):
+
+\[p_{F}(_{ t},,_{1}_{0})=_{ i=0}^{T-1}p_{F}(_{(i+1) t}_{ t}).\] (4)
+
+Similarly, a discrete-time reverse process \(_{1}_{1- t}_{1-2  t}_{0}\) with transition densities \(p_{B}(_{t- t}_{t})\) defines a joint distribution1 via
+
+\[p_{B}(_{0},,_{1- t}_{1})=_{ t=1}^{T}p_{B}(_{(i-1) t}_{ t}).\] (5)
+
+If the forward and backward processes (starting from \(_{0}\) and \(p_{}\), respectively) are reverses of each other, then they define the same distribution over trajectories, _i.e._, for all \(_{0}_{ t} _{1}\),
+
+\[_{0}(_{0})p_{F}(_{ t},,_{1} _{0})=p_{}(_{1})p_{B}(_{0},, _{1- t}_{1}).\] (6)
+
+In particular, the marginal densities of \(_{1}\) under the forward and backward processes are then equal to \(p_{}\), and the forward process can be used to sample the target distribution.
+
+Because the reverse of a process with Gaussian increments is, in general, not itself Gaussian, (6) can be enforced only approximately, but the discrepancy vanishes as \( t 0\) (_i.e._, increments are infinitesimally Gaussian), an application of the central limit theorem that is key to stochastic calculus .
+
+**SDE learning as hierarchical variational inference.** The problem of learning the parameters \(\) of the forward process so as to enforce (6) is one of hierarchical variational inference. The backward process transforms \(_{1}\) into \(_{0}\) via a sequence of latent variables \(_{1- t},,_{0}\), and the forward process aims to match the posterior distribution over these variables and thus to approximately enforce (6).
+
+In the setting of diffusion models learned from data, where one has samples from \(p_{}\), one can optimize the forward process by minimizing the KL divergence \(D_{}(p_{} p_{B}\|_{0} p_{F})\) between the distribution over trajectories given by the reverse process and that given by the forward process.
+
+This is equivalent to the typical training of diffusion models, which optimizes a variational bound on the data log-likelihood (see ). However, in the setting of an intractable density \(p_{}\), unbiased estimators of this divergence are not available. Instead, one can optimize the reverse KL:2
+
+\[D_{}(_{0} p_{F}\|p_{} p_{B})\] \[= \,(_{0})p_{F}(_{M}, ,_{1}_{0})}{p_{}(_{1})p_ {B}(_{0},,_{1- t}_{1})}d_{0}( _{0})p_{F}(_{M},,_{1}_{0}) \;\;d_{M}\;\;d_{1}.\] (7)
+
+Various estimators of this objective are available. For instance, the path integral sampler objective [PIS; 88] uses the reparametrization trick to express (7) as an expectation over noise variables \(_{t}\) that participate in the hierarchical sampling of \(_{ t},,_{1}\), yielding an unbiased gradient estimator, but one that requires backpropagation into the simulation of the forward process. The related denoising diffusion sampler [DDS; 78] applies the same principle in a different integration scheme.
+
+### Euler-Maruyama samplers as GFlowNets
+
+Continuous generative flow networks (GFlowNets)  express the problem of enforcing (6) as a reinforcement learning task. In this section, we summarize this interpretation, its connection to neural SDEs, the associated learning objectives, and their relative advantages and disadvantages.
+
+The connection between generative flow networks and diffusion models or SDEs was first made informally by  in the distribution-matching setting and by  in the maximum-likelihood setting, while the theoretical foundations for continuous GFlowNets were later laid down by .
+
+**State and action space.** To formulate sampling as a sequential decision-making problem, one must define the spaces of states and actions. In the case of sampling by \(T\)-step Euler-Maruyama integration, assuming \(_{0}\) is a point mass at \(\), the state space is
+
+\[=\{(,0)\,\{(,t): ^{d},t\{ t,2 t,,1\}\},.\]
+
+with the point \((,t)\) representing that the sampling agent is at position \(\) at time \(t\).
+
+Sampling begins with the _initial state_\(_{0}:=(,0)\), proceeds through a sequence of states \((_{ t}, t)\), \((_{2 t},2 t)\), \(\), and ends at a state \((_{1},1)\); states \((,t)\) with \(t=1\) are called _terminal states_ and their collection is denoted \(\). From now on, we will often write \(_{t}\) in place of the state \((_{t},t)\) when the time \(t\) is clear from context. The sequence of states \(_{0}_{ t} _{1}\) is called a _complete trajectory_.
+
+The _actions_ from a nonterminal state \((_{t},t)\) correspond to the possible next states \((_{t+ t},t+ t)\) that can be reached from \((_{t},t)\) by a single step of the Euler-Maruyama integrator.3
+
+**Forward policy and learning problem.** A _(forward) policy_ is a collection of continuous distributions over the successor states - states reachable by a single action - of every nonterminal state \((,t)\). In our context, this amounts to a collection of conditional probability densities \(p_{F}(_{t+ t}_{t};)\), representing the density of the transition kernel from \(_{t}\) to \(_{t+ t}\). GFlowNet training optimizes the parameters \(\), which may be the weights of a neural network specifying a density over \(_{t+ t}\) conditioned on \(_{ t}\).
+
+A policy \(p_{F}\) induces a distribution over complete trajectories \(=(_{0}_{ t} _{1})\) via
+
+\[p_{F}(;)=_{i=0}^{T-1}p_{F}(_{(i+1) t} _{i t};).\]
+
+In particular, we get a marginal density over terminal states:
+
+\[p_{F}^{}(_{1};)\!\!=\!\!\! p_{F}(_{0} _{ t}_{1}; )\,d_{ t}\,\,d_{1- t}.\] (8)
+
+The learning problem solved by GFlowNets is to find the parameters \(\) of a policy \(p_{F}\) whose terminating density \(p_{F}^{}\) is equal to \(p_{}\), _i.e._,
+
+\[p_{F}^{}(_{1};)=_{1})}{Z} _{1}^{d}.\] (9)However, because the integral (8) is intractable and \(Z\) is unknown, auxiliary objects must be introduced into optimization objectives to enforce (9), as discussed below.
+
+Notably, if the policy is a Gaussian with mean and variance given by neural networks taking \(_{t}\) and \(t\) as input, then learning the policy amounts to learning the drift \(u(_{t},t;)\) and diffusion \(g(_{t},t;)\) of a SDE (1), _i.e._, fitting a neural SDE. **The SDE learning problem in SS3.1 is thus the same as that of fitting a GFlowNet with Gaussian policies.**
+
+**Backward policy and trajectory balance.** A _backward policy_ is a collection of conditional probability densities \(p_{B}(_{t- t}_{t};)\), representing a probability density of transitioning from \(_{t}\) to an ancestor state \(_{t- t}\). The backward policy induces a distribution over complete trajectories \(\) conditioned on their terminal state (cf. (5)):
+
+\[p_{B}(_{1};)=_{i=1}^{T}p_{B}(_{(i-1)  t}_{i t};),\]
+
+where exceptionally \(p_{B}(_{0}_{ t})=1\) as \(_{0}\) is a point mass.
+
+Generalizing a result in the discrete-space setting  show that \(p_{F}\) samples from the target distribution (_i.e._, satisfies (9)) if and only if there exists a backward policy \(p_{B}\) and a scalar \(Z_{}\) such that the _trajectory balance conditions_ are fulfilled for every complete trajectory \(=(_{0}_{ t} _{1})\):
+
+\[Z_{}p_{F}(;)=R(_{1})p_{B}(_{1}; ).\] (10)
+
+If these conditions hold, then \(Z_{}\) equals the true partition function \(Z=_{}R()\ d\). The _trajectory balance objective_ for a trajectory \(\) is the squared log-ratio of the two sides of (10), that is:
+
+\[_{}(;,)=(p_{F}( ;)}{R(_{1})p_{B}(_{1};)})^{2}.\] (11)
+
+One can thus achieve (9) by minimizing to zero the loss \(_{}(;,)\) with respect to the parameters \(\) and \(\), where the trajectories \(\) used for training are sampled from some _training policy_\(()\). While it is possible to optimize (11) with respect to the parameters of both the forward and backward policies, in some learning problems, one _fixes_ the backward policy and only optimizes the parameters of \(p_{F}\) and the estimate of the partition function \(Z_{}\). For example, for most experiments in SS5, we fix the backward policy to a discretized Brownian bridge, following past work.
+
+**Off-policy optimization.** Unlike the KL objective (7), whose gradient involves an expectation over the distribution of trajectories under the current forward process, (11) can be optimized off-policy, _i.e._, using trajectories sampled from an arbitrary distribution \(\). Because minimizing \(_{}(;,)\) to \(0\) for all \(\) in the support of \(\) will achieve (9), \(\) can be taken be any distribution with full support, so as to promote discovery of modes of the target distribution. Various choices motivated by reinforcement learning techniques have been proposed, including noisy exploration or tempering , replay buffers , Thompson sampling , and backward traces from terminal states obtained by MCMC . In the continuous case,  proposed to simply add a small constant to the policy variance when sampling trajectories for training. Off-policy optimization is a key advantage of GFlowNets over variational methods such as PIS, which require on-policy optimization .
+
+However, when \(_{}\) happens to be optimized on-policy, _i.e._, using trajectories sampled from the policy \(p_{F}\) itself, we get an unbiased estimator of the gradient of the KL divergence (7) with respect to \(p_{F}\)'s parameters up to a constant , that is:
+
+\[_{-p_{F}()}\ [_{^{}}_{}( ;,)]=2_{^{}}D_{}(p_{F}(;) \|p_{}(_{1})p_{B}(_{1};)),\]
+
+where \(_{^{}}\) denotes the gradient with respect to the parameters of \(p_{F}\), but not \(Z_{}\). This unbiased estimator tends to have higher variance than the reparametrization-based estimator used by PIS. On the other hand, it does not require backpropagation through the simulation of the forward process and can be used to optimize the parameters of both the forward and backward policies.
+
+**Other objectives.** The trajectory balance objective (11) is not the only possible objective that can be used to enforce (9). A notable generalization is _subtrajectory balance_[SubTB; 44], which involves modeling a scalar _state flow_\(f(_{t};)\) associated with each state \(_{t}\) - intended to model the marginal density of the forward process at \(_{t}\) - and enforcing _subtrajectory balance_ conditions for all partial trajectories \(_{m t}_{(m+1) t} _{n t}\):
+
+\[f(_{m t};)_{i=m}^{n-1}p_{F}(_{(i+1)  t}_{i t};)=f(_{n t};) _{i=m+1}^{n}p_{B}(_{(i-1) t}_{i t}; ),\] (12)where for terminal states \(f(_{1})=R(_{1})\). This approach has some computational overhead associated with training the state flow, but has been shown to be effective in discrete-space settings, especially when combined with the _forward-looking_ reward shaping scheme proposed by . It has also been tested in the continuous case, but our experimental results suggest that it offers little benefit over the TB objective in the diffusion setting (see SS4.1 and SSB.1).
+
+It is also worth noting the off-policy VarGrad estimator [53; 62], rediscovered for GFlowNets by . Like TB, VarGrad can be optimized over trajectories drawn off-policy. Rather than enforcing (10) for every trajectory, VarGrad optimizes the empirical _variance_ (over a minibatch) of the log-ratio of the two sides of (10). As noted by , this is equivalent to minimizing \(_{}\) first with respect to \( Z_{}\) to optimality over the batch, then with respect to the parameters of \(p_{F}\).
+
+## 4 Exploration and credit assignment in continuous GFlowNets
+
+The main challenges in training off-policy sampling models are exploration efficiency (discovery of high-reward states) and credit assignment (propagation of reward signals to the actions that led to them). We describe several new and existing methods for addressing these challenges in the context of diffusion-structured GFlowNets. These techniques will be empirically studied and compared in SS5.
+
+### Credit assignment methods
+
+**Partial energies and subtrajectory-based learning.** studied the diffusion sampler learning problem introduced by , but replaced the TB learning objective with the SubTB objective.4 In addition, an inductive bias resembling the geometric interpolation in  was used for the state flow function:
+
+\[ f(_{t};)=(1-t) p_{t}^{}(_{t})+t  R(_{t})+(_{t},t;),\] (13)
+
+where NN is a neural network and \(p_{t}^{}(_{t})=(_{t};0,^{2}tI _{d})\) is the marginal density of a Brownian motion with rate \(\) at \(_{t}\). The use of the target density \( R(_{t})=-(_{t})\) in the state flow function was hypothesized to provide an effective signal driving the sampler to high-density states at early steps in the trajectory. Such an inductive bias on the state flow was called _forward-looking_ (FL) by , and we will refer to this method as **FL-SubTB** in SS5.
+
+**Langevin dynamics inductive bias.** proposed an inductive bias on the architecture of the drift of the neural SDE \(u(_{t},t;)\) (in GFlowNet terms, the mean of the Gaussian density \(p_{F}(_{t+ t}_{t};)\)) that resembles a Langevin process on the target distribution. One writes
+
+\[u(_{t},t;)=_{1}(_{t},t;)+_{ 2}(t;)(_{t}),\] (14)
+
+where NN\({}_{1}\) and NN\({}_{2}\) are neural networks outputting a vector and a scalar, respectively. The second term in (14) is a scaled gradient of the target energy - the drift of a Langevin SDE - and the first term is a learned correction. This inductive bias, which we name the _Langevin parametrization_ (**LP**), was shown to improve the efficiency of PIS. We will study its effect on continuous GFlowNets in SS5.
+
+The inductive bias (14) placed on policies represents a different way of incorporating the reward signal at intermediate steps in the trajectory and can steer the sampler towards low-energy regions. It contrasts with (13) in that it provides the gradient of the energy directly to the policy, rather than just using the energy to provide a learning signal to policies via the parametrization of the log-state flow (13).
+
+Considerations of the continuous-time limit lead us to conjecture that the Langevin parametrization (14) with NN\({}_{1}\) independent of \(_{t}\) is _equivalent_ to the forward-looking flow (13) in the limit of small time increments \( t 0\), _i.e._, they induce the same asymptotics of the discrepancy in the SubTB constraints (12) over short partial trajectories. Such theoretical analysis can be the subject of future work.
+
+### A new method for off-policy exploration with local search and replay buffer
+
+**Local search with parallel MALA.** The FL and LP inductive biases both induce computational overhead: either in the evaluation and optimization of a state flow or in the need to evaluate the energy gradient at every step of sampling (see SSC.3). We present an alternative technique that does not induce additional computation cost per training trajectory.
+
+To enhance the quality of samples during training, we incorporate local search into the exploration process, motivated by the success of local exploration  and replay buffer [_e.g._, 17] methods for GFlowNets in discrete spaces. Unlike these methods, which define MCMC kernels via the GFlowNet policies, our method leverages parallel Metropolis-adjusted Langevin (MALA) directly in the target space.
+
+In detail, we initially sample \(M\) candidates from the sampler: \(\{^{(1)},,^{(M)}\} p_{F}^{}()\). Subsequently, we run parallel MALA across \(M\) chains over \(K\) transitions, with the initial states of the Markov chain being \(\{^{(1)},,^{(M)}\}\). After the \(K_{}\) burn-in transitions, the accepted samples are stored in a local search buffer \(_{}\). We occasionally update the buffer using MALA steps and replay samples from it to minimize the computational demands of iterative local search. MALA steps are far more parallelizable than sampler training and need to be made only rarely (as the buffer is much larger than the training batch size), so the overhead of local search is small.
+
+**Training with local search and replay buffer.** To train samplers with the aid of the buffer, we draw a sample \(\) from \(_{}\) (uniformly or using a prioritization scheme, SSE), sample a trajectory \(\) leading to \(\) from the backward process, and make a gradient update on the objective (_e.g._, TB) associated with \(\).
+
+When training with local search guidance, we alternate two steps, inspired by , who alternate training on forward trajectories and backward trajectories initialized at a _fixed_ set of MCMC samples. Step A involves training with on-policy or exploratory forward sampling while Step B uses samples drawn from the local search buffer described above. This allows the sampler to explore both diversified samples (Step A) and low-energy samples (Step B). See SSE for detailed pseudocode of adaptive-step parallel MALA and local search-guided GFlowNet training.
+
+## 5 Experiments
+
+We conduct comprehensive benchmarks of various diffusion-structured samplers, encompassing both GFlowNet samplers and methods such as PIS. For the GFlowNet samplers, we investigate a range of techniques, including different exploration strategies and loss functions. Additionally, we examine the efficacy of the Langevin parametrization and the newly proposed local search with buffer.
+
+### Tasks and baselines
+
+We explore two types of tasks, with more details provided in SSB: sampling from energy distributions - a 2-dimensional mixture of Gaussians with 25 modes (**25GMM**), the 10-dimensional **Funnel**, the 32-dimensional **Manywell** distribution, and the 1600-dimensional **Log-Gaussian Cox process
+
+  Energy \(\) &  &  &  &  \\ Algorithm 1 Metric \(\) & \( Z\) & \( Z\) & \( Z^{}\) & \( Z\) & \( Z\) & \( Z\) & \( Z^{}\) \\  SMC &  & 0.561\(\)0.001 &  & _See discussion in §8.1_ \\ GONS  &  & 0.033\(\)0.17 & 0.029\(\)0.044 &  &  \\  DIS  & 1.125\(\)0.065 & 0.936\(\)0.011 & 0.839\(\)0.016 & 0.093\(\)0.018 & 10.35\(\)0.016 & 299\(\)0.016 & 361\(\)5.48 \\ DDS  & 1.760\(\)0.018 & 0.746\(\)0.019 & 0.424\(\)0.006 & 0.206\(\)0.013 & 7.36\(\)0.24 & 23.48\(\)0.017 & 4716\(\)4.20 \\ PIS  & 1.769\(\)0.014 & 1.274\(\)0.123 & 0.534\(\)0.005 & 0.262\(\)0.005 & 38.58\(\)0.019 & 2.69\(\)0.010 & 381\(\)1.44 & 4714\(\)4.20 \\ + LP  & 1.799\(\)0.019 & 0.225\(\)0.005 & 0.587\(\)0.012 & 0.288\(\)0.014 & 13.94\(\)0.007 & 4716\(\)5.58 & 487\(\)22.02 \\  TB  & 1.176\(\)1.00 & 1.071\(\)0.112 & 0.690\(\)0.018 & 0.239\(\)0.104 & 4.01\(\)0.044 & 26.71\(\)0.010 & 336\(\)0.706 & 327\(\)39.50\(\)0.99 \\ TB + Expl.  & 0.560\(\)0.015 & 0.422\(\)0.139 & 0.749\(\)0.015 & 0.226\(\)0.138 & 4.01\(\)0.56 & 2.68\(\)0.018 & 346\(\)10.75\(\)34 & 389\(\)21.41 \\ VarGad + Expl. & 0.615\(\)0.024 & 0.487\(\)0.120 & 0.620\(\)0.012 & 0.250\(\)0.111 & 4.01\(\)0.055 & 2.69\(\)0.017 & 337\(\)39.75\(\)0.43 & 4037\(\)39.73 \\ FL-SubTR & 1.272\(\)0.010 & 1.204\(\)0.004 & 0.527\(\)0.011 & 0.152\(\)0.014 & 3.96\(\)0.017 & 365\(\)20.24 & 365\(\)20.24 & 402\(\)65.54 \\ + LP  & 0.209\(\)0.028 & 0.011\(\)0.008 & 0.563\(\)0.012 & 0.155\(\)0.517 & 4.23\(\)0.12 & 2.66\(\)0.22 & 465.44\(\)1.23 & 483\(\)90.94 \\  TR + Expl + LS (_ours_) & (0.171\(\)0.003) & 0.004\(\)0.001 & 0.653\(\)0.025 & (0.285\(\)0.009 & 4.572\(\)0.33) & 10.96\(\)0.02 & 384\(\)90.63 & 419\(\)55.24 \\ TR + Expl + LP (_ours_) & 0.206\(\)0.018 & 0.011\(\)0.006 & 0.066\(\)0.005 & 0.051\(\)0.015 & 7.46\(\)1.14 & 1.06\(\)1.11 & 452\(\)22.84 & 447\(\)62.19 \\ TR + Expl + LP + LS (_ours_) & 0.190\(\)0.013 & 0.007\(\)0.017 & 0.76\(\)0.012 & 0.264\(\)0.004 & 4.68\(\)0.010 & 0.07\(\)1.714 & 389\(\)20.59 & 489\(\)30.31 \\ VarGad + Expl. + LP + LS (_ours_) & 0.207\(\)0.046 & 0.015\(\)0.015 & 0.920\(\)0.118 & 0.256\(\)0.017 & 4.11\(\)0.04 & 0.02\(\)42.48 & 468\(\)65.48 & 487\(\)34.14 \\  
+
+Table 1: Log-partition function estimation errors for unconditional modeling tasks (mean and standard deviation over 5 runs). The four groups of models are: MCMC-based samplers, simulation-driven variational methods, baseline GFlowNet methods with different learning objectives, and methods augmented with Langevin parametrization and local search. See §C.1 for additional metrics.
+
+Figure 1: Two-dimensional projections of **Manywell** samples from models trained by different algorithms. Our proposed replay buffer with local search is capable of preventing mode collapse.
+
+and _conditional_ sampling from the latent posterior of a variational autoencoder (**VAE**; ). This allows us to investigate both unconditional and conditional generative modeling techniques.
+
+We evaluate three algorithm categories:
+
+1. **Traditional sampling methods:** We consider a standard Sequential Monte Carlo (SMC) implementation and a state-of-the-art nested sampling method (GGNS, ).
+2. **Simulation-driven variational approaches:** DIS , DDS , and PIS .
+3. **Diffusion-based GFlowNet samplers:** Our evaluation focuses on TB-based training and the enhancements described in SS4: the VarGrad estimator (**VarGrad**), off-policy exploration (**Expl.**), Langevin parametrization (**LP**), and local search (**LS**). Additionally, we assess the FL-SubTB-based continuous GFlowNet as studied by  for a comprehensive comparison.
+
+For (2) and (3), we employ a consistent neural architecture across methods (details in SSD).
+
+**Learning problem and fixed backward process.** In our main experiments, we borrow the modeling setting from . We aim to learn a Gaussian forward policy \(p_{F}\) that samples from the target distribution in \(T=100\) steps (\( t=0.01\)). Just as in past work , the backward process is fixed to a discretized Brownian bridge with a noise rate \(\) that depends on the domain; explicitly,
+
+\[p_{B}(_{t- t}_{t})=(_{t- t};_{t}, ^{2} t_{d}),\] (15)
+
+understood to be a point mass at \(\) when \(t= t\). To keep the learning problem consistent with past work, we fix the variance of the forward policy \(p_{F}\) to \(^{2}\). This simplification is justified in continuous time, when the forward and reverse SDEs have the same diffusion rate. However, in SS5.3, we will provide evidence that _learning_ the forward policy's variance is quite beneficial for shorter trajectories.
+
+**Benchmarking metrics.** To evaluate diffusion-based samplers, we use two metrics from past work , which we restate in our notation. Given any forward policy \(p_{F}\), we have a variational lower bound on the log-partition function \( Z=_{^{d}}R()\,d\):
+
+\[_{^{d}}R()\,d=*{}_{=(_{1})-p_{F}()}[_{1})p_{ B}(_{1})}{p_{F}()}]*{}_{ =(_{1})-p_{F}()}[_{1})p_{ B}(_{1})}{p_{F}()}].\]
+
+We use a \(K\)-sample (\(K=2000\)) Monte Carlo estimate of this expectation, \(\), as a metric, which equals the true \( Z\) if \(p_{F}\) and \(p_{B}\) jointly satisfy (10) and thus \(p_{F}\) samples from the target distribution. We also employ an importance-weighted variant, which emphasizes mode coverage over accurate local modeling:
+
+\[^{}:=_{i=1}^{K}[_{1}^{(i)}) p_{B}(^{(i)}_{1}^{(i)})}{p_{F}(^{(i)})}],\]
+
+where \(^{(1)},,^{(K)}\) are trajectories sampled from \(p_{F}\) and leading to terminal states \(_{1}^{(1)},,_{1}^{(K)}\). The estimator \(^{}\) is also a lower bound on \( Z\) and approaches it as \(K\). In the unconditional modeling benchmarks, we compare both estimators to the true log-partition function, which is known analytically for all tasks except LGCP (leading to discrepancies in past work; see SSB.1).
+
+In addition, we include a sample-based metric (2-Wasserstein distance); see SSC.1.
+
+### Results
+
+**Unconditional sampling.** We report the metrics for all algorithms and energies in Table 1.
+
+We observe that TB's performance is generally modest without additional exploration and credit assignment mechanisms, except on the **Funnel** task, where variations in performance across methods are negligible. This confirms hypotheses from past work about the importance of off-policy exploration  and the importance of improved credit assignment . On the other hand, our results do not show a consistent
+
+Figure 2: Effect of exploration variance on models trained with TB on the **25GMM** energy. Exploration promotes mode discovery, but should be decayed over time to optimally allocate the modeling power to high-likelihood trajectories.
+
+and significant improvement of the FL-SubTB objective used by  over TB. Replacing TB with the VarGrad objective yields similar results.
+
+The simple off-policy exploration method of adding variance to the policy notably enhances performance on the **25GMM** task. We investigate this phenomenon in more detail in Fig. 2, finding that exploration that slowly decreases over the course of training is the best strategy.
+
+On the other hand, our local search-guided exploration with a replay buffer (LS) leads to a substantial improvement in performance, surpassing or competing with GFlowNet baselines, non-GFlowNet baselines, and non-amortized sampling methods in most tasks and metrics. This advantage is attributed to efficient exploration and the ability to replay past low-energy regions, thus preventing mode collapse during training (Fig. 1). Further details on LS enhancements are discussed in SSE with ablation studies in SSE.2.
+
+Incorporating Langevin parametrization (LP) into TB or FL-SubTB results in notable performance improvements (despite being 2-3\(\) slower per iteration), indicating that previous observations  transfer to off-policy algorithms. Compared to FL-SubTB, which aims for enhanced credit assignment through partial energy, LP achieves superior credit assignment leveraging gradient information, akin to partial energy in continuous time. LP is either superior or competitive across most tasks and metrics.
+
+In SSC.3, we study the scaling of the algorithms with dimension, showing efficiency of the proposed LS.
+
+**Conditional sampling.** For the VAE task, we observe that the performance of the baseline GFlowNet-based samplers is generally worse than that of the simulation-based PIS (Table 2). While LP and LS improve the performance of TB, they do not close the gap in likelihood estimation; however, with the VarGrad objective, the performance is competitive with or superior to PIS. We hypothesize that this discrepancy is due to the difficulty of fitting the conditional log-partition function estimator, which is required for the TB objective but not for VarGrad, which only learns the policy. (In Fig. D.1 we show decoded samples encoded using the best-performing diffusion encoder.)
+
+   Algorithm 1 Metric \(\) & \( Z\) & \( Z^{}\) \\  GGNS  & \(-82.406 0.82\) \\  PS  & \(-102.54 0.45\) & \(-47.753 2.321\) \\ + LP  & \(-99.890 0.373\) & \(-47.326 0.77\) \\  Tn  & \(-162.73 5.35\) & \(-61.407 7.13\) \\ VarGrad & \(-102.74 5.94\) & \(-46.502 0.18\) \\ TB + Expl.  & \(-148.04 0.06\) & \(-49.967 5.688\) \\ FL-SubTB & \(-147.992 22.61\) & \(-54.169 39.99\) \\ + LP  & \(-111.536 1.61\) & \(-47.640 4.13\) \\  TB + Expl. + LS (_ours_) & \(-245.78 13.80\) & \(-55.378 1.12\) \\ TB + Expl. + LP (_ours_) & \(-112.45 0.54\) & \(-48.827 21.70\) \\ TB + Expl. + LP (_L_* _(ours)_) & \(-117.26 20.42\) & \(-49.157 6.80\) \\ VarGrad + Expl. (_ours_) & \(-103.39 0.01\) & \(-47.318 39.81\) \\ VarGrad + Expl. + LS (_ours_) & \(-103.40 0.04\) & \(-48.235 0.09\) \\ VarGrad + Expl. + LP (_ours_) & \(-99.472 20.29\) & \(-46.574 73.76\) \\ VarGrad + Expl. + LP + LS (_ours_) & \(-99.783 0.312\) & \(-46.245 6.95\) \\   
+
+Table 2: Log-likelihood estimates on a test set for a pretrained VAE decoder on MNIST. The latent being sampled is 20-dimensional. The VAE’s training ELBO (Gaussian encoder) was \(-101\).
+
+Figure 3: **Left: Distribution of \(_{0},_{0,1},,_{1}\) learned by 10-step samplers with fixed (_top_) and learned (_middle_) forward policy variance on the **25GMM** energy. The last step of sampling the _fixed-variance_ model adds Gaussian noise of a variance close to that of the components of the target distribution, preventing the the sampler from sharply capturing the modes. The last row shows the policy variance learned as a function of \(_{t}\) at various time steps \(t\) (white is high variance, blue is low), showing that less noise is added around the peaks near \(t=1\). The two models’ log-partition function estimates are \(-1.67\) and \(-0.62\), respectively. **Right:** For varying number of steps \(T\), we plot the \( Z\) obtained by models with fixed and learned variance. **Learning policy variances gives similar samplers with fewer steps.
+
+### Extensions to general SDE learning problems
+
+Our implementation of diffusion-structured generative flow networks includes several additional options that diverge from the modeling assumptions made in most past work in the field. Notably, it features the ability to:
+
+* not only the denoising process
+- as was done for related learning problems in [12; 63; 79];
+* **learn the forward process's diffusion rate \(g(_{t},t;)\)**, not only the mean \(u(_{t},t;)\);
+* assume a **varying noise schedule** for the backward process, making it possible to train models with standard noising SDEs used for diffusion models for images.
+
+These extensions will allow others to build on our implementation and apply it to problems such as finetuning diffusion models trained on images with a GFlowNet objective.
+
+As noted in SS5.1, in the main experiments we fixed the diffusion rate of the learned forward process, an assumption inherited from all past work and justified in the continuous-time limit. However, we perform an experiment to show the importance of extensions such as learning the forward variance in discrete time. Fig. 3 shows the samples of models on the **25GMM** energy following the experimental setup of . We see that when the forward policy's variance is learned, the model can better capture the details of the target distributions, choosing a low variance in the vicinity of the peaks to avoid 'blurring' them through the noise added in the last step of sampling.
+
+In SSC.2, we include preliminary results using a variance-preserving backward process, as commonly used in diffusion models, in place of the reversed Brownian motion used in the main experiments.
+
+The ability to model distributions accurately in fewer steps is important for computational efficiency. Future work can consider ways to improve performance in coarse time discretizations, such as non-Gaussian transitions, whose utility in diffusion models trained from data has been demonstrated .
+
+## 6 Conclusion
+
+We have presented a study of diffusion-structured samplers for amortized inference over continuous variables. Our results suggest promising techniques for improving the mode coverage and efficiency of these models. Future work on applications can consider inference of high-dimensional parameters of dynamical systems and inverse problems. In probabilistic machine learning, extensions of this work should study integration of our amortized sequential samplers as variational posteriors in an expectation-maximization loop for training latent variable models, as was recently done for discrete compositional latents by , and for sampling Bayesian posteriors over high-dimensional model parameters. The most important direction of theoretical work is understanding the continuous-time limit (\(T\)) of all the algorithms we have studied.
+
+_Note added in final version:_ In a paper that appeared subsequently to the publication of this work, Berner et al.  have shown connections among the families of diffusion sampling algorithms considered here and analyzed their continuous-time limits.

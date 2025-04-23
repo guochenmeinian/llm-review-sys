@@ -1,0 +1,183 @@
+# No Regrets: Investigating and Improving Regret Approximations for Curriculum Discovery
+
+Alex Rutherford Michael Beukman
+
+**Timon Willi Bruno Lacerda** Nick Hawes Jakob Foerster
+
+Equal Contribution. Correspondence to arutherford@robots.ox.ac.uk.
+
+University of Oxford
+
+###### Abstract
+
+What data or environments to use for training to improve downstream performance is a longstanding and very topical question in reinforcement learning. In particular, Unsupervised Environment Design (UED) methods have gained recent attention as their adaptive curricula promise to enable agents to be robust to in- and out-of-distribution tasks. This work investigates how existing UED methods select training environments, focusing on task prioritisation metrics. Surprisingly, despite methods aiming to maximise regret in theory, the practical approximations do not correlate with regret but with success rate. As a result, a significant portion of an agent's experience comes from environments it has already mastered, offering little to no contribution toward enhancing its abilities. Put differently, current methods fail to predict intuitive measures of "learnability." Specifically, they are unable to consistently identify those scenarios that the agent can sometimes solve, but not always. Based on our analysis, we develop a method that directly trains on scenarios with high learnability. This simple and intuitive approach outperforms existing UED methods in several binary-outcome environments, including the standard domain of Minigrid and a novel setting closely inspired by a real-world robotics problem. We further introduce a new adversarial evaluation procedure for directly measuring robustness, closely mirroring the conditional value at risk (CVaR). We open-source all our code and present visualisations of final policies here: https://github.com/amacrutherford/sampling-for-learnability.
+
+## 1 Introduction
+
+Curriculum discovery--automatically generating environments for reinforcement learning (RL) agents to train on--remains a longstanding and active area of research . Automated curriculum learning (ACL) methods offer the potential to generate diverse environments, leading to the development of more general and robust agents. Recently, a class of methods under the umbrella of Unsupervised Environment Design (UED) has gained popularity, owing to their theoretical guarantees of robustness and empirical improvements in out-of-distribution generalisation .
+
+Currently, the most popular and empirically successful subfield of UED develops methods that aim to maximise _regret_--the difference in performance between an optimal agent and the current agent . However, computing regret is intractable in all but the simplest tasks, forcing practical methods to instead approximate it . While the prevailing assumption has been that these approximations are faithful, we investigate this further and find that this is not the case: specifically, these scoring functions correlate with _success rate_ rather than regret. This means that these methods tend to prioritise tasks that the agent can already solve, leading to much of the collected experience not contributing to learning an improved policy.
+
+While we find that regret performs well in settings where we can compute it--confirming that the underlying theory is sound--we show that the common approximations are unreliable. Therefore, we focus on a different scoring mechanism which instead prioritises levels that provide a clear learning signal to the agent. More specifically, these levels are those where the agent's success rate is neither 100% nor 0%, i.e., levels that are neither too difficult nor too easy [1; 10].
+
+Using this scoring function, we develop _Sampling For Learnability_ (SFL), a method that estimates learnability by rolling out the current policy on randomly sampled levels and selecting those that the agent solves sometimes, but not always. We find that this simple and intuitive approach outperforms DR , Prioritised Level Replay [4; 9] and ACCEL  on four challenging environments, including our novel single- and multi-agent robotic navigation domain, Xland-Minigrid  and Minigrid .
+
+To truly put our method to the test, we develop a new, more rigorous robustness evaluation protocol for ACL, and demonstrate that SFL significantly outperforms all other methods. Rather than evaluating on a set of arbitrary hand-designed environment configurations, our protocol computes a _risk_ metric on the performance of the method, by evaluating its performance in the worst \(\%\) of a newly sampled set of environments.
+
+Our contributions are as follows:
+
+1. We illustrate the inefficacy of current UED methods on several domains, including a novel robot navigation environment.
+2. We identify the reason for this observation: current UED regret approximations are flawed.
+3. We present _Sampling For Learnability_ (SFL), a simple algorithm that trains on environment configurations that have a positive, but not perfect, solve rate, and show that it significantly outperforms current UED approaches on four domains.
+4. We introduce a new evaluation protocol: the conditional value at risk (CVaR) of success of a trained agent on a set of sampled levels. This metric specifically measures the risk of poor generalisation, quantifying robustness in the ACL setting.
+
+## 2 Background
+
+### Reinforcement Learning & UPOMDPs
+
+We model the reinforcement learning problem as an underspecified partially observable Markov decision process (UPOMDP) , denoted by \(= A,O,,S,,,,\). Here, \(A\), \(S\), and \(O\) represent the action, state, and observation spaces, respectively. The agent receives an observation \(o\) (without directly knowing the true state \(s\)) and selects an action, which results in a transition to a new state, a new observation, and an associated reward. \(\) represents the set of possible parameters, where each \(\) defines a specific level. Each \(\) corresponds to a particular instantiation of the POMDP, with an associated transition function \(P_{}:S A(S)\) and an observation function \(_{}:S O\).
+
+In a multi-agent setting, \(n\) agents make decisions simultaneously. At each step, agent \(i\) chooses an action \(a_{i}\), forming a joint action \(a=\{a_{1},,a_{n}\}\) that transitions the environment according to \(P_{}\). Each agent then receives a reward based on the reward function \(:S\), which may be shared among all agents or be agent-specific.
+
+### Unsupervised Environment Design (UED)
+
+UED is an autocurricula paradigm that frames curriculum design as a two-player zero-sum game between a level-generating adversary and an agent. The agent seeks to maximise its expected return in the standard RL manner, while the adversary can pursue various objectives. Domain Randomisation (DR) fits within this framework by assigning a constant utility to each level, reducing level generation to mere random sampling . Worst-case methods, on the other hand, incentivise the adversary to minimise the agent's reward, aiming to enhance performance on the most challenging levels . However, this approach often results in the generation of unsolvable levels .
+
+Regret-based UED methods offer an alternative by generating levels that maximise the agent's regret. Here, the regret of a policy \(\) on a level \(\) is defined as the difference between the policy's discounted return on \(\) and the optimal return achievable on that level, expressed as \(U(_{}^{*})-U()\), where denotes the policy's discounted return and \(^{*}_{}\) is the optimal policy on \(\). This approach deprioritises unsolvable levels and should, in theory, generate levels on which the agent can continue to improve. Moreover, using regret as the adversary's objective provides additional theoretical benefits. At the convergence of the two-player zero-sum game, the agent's policy enjoys minimax regret robustness, meaning that the maximum regret over the entire level space \(\) is bounded .
+
+However, computing regret in complex settings is intractable because it requires access to the optimal policy for each level. As a result, current UED methods rely on heuristic score functions that aim to approximate regret. The two most commonly used heuristic approaches are Positive Value Loss (PVL) and Maximum Monte Carlo (MaxMC).
+
+**Positive Value Loss (PVL).** PVL approximates regret as the average of the value loss across all timesteps where it is positive. When using GAE  (as in PPO ), PVL can be written as follows:
+
+\[_{t=0}^{T}(_{k=t}^{T}( )^{k-t}_{k},0),\]
+
+where \(\) is the discount factor, \(\) is the GAE coefficient and \(T\) is the length of the episode. \(_{t}\) is the TD-error at timestep \(t\), defined as \(_{t}R_{t}+ V(o_{t+1})-V(o_{t})\), with \(V\) denoting the agent's value function, corresponding to the discounted return by following \(\) from \(o_{t}\).
+
+**Maximum Monte Carlo (MaxMC).** Instead of using the bootstrapped value target, MaxMC instead uses the highest return obtained on a particular level:
+
+\[_{t=0}^{T}(R_{}-V(o_{t}) ).\]
+
+#### 2.2.1 Current UED Methods
+
+Prioritised Level Replay (PLR) [4; 9] involves two key steps: generating random levels and replaying levels from a buffer. Initially, random levels are created, and the agent is evaluated on them, with each level being assigned a score. High-scoring levels are then added to a buffer. Subsequently, levels are sampled from this buffer based on their score and the time elapsed since their last selection, and the agent is trained on these sampled levels. PLR has two variants: standard PLR and Robust PLR. In standard PLR, the agent's policy is updated using rollouts from the randomly generated environments, whereas in Robust PLR, the policy is not updated during this phase. ACCEL  extends the PLR framework by incorporating a mechanism that randomly mutates previously high-scoring levels, generating new levels that push the agent to the edge of its capabilities. For additional methods, see Section 8, and for a more detailed introduction to ACL, refer to Appendix E.2.
+
+## 3 JaxNav
+
+In this section, we first touch on hardware-accelerated environments, and robotic navigation. We then go on to introduce JaxNav, a hardware-accelerated, single and multi-agent robotic navigation environment. While similar on a surface level to Minigrid, JaxNav has several additions that make it closer to real-world robotics environments.
+
+Figure 1: JaxNAV (b) brings UED, often tested on Minigrid (a), closer to the real world (c)
+
+### Hardware Accelerated Environments
+
+Recently, Bradbury et al.  released JAX, a Python numpy-like library that allows computations to run natively on accelerators (such as GPUs and TPUs). This has led to an explosion in reinforcement-learning environments being implemented in JAX, leading to the time it takes to train an RL agent being reduced by hundreds or thousands of times [19; 20; 21; 12]. This has enabled researchers to run experiments that used to take weeks in a few hours [22; 23]. One side effect of this, however, is that current UED libraries are written in JAX, meaning they are primarily compatible with the (relatively small) set of JAX environments.
+
+### Robot Navigation
+
+Motion planning is a fundamental problem for mobile robotics. The general aim is to find a collision-free path from a starting location to a goal region in two or three dimensions. We focus specifically on the popular setting of 2D navigation problems for differential drive robots using 2D LiDAR readings as the sensory input for their navigation policies. Given range readings, the robot's current velocity and the direction of its goal, the navigation policy must produce velocity commands to move the robot to its goal location while avoiding static and dynamic obstacles.
+
+### Environment Description
+
+The observation space of JaxNav is highly partially observable and is based on LiDAR readings, depicted by the blue dots in Figure 0(b). This is in contrast to Minigrid, which provides a top-down, ego-centric, image-like observation, as shown by the highlighted region in Figure 0(a). Additionally, while Minigrid features discrete forward and turn actions, the robots in JaxNav operate in continuous space using differential drive dynamics. Similar to Minigrid, agents in JaxNav must navigate from a starting location to a goal region, with the goal centre represented by the green cross in Figure 0(b).
+
+These design choices make JaxNav a close approximation of many real-world robotic navigation tasks [24; 25], including the ICRA BARN Challenge , which is depicted in Figure 0(c). This challenge, which has run annually since 2022, aims to benchmark single-robot navigation policies in constrained environments for differential drive robots using 2D LiDAR as sensory input. Even with a cell size of 1.0 m, JaxNav offers a similar clearance between robots and obstacles as the test maps used in the BARN Challenge, underscoring its relevance not only for evaluating UED methods but also for advancing robotics research. Our environment's full design is outlined in Appendix A.
+
+## 4 Understanding and Improving Level Selection in Goal Directed Domains
+
+In this section, we examine current UED methods, and investigate how they select levels to train on. In particular, we investigate how well currently-used score functions correlate with (a) success rate (i.e., the fraction of times the agent solves the level); and (b) learnability (defined below). We then develop a method which directly samples levels according to their learnability potential, with the following sections detailing our experimental setup and results.
+
+### Defining Learnability
+
+Similarly to the _Goals of Intermediate Difficulty_ objective proposed by Florensa et al.  and the _ProCuRL_ curriculum strategy proposed by Tzannetos et al. , we desire agents to learn on levels that they can solve sometimes but have not yet mastered. Such levels hold the greatest source of possible improvement for an agent's policy and so a successful autocurricula method must be able to find these. Indeed, given a success rate (i.e., the fraction of times the agent solves the level) of \(p\) on a given level, we follow Tzannetos et al.  and define learnability to be \(p(1-p)\). In a goal-based setting where there is only a nonzero reward for reaching the goal, we justify this definition as follows:
+
+1. \(p\) represents how likely the agent is to obtain positive learning experiences from a level, while \(1-p\) represents the maximum potential improvement the agent can make on that level. Multiplying these yields (probability of improvement) \(\) (improvement potential), i.e., expected improvement.
+
+2. Tzannetos et al.  derive this definition for two specific, simple, learning settings and show that at each training step, selecting for the highest learnability is equivalent to greedily optimising the agent's expected improvement in its training objective.
+3. \(p(1-p)\) can also be seen as the variance of a Bernoulli distribution with parameter \(p\), i.e., how inconsistent the agent's performance is.
+
+### Analysing Regret Approximations used by UED Methods
+
+Having defined learnability, we now turn our attention to the current UED score functions. As demonstrated in Section 7, the latest state-of-the-art UED methods fail to outperform Domain Randomisation (DR) in the multi-agent JaxMax environment. To highlight the limitations of these approaches, we examine whether their score functions can reliably identify the frontier of learning, i.e., levels that agents can only sometimes solve.
+
+We focus on the single-agent version of JaxMax and conduct rollouts using the top-performing seed for PLR-MaxMC on randomly sampled levels over 5000 timesteps. From these rollouts, we compile a set of 2500 levels, evenly distributed into 10 bins based on mean success rate values ranging from 0 to 1. We then perform additional rollouts on this collected set, running for 512 environment timesteps (the same number as used during training) across 10 parallel workers, and average the results. In Figure 2, we plot the mean MaxMC, PVL and Learnability scores against the mean success rate for each level. We additionally report the Pearson correlation coefficient, \(r\), and \(p\)-value for the linear relationship between the success rate and the regret score.
+
+Our analysis reveals no correlation between MaxMC and learnability, and MaxMC instead shows a slight correlation with success rate. While PVL has a weak correlation with learnability, the high variance causes already-solved maps to be prioritised alongside those with high learnability. These plots contrast heavily with that of our learnability metric, which directly prioritises levels with the greatest expected improvement. We hypothesise that the root cause of this issue is the agent's poor value estimation. In a highly partially observable environment, the agent struggles to accurately estimate the value of a state, leading to noisy MaxMC and PVL scores, which in turn hinder UED methods from effectively identifying the learning frontier. Given that reward is strongly correlated with success rate, these findings also apply when comparing scores against reward, as detailed in Appendix F.
+
+### Sampling For Learnability: Our Simple and Intuitive Fix
+
+Following on from our analysis, we now present _Sampling For Learnability_ (SFL), a simple approach that directly chooses levels that optimise learnability. Our approach maintains a buffer of levels with high learnability and trains on a set of levels drawn from this buffer alongside randomly generated levels. Algorithm 1 outlines the overall approach for SFL and illustrates the relative simplicity of our method compared to SoTA UED approaches. The policy's weights \(\) are updated using any RL algorithm; we use PPO  for all of our experiments. Meanwhile, our method for collecting learnable levels is detailed in Algorithm 2. We find that the default values of \(T=50\), \(=0.5\), \(N_{L}=256\), \(L=2000\), \(N=5000\) and \(K=1000\) work well across domains. However, the
+
+Figure 2: Our analysis of UED score functions shows that they are not predictive of “learnability”.
+
+per-environment hyperparameters we use are listed in Appendix C, and Appendix I contains plots showing the effect of changing each of these hyperparameters.
+
+``` Initialize: policy \(_{}\), level buffer \(\) while not converged do \(\) collect_learnable_levels\((_{})\) Using Alg. 2 for\(t=1,,T\)do \(_{t} N_{L}\) levels sampled uniformly from \(\) \(_{t}_{t}(1-) N_{L}\) randomly generated levels  Collect \(\)'s trajectory on \(_{t}\) and update \(\) endfor  endwhile ```
+
+**Algorithm 1** Sampling For Learnability
+
+While a key limitation of this approach is the additional timesteps required to form the learnability buffer, we find that due to the speed of forward rollouts on JAX-based environments, this does not dramatically increase our overall compute time, see Appendix H for a more detailed discussion.
+
+## 5 Experimental Setup
+
+We now outline the domains used along with our adversarial evaluation protocol. Rather than taking the common approach of reporting average performance on a set of hand designed levels (which by their very nature are arbitrary), we sample a large set of levels and examine each method's performance on their worst-case levels. This directly targets the tails of the level distribution and as such is a superior measure of robustness. We further report the comparative performance of methods on the sampled set to determine the degree to which one method dominates another.
+
+We use four domains for our experiments, JaxNav in single-agent mode, JaxNav in multi-agent mode, the common UED domain Minigrid  and XLand-Minigrid . See Appendix B for more details about the environments. We use 10 seeds for Minigrid and single-agent JaxNav, and 5 seeds for multi-agent JaxNav and XLand-Minigrid. In all of our plots, we report mean and standard error.
+
+Since SFL performs more environment rollouts, we perform fewer PPO updates in single-agent JaxNav and XLand-Minigrid to ensure that SFL uses as much compute time as ACCEL. In Minigrid, the additional environment interactions take a negligible amount of time, so we run the same number of PPO updates for all methods. For multi-agent JaxNav, we compare each method using the same number of PPO updates. See Appendix H for more information on the relative speed of each method, and how many updates we run for each method. Generally, the additional SFL rollouts take much less time than the updates themselves, due to the massive parallelisation afforded by hardware-accelerated environments. Additionally, recent work suggests that world-models could also allow more samples to be taken than the base environment allows [27; 28; 29; 30], highlighting the future potential of this approach.
+
+We compare against several state-of-the-art UED methods as baselines, implemented with JaxUED. We use **ACCEL**, with the MaxMC score function, where the agent trains on randomly generated, mutated and curated levels. We also include a "robust" version , where no gradient updates are performed on the former two sets of levels. This uses three times as many environment interactions and is roughly twice as slow as SFL for single-agent JaxNav. We use **PLR** with both the PVL and MaxMC score functions. We also include a robust version of PLR which only performs gradient updates on the curated levels; this uses twice as many environment interactions and is 80% slower than SFL on single-agent JaxNav. We also use Domain Randomisation (**DR**), which trains only on randomly generated levels, with no curation or prioritisation.
+
+## 6 A Risk-Based Evaluation Protocol
+
+The standard approach to evaluating UED agents is to test them on a set of hand-designed holdout levels [3; 4; 5]. Whilst this evaluation approach illustrates the performance of agents on human-relevant tasks, we believe it has several limitations. First, the hand-designed levels are arbitrary, so performance on them is not representative of general performance; second, it does not test a central claim of UED: that it trains agents which are robust to worst-case (yet solvable) environments. To address this, we propose a novel evaluation protocol that rectifies both of these problems: measuring the conditional value at risk (CVaR) of the success of the trained agent on a set of sampled levels.
+
+To calculate the CVaR we sample \(N\) (\(10,000\) in practice) random, but solvable,2 levels and rollout the agent policy for \(10\) episodes on each level. We then find the \(\)% of levels on which the agent performs worst. To mitigate bias, we rollout the agent again on these levels, and report the average success rate on this \(\)% subset, i.e., the CVaR at level \(\). This metric directly quantifies the performance of a training method _on its own worst-case levels_, which measures its ability to produce robust agents. We perform this computation for each seed, and report the mean and standard error over seeds, at various \(\) levels. We further use the \(N\) sampled levels to calculate the following metrics.
+
+**Mean Success Rate** We average the success of each method over all \(N\) levels and then report this as the mean success rate and its standard error over multiple independent seeds. Due to space requirements, these results are included in Appendix G.
+
+**Domination Comparison** To identify the degree to which one method dominates another, we obtain the average solve rate of each method (averaging over seeds) per environment. We then plot a heatmap, where cell \((x,y)\) contains the number of levels method \(A\) solves \(x\)% of the time while method \(B\) solves them \(y\)% of the time. This metric measures how many environments one method strictly solves more often than another.
+
+## 7 Results
+
+### Single-Agent \(\)
+
+Figure 2(a) shows the CVaR results on single-agent \(\). We find that optimising for learnability--as our method does--results in superior robustness over a wide range of \(\) values, despite all methods performing similarly with \(=100\%\) (which amounts to expected success rate over the entire distribution). In this plot, we also plot the results of an oracle method named _Perfect Regret_. This uses the same procedure as SFL but with the score function: \(1-p()\). Importantly (and different to all other methods), this method only samples solvable levels, so this metric corresponds closely to regret. While not shown here, using the same metric with unrestricted level sampling--which is a more realistic setting--performs poorly due to it prioritising unsolvable levels. In Figure 4, we perform pairwise comparisons of each baseline against our approach. We find that there are a large number of environments that all methods solve (the bright top-right corner). However, the bottom-right is generally brighter than the top-left, indicating that SFL performs better in general. Overall, SFL's superiority, and Perfect Regret's strong performance, indicates that the flawed approximations of regret are responsible for UED's lack of performance. We provide further evidence for this claim in Appendix I.2, where we use learnability as a score function within PLR and ACCEL.
+
+Figure 3: Single-agent \(\) performance on (a) \(\)-worst levels and (b) a challenging hand-designed test set. Only _Perfect (Oracle) Regret_ matches SFL across both metrics.
+
+### Multi-Agent JaxNav
+
+Figures 5 and 6 illustrate the performance of all methods on multi-agent JaxNav throughout training. We train with 4 agents and report performance over both a hand designed test set and a randomly sampled set of 100 maps. The levels used in the hand designed set are given in Appendix D and feature cases with 1, 2, 4 and 10 agents. The levels in the sampled set all feature 4 agents and solvability is checked for each agent's individual path. As we train with IPPO, regret scores are calculated on a per-agent basis and the score of a level is computed as the mean across individual agent scores. For \(n\) agents, learnability is computed as \(_{i=1}^{n}(p_{i}(1-p_{i}))\), where \(p_{i}\) is the success rate for agent \(i\) on on a given level. We find that JaxNav significantly outperforms all UED methods.
+
+### Minigrid
+
+We next move on to the standard domain of Minigrid (see Figure 7). Here we find that most methods perform similarly on the hand-designed test set; however, SFL significantly outperforms all other methods on the adversarial evaluation, indicating it results in more robust policies.
+
+Figure 4: Single-agent JaxNav comparison results. For each figure, cell \((x,y)\) indicates how many environments have method \(X\) solving them \(x\)% of the time and method \(Y\) solving them \(y\%\) of the time. The density below the diagonal indicates that SFL is more robust than DR, ACCEL and PLR.
+
+Figure 5: Performance of Multi-Agent Policies over 5 seeds. SFL outperforms all UED baselines in each of these. We do not include _oracle regret_, since it cannot be easily measured in this setting.
+
+### XLand-Minigrid
+
+Our final evaluation domain is XLand-Minigrid's  meta-RL task using their high-3m benchmark. We report performance using our CVaR evaluation procedure and, in line with , as the mean return on an evaluation set during training. Our results are presented in Figure 8, with SFL outperforming both PLR and DR. During evaluation each ruleset was rolled out for 10 episodes. Due to the large number of levels being rolled out to fill SFL's buffer, SFL was slower than DR and PLR. As such, we report results for SFL compute-time matched to PLR.
+
+Figure 8: XLand-Minigrid performance over five seeds on (a) \(\) worst-case and (b) the evaluation set. SFL outperforms both PLR and DR.
+
+Figure 6: Multi-agent heatmap results. The bright areas toward the right of the plots indicate that SFL outperforms the baselines we compare against.
+
+Figure 7: Minigrid performance on (a) \(\) worst-case and (b) holdout levels. SFL is more robust than the baselines on worst-case levels.
+
+Related Work
+
+Unsupervised Environment Design (UED) has emerged as a prominent method in the ACL field, promising robust agent training through adaptive curricula. Early works focused on learning potential, where the improvement in an agent's performance determined the choice of training levels [1; 2; 31; 32]. However, robustness-oriented methods such as adversarial minimax introduced the notion of training on levels that minimise agent performance, though these often resulted in infeasible scenarios offering no learning benefits [3; 14; 33]. Minimax regret (MMR), a more refined robustness approach, alleviates some of these issues by ensuring the chosen levels are learnable [3; 4; 5]. However, recent work  demonstrated that even true regret does not always correspond to learnability, and this mismatch can lead to stagnation during training. Our work extends this line of research by utilising a scoring mechanism that estimates expected improvement, targeting environments with a positive but not perfect solve rate. Unlike existing MMR methods, our approach directly optimises for learnability, instead of using an imperfect proxy for regret, leading to more effective training on our domains.
+
+Relatedly, Tzannetos et al.  introduce _ProCuRL_, which uses a similar learnability score as SFL (and further introduce an approximation to the solve rate \(p\) using the agent's value function). However, their problem setting is distinct from ours as they assume only a limited fixed pool of tasks are utilised during training, with the goal of improving an agent's performance over a uniform distribution over this pool. We, instead, consider the standard UED setting where we can sample an effectively unbounded number of tasks from some large distribution \(\), with the goal of achieving an agent that is _robust_ to worst-case settings and can generalise to unseen problems. Following on from this, Tzannetos et al.  extend _ProCuRL_ to the setting where the target distribution of tasks is given, and they take into account both how learnable the selected task is, as well as how correlated it is with learnable tasks from the target distribution. While this approach outperforms the original method, it tackles a different problem to SFL and UED in general, i.e., where the target distribution is known.
+
+Finally, robust RL methods have the goal of improving an agent's robustness to environmental disturbances, and worst-case environment dynamics [35; 36; 37; 38; 39; 40; 41; 42; 43; 44; 45; 46; 47]. However, these methods generally consider continuous perturbations instead of a mix of discrete and continuous environment settings. Furthermore, these methods tend to be overly conservative and prioritise unsolvable levels.
+
+## 9 Discussion and Limitations
+
+In this work we only consider deterministic, binary outcome domains and due to the nature of the learnability score, SFL is only applicable to such settings. In other domains, we could potentially reuse the intuition that \(p(1-p)\) is the variance of a Bernoulli distribution; in a continuous domain, an analogous metric would be the variance of rewards obtained by playing the same level multiple times. Furthermore, our implementation of SFL is in JAX but the method is general. However, one must take the cost of SFL's additional environment rollouts into account when considering implementing our algorithm; we chose JAX because its speed and parallelisation significantly alleviates this constraint. Next, while most current SoTA UED methods, including SFL, randomly generate and curate levels, this approach may become infeasible when the environment space is vast, as random generation may have a very low likelihood of generating valid levels. Finally, while JaxNav does have deterministic dynamics, Fan et al.  successfully transferred an RL-based multi-robot navigation policy from a simulator of identical fidelity to the real world, suggesting this should be equally possible with JaxNav.
+
+## 10 Conclusion
+
+In this paper, we investigate the scoring functions used by current regret-based UED methods and analyse whether they can accurately approximate regret. We find that this is not the case and that these prioritisation metrics instead correlate with success rate, leading to a large amount of experience not contributing to learning an improved policy. Inspired by this analysis, we develop a method based on an intuitive notion of learnability and find that this improves the robustness of the final policies. We also introduce a new robustness-measuring evaluation protocol, reporting a risk measure on performance over the \(\%\) worst-case (but solvable) levels for each method. We hope that our findings inspire future work on more general, domain-agnostic scoring functions, and we open-source all of our code to facilitate this process. Ultimately, we believe this work is a stepping stone towards bridging the gap between popular testbeds for UED and real-world applications.

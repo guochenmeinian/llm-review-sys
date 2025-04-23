@@ -1,0 +1,142 @@
+# Kraken: Inherently Parallel Transformers For
+
+Efficient Multi-Device Inference
+
+ Rohan Baskar Prabhakar
+
+Princeton University
+
+rohanbp@princeton.edu
+
+&Hengrui Zhang
+
+Princeton University
+
+hengrui.zhang@princeton.edu
+
+&David Wentzlaff
+
+Princeton University
+
+wentzlaf@princeton.edu
+
+###### Abstract
+
+Large Transformer networks are increasingly used in settings where low inference latency is necessary to enable new applications and improve the end-user experience. However, autoregressive inference is resource intensive and requires parallelism for efficiency. Parallelism introduces collective communication that is both expensive and represents a phase when hardware resources are underutilized. Towards mitigating this, Kraken is an evolution of the standard Transformer architecture that is designed to complement existing tensor parallelism schemes for efficient inference on multi-device systems. By introducing a fixed degree of intra-layer model parallelism, the architecture allows collective operations to be overlapped with compute, decreasing latency and increasing hardware utilization. When trained on OpenWebText, Kraken models reach a similar perplexity as standard Transformers while also preserving their language modeling capabilities as evaluated on the SuperGLUE benchmark. Importantly, when tested on multi-GPU systems using TensorRT-LLM engines, Kraken speeds up Time To First Token by a mean of \(35.6\%\) across a range of model sizes, context lengths, and degrees of tensor parallelism.
+
+## 1 Introduction
+
+Deep neural networks based on the Transformer architecture [(51)] have become the prevalent choice for a variety of tasks involving sequences, especially in natural language processing and computer vision [(44)][(7)][(19)]. Their capabilities, particularly in language modeling, have been driven by a rapid increase in parameter count [(7)]. Today's largest language models have up to a trillion parameters [(21)] and consequently demand more efficiency from the systems used to train and serve them. This has necessitated the need for many techniques and optimizations that focus on improving the performance of both algorithms and systems [(47)][(34)][(17)][(37)][(12)].
+
+Large models are often used in interactive applications where latency is an important metric that dictates the quality of the end-user experience [(28)]. A typical web search takes about \(0.2\) seconds but the Time To First Token (TTFT) for large models can be up to a few seconds (depending on context length, model size, and available hardware) [(42)]. Additionally, because it is not always feasible to run models on local hardware, they are served to users via datacenters that use multi-device compute nodes, adding to latency constraints. Increasingly, language models are also used as intermediate steps in longer processes such as augmenting web searches or presenting the results of database queries [(28)]. The rising prevalence of such multi-step applications makes reducing inference latency even more critical.
+
+Continuing this theme, this work focuses on reducing the latency cost of the collective operations introduced by tensor parallelism  in the forward pass. In particular, it introduces Kraken, a variation of the standard Transformer architecture  that reduces the amount of inter-device communication and allows remaining collective operators to be overlapped with compute. Kraken models have a fixed degree of innate model parallelism that allows computational graphs on each device to run independently without having to wait for the results of collective operations. The architecture is designed to complement the topology of multi-device setups such as nodes in typical datacenters and DGX  systems. By designing the model architecture to account for characteristics of the hardware, our approach increases compute utilization and allows more efficient inference.
+
+We evaluate the improvements Kraken offers over standard Transformers in two key aspects: model quality and inference latency. For the former, we train a series of Kraken models with varying degrees of parallelism and parameter count on OpenWebText  and compare them with the GPT-2  family of models on the SuperGLUE suite of benchmarks . We then implement Kraken using the TensorRT-LLM library  and measure the Time To First Token (TTFT) given various model sizes and context lengths to illustrate the efficiency gains when collective operators are no longer on the critical path. We find that while maintaining the language modeling capabilities of standard Transformers, Kraken models speedup the Time To First Token (TTFT) by a geomean of \(35.6\%\) when tested across a range of model sizes, context lengths, and degrees of parallelism.
+
+## 2 Background
+
+### Decoder-Only Transformer models
+
+We will briefly discuss the forward pass of decoder-only Transformer (DTransformer) models that use self-attention mechanisms to perform language modeling  in order to motivate our approach. Given an input sequence \(x\) consisting of tokens belonging to a vocabulary \(V\), such models return a probability distribution over the vocabulary that describes what the next token in \(x\) could be i.e., the model is trained to estimate \(P(x[+I] x[1:])\) where \(\) is the initial length of \(x\). To compute the output logits in the forward pass, \(x\) is converted to a sequence of embeddings that incorporate information about each token and its position in the sequence. These embeddings are used as input to a stack of Transformer layers one of which is depicted in Figure 1.
+
+Figure 1: **One layer of a standard Transformer consisting of Multi-Head Attention (also shown) followed by a FeedForward Network. Residual connections have been omitted.**
+
+Figure 2: **Increasing the degree of tensor parallelism decreases the Time To First Token. Even when weights and KV cache fit on device memory, parallelism can be worthwhile. These results are for a 6.7B parameter GPT-3 like model and were collected using TensorRT-LLM engines on our evaluation platform: an HGX A100 40GB system.**
+
+Such layers comprise the bulk of the compute in the model and consist of a Multi-Head Attention (MHA) block followed by a FeedForward Network (FFN or Multi-Layer Perceptron). The FFN typically consists of two linear transformations with a non-linear activation function in between. On the other hand, Multi-Head Attention (Figure 1) implements scaled dot-product attention i.e., each head computes \((}{})V\) where \(Q,K,V^{h l}\). Here, \(h\) is the head dimension and \(l\) is the sequence length. The General Matrix Multiply (GEMM) \(W_{out}\) combines the outputs of the different heads. The activations of the last layer are used as input to the unembedding operation. Henceforth, we will refer to the GPT-2,3 (44)(7) like construction as the standard Transformer architecture. This variant uses MHA, has sequential Attention and FFN blocks, expands the embedding dimension from \(d\) to \(4d\) in the hidden layer of the FFN, uses Gaussian Error Linear Unit (GELU) non-linearities, and places Layer Norm operators before the MHA and FFN i.e., is a Pre-LN Transformer.
+
+A widely used optimization during inference involves caching the Key and Value matrices (from GEMM \(QKV\) in Figure 1) of each token in a KV cache that is stored in memory. This memoization has the effect of breaking up autoregressive inference (38)(58) into two distinct steps: 1) Prefill (when the first token and the KV cache are generated) and 2) Decode(for all subsequent tokens). Both these steps have distinct runtime characteristics with Prefill being more compute bound and Decode being more memory bandwidth bound (58). The KV cache entry for the next generated token is appended during each Decode step. Prefill, measured by TTFT, typically takes much longer than a single Decode step and will be the focus of this work.
+
+### Multi-Device systems
+
+Given the extensive amount of compute and memory capacity required to efficiently serve large models, most widely used systems are node-based configurations where each node has a small number (between \(4\) and \(16\)) of devices. These devices usually take the form of Graphics Processing Units (GPUs) or Tensor Processing Units (TPUs). The discussion in this work will focus on GPUs but we expect that our findings will also be of relevance to other choices of accelerators such as TPUs. Accessing data at levels of the system physically closer to compute cores such as scratchD memory or caches is typically much faster and more efficient compared to accessing off-chip memory. Techniques like tiled matrix multiplication (20) and FlashAttention (17) account for this characteristic, considerably improving the runtime performance of implementations.
+
+Devices within a node are configured in a topology and linked by interconnects such as Peripheral Component Interconnect Express (PCIe), NVLink, and NVSwitch. The different standards balance versatility and cost with performance. For instance, a topology that uses PCIe switches across some connections will have less overall bandwidth than a system that uses solely NVLink/NVSwitch. Inter-device communication primitives are provided to other software by libraries like NCCL (14) and RCCL (11). Communication is comparatively expensive and represents a phase in the forward pass where compute cores are mostly idle. This work strives to extend the IO-aware approach used by techniques like FlashAttention (17) towards the multi-device setting.
+
+### Tensor parallelism
+
+Serving large models in multi-device settings requires parallelization schemes and strategies that partition the input sequence, model weights, activations, and/or incoming inference requests (49) (56) (35) (1) (60). In particular, model parallel (intra-operator) schemes fall into two broad categories: tensor parallelism and pipeline parallelism. Since Kraken models are designed to improve inference latency, this discussion will center around tensor parallelism.
+
+There are several possible strategies (42) (55) to achieve distributed tensor parallelism in Transformer models but we will focus on the widely used scheme introduced by Shoeybi et al. (49) which is well-suited for multi-GPU settings. This scheme introduces two AllReduce operations per layer and takes advantage of the implicitly parallel nature of Multi-Head Attention with optimal partitioning of the FeedForward Network. In each layer, contiguous groups of Attention heads are placed across different devices and the \(W_{out}\) matrix that is used to combine the output of the different heads is partitioned across columns. The output of the MHA block is retrieved by reducing the local output of all devices; this introduces one AllReduce as shown in Figure 1. Similarly, in the FFN block, the \(W_{1}\) weight matrix is partitioned across rows (using the notation where \(W_{1}\) is multiplied by a column-vector of activations) and the \(W_{2}\) weight matrix is partitioned across columns. The output of the FFN is computed by reducing the local output of all devices, thereby introducing another AllReduce operation. The objective of this work is to reduce and hide the runtime impact of these collectives introduced by tensor parallelism.
+
+## 3 Kraken: Model architecture
+
+### Layer construction
+
+The primary objective of Kraken is to preserve as much of the standard Transformer (GPT-2,3 like)(44)(7) architecture as possible while reducing the latency cost of the collective communication introduced by tensor parallelism. To achieve this, we allow each of the individual shards of a parallelized Transformer layer to behave as independent, smaller layers. More precisely, as depicted in Figure 3, instead of sharding the Multi-Head Attention and FeedForward Network blocks, each MHA and FFN block is replaced with a smaller, independent block. This introduces _a fixed degree of parallelism_ that is chosen at the outset of training and accounts for the most common hardware deployment target. For example, if a model will be mostly served on nodes with eight GPUs each, a reasonable choice would be to use either 4-way or 8-way parallelism (depending on the size of the model). The former would be suitable for smaller models, allowing each node to serve two different inference requests at the same time.
+
+Consequently, the only inter-device dependency is an AllReduce operation at the end of every layer. This collective represents the only interchange of activations between groups of sub-layers. Its output is used in the FFN block of the next layer and not in the MHA block. As shown in Figure 3, this allows for overlapping the compute in the MHA block with the AllReduce, effectively removing most inter-device communication from the critical path. Much like how positional embeddings are added to the token embeddings prior to the first layer (39), we chose to use element-wise addition to combine the outputs of the various sub-layers from the previous layer. This occurs prior to the Layer Norm before the FFN. The forward pass of each sub-layer, including residual connections, is also described in Algorithm 1. All pretrained models in our evaluation use the GELU activation function in the FFN. In initial experiments that explored different constructions, we scaled the weights of the residual layer by \(}\) using a similar line of reasoning as that used by Radford et al. (44). Here, \(L\) is the number of layers, and \(N\) is the degree of parallelism. We did not remove this initialization scheme in subsequent experiments even though accumulation along residual connections was limited to groups of \(L\) sub-layers.
+
+Figure 3: **Parallelizing two standard Transformer layers compared to executing two layers of a Kraken Transformer with 2-way parallelism.** Kraken Transformers have fewer AllReduce operations and these can be run concurrently with the Multi-Head Attention in the next layer. Step lengths are illustrative and not indicative of how much wall-clock time a particular operation might require.
+
+The token and positional embeddings are shared across all sub-layers of the first layer i.e., there is still one set of embeddings to maintain compatibility with weight tying (27) (43). After the last layer, we combine the outputs of the different sub-layers using a linear transformation with weights \(W_{concat}^{d*N d}\) where \(d\) is the embedding dimension and \(N\) is the degree of parallelism. The output of this transformation is used as input to the unembedding. Depending on the implementation, this linear layer introduces the only blocking collective in the computational graph.
+
+### Deriving model configurations for a fixed parameter budget
+
+Increasing the degree of parallelism while keeping other hyperparameters like the embedding dimension constant will increase the parameter count. Instead, using a configuration of a standard Transformer as the basis, we make the following two modifications to derive a Kraken configuration that has approximately the same number of parameters:
+
+* First, the hidden state expansion in the FFN is reduced from \(4d\) to \(2d\) where \(d\) is the embedding/model dimension.
+* Given the number of parameters \(P\), degree of parallelism \(N\), number of layers \(L\), and vocabulary size \(V\), we derive a closed form expression for \(P\) and solve for \(d\) i.e., \(P=V*d+_{i=1}^{L}N*((3*(d d)+(d d))+2*(d 2d))\) where the term \(((3*(d d)+(d d))\) comes from MHA and \(2*(d 2d))\) comes from the FFN.
+
+## 4 Evaluation
+
+### Model configurations and perplexity
+
+To evaluate language modeling performance, we train a series of models up to 761 million parameters large and with varying degrees of parallelism on OpenWebText (23). This allows us to compare the performance of the Kraken architecture with the GPT-2 (44) family of models. Because of limited access to compute, we do not exhaustively search for hyperparameters and stop training at \(150\) billion tokens in contrast to the about \(300\) billion tokens that language models of such sizes are typically trained for (44)(24). Table 1 details the embedding dimensions, number of layers, and other hyperparameters for each configuration. For Kraken configurations, the number of Attention heads in each layer is summed across all sub-layers. The context length was set at \(1024\) tokens. Models similar in size were trained using the same learning rate schedule and for the same number of gradient steps. More details about the training setup, required compute, and how each configuration was derived can be found in Appendix A.1. Pertinent code including the TensorRT-LLM implementation is available at https://github.com/rohan-bp/kraken.
+
+Perplexity measurements for GPT-2 models are provided to add context to the results with the caveat that all Kraken models were trained on OpenWebText but GPT-2 models were trained on the closed-source WebText dataset. We would expect that all things equal, Kraken models will have lower perplexity unless the GPT-2 models were subsequently fine-tuned on OpenWebText. Nonetheless,
+
+[MISSING_PAGE_FAIL:6]
+
+plugins, and other optimizations that can be used to create efficient TensorRT engines (containing model weights) and serve them on systems with GPUs. All experiments were conducted on a 8 x A100 GPU machine with NVSwitch and 40GB of HBM memory per GPU.
+
+### Speedup in Time To First Token
+
+For comparisons with other model architectures, we build engines for standard, GPT-like configurations and GPT-J (54) like configurations as detailed in Table 4. The latter serves to contrast our approach with one that runs the FFN in parallel with the Attention (10) (54). Such parallel layers require only one AllReduce in a layer but unlike Kraken, the collective cannot be overlapped with compute. For similarly sized models, the only difference is the embedding dimension for the Kraken models. All configurations follow the convention where dModel is divided by the number of Attention heads to calculate the size of each head. Other configuration parameters such as the number of layers, maximum context length, and vocabulary size were the same. The Attention heads are per sub-layer for Kraken models and parameter counts do not include biases and layer normalization.
+
+There are two sets of engines, one for 4-way tensor parallelism and another for 8-way parallelism. We also did not follow the earlier convention 3.2 of solving for the embedding dimension of a Kraken model precisely. This is because the available optimizations in TensorRT-LLM are compatible only with specific Attention head dimensions. To account for this, we handpicked embedding dimensions that, given an equivalent GPT-like configuration, have about the same number of parameters while still being compatible with the available kernels. This was necessary for a fair evaluation but in practice, the chosen embedding dimension should also account for the performance
+
+  
+**Model** & **Layers** & **dModel** & **Params.** & **Attention** & **Kraken** & **4-way** & **4-way** & **Kraken** & **8-way** & **8-way** \\
+**Size** & & & **Per** & **Heads** & **4-way** & **Params.** & **Attention** & **8-way** & **Params.** & **Attention** \\  & & & **Layer** & & **dModel** & **Per** & **Heads** & **Model** & **Layer** & **Heads** \\ 
+1.3B & 24 & 2048 & 50.3M & 16 & 1248 & 49.9M & 12 & 960 & 59.0M & 10 \\
+6.7B & 32 & 4096 & 201.3M & 32 & 2496 & 199.4M & 24 & 1920 & 235.9M & 20 \\
+13B & 40 & 5140 & 317.0M & 40 & 3120 & 311.5M & 30 & 2304 & 339.7M & 32 \\
+65B & 80 & 8192 & 805.3M & 64 & 4992 & 797.4M & 39 & 3648 & 851.7M & 38 \\
+175B & 96 & 12288 & 1.81B & 96 & 7424 & 1.76B & 58 & 5472 & 1.92B & 57 \\   
+
+Table 4: **Configurations for the different model engines used to compare TTFT.** For models of similar sizes, hyperparameters are shared for the GPT-like and Parallel Attention + FeedForward variants. 4-way denotes Kraken configurations used when evaluating tensor parallelism across 4 devices and likewise for 8-way.
+
+  
+**Model** & **BoolQ** & **RTE** & **CB** & **COPA** & **ReCoRD** & **WIC** & **WSC** & **MultiRC** & **Average** \\  GPT-2 & 53.76 & 47.65 & 42.86 & 60.0 & 70.12 & 50.0 & 51.92 & 50.62 & 53.37 \\ Kraken 124M & 55.14 & 48.74 & 44.64 & 61.0 & 68.83 & 49.69 & 47.12 & 50.56 & 53.22 \\ (2-way) & & & & & & & & & \\ Kraken 124M & 59.05 & 44.04 & 48.21 & 64.0 & 69.94 & 47.49 & 51.92 & 54.17 & 54.85 \\ (4-way) & & & & & & & & & \\ Kraken 124M & 54.28 & 46.93 & 42.86 & 63.0 & 69.17 & 49.37 & 44.23 & 51.96 & 52.72 \\ (6-way) & & & & & & & & & \\  GPT-2 & 60.58 & 47.65 & 44.64 & 68.0 & 78.35 & 47.65 & 50.0 & 53.22 & 56.26 \\ Medium & & & & & & & & & \\ Kraken 355M & 50.73 & 53.07 & 37.5 & 68.0 & 79.01 & 49.06 & 66.35 & 51.34 & 56.88 \\ (2-way) & & & & & & & & & \\ Kraken 355M & 61.8 & 51.99 & 50.0 & 73.0 & 77.97 & 47.49 & 44.23 & 54.17 & 57.58 \\ (4-way) & & & & & & & & & \\  GPT-2 Large & 60.58 & 51.99 & 39.29 & 70.0 & 81.05 & 47.81 & 60.58 & 51.53 & 57.85 \\ Kraken 760M & 55.75 & 53.79 & 42.86 & 68.0 & 81.03 & 45.77 & 62.5 & 53.47 & 57.9 \\ (4-way) & & & & & & & & & \\   
+
+Table 3: **Three-Shot performance on SuperGLUE.** ReCoRD uses the F1 score as the evaluation metric. All other benchmarks use accuracy.
+
+of the computational kernels it would map to. Anthony et al. (4) discuss this, showing how model hyperparameters can affect GEMM performance and consequently training efficiency.
+
+Figure 4 shows the speedup in latency compared to GPT-like models on our evaluation platform and with 4-way parallelism while Figure 5 depicts improvements for 8-way parallelism. Across a range of model sizes and context lengths of \(128\) and \(2048\) tokens, using Kraken models can improve inference latency by anywhere from \(10.9\%\) to \(63.7\%\). These results are end-to-end and include the extra fully-connected layer required by Kraken models. All results are normalized to the equivalent latency for a similar GPT-3 like model and engines were generated with random weights and _fp16_ precision. Latency in terms of milliseconds is reported in Appendix A.3. Importantly, our evaluation platform uses NVSwitch and consequently has considerable inter-device bandwidth (\(600\) GB/s) which means communication can be relatively inexpensive. We expect that these gains will be more pronounced on systems with less performant interconnects.
+
+A more detailed evaluation on precisely which operators contribute to overall runtime is presented in Section 4.5. In order to take advantage of the concurrent communication and compute that Kraken allows, we extended TensorRT-LLM with the Overlap plugin that is described in Appendix A.2.
+
+Each configuration was evaluated using the _gptSessionBenchmark_ that is available as part of TensorRT-LLM. We enabled the default set of optimizations which include GPT Attention plugin, Remove Input Padding, and GEMM plugin. Experiments were run with a batch size of \(1\) but engines were
+
+Figure 4: **Speedup in Time To First Token over standard Transformers on a system that uses NVSwitch and with 4-way parallelism**. x-axis labels denote the size of the model followed by the context length. Bar labels are in percentage improvement.
+
+Figure 5: **Speedup in Time To First Token over standard Transformers on a system that uses NVSwitch and with 8-way parallelism**. x-axis labels denote the size of the model followed by the context length. Bar labels are in percentage improvement.
+
+[MISSING_PAGE_EMPTY:9]
+
+Discussion and Limitations
+
+**Need for pretraining:** Currently, our approach requires training Kraken models from scratch which can be very resource intensive. Consequently, developing techniques to distill learned weights from existing models possibly as part of the weight initialization scheme is a promising area of future work. We also do not compare with more state-of-the-art Transformer training recipes or alternatives because of limited access to GPU compute. Training larger, compute-optimal (25) Kraken models on higher-quality datasets will permit evaluations on newer, more complex language modeling benchmarks. The fixed degree of model parallelism also places restrictions on the optimal choice of hardware to run a model on. For example, if we tried to deploy a model with 4-way parallelism on a system with two or six devices, we would either need to run groups of two sub-layers together or introduce more collectives. Either approach might negate most of the latency gains offered in the first place.
+
+**Compatibility with standard Transformer improvements:** Since Kraken models replicate the Attention block by the degree of tensor parallelism, the size of the KV cache will also be larger than that of an equivalent Transformer model. One way to mitigate the increased memory consumption would be to replace Multi-Head Attention with either Multi-Query Attention (47) or Grouped Query Attention (3). Similarly, many other improvements to the standard Transformer architecture are also applicable to Kraken models such as RoPE embeddings (50) and RMSNorm (57). The architecture is also compatible with "drop-in" replacements for Attention that are more efficient because of time-complexity and/or sparsity (31) (9). Furthermore, we expect that the notion of parallelizing individual layers of the model will also prove useful in large deep learning models that use constructions other than Attention or MLPs (24). Incorporating a communication-aware approach to Neural Architecture Search (8) for Transformers is another promising area of future work.
+
+**Applicability of existing optimizations:** We expect that Kraken will be readily compatible with many existing system-aware techniques used in deploying standard Transformers (56) (32) (1) (35). For example, it provides an extra degree of freedom to the various partitioning strategies proposed by Pope et al. (42). It is also compatible with techniques like FlashAttention (17), Speculative Decoding (34), fusing Attention with the FFN (36), and PagedAttention (32).
+
+**Mixture-of-Experts and hybrid models:** By virtue of its architecture, Kraken evokes a comparison to Mixture-of-Experts (MoE) architectures such as the SwitchTransformer (21)(48). Layers in current MoE models have a single Attention block and use a learned Router to direct each token to one of a set of FeedForward Networks. Because the forward pass activates only a fixed fraction of the parameters, MoE models can be much larger than dense Transformers while maintaining the computational profile of inference. Nonetheless, serving them efficiently in multi-device settings is a challenge: MoEs require dynamic routing and suffer from load balancing issues. For instance, Huang et al. (26) find that the required All-to-All collectives can comprise a significant fraction of inference latency. An interesting direction of future work would be to incorporate an inter-device IO-aware approach in the construction of MoE models. In addition, recent work (52) has found that hybrid architectures that combine Multi-Head Attention, State Space Models (SSMs) (24), and FFNs in the same model perform better than models that use solely SSMs or MHA for the sequence-to-sequence transformation. Similarly, Kraken layers can be combined with standard Transformer layers and pure SSM layers to develop high-quality language models that are also efficient to run on hardware.
+
+## 6 Acknowledgements
+
+This material is based on research sponsored by the Air Force Research Laboratory (AFRL) and the Defense Advanced Research Projects Agency (DARPA) under agreement No. FA8650-18-2-7862. The U.S. Government is authorized to reproduce and distribute reprints for Governmental purposes notwithstanding any copyright notation thereon. The views and conclusions contained herein are those of the authors and should not be interpreted as necessarily representing the official policies or endorsements, either expressed or implied, of the Air Force Research Laboratory (AFRL), the Defense Advanced Research Projects Agency (DARPA), or the U.S. Government. We thank Princeton Research Computing for their assistance in setting up and maintaining the necessary compute infrastructure. We thank Ashwinee Panda for feedback and aid in brainstorming the title. We also thank Jens Tuyls for the helpful discussions.

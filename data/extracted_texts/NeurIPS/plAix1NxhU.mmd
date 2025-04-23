@@ -1,0 +1,200 @@
+# TpuGraphs: A Performance Prediction Dataset on
+
+Large Tensor Computational Graphs
+
+ Phitchaya Mangpo Phothilimthana
+
+Google
+
+&Sami Abu-El-Haija
+
+Google
+
+&Kaidi Cao1
+
+Stanford
+
+&Bahare Fatemi
+
+Google
+
+&Mike Burrows
+
+Google
+
+&Charith Mendis1
+
+UIUC
+
+&Bryan Perozzi
+
+Google
+
+&
+
+###### Abstract
+
+Precise hardware performance models play a crucial role in code optimizations. They can assist compilers in making heuristic decisions or aid autotuners in identifying the optimal configuration for a given program. For example, the autotuner for XLA, a machine learning compiler, discovered 10-20% speedup on state-of-the-art models serving substantial production traffic at Google. Although there exist a few datasets for program performance prediction, they target small sub-programs such as basic blocks or kernels. This paper introduces TpuGraphs, a performance prediction dataset on full tensor programs, represented as computational graphs, running on Tensor Processing Units (TPUs). Each graph in the dataset represents the main computation of a machine learning workload, _e.g._, a training epoch or an inference step. Each data sample contains a computational graph, a compilation configuration, and the execution time of the graph when compiled with the configuration. The graphs in the dataset are collected from open-source machine learning programs, featuring popular model architectures, _e.g._, ResNet, EfficientNet, Mask R-CNN, and Transformer. TpuGraphs provides 25x more graphs than the largest graph property prediction dataset (with comparable graph sizes), and 770x larger graphs on average compared to existing performance prediction datasets on machine learning programs. This graph-level prediction task on large graphs introduces new challenges in learning, ranging from scalability, training efficiency, to model quality.
+
+## 1 Introduction
+
+Compilers often use performance models to solve optimization problems [28; 48], as collecting performance measurements from real hardware can be expensive, limited, or infeasible. A performance model can also be used by a compiler autotuner to evaluate candidate configurations in a search space [2; 14; 37; 53; 56]. However, developing an accurate analytical model of program performance on a modern processor is challenging and time-consuming because the underlying processor architecture, the compiler, and their interactions are complex and difficult to model analytically.
+
+Many recent methods [2; 14; 41; 51; 66; 65; 5; 79; 45; 3; 24; 37] apply machine learning (ML) to learn performance prediction models. However, there exist only a few datasets for program performance prediction, and they all target small sub-programs. BHive  targets small basic blocks of assembly instructions. TenSet  targets ML kernels consisting of a small number of tensor operations. The database-query dataset  contains larger query programs, but they are still relatively small, most with fewer than 100 nodes.
+
+Unlike prior datasets, TpuGraphs is a performance prediction dataset on full tensor programs, represented as computational graphs. Each graph represents the main computation of an ML program, which is usually one or many training steps or one inference step. The graphs in the dataset are collected from open-source ML programs, featuring popular models (_e.g._, ResNet, EfficientNet, Mask R-CNN, and a large variety of Transformer) for a wide range of tasks, _e.g._, vision, NLP, speech, audio, recommendation, and generative AI. Each data sample contains a computational graph, a compilation configuration, and the execution time when executing the graph when compiled with the given configuration on a Tensor Processing Unit (TPU) v3 , an accelerator for ML workloads. A compilation configuration controls how the XLA compiler  transforms the graph for a specific optimization pass. In particular, the TpuGraphs dataset consists of two collections: (i) _layout_ and (ii) _tile_. _Layout_ configurations control how tensors are laid out in the physical memory, by specifying the dimension order of each input and output of an operation node. A _tile_ configuration controls the tile size of each fused subgraph. We primarily focus on layout and tile configurations because tuning them offers the highest performance gain on average, compared to tuning other compiler optimizations.
+
+The layout collection contains 31 million pairs of graphs and configurations, averaging over 7,700 nodes per graph. The tile collection contains 13 millions pairs of kernels and configurations, averaging 40 nodes per kernel subgraph. The layout collection is unique among existing graph datasets, in that it provides data for graph-level predictions on very large graphs. In contrast, most of the existing graph datasets fall into two categories: graph-level prediction on small graphs [11; 72; 32; 4; 32; 14; 81; 67; 83], and node-level or edge-level prediction on large graphs [29; 12; 34; 77; 86; 9; 49]. TpuGraphs provides 25x more graphs than MalNet  -- the largest graph property prediction dataset with comparable graph sizes -- and 770x larger graphs on average compared to TenSet  -- the only existing large-scale ML program performance dataset -- as depicted in Figure 1. The scale of TpuGraphs poses several new research challenges:
+
+* How to train a neural network model that can perform graph-level predictions when the memory required to train the model on a single graph may not fit on a single device?
+* How to make a model generalize well to unseen graphs when they are diverse, and the training data may be imbalanced?
+* How to improve the efficiency of a training pipeline when multiple data points contain a large amount of redundant data (same core graph but different graph configurations)?
+
+We provide baseline model code2 based on a Graph Neural Network (GNN) , following the techniques from the most recent works on TPU learned cost models [41; 10]. The baseline models achieve moderate performance on both layout and tile collections. For competitive baselines, we encourage the reader to follow the Kaggle competition3.
+
+## 2 Background & Challenges
+
+ML compilers solve multiple optimization problems to translate an ML program, typically represented as a tensor computation graph, to an efficient executable for a hardware target. Recent works have demonstrated that search-based _autotuning_ techniques can be used to generate code with close to optimal performance [13; 82; 2; 3; 71; 36; 65; 56]. However, autotuning requires a relatively large
+
+Figure 1: Scale of TpuGraphs compared to other graph property prediction datasets.
+
+amount of resources to find quality candidates compared to traditional heuristics-based compilers. Therefore, many methods develop a learned cost model to accelerate autotuning [14; 41; 65; 79; 45; 3].
+
+### XLA and Autotuner
+
+XLA  is a production-grade heuristics-based compiler for ML programs, capable of generating code for various hardware targets, including CPUs, GPUs, and notably TPUs [38; 39]. Figure 2 depicts important optimizations that are featured in XLA and most ML compilers. Graph-level optimizations require the context of the entire program graph to make good decisions, while kernel-level optimizations can be done independently within each kernel. A tensor computation graph is represented as High Level Operations (HLO) in XLA. Each optimization pass transforms an HLO graph into a functionally-equivalent one. The output of graph-level optimizations are a collection of kernels (represented as fused subgraphs). XLA has an accompanying autotuner  that can tune both graph-level and kernel-level configurations for TPUs, unlike most search-based compilers [13; 14; 79; 82; 2; 3; 71; 45; 3], which focus on kernel-level optimizations.
+
+Kernel-Level Optimizations.Each node in a tensor computation graph represents a tensor operation, such as matrix multiplication, convolution, element-wise addition, _etc_. A kernel, represented as a fused subgraph, is then a fusion of multiple tensor operations. For example, Convolution-BatchNormNorm is a common fused kernel that appears in Convolutional Neural Networks. The most important optimization at the kernel level is tile size selection: selecting the shape of a tile of the output tensor to maximize compute efficiency of the hardware, while the required regions of input, output, and intermediate data fit in the local cache or scratchpad memory. The XLA tile size autotuner has been deployed in production to optimize the most heavily executed kernels on Google TPU fleet on a daily basis, saving approximately 2% of the total TPU compute time overall . The learned cost model based on a GNN is used to select the top K most promising tile sizes to execute on real hardware , reducing the autotuning search time by approximately 20x.
+
+Graph-Level Optimizations.At the graph level, the XLA autotuner supports tuning layout assignment, fusion, and memory space assignment passes, as well as compiler flags that control multiple optimization passes. The XLA graph-level autotuner has delivered 10-20% speedup state-of-the-art models serving substantial production traffic at Google. However, it often takes at least a few hours for the autotuner to converge when tuning one optimization pass of a single graph, and much longer for larger computation graphs. Therefore, a learned cost model would significantly reduce the search time. This motivates us to release the dataset collected from the autotuning process to advance research in developing learned performance prediction models, by addressing challenges outlined in Section 2.2, and ultimately accelerate the autotuning process for production ML workloads.
+
+We focus on layout tuning because it offers the most speedup in general. The layout assignment pass chooses the physical layouts of the input and output tensors of each node that satisfy constraints, while minimizing program's execution time. A layout determines the order of (minor-to-major) tensor dimensions. Figure 3 displays valid input layouts in blue and the chosen layout in red. If an edge connects an output to an input with a different layout, the compiler inserts a copy (transpose) operator to convert the layout. In Figure 3 (left), layout of \(\{1,0,2\}\) is assigned to the output of add but \(\{0,1,2\}\)
+
+Figure 2: Important optimizations in ML compilers include graph-level and kernel-level optimizations. A graph-level optimization requires the context of the entire graph to make optimal decisions and transforms the entire graph accordingly. A kernel-level optimization transforms each kernel (a fused subgraph) at a time, independently of other kernels.
+
+to the first input of conv, causing a layout mismatch, unless a copy operator is inserted. The compiler must trade off between selecting the best layouts for each specific operator and the overhead of copy operators. The autotuner tunes the input-output layouts of the most layout-performance-critical nodes -- _i.e._, convolution, dot (einsum), and reshape because they are common operations and have the most constrained implementations for TPUs -- and propagates layouts from these nodes to others. The autotuner picks one input-output layout combination from the valid options for each configurable node.
+
+### Learning Challenges
+
+TpuGraphs is non-trivial because training a neural network model to make an accurate prediction on a large graph comes with multiple challenges, as follows.
+
+Scalability.Existing efforts to scale GNNs have mostly focused on node-level and edge-level prediction using sampled subgraphs  or graph transformations followed by local models . However, there is a lack of research on how to train scalable models for _property prediction of large graphs_. Training on sampled subgraphs alone is insufficient as they may not contain all the necessary information for accurate predictions. Aggregating information from the entire graph is essential for graph property prediction, but it poses challenges due to memory limits on a training device, as the memory required scales at least linearly with the size of the graph . Our layout collection contains graphs of up to 44,000 nodes, so training a GNN model on an entire graph (or a batch of thereof) using a single GPU may run out of memory.
+
+Diversity and Imbalance of Graphs.We want to learn a model that generalizes well to unseen graphs. However, this is non-trivial because the model must be trained on diverse types of graphs with enough samples for each type. TpuGraphs consists of graphs for all kinds of important ML workloads, including both inference and training, from past to present. While the dataset may be imbalanced -- containing graphs from some types of architectures more than others -- each graph has at least 10,000 samples of data from different configurations on average.
+
+Redundancy.Another unique property of our dataset is that many samples share the same graph, which represents a large amount of redundant data. An efficient training pipeline should leverage this knowledge and reduce the redundant computation when possible. Additionally, there is another aspect of redundancy within each graph. A tensor computation graph, representing an ML workload, often consists of repeated blocks of neural network layers. The repeated blocks appear as repeated subgraphs. One may leverage this knowledge to improve the learning algorithm.
+
+The baselines accompanying this dataset attempt to address some of these challenges, but are not close to fully solving them.
+
+## 3 The TpuGraphs Dataset
+
+The TpuGraphs dataset contains execution time data points, where each data point contains an HLO graph, its configuration, and its execution time on a single core of TPU v3. The HLO graph in
+
+Figure 3: A node represents a tensor operator, annotated with its output tensor shape \([n_{0},n_{1},...]\), where \(n_{i}\) is the size of dimension \(i\). Layout \(\{d_{0},d_{1},...\}\) represents minor-to-major ordering in memory. Applied configurations are highlighted in red, and other valid configurations are highlighted in blue. A layout configuration specifies the layouts of inputs and outputs of influential operators (_i.e._, convolution, dot, and reshape). A copy operator is inserted when there is a layout mismatch.
+
+each data point is a partially optimized graph before being fed into the corresponding optimization pass. For example, in the _layout_ collection, an HLO graph is the input graph to the layout assignment pass. The layout configuration of a graph is a collection of per-node layout decisions on configurable nodes (_i.e._, convolution, dot, and reshape). For the _tile_ collection, an HLO graph in each data point is a fused subgraph representing a kernel. The tile configuration of a subgraph is a configuration for the entire subgraph, not specific to any particular node.
+
+### Data Generation
+
+Within our dataset, there are multiple collections of data, differing in terms of (1) the compiler optimization (_i.e._, layout and tile), (2) the source of graphs, and (3) the search strategy.
+
+Graphs Collection.We collect HLO graphs from two sources. The first source, called _XLA_, is the combination of the XLA regression benchmark -- from where we collect all open-source models -- and the MLPerf benchmark [50; 35]. The _XLA_ graphs span diverse types of popular ML training and inference models, such as vision, NLP, speech, audio, and recommendation. The second source, called _NLP_, contains a variety of BERT for training and inference, with varying number of layers, attention heads, and hidden sizes. For each model, we run the program -- written in TensorFlow, PyTorch, or JAX -- and collect the largest HLO graph compiled by XLA, which represents the model's main computation. Note that a typical way that XLA handles a graph with dynamic shapes is to bucketize the graph into multiple static-shape graphs. During execution, the runtime will pad the input to match the static-shape graph with the larger closet shape. Our dataset includes graphs -- for varying sequence length, batch size, model size, etc. -- some of which are used for dynamic shape workloads. The TpuGraphs dataset is similar to the internal datasets used for prior TPU learned cost models [41; 10], but it exclusively contains graphs from open source-programs, while the internal datasets also include production models that cannot be released publicly.
+
+Configurations Generation.Once we have the graphs, we use the XLA autotuner to generate data samples. The set of configurations being generated depends on how the autotuner explores the search space. For the layout collections, we ran the autotuner in two modes. The first mode explores the search space using a genetic algorithm starting from the default configuration, chosen by the compiler's heuristic. Data collected from this mode is labeled _default_. The second mode explores the search space by picking random candidates. Data collected from this mode is labeled _random_. We keep data collected in different modes in separate collections; the default collection tends to contain configurations that are not too different from the default, and have similar execution times, while the random collection includes very different configurations with very different execution times.
+
+For the tile size tuning, the autotuner first invokes the compiler to run the graph-level optimizations and obtain fused subgraphs (kernels). For each subgraph, the autotuner enumerates all possible tile sizes for the kernel in a random order, limited by a timeout. Note that the tile size search space is much smaller than the layout search space, so we can enumerate all possible tile sizes. Therefore, there is one data collection for tile sizes. We use only the _XLA_ source for graphs in this collection.
+
+Appendix A.2 describes how we measure the execution time of a given graph and configuration.
+
+### Dataset Statistics and Related Datasets
+
+Table 1 summarizes the details of the different data collections, where the collection name follows the pattern _optimization:source:search_. Table 3 in Appendix A.1 compares properties of the TpuGraphs dataset (all collections) against existing graph property prediction datasets.
+
+ML Program Performance.The TpuGraphs layout collections provide more than 770x larger graphs on average compared to TenSet , the only existing large-scale dataset on ML program performance. Our tile collection is similar to TenSet as the configuration controls the optimization at the kernel (fused subgraph) level. However, it compliments TenSet nicely as it provides data points on different hardware. Halide Auto-scheduler  releases their evaluation dataset of Halide programs mainly consisting of image processing benchmarks with a few ML benchmarks.
+
+Other Program Performance.Beyond ML programs, the performance prediction dataset with largest graphs is on database queries , whose graphs are still more than a few orders of magnitudessmaller than ours. Another popular performance prediction dataset is BHive , consisting of x86 basic blocks sourced from multiple open source programs, with runtime measurements on different Intel hardware platforms. However, the basic blocks are quite small, including four instructions on average. CompilerGym  releases a collection of LLVM IR code datasets that can be evaluated in their environment. The largest datasets in their collection includes AnghaBench  and CSmith . AnghaBench provides a large number of relatively small real-world programs. CSmith programs are large (comparable to ours), but they are randomly generated programs. Additionally, CompilerGym's datasets do not come with performance measurements, so one would have to execute the programs and configurations in the CompilerGym's environment themselves to obtain program execution time.
+
+Program Analysis.Other closely related datasets are on programming tasks. CodeNet  is a large dataset to teach AI to code, in which each code sample is a solution to one of the coding problems. OBGB-CODE2  is for code summarization, containing Abstract Syntax Trees obtained from Python functions. TBCNN  releases its dataset on program classification from a pedagogical programming open judge system. CuBERT  uses Python files extracted from the ETH Py150 dataset  for fine-tuning and uses github_repos dataset under BigQuery's public-data project for pre-training. CodeBERT  releases its multi-programming-lingual dataset used for pre-training. Works such as inst2vec  and ProGraML  uses datasets of code in LLVM compiler intermediate representation to learn generic code representation for various program analyses and optimizations.
+
+Other.Apart from code datasets, there are many other graph datasets. Open Graph Benchmark  suite presents graphs that are used for machine learning tasks such as GNN inference and training. GAP  and Graph Based Benchmark Suite (GBBS)  provide large-scale curated sets of graphs, primarily for evaluating traditional graph problems. SuiteSparse  consists of a wide variety of sparse matrices, which can be viewed as graphs. Most of these datasets are for node-level or edge-level prediction tasks. TpuGraphs is by far one of the largest graph property prediction datasets. TpuGraphs' average graph size is comparable to that of MalNet  -- the largest scale graph property prediction dataset to date -- while offering 25x more combinations of graphs and configurations. Other popular graph property prediction datasets include small molecule [58; 61], bioinformatic [22; 33], and social network datasets [62; 74].
+
+### Dataset Split
+
+We split the data using 80-10-10 ratio by graphs in each collection. Splitting data by graphs ensures that graphs in the validation and test sets do not appear in the training set to evaluate the generalization of the model on unseen graphs. The validate and test graphs stay the same across different XLA collections; the same applies to NLP collections. We deliberately holdout the target labels of samples in the test set for competition purposes.
+
+We report test and validation metrics for the tile collection by considering all configurations. For the layout collections, we report final metrics only on 1,000 configurations to reduce the computational demand for the model evaluation. We select these 1,000 configurations by sorting all configurations based on their execution times and extracting the \([0,m,2m,,length-1]\)th configurations. The dataset includes the indices of the selected configurations4.
+
+    &  &  &  &  &  \\  & **(Sub) Graphs** & & & & \(+\) Configs & \\  Layout:XLA:Default & 78 & 14,105 (372–43,615) & 10,147 (681–71,574) & **771,496** & 1,272,538 \\ Layout:XLA:Random & & & 11,648 (109–99,783) & **908,561** & 1,115,709 \\ Layout:NLP:Default & 244 & 5,659 (876-21,919) & 56,534 (0932–90,985) & **13,285,415** & 15,479,038 \\ Layout:NLP:Random & & & 66,089 (8,843–100,001) & **16,125,781** & 16,135,731 \\ Tile:XLA & 6,988 & 40 & 1,842 & **12,870,077** & 12,870,077 \\   
+
+Table 1: Statistics of TpuGraphs collections. The collection name follows the pattern _optimization:source:search_. The search may explore the same configuration multiple times, so the same pair of graph and configuration may appear multiple times with slightly different execution time from multiple measurements. The total number of samples is thus higher than the number of unique pairs.
+
+Learning a Performance Prediction Model
+
+The goal of a learned cost model is to rank the performance of different configurations of a given graph. This section explains the baseline models we provide and how we train them, primarily based on the TPU learned cost model papers [41; 10].
+
+### Feature Extraction
+
+TpuGraphs provides data in two formats: raw protobuf format and numpy arrays similar to the OGBG format . The autotuner produces output results in protobuf format. A data pre-processing script converts data from the protobuf format to the numpy format. The main function of the data pre-processor is feature extraction. Node features describe the node's properties, such as output tensor shape, tensor layout, striding, padding, and operation-specific parameters. Our feature extraction is minimal. To extract a node feature vector, we either copy values from various fields in an HLO instruction (a node in an HLO graph) as they are, or convert categorical values using one-hot encoding. To convert an unbounded list of numbers (_e.g._, tensor shape) to a fixed-size vector, we truncate the list to six elements and include the summation and/or product of all elements in the list (_e.g._, the product of dimension sizes represents the volume of the tensor) because the tensors appearing our dataset do not contain more than six dimensions. A per-node layout configuration and tile size can be represented as a nested list with some unbounded dimensions. Similarly, we truncate these unbounded dimensions to six elements. The detailed description of node and configuration features can be found in the GitHub repo.
+
+We provide code for training a variety of models over the numpy format. Nonetheless, the raw format can allow researchers to experiment with different feature extractions and measure impacts on the quality of a learned model.
+
+### Model Architecture
+
+Figure 4 shows the model architecture we use for our baseline models, which are based on a GNN since the input program is represented as a graph. Node features consist of two parts. The first part is an opcode id, _i.e._, type of tensor operation (such as convolution). Our baseline models map an opcode id to an opcode embedding via an embedding lookup table. The opcode embedding is then concatenated with the rest of the node features as inputs to a GNN. We combine the node embeddings produced by the GNN to create the embedding of the graph using a simple pooling reduction. The resulting graph embedding is then linearly transformed into the final scalar output by a feedforward layer. Prior work  has studied alternative models, including LSTM and Transformer, and shown that GNNs offer the best performance. We provide baseline models with GCN  and GraphSAGE .
+
+### Loss Functions
+
+The primary use case of the model is to rank configurations within a given graph and select top candidates to evaluate on real hardware. Thus, we can train the model using regression losses (_e.g._, Mean Square Error (MSE)) or ranking losses (_e.g._, pairwise hinge loss and ListMLE ). A ranking loss is computed among sample pairs within the same graph in the same batch, and the losses from different graphs in the batch are reduced to get the total loss. We use Ordered Pair Accuracy (OPA) as a validation metric to select the best model checkpoint.
+
+Figure 4: Model architecture.
+
+### Implementation
+
+Layout model.Our baseline model is a 3-layer GraphSAGE with residual connections. We concatenate node features and per-node configuration features as inputs to the GNN. If a node is non-configurable (having no layout configuration), we use a zero vector as configuration features. Our baseline code allows both a typical full graph training and a graph segment training . One may improve the compute efficiency further by using historical embeddings of subgraphs and segment dropout, as in the Graph Segment Training paper.
+
+Tile size model.For the tile collection, we implement three baselines: an MLP model and two GNNs (GraphSAGE and GCN with residual connections). The MLP model embeds all opcodes, concatenates with node features, sums across all nodes, and then concatenates with kernel configuration features, feeding into a 3-layer MLP. We experiment with two options to combine the graph-level kernel configuration features with the node-level information (yellow in Figure 4): either _late-join_ or _early-join_. The first runs the GNN only on node features, reduces the node embeddings, and then concatenates with the graph (configuration) features. The second replicates the graph features onto every node. The early-join GraphSAGE model closely resembles the original TPU learned cost model .
+
+For both models, we experiment with two objective functions: MSE and ListMLE. We find that ListMLE gives better empirical performance. Our baseline models are available at https://github.com/google-research-datasets/tpu_graphs. They are implemented using TensorFlow-2 and TF-GNN. The details of hyperparameters can be found in Appendix B.
+
+## 5 Evaluation
+
+### Evaluation Metrics
+
+To evaluate a model, we use two metrics. (1) Kendall's Tau assesses how well a model's ranking of configurations correlates with their corresponding runtimes. (2) _Top-K error_ (or _slowdown error@\(K\)_) measures the slowdown of the chosen \(K\) configurations as:
+
+\[=K}{}-1=y_{i}}{_{i A}y_{i}}-1\] (1)
+
+where \(K\) is the top-K predictions, \(A\) is all configurations of the given graph from the dataset collection, and \(y\) is the measured execution time.
+
+The choice of metrics is justified as follows. For the tile collection, since the number of configurations per graph is relatively small, one can apply the model to obtain the predictions of all configurations, choose top-K candidates according to the model to measure on real hardware, and finally select the best one according to the real measurements. On the other hand, for the layout collections, the search space is quite large. Therefore, common search strategies, such as Genetic Algorithm and Simulated Annealing, need access to a fitness function (which can be the model). Therefore, it is important that the model can well-preserve the order of the configurations (from fastest to slowest) as reflected by the correlation score.
+
+### Experimental Setup
+
+Layout model.For each model variant, we train the model once with only a few set of hyperparameters, and select the checkpoint with the highest OPA on the validation set to evaluate its ranking correlation and top-K prediction errors. Table 5 in Appendix B reports attempted hyperparameters for modeling layout. We report the performance of the best model based on the validation score.
+
+Tile size model.For each model variant, we perform hyperparameter search on opcode embedding size, hidden size, network depth, and learning rate, considering values specified in Table 5. Unlike in the layout collections where the accuracy of each model is quite stable across multiple training runs, the accuracy of a model in the tile collection fluctuates dramatically. Therefore, we train each model variant three times. For each run, we select the model checkpoint with the highest OPA on the validation set. We report the top-K errors of the run that achieves the median top-1 error onthe validation set. An aggregated top-K error is an average across all kernels in the graphs in the validation/test set. Note that the number of kernels varies across graphs.
+
+### Results on Layout Collections
+
+Table 2 reports the top-K slowdown errors and Kendall's Tau correlation of the best model across all graphs (programs) in the validation and test sets for each dataset collection. According to the correlation scores, the layout collections on the default search space are more difficult than those on the random search space. This result matches our intuition because the default search space contains many similar configurations near the default, so it is difficult to rank them; whereas, the random search space contains more diverse configurations. The XLA layout collections are also noticeably more difficult than the NLP layout collections. This is also expected because the XLA collections contain more diverse graphs, while the NLP collections contain only graphs with the Transformer architecture. In terms of top-K errors, the model struggles to identify fast candidates on Layout:XLA:Random. If we use the learned cost model to select the top configuration, we will be on average 10-20% slower than the known optimal configuration. Even if we consider the top 10 candidates, we will still be on average 5-13% off. We hypothesize that this is due to the combination of the diversity of both graphs and configurations in this collection. The correlation and top-K errors vary wildly across graphs (programs) as shown in Table 7 in Appendix C.
+
+### Results on Tile Collection
+
+Table 2 also reports the average top-K errors on the tile collection. The average top-1 error of the best model is comparable to the original TPU learned cost model paper's . Figure 5 compares alternative choices. Similar to the original paper, our results show that combining configuration features with node features early (_early-join_) is superior to combining configuration features with a reduced graph embedding later (_late-join_). Using a ranking loss (ListMLE) is much more effective than using MSE. Additionally, we compare the choice of a GNN between GraphSAGE and GCN, and find they are comparable. We also provide an MLP baseline without a GNN, and confirm that a GNN is essential to achieve good accuracy.
+
+  
+**Collection** &  & \) E \%**} & \) E \%**} & \) E \%**} \\   & Val & Test & Val & Test & Val & Test & Val & Test \\  Layout:XLA:Random & 0.19 & 0.34 & 19.8 & 10.9 & 12.3 & 5.7 & 9.7 & 1.6 \\ Layout:XLA:Default & 0.12 & 0.21 & 3.8 & 14.1 & 1.9 & 0.6 & 0.3 & 0.2 \\ Layout:NLP:Random & 0.58 & 0.53 & 2.1 & 4.6 & 2.0 & 1.0 & 0.6 & 0.09 \\ Layout:NLP:Default & 0.30 & 0.28 & 4.0 & 4.0 & 3.7 & 3.1 & 3.5 & 0.13 \\ Tile:XLA & – & – & 10.5 & 9.1 & 3.0 & 4.2 & 1.8 & 2.8 \\   
+
+Table 2: Kendall’s Tau correlation and prediction errors (Eq. 1) of our best baseline model on different dataset collections. The values of (\(K_{1}\), \(K_{2}\), \(K_{3}\)) are (1, 10, 100) for the layout collections, and (1, 5, 10) for the tile collection.
+
+Figure 5: Prediction errors (%) of different model variants on the Tile:XLA collection. _Early_ and _Late_ refer to _early-join_ and _late-join_ options.
+
+Appendix C reports additional results including per-graph evaluation metrics, an additional ablation study, and model's prediction overhead. Note that our dataset is not exactly the same as the internal dataset used in the original papers [41; 10], but they share a large number of overlapping graphs.
+
+## 6 Discussion and Future Directions
+
+There are many potential improvements to be made on top of the baseline models we provide. First, we observe that a tensor computation graph typically contains repeated subgraphs, representing repeated blocks of neural network layers. One direction is to leverage this repeated structure to devise a more compact representation that is easier to learn. Second, as mentioned earlier, the dataset may contain some types of graphs, _e.g._, ResNet, significantly more than others. This skew may make the learned model perform well on common types of graphs, but poorly on uncommon types. One may investigate how to address this data imbalance problem to improve the quality of the learned model. Finally, while we know that developing a purely analytical cost model is extremely difficult, training an accurate learned cost model is not easy either, especially when graphs are large. One idea is to combine the best of both worlds, using analytical modeling when easy to do and letting the learned model make corrections to the analytical estimates.
+
+We plan to continue improving our dataset in multiple aspects. First, we would like to include more diverse graphs. Prior approaches generate random programs for training data [2; 14; 5]. We deliberately avoid randomly generated programs in our dataset because we would like a model trained on the dataset to achieve high performance on realistic programs used in production, instead of achieving moderate performance on both real-word and randomly generated programs. However, we acknowledge that the diversity of graphs in the dataset is extremely important for the generalization of the model. One way to generate more realistic tensor programs is to leverage Neural Architecture Search [84; 68; 69; 85; 47; 46; 60; 64; 76; 23]. We leave this as future work, potentially the next version of the dataset. Second, we would like to include data measured on other hardware platforms beyond TPUs, such as CPUs and GPUs. Nonetheless, we believe that the general techniques of training an accurate learned performance model (_e.g._, improvements on GNNs, Graph Segment Training method, etc.) are applicable to other hardware targets; therefore, the improvements coming out from experimenting with the current version of the dataset should also benefit other hardware platforms as well. Many compiler optimizations are also common across multiple hardware backends. For example, the tile size selection has shown to be one of the most important optimizations across all widely used hardware (_i.e._, CPUs, GPUs, and TPUs) and even custom accelerators. Layout optimizations are also applicable on CPUs and GPUs, but the layout options on CPUs and GPUs may be limited if the compiler depends on pre-optimized library kernels.
+
+We hope that TruGraphs will propel advances in compilers. In particular, researchers may be able to extract insights on how to improve code generation for tensor programs. For example, which information in a tensor computation graph is important to make various optimization decisions? How can we build an accurate cost model for an important class of hardware architectures? Can a learned representation for tensor programs guide various tensor compiler optimizations?

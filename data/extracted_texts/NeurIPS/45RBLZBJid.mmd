@@ -1,0 +1,247 @@
+# Accelerated On-Device Forward Neural Network Training with Module-Wise Descending Asynchronism
+
+Xiaohan Zhao\({}^{1}\)
+
+xiaotuzxh@gmail.com
+
+&Hualin Zhang\({}^{2}\)
+
+zhanghualin98@gmail.com
+
+&Zhouyuan Huo\({}^{*}\)
+
+huozhouyuan@gmail.com
+
+&Bin Gu\({}^{2,3}\)
+
+jsbugin@gmail.com
+
+\({}^{1}\) Nanjing University of Information Science and Technology, China
+
+\({}^{2}\) Mohamed bin Zayed University of Artificial Intelligence, UAE
+
+\({}^{3}\) School of Artificial Intelligence, Jilin University, China
+
+Author Zhouyuan Huo is currently at Google. No work performed at Google.Corresponding author.
+
+###### Abstract
+
+On-device learning faces memory constraints when optimizing or fine-tuning on edge devices with limited resources. Current techniques for training deep models on edge devices rely heavily on backpropagation. However, its high memory usage calls for a reassessment of its dominance. In this paper, we propose forward gradient descent (FGD) as a potential solution to overcome the memory capacity limitation in on-device learning. However, FGD's dependencies across layers hinder parallel computation and can lead to inefficient resource utilization. To mitigate this limitation, we propose AsyncFGD, an asynchronous framework that decouples dependencies, utilizes module-wise stale parameters, and maximizes parallel computation. We demonstrate its convergence to critical points through rigorous theoretical analysis. Empirical evaluations conducted on NVIDIA's AGX Orin, a popular embedded device, show that AsyncFGD reduces memory consumption and enhances hardware efficiency, offering a novel approach to on-device learning.
+
+## 1 Introduction
+
+Deep learning models have increasingly gained attraction in a multitude of applications, showcasing exceptional predictive capabilities. Nevertheless, their rapidly expanding size  poses a formidable challenge for resource-limited edge devices, such as mobile phones and embedded systems. These devices are pervasive in our society and continuously generate new data. To attain model customization, user privacy, and low latency, these devices necessitate on-device learning, involving training and fine-tuning models on freshly gathered data . However, the restricted memory capacity of these devices emerges as a significant hindrance. For example, the Raspberry Pi Model A, introduced in 2013, only featured 256 MB of memory , while the more recent Raspberry Pi 400, released in 2020, modestly increased this capacity to a mere 4 GB.
+
+Various techniques have been proposed to address this issue, encompassing quantized training, efficient transfer learning, and rematerialization. Quantized training curtails memory consumption by utilizing low-precision network representation . Efficient transfer learning diminishes training costs by updating merely a subset of the model . Lastly, rematerializationconserves memory at the expense of time by discarding and recomputing intermediate variables [3; 7; 16; 35].
+
+Although most of these techniques can be applied irrespective of the optimization strategy, they are frequently employed in tandem with backpropagation in deep learning. Due to the reciprocal nature of backpropagation (i.e., activations from the forward pass are preserved for the subsequent backward pass), the training of deep models utilizing backpropagation typically commands a memory footprint that is 3-4\(\) larger than the number of parameters involved. Consequently, reexamining backpropagation within the context of surpassing the memory capacity barrier is crucial due to its elevated memory consumption.
+
+The recent revival of interest in the forward-forward algorithm proposed by , along with other algorithms predicated on forward computation [39; 28; 1; 33], has prompted a reevaluation of backpropagation. The question persists: is it essential to store intermediate variables and pause to propagate gradients? An alternative, forward gradient descent (FGD), leverages the Jacobian-vector product (JVP) under automatic differentiation [37; 1; 33] to assess the effect of a stochastic perturbation in conjunction with the forward pass, yielding an unbiased approximation of the true gradient. FGD offers benefits in terms of memory consumption and biological plausibility, as it solely employs forward passes and substantially reduces the storage of intermediate variables . Moreover, FGD can be combined with other existing techniques, such as quantized training and efficient transfer learning, potentially further diminishing memory costs.
+
+Nonetheless, the intrinsic locking mechanism within FGD, more specifically, the layer-by-layer sequential computation during the forward pass, poses an impediment to parallel computation across disparate layers as shown in Fig. 1. In response to these challenges, this paper aims at training deep models on edge devices with memory constraints from an optimization perspective, while improving resource utilization by breaking the lock inside the forward pass with provable convergence. Thus, we propose AsyncFGD, an asynchronous version of Forward Gradient Descent with module-wise asynchronism in the forward pass to disentangle its dependencies, allowing simultaneous computation on different workers. The induced module-wise decreasing and bounded staleness in the parameters not only accelerates prediction and training but also provides theoretical guarantees in convergence. We empirically validate our method across multiple architectures and devices, including CPUs, GPUs, and embedded devices. Our results indicate that AsyncFGD reduces memory consumption and improves hardware efficiency, achieving efficient training on edge devices.
+
+## 2 Related Works
+
+### Forward Gradient with Reinforcement Learning
+
+This research builds upon the concept of forward-mode automatic differentiation (AD) initially introduced by . It has since been applied to learning recurrent neural networks  and calculating
+
+Figure 1: Comparison of Vanilla FGD and AsyncFGD, where A, B, and **C** signify workers in the system. Through the allocation of tasks from varying iterations, AsyncFGD breaks forward locking in FGD, thereby maximizing worker utilization.
+
+Hessian vector products . However, exact gradient computation using forward-mode AD requires the complete and computationally expensive Jacobian matrix. Recently, Baydin et al.  and Silver et al.  proposed an innovative technique for weight updating based on directional gradients along randomly perturbed directions. These algorithms have connections to both reinforcement learning (RL) and evolution strategies (ES), since the network receives global rewards in each instance. RL and ES have been successfully utilized in specific continuous control and decision-making tasks in neural networks [38; 34; 32; 4]. Clark et al.  observed that global credit assignment performs well in vector neural networks with weights between vectorized neuron groups. However, in forward-model AD methods, much like in evolution strategies, the random sampling approach can lead to high variance in the estimated gradient, particularly when optimizing over a large-dimensional parameter space .
+
+### Parallel Strategies and Asynchronous Approaches
+
+Various parallel frameworks have been developed to accelerate computations by utilizing multiple workers. These frameworks include data parallelism , pipeline parallelism [12; 30; 23; 14], and tensor parallelism [29; 24]. Each approach leverages different dimensions of data - batch dimension for data parallelism, layer dimension for pipeline parallelism, and feature dimension for tensor parallelism - to improve computational efficiency.
+
+However, in edge computing environments, data is often collected and processed frame-by-frame rather than in batches. This is particularly true for scenarios requiring real-time adaptation and streaming data learning. In such contexts, edge models must quickly adapt to newly acquired data in real-time, leaving limited scope for collecting, fetching, and batching historical data. Therefore, algorithms that do not depend on batch size are preferable.The ability to align with this pipeline and train the model on the fly with incoming data is crucial. Therefore, our research specifically focuses on pipeline parallelism.
+
+Pipeline parallelism can be categorized into synchronous and asynchronous pipelines, which divide computations into sequential stages and align well with the data stream on edge devices. However, in edge devices with limited computational power, potential idle workers due to synchronization in synchronous pipelines like  are not optimal.
+
+Asynchronous parallelism, which allows non-simultaneous task execution to enhance resource utilization, is particularly relevant to our method. [23; 14] parallelize tasks by executing them from different iterations. However, the additional memory overhead of storing replicate copies to handle staleness in  and the use of multiple activations for backpropagation make the algorithm memory inefficient. This memory overhead is mitigated in strategies such as "rematerialization" [40; 13] and weight estimation . However, these strategies were originally designed for backpropagation, while our focus is on FGD, which has distinct computational characteristics, rendering the existing "1B1F" strategy for work scheduling in [40; 13; 41; 23] unsuitable.
+
+## 3 Preliminaries
+
+**Gradient-based Method.** We commence with a succinct introduction to gradient-based methods deployed in neural networks. Envision the training of a \(L\)-layer feedforward neural network, where each layer \(l\) accepts \(h_{l-1}\) as an input, generating an activation \(h_{l}=F_{l}(h_{l-1};w_{l})\) with weight \(w_{l}^{d_{l}}\). We represent all parameters by \(w=[w_{1}"1",w_{2}"1",,w_{L}"1"]"^{d}\) and the output of the network by \(h_{L}=F(h_{0},w)\), where \(h_{0}\) symbolizes the input data \(x\). Given a loss function \(f\) and targets \(y\), the objective problem is as follows:
+
+\[_{w}f(F(x;w),y) \]
+
+Here, we use \(f(x;w)\) in subsequent sections for the sake of brevity.
+
+Gradient-based methods are widely used to optimize deep learning problems. At iteration \(t\), we feed data sample \(x_{i(t)}\) into the network, where \(i(t)\) signifies the sample's index. As per the principles of stochastic gradient descent (SGD), we define the network parameters as follows:
+
+\[w_{l}^{t+1}=w_{l}^{t}-_{t} f_{l,x_{i(t)}}(w^{t}), l \{1,2,,L\} \]
+
+Here, \(_{t}\) is the stepsize and \( f_{l,x_{i(t)}}(w^{t})^{d_{l}}\) is the gradient of the loss function with respect to the weights at layer \(l\) and data sample \(x_{i(t)}\).
+
+The crux of the matter is obtaining \( f_{l,x_{i(t)}}(w^{t})\). Both scientific and industrial sectors lean towards backpropagation underpinned by automatic differentiation (AD). However, FGD could be another alternative, because it can approximate the true gradient without bias by using forward-mode AD, and importantly has low memory consumption as it only preserve the intermediate variable passed from previous layer, while backpropagation need to store intermediate variable in each layer.
+
+**Forward Gradient Descent.** Let \(J_{F_{l}}\) represent the Jacobian matrix of layer \(l\) while \(u_{w_{l}}\) represent the random perturbation on \(w_{l}\) (more precisely, tangent vector around \(w_{l}\)), we can calculate the JVP value \(o_{l}\), in each layer sequentially by
+
+\[h_{l} =F_{l}(h_{l-1};w_{l})^{d_{h_{l}}}, \] \[o_{l} =J_{F_{l}}(h_{l-1},w_{l})u_{l}^{d_{h_{l}}},  u_{l}=[o_{l-1},u_{w_{l}} {}]^{d_{h_{l-1}}+d_{l}} \]
+
+Mathematically, \(o_{l}\) is the directional derivative of \(F_{l}\) along \(u_{l}\); intuitively, \(o_{l}\) can be interpreted as the influence of the perturbation \(u_{w_{l}}\) on function value \(h_{l}\) (we set \(o_{l}\) to be 0 since we don't need to calculate the JVP value with respect to the input data). This process can be arranged within the forward pass such that (3), (4) are computed in the same pass. Also, since we don't need to propagate backward, \(h_{l-1}\) and \(o_{l-1}\) are thrown away right after the computation of \(h_{l}\) and \(o_{l}\). Then we can approximate the true gradient \( f(x;w)\) unbiasedly (Lemma 3.1) by \((}o_{L})u\), where \(u=[u_{w_{1}},,u_{w_{L}}]\).
+
+**Lemma 3.1**.: _Let \(u_{w_{l}}^{d_{l}},l\{1,2,,L\}\) be a normally distributed random Gaussian vectors, then the forward gradient computed through Eq.(3), (4) is an unbiased estimate of the true gradient_
+
+\[ f(x;w)=_{u}[(}o_{L} )u].\]
+
+More specifically, each layer \(l\) receives \(o_{L}\) from the last layer and updates its own parameters locally by using \(_{u_{w_{l}}}(u_{w_{l}} o_{L})\). We can then rewrite (2) as :
+
+\[w_{l}^{t+1}=w_{l}^{t}-_{t}((}o _{L}^{t})u_{w_{l}}^{t}) \]
+
+**Forward Locking.** It is evident from Eq.(4) that the computation in layer \(l\) depends on the activation and JVP value \(h_{l-1},o_{l-1}\) from layer \(l-1\). This dependency creates a "lock" that prevents all layers from updating before receiving the output from dependent layers, thus serializing the computation in the forward pass (refer to Figure 1 for illustration).
+
+## 4 AsyncFGD
+
+In this section, we propose an innovative approach that utilizes module-wise staleness to untether the dependencies inherent in FGD. This method, which we've named AsyncFGD, facilitates the simultaneous execution of tasks originating from disparate iterations. Suppose a \(L\)-layer feedforward neural network is divided into \(K\) modules, with each module comprising a set of consecutive layers and their respective parameters. Consequently, we have a configuration such that \(w=[w_{(0)},w_{(1)} {},,w_{(K-1)}] {}\), with \((k)\) denoting the layer indices in group \(k\).
+
+Now, let's delve into the details of how AsyncFGD untethers iteration dependencies and expedites the training process.
+
+### Detaching Iteration Dependency
+
+**Forward.** At the timestamp \(t\), the data sample \(x_{i}(t)\) is pumped to the network. In contrast to sequential FGD , AsyncFGD permits modules to concurrently compute tasks, each originally belonging to a distinct iteration. All modules, with the exception of the last, operate using delayed parameters. We designate the activation and its JVP value originally ascribed to iteration \(t\) in Eq.(3), (4) as \(_{l}^{t},_{l}^{t}\) respectively. Though the superscript \(t\) is no longer time-dependent, it maintains its role in indicating sequential order. Consider \(L_{k}(k)\) as the final layer in module \(k\) and \(f_{k}\) as the activation of this last layer. The computation in module \(k\) at timestamp \(t\) is defined recursively as follows:
+
+\[_{L_{k}}^{t-k}= f_{k}(_{L_{k-1}}^{t-k};w_{(k)}^{t-2K+k+2 }) \]\[_{L_{k}}^{t-k}= J_{f_{k}}(_{L_{k-1}}^{t-k};w_{(k)}^{t-2K+k+2} )u_{(k)}^{t-k},\ \ \ u_{(k)}^{t-k}=[_{L_{k-1}}^{t-k },u_{w_{(k)}}^{t-k}]^{}. \]
+
+Concurrently, each module receives and stores output from its dependent module for future computations.
+
+**Update.** The update phase in AsyncFGD parallels that in FGD . The final module broadcasts its JVP value, triggering each module to perform local updates to their parameters. To summarize, at timestamp \(t\), we execute the following update:
+
+\[w^{t-K+2}=w^{t-K+1}-_{t-K+1}(_{L_{K-1}}^{t-K+1}u_{w}^{t-K+1}) \]
+
+**Staleness.** We measure the time delay in Eq.(6), (7) with \(g(k)=K-1-k\), and \(g(K-1)=0\) indicates that last module employs up-to-date parameters.
+
+This approach effectively disrupts the "lock-in" characteristic of FGD, facilitating a parallel forward pass. A comparative illustration of the execution details in sequential FGD and AsyncFGD is provided in Figure 1.
+
+### Stochastic AsyncFGD Algorithm
+
+To better illustrate the working state of AsyncFGD, we make the following definitions:
+
+\[w^{t-K+1}:=w^{0},&t-K+1<0\\ w^{t-K+1},&;\ \ \ \ _{L_{k}}^{t-k}, _{L_{k}}^{t-k}:=0,0,&t-k<0\\ _{L_{k}}^{t-k},_{L_{k}}^{t-k},& \]
+
+Unlike FGD, AsyncFGD forwards the JVP value and activations by parameters in different time delays, which can be concluded as \(f(x_{i(t-2K+2)};w_{(0)}^{t-2K+2};w_{(1)}^{t-2K+3}; ;w_{(K-1)}^{t-K+1})\). A detailed illustration of the AsyncFGD with \(K=3\) is shown in Appendix G.2. We summarize the proposed algorithm in Algorithm 1 by example of sampling one tangent vector per iteration.
+
+```
+1:Stepsize sequence \(\{_{t}\}_{t=K-1}^{T-1}\), weight \(w^{0}=[w_{(0)}^{0},,w_{(K-1)}^{0}] ^{d}\)
+2:for\(t=0,1,,T-1\)do
+3:for\(k=0,1,,K-1\)in paralleldo
+4: Read \(_{L_{k-1}}^{t-k},_{L_{k-1}}^{t-k}\) from storage if \(k 0\)
+5: Compute \(_{L_{k}}^{t-k},_{L_{k}}^{t-k}\)
+6: Send \(_{L_{k}}^{t-k},_{L_{k}}^{t-k}\) to next worker's storage if \(k K-1\)
+7:endfor
+8: Broadcast \(_{L_{K-1}}^{t-K+1}\)
+9:for\(k=0,1,,K-1\)in paralleldo
+10: Compute \( w_{(k)}^{t-K+1}=_{L_{K-1}}^{t-K+1}u_{w_{(k )}}^{t-K+1}\)
+11: Update \(w_{(k)}^{t-K+2}=w_{(k)}^{t-K+1}-_{t-K+1} w_{ (k)}^{t-K+1}\)
+12:endfor
+13:endfor
+```
+
+**Algorithm 1** AsyncFGD-SGD
+
+Additionally, the procedure in line 5 could overlap with the operations in line 7,9 and 10. We can also apply this approximation algorithm to gradient-based methods like Adam  with little modification to the original. Details can be found in Appendix G.1.
+
+**Tangent checkpoint.** However, some workers, especially those which are closer to the input, store duplicated tangent vectors. To tackle this issue, we use tangent checkpoint,i.e., storing the seed of tangent vectors and reproducing them in the update stage.
+
+**Integration with Efficient Transfer Learning** Although AsyncFGD offers several advantages over backpropagation, it shares a common challenge with random Zeroth-Order Optimization and Evolution Strategy methods: the variance of the approximation increases with the dimension of random perturbations. Reducing the learning rate can help but may result in slower convergence. However, we observe that deploying models on edge devices typically involves fine-tuning rather than training from scratch. Our method can flexibly incorporate the principles of efficient transfer learning by introducing a scaling factor \(\) to the randomly sampled tangent:
+
+\[u^{}_{w_{l}}=u_{w_{l}}_{w_{l}}\]
+
+The modified \(u^{}_{w_{l}}\) still supports an approximation of the true gradient, with the expectation of the modified estimator being \(_{w_{l}}^{2} f(x;w_{l})\). When \(_{w_{l}}\) is set to \(0\), the corresponding parameter is "frozen," resulting in no perturbation or updates and a transparent transmission of JVP values. By adjusting \(\) to various values, we can either fix or reduce the influence and learning of specific layers, aligning our approach with the objectives of efficient transfer learning.
+
+### Acceleration of AsyncFGD
+
+When \(K=1\) the AsyncFGD is reduced to vanilla FGD without any time delay in parameters. When \(K 2\), we can distribute the network across multiple workers. Figure 2 shows the computational time of different algorithms in ideal conditions (i.e. the network is evenly distributed and the communication is overlapped by computation and update). \(T_{F}\) denotes the time for forward pass and \(T_{U}\) denotes the time for updates. It is easy to see that AsyncFGD can fully utilize the computation resources, thus achieving considerable speedup.
+
+## 5 Convergence Analysis
+
+In this section, we provide the convergence guarantee of Algorithm 1 to critical points in a non-convex setup. We first make the following basic assumptions for nonconvex optimization:
+
+**Assumption 5.1**.: The gradient of \(f(w)\) is Lipschitz continuous with Lipschitz constant \(L>0\), \(i.e.,\)
+
+\[ x,y^{d},\| f(x)- f(y)\| L\|x-y\|.\]
+
+**Assumption 5.2**.: The second moment of stochastic gradient is bounded, i.e., there exist a constant \(M 0\), for any sample \(x_{i}\) and \( w^{d}\):
+
+\[\| f_{x_{i}}(w)\|^{2} M.\]
+
+**Lemma 5.3** (Mean and Variance).: _Let \(t^{}=t-K+1\) and diagonal matrices \(_{0},,_{k},,_{K-1}^{d  d}\) such that all the principle diagonal elements of \(_{k}\) in \((k)\) are \(1\), and all the principle diagonal elements of \(I_{k}\) in other than \((k)\) are \(0\). Then we can obtain the mean value and the variance of the forward gradient as follows,_
+
+\[_{u^{t^{}}_{(k)}}(o^{t^{}}_{ L_{K-1}} u^{t^{}}_{_{(k)}})= f_{ (k),x_{i(t^{})}}(w^{t^{}-K+k+1}), \] \[_{u^{t^{}}_{w}}\|_{k=0}^{K-1}_ {k}^{t^{}}_{L_{K-1}} u^{t^{}}_{w_{(k) }}\|^{2}(d+4)\|_{k=0}^{K-1}_{k} f_{(k),x_{i(t^{})}}(w^{t^{}-K+k+1})\|^{2}. \]
+
+_Remark 5.4_.: Note that, from modules \(0\) to \(K-1\), the corresponding time delays are from \(K-1\) to \(0\). Specifically, in timestamp \(t^{}\), when \(k=K-1\), \(_{u^{t^{}}_{(K-1)}}(o^{t^{}}_{L} u^ {t^{}}_{w_{(K-1)}})= f_{(K-1),x_{i(t^{ })}}(w^{t^{}})\) indicates that the forward gradient in module \(K-1\) is an unbiased estimation of the up-to-date gradient.
+
+Under Assumption 5.1 and 5.2, we obtain the following descent lemma about the objective function value:
+
+**Lemma 5.5**.: _Assume that Assumption 5.1 and 5.2 hold. In addition, let \(t^{}=t-K+1,:=_{t^{}}-K+1 )}}{_{t^{}}}\), \(M_{K}=KM+ K^{4}M\) and choose \(_{t^{}}\). The iterations in Algorithm 1 satisfy the following descent property in expectation, \( t^{}\):_
+
+\[[f(w^{t^{}+1})]-f(w^{t^{}}) -}}{2}\| f(w^{t^{}})\|^{2}+4(d+4)L_{ t^{}}^{2}M_{K}, \]
+
+Figure 2: Comparison of computation time and training process when the network is deployed across \(K\) workers. Since \(T_{F}\) is much larger than \(T_{U}\), AsyncFGD can achieve considerable speedup.
+
+**Theorem 5.6**.: _Assume Assumption 5.1 and 5.2 hold and the fixed stepsize sequence \(\{_{t^{}}\}\) satisfies \(_{t^{}}=\), \( t^{}\{0,1,,T-1\}\). In addition, we assume \(w^{*}\) to be the optimal solution to \(f(w)\) and let \(t^{}=t-K+1\), \(=1\) such that \(M_{K}=KM+K^{4}M\). Then, the output of Algorithm 1 satisfies that:_
+
+\[_{t^{}=0}^{T-1}\| f(w^{t^{}})\|^{2} )-f(w^{*}))}{ T}+4(d+4)L M_{K}. \]
+
+**Theorem 5.7**.: _Assume Assumption 5.1 and 5.2 hold and the diminishing stepsize sequence \(\{_{t^{}}\}\) satisfies \(_{t^{}}=}{t^{}+1}\). In addition, we assume \(w^{*}\) to be the optimal solution to \(f(w)\) and let \(t^{}=t-K+1\), \(=K\) such that \(M_{K}=KM+K^{5}M\). Let \(_{T}=_{t^{}=0}^{T-1}_{t^{}}\), the output of Algorithm 1 satisfies that:_
+
+\[}_{t^{}=0}^{T-1}_{t^{}}\|  f(w^{t^{}})\|^{2})-f(w^{*}))}{ _{T}}+=0}^{T-1}4(d+4)_{t^{}}^{2}LM_{K}}{ _{T}} \]
+
+_Remark 5.8_.: Since the stepsize sequence \(_{t}=}{t+1}\) satisfies that \(_{T}_{t=0}^{T-1}_{t}=\), \(_{T}_{t=0}^{T-1}_{t}^{2}<\), when \(T\), the RHS of Eq.(14) will converges to \(0\). Let \(w^{s}\) be randomly chosen from \(\{w^{t^{}}\}_{t^{}=0}^{T-1}\) with probabilities proportional to \(\{_{t^{}}\}_{t^{}=0}^{T-1}\), then we have \(_{s}\| f(w^{s})\|^{2}=0\).
+
+## 6 Experiments
+
+This section embarks on a meticulous examination of our proposed method, AsyncFGD. We assess its performance through three distinct facets: memory consumption, acceleration rate, and accuracy. We initiate our analysis by outlining our experimental setup. To validate the efficacy of applying directional derivatives and utilizing module-wise stale parameters, we contrast AsyncFGD with an array of alternative methods encompassing backpropagation, conventional FGD, and other backpropagation-free algorithms. Subsequently, our focus shifts towards scrutinizing the potential of AsyncFGD within the sphere of efficient transfer learning, conducting experiments on prevalent efficient networks. Memory consumption represents another cardinal aspect that we explore, benchmarking AsyncFGD against popular architectures and unit layers like fully-connected layers, RNN cells, and convolutional layers. Concluding our empirical investigation, we assess the speedup of our method relative to other parallel strategies under a diverse set of conditions across multiple platforms.
+
+### Experimental Setup
+
+**Methods.** We contrast our proposal's memory footprint with Backpropagation, Sublinear , Backpropagation through time, and Memory Efficient BPTT . Accuracy-wise, we compare with backpropagation-free methods: Feedback Alignment (FA) , Direct Feedback Alignment (DFA) , Direct Random Tangent Propagation, and Error-sign-based Direct Feedback Alignment (sDFA) . We also apply parallelization to FGD through FGD-DP (data parallelism) and FGD-MP (model parallelism).
+
+**Platform.** Experiments utilize Python 3.8 and Pytorch, primarily on nVidia's AGX Orin. Additional results on alternate platforms are in the appendix.
+
+**Training.** Batch size is 64 unless noted. The optimal learning rate (chosen from \(\{1e-5,1e-4,1e-3,1e-2\}\) with Adam optimizer ) is based on validation performance. The parameter \(\) is initially set to \(1\) for the classifier, with others at \(0\) for the first 10 epochs. Subsequently, \(\) is gradually increased to \(0.15\) for specific layers. More details are in the appendix.
+
+### Effectiveness of Directional Derivative and Asynchronism
+
+This section documents our experimentation on the effectiveness of using random directional derivative to approximate the true gradient by contrasting it with other BP-free algorithms. Furthermore, we demonstrate that the consistency remains intact when using module-wise stale parameters to uncouple the dependencies, comparing AsyncFGD with vanilla FGD. Results in Table 1 indicate that AsyncFGD can produce results closely aligned with vanilla FGD. Notably, FGD and AsyncFGD yieldthe most optimal outcomes when the network is more complex, or when we employ ReLU as the activation function devoid of batchnorm layers (results from ConvS\({}_{ReLU}\) and FCS\({}_{ReLU}\)), situations where FA, DFA and sDFA often fail to propagate an effective error message. Backpropagation results are also furnished solely as a reference to true gradient results. However, when the network grows larger, all BP-free algorithms grapple with variance. The use of larger networks results in only minor improvements compared to BP. We try to address this challenge through efficient transfer learning in the subsequent section.
+
+### Efficacy of Efficient Transfer Learning
+
+In this segment, we delve into the efficacy of amalgamating AsyncFGD with efficient transfer learning, focusing on popular architectures like ResNet-18(Res-18) ; MobileNet (Mobile); MnasNet(Mnas) and ShuffleNet(Shuffle) with their lightweight counterpart. The models are fine-tuned with weights pre-trained on Imagenet. AsyncFGD\({}^{}\) denotes AsyncFGD utilizing the efficient training strategy. As can be observed from Table 2, the application of an efficient transfer learning strategy brings about substantial performance enhancement, yielding superior results
+
+    &  &  &  \\   & & & FA & DFA & sDFA & DRTP & FGD & Async \\    & ConvS\({}_{Tanh}\) & 98.7 & 88.1 & 95.9 & **96.8** & 95.4 & 94.6 & 94.4 \\  & ConvS\({}_{ReLU}\) & 99.2 & 12.0 & 11.5 & 13.8 & 13.6 & **95.5** & **95.5** \\  & ConvL\({}_{Tanh}\) & 99.3 & 8.7 & 92.2 & 93.4 & 92.6 & **94.4** & **94.2** \\  & ConvL\({}_{ReLU}\) & 99.3 & 89.7 & 93.0 & 93.1 & **93.2** & 93.0 & **93.2** \\  & FCS\({}_{Tanh}\) & 98.9 & 83.2 & **95.6** & 94.2 & 94.5 & 94.4 & 94.3 \\  & FCS\({}_{ReLU}\) & 98.5 & 8.8 & 10.0 & 10.8 & 9.9 & 93.6 & **93.7** \\  & FCL\({}_{Tanh}\) & 98.8 & 89.8 & 93.0 & 92.0 & 92.4 & **95.2** & **95.4** \\  & FCL\({}_{ReLU}\) & 99.3 & 86.3 & 93.8 & 94.3 & 94.1 & 94.8 & **95.3** \\   & ConvS\({}_{Tanh}\) & 69.1 & 33.4 & 56.5 & 57.4 & **57.6** & 46.5 & 46.0 \\  & ConvS\({}_{ReLU}\) & 69.3 & 12.0 & 11.5 & 10.8 & 12.0 & **40.0** & 39.7 \\  & ConvL\({}_{Tanh}\) & 71.0 & 40.4 & 42.0 & 43.6 & 44.1 & **47.3** & **47.3** \\  & ConvL\({}_{ReLU}\) & 71.2 & 40.4 & 42.0 & 43.6 & 44.1 & **44.2** & 44.1 \\  & FCS\({}_{Tanh}\) & **47.8** & 46.2 & 46.4 & 46.0 & 46.2 & 42.0 & 42.3 \\  & FCS\({}_{ReLU}\) & 52.7 & 10.2 & 12.0 & 10.0 & 10.3 & **43.7** & 43.6 \\  & FCL\({}_{Tanh}\) & 54.4 & 17.4 & 44.0 & 44.3 & 45.5 & **47.2** & **47.2** \\  & FCL\({}_{ReLU}\) & 55.3 & 40.4 & 42.0 & 43.6 & 44.1 & 46.0 & **46.7** \\   
+
+Table 1: Comparison for AsyncFGD with other BP-free methods. ConvS and FCS refers to small convolutional network and full-connected network while ConvL and FCL refers to their slightly bigger couterpart. Different activation functions are marked as subscript. Details of network architecutre can be found in Appendix H.2
+
+Figure 3: Memory footprint comparison across methods. Async\({}^{}\) is AsyncFGD without tangent checkpoint while Async\({}^{*}\) refers to AsyncFGD using efficient training strategy. (a) FC layer memory vs. layer count; (b) RNN memory vs. sequential length; (c) Accuracy vs. memory on efficient architectures.
+
+compared to training with perturbation on the full model. Ablation studies on \(\) provided in Appendix I.1 also shows that, compared to optimizing subset of the model, FGD suffers more from variance.
+
+### Memory Footprint
+
+As illustrated in Fig 3(c), when we plot accuracy against memory consumption, it is evident that AsyncFGD employs approximately one-third of the memory while maintaining close accuracy. Further experimentation on memory consumption with respect to the computing unit reveals, as shown in Fig 3(a) and Fig 3(b), that the additional memory consumption in AsyncFGD mainly serves as placeholders for random tangents, while the JVP computation consumes a negligible amount of additional memory. Memory consumption of other basic units like CNN and batch norm layers, are provided in Appendix.
+
+### Acceleration on Input Stream
+
+In this final section, we assess the acceleration of ResNet-18 with varying \(K\). In this setting, the batch size is set to 4 to better reflect the mechanism of streamlined input on edge device. As demonstrated in 4, AsyncFGD, by detaching dependencies in the forward pass, can outperform other parallel strategies in terms of acceleration rate. While pipeline parallelism is fast, the locking within the forward pass still induces overhead for synchronization, ultimately leading to lower hardware utilization and speed. Results pertaining to different network architectures and other platforms like CPU and GPU as well as more generalized case for larger batch size can be found in the Appendix I.2.
+
+## 7 Limitations and Discussion
+
+While AsyncFGD offers computational benefits, it is not without limitations. A key drawback is its inferior performance compared to traditional Backpropagation (BP). This performance disparity is largely attributed to the use of randomly sampled directional derivatives in the forward gradient computation, aligning AsyncFGD with Zeroth-Order (ZO) optimization methods and evolutionary strategies. This sampling introduces a significant source of gradient variance, a challenge that is part of a larger problem in the field of stochastic optimization. However, we take encouragement from
+
+   Dataset & Model & BP & FGD & Async & Async\({}^{*}\) \\    & Res-18 & 98.5 & 90.6 & 90.4 & **96.4** \\  & Mobile & 99.2 & 89.3 & 88.4 & **97.1** \\  & Efficient & 99.2 & 90.4 & 90.1 & **95.9** \\  & Mnas & 98.9 & 86.6 & 86.3 & **96.0** \\  & Shuffle & 99.0 & 85.8 & 85.8 & **96.4** \\   & Res-18 & 93.0 & 71.2 & 71.2 & **87.8** \\  & Mobile & 94.0 & 72.3 & 72.2 & **91.1** \\  & Efficient & 94.9 & 70.2 & 70.1 & **90.2** \\  & Mnas & 84.2 & 68.8 & 68.5 & **78.9** \\  & Shuffle & 89.9 & 72.5 & 72.5 & **82.0** \\   & Res-18 & 94.2 & 80.2 & 80.2 & **88.0** \\  & Mobile & 93.2 & 82.3 & 83.1 & **90.6** \\   & Efficient & 92.8 & 79.8 & 79.8 & **90.4** \\   & Mnas & 92.1 & 77.1 & 77.0 & **87.0** \\   & Shuffle & 92.8 & 78.4 & 78.4 & **87.3** \\   
+
+Table 2: Results for different algorithms in transfer learning. Async\({}^{*}\) refers to using efficient transfer learning strategy.
+
+Figure 4: Comparison for acceleration of different parallel methods.
+
+recent advancements aimed at reducing this variance, some of which have even facilitated the training of large-scale models .
+
+Another constraint pertains to the availability of idle workers on edge devices--a condition that is not universally applicable given the wide variety of edge computing environments. These can span from IoT chips with limited computational resources, where even deploying a standard deep learning model can be problematic, to high-capacity micro-computers used in autonomous vehicles.
+
+Nevertheless, our experimental findings suggest that AsyncFGD is particularly beneficial for specific edge computing scenarios. In such settings, it may serve as a viable alternative for reducing memory usage while fully leveraging available computational resources.
+
+## 8 Conclusion
+
+In the present paper, we introduce AsyncFGD, an innovative approach designed to shatter the shackles of locking within the forward pass in FGD. This is achieved by incorporating module-wise stale parameters, simultaneously retaining the advantage of minimized memory consumption. In the theoretical segment, we offer a lucid analysis of this partially ordered staleness, demonstrating that our proposed method is capable of converging to critical points even in the face of non-convex problems. We further extend our algorithm to efficient transfer learning by introducing a scale parameter. Our experimental reveals that a sublinear acceleration can be accomplished, without compromising accuracy as well as huge performance gain when utilizing efficient transfer learning strategy. While the exploration of large models employing extensive datasets will undoubtedly continue to rely on backpropagation , we assert that the potential of asynchronous algorithms predicated on forward computation should not be overlooked. It offers a promising avenue for fully harnessing limited resources in on-device learning scenarios.

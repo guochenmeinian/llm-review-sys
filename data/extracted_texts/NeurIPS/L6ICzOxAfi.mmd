@@ -1,0 +1,233 @@
+# LoCo: Learning 3D Location-Consistent Image Features with a Memory-Efficient Ranking Loss
+
+**Dominik A. Kloepfer**
+
+Visual Geometry Group
+
+University of Oxford
+
+dominik@robots.ox.ac.uk
+
+**Joao Henriques**
+
+Visual Geometry Group
+
+University of Oxford
+
+joao@robots.ox.ac.uk
+
+**Dylan Campbell**
+
+School of Computing
+
+Australian National University
+
+dylan.campbell@anu.edu.au
+
+###### Abstract
+
+Image feature extractors are rendered substantially more useful if different views of the same 3D location yield similar features while still being distinct from other locations. A feature extractor that achieves this goal even under significant viewpoint changes must recognise not just semantic categories in a scene, but also understand how different objects relate to each other in three dimensions. Existing work addresses this task by posing it as a patch retrieval problem, training the extracted features to facilitate retrieval of all image patches that project from the same 3D location. However, this approach uses a loss formulation that requires substantial memory and computation resources, limiting its applicability for large-scale training. We present a method for memory-efficient learning of location-consistent features that reformulates and approximates the smooth average precision objective. This novel loss function enables improvements in memory efficiency by three orders of magnitude, mitigating a key bottleneck of previous methods and allowing much larger models to be trained with the same computational resources. We showcase the improved location consistency of our trained feature extractor directly on a multi-view consistency task, as well as the downstream task of scene-stable panoptic segmentation, significantly outperforming previous state-of-the-art.
+
+Figure 1: Our approach—LoCo—offers memory-efficient learning of location-consistent (LoCo) features. That is, features that backproject to nearby 3D locations are encouraged to have similar image patch features (illustrated here by the pair of blue stacked cubes and the pair of red stacked cubes), while those that backproject to well-separated points are trained to have more dissimilar features (here, the blue _vs._ red cube stacks). This is achieved via a novel ranking loss that reformulates and corrects the smooth average precision loss proposed in previous work . This facilitates the derivation of a close approximation to the loss that is significantly more efficient to compute, allowing the method to scale to much larger models with the same computational resources.
+
+Introduction
+
+Reasoning in 3D is critical for developing a useful visual understanding of an environment. However, image-centric approaches, including patch feature extractors like DINO [5; 31], are not 3D-consistent, as a recent paper by El Banani _et al_.  demonstrates. That is, the same 3D location may yield significantly different features from different viewpoints in space and time, due to occlusions, self-occlusion, reflections, lighting variations, and motion. When this occurs, it is challenging to maintain a spatially and temporally consistent model of the world. Thus, it is useful to first convert visual observations into a form that is stable across different spatio-temporal viewpoints.
+
+Existing approaches [3; 18; 27; 29; 40] aggregate or distil visual features in 3D, ensuring view-consistency at the cost of requiring a full 3D reconstruction pipeline. In contrast, recent work  explores a more flexible image-centered representation that encourages similarity between image patch features that backproject to the same region of 3D space, within a spatial tolerance. It employs a ranking-based loss function, smooth Average Precision (sAP), to encourage all spatially co-located features to be similar and all non-colocated features to be dissimilar, as illustrated in Fig. 1.
+
+Like this approach, we formulate the learning problem as one of patch retrieval: given one image patch, retrieve with high precision and recall all patches in other views that project from the same 3D region. However, the smooth Average Precision (sAP) loss function requires substantial memory and computation, precluding its deployment in large-scale training. By rewriting the loss function in terms of pairs of image patches rather than individual patches, we derive a more general form of the sAP objective that lends itself to approximation. This novel formulation enables improvements in memory efficiency by three orders of magnitude, mitigating a key bottleneck and allowing larger models to be trained with the same computational resources. By applying this novel loss function within a new training strategy, we obtain a method for memory-efficient learning of location-consistent (LoCo) features that are semantically-meaningful and stable across viewpoints. Our contributions are:
+
+1. A novel reformulation and approximation of the smooth average precision loss function that can be computed significantly more efficiently than the original;
+2. A training strategy for scalable and memory-efficient learning of location-consistent image features; and
+3. Applications to pixel correspondence estimation and scene-stable panoptic segmentation.
+
+The approach is evaluated on a recently proposed multi-view consistency task  and is tested on two real-world indoor datasets, significantly outperforming state-of-the-art feature extractors.
+
+## 2 Related Work
+
+The topics of panoptic image segmentation , visual place recognition [20; 23], image retrieval [2; 4; 13; 32], and visual feature learning [5; 16] are well-studied. Here, we focus on the most recent and related work.
+
+**Image segmentation.** Visual features from pre-trained models were shown to be very useful for panoptic (instance and semantic) image segmentation [5; 25; 43]. Interestingly, location-consistent visual features unlock the possibility of "scene-stable panoptic segmentation", where instance IDs are consistent across multiple views of the same scene . This is related to identity-preserving video segmentation , where object identities are tracked, leveraging temporal smoothness.
+
+**Image retrieval.** Learning representations that facilitate the ranking of images according to their relevance to a query has been studied extensively [2; 13; 32]. One class of approaches, metric learning, uses contrastive losses [8; 42] to encourage positive instances to be close and negative instances to be further apart, while others optimise ranking-based metrics like Average Precision (AP) directly [4; 34]. For example, Smooth-AP  recommends the use of an approximated AP ranking function, which targets the correct ranking without being concerned with the absolute feature distances. We pose our location-consistent feature learning problem as a patch retrieval problem, allowing us to adapt strategies from the image retrieval literature.
+
+**Self-supervised visual feature learning.** Self-supervision has emerged as a dominant strategy for training foundation models in computer vision on large-scale image datasets. Notably, DINO  leveraged a knowledge-distillation framework to learn to extract semantically meaningful feature maps. Building upon DINO's foundation, DINOv2  refines the training algorithm and scales up model sizes on larger datasets, resulting in enhanced performance. Another noteworthy approach is the Masked Autoencoder (MAE) , which employs an autoencoder architecture to reconstruct masked-out patches, and demonstrated the scalability of autoencoders to large datasets.
+
+In a similar vein, CroCo  and its successor, CroCo-v2 , also adopt an encoder-decoder architecture for reconstructing masked-out patches. However, in these works the decoder reconstructs the patches based on a feature map extracted from a non-masked image of the same scene but observed from a different viewpoint. While we also use different viewpoints as the source of the supervision signal like CroCo, the learning process is quite different and makes more explicit use of geometric constraints in forming positive and negative pairs of patches (_cf_. Section 3.2). Most closely related to our work is LoCUS , which uses a similar problem set-up and loss function. Where they approach the task from the perspective of extracting distinctive landmarks (individual patches or points in the scene), our areas of interest are _pairs_ of patches. Crucially, this allows us to massively decrease the algorithm's memory consumption and unlock significant performance gains. We provide further detail in Section 3.
+
+Other works [27; 29; 40] distil visual features in 3D in order to ensure location-consistency, the same goal as our approach. For example, N3F  distilled DINO image features into a 3D feature field using the same rendering loss as NeRF . While the resulting features are 3D-consistent by design, this comes at the cost of requiring a full 3D reconstruction pipeline. In contrast, our approach is image-centric and lightweight, predicting location-consistent features from one image at a time without requiring input poses or re-training for new scenes.
+
+## 3 Efficiently Learning LoCo Image Features
+
+In this section, we outline our method for learning 3D location-consistent (LoCo) image features in a scalable, memory-efficient way. We first formalise the problem definition and define the positive and negative sets, then we reformulate the retrieval objective function and show how this facilitates very significant reductions in the memory requirements. This allows our method to overcome a critical bottleneck in the learning process for these features, permitting us to scale up the model size. Sec. 4 shows that this has a large impact on performance, justifying the need for the reformulation.
+
+### Problem Definition
+
+Our goal is to extract feature maps so that the extracted features are similar for sets of image patches that depict the same region in 3D space. Like Kloepfer _et al_. , we make this task tractable by recognising that feature maps solving this task can also be used for _patch retrieval_: given an image patch and associated feature vector, retrieve all patches that project from the same region in 3D space. This allows us to adapt methods from the extensive literature on image retrieval.
+
+Formally, given a set \(\) of training images \(I_{i}^{H W 3}\) drawn from an environment \(e\), we aim to train a feature extractor \(:^{h w d}\). Here, \(h H\) and \(w W\) are the height and width of the extracted feature map, and \(d\) is the dimension of the extracted feature vectors, so each feature vector is associated with an image patch \(x_{k} I_{i}\) consisting of \(\) pixels.
+
+We denote an image patch as \(x_{k}\), the associated feature vector as \(_{k}\), a patch pair as \(c_{}=(x_{i},x_{j})\), and the associated cosine similarity score between the feature vectors of a patch pair as \(s_{}=_{i}^{}_{j}/(\|_{i}\|\|_{j}\|)\). We use Greek subscripts to index _pairs of patches_, rather than individual patches. Each patch \(x_{k} I_{i}\) is also associated with a point \(p_{k}^{3}\) in the environment, obtained by backprojecting the centre coordinates of the patch into the environment using estimated or provided camera intrinsic and extrinsic parameters and depth . This auxiliary information is only required at training time; at test time the trained feature extractor \(\) only requires a raw RGB image.
+
+### Positive and Negative Sets
+
+As illustrated in Fig. 1(a), we define two patches \(x_{i}\) and \(x_{j}\), not necessarily from the same image, as a 'positive' pair if and only if they are drawn from images in the same environment and the distance between their associated 3D points \(p_{i}\) and \(p_{j}\) is below a threshold \(\). Therefore, given the index of the environment \(e_{i}\) associated to each patch \(x_{i}\), the set of all positive pairs is
+
+\[=\{(x_{i},x_{j}):\|p_{i}-p_{j}\|\,\,e_{i}=e_{j}\}.\] (1)
+
+Pairs of patches that do not observe the same 3D region form a 'negative' pair. As a form of hard negative mining, we restrict our attention to those negative pairs whose patches depict locationswithin a distance of \(>\) of each other, and define the set of negative pairs as \(=\{(x_{i},x_{j}):<\|p_{i}-p_{j}\|\,\,e_{i}=e_{ j}\}\). For convenience we also define the set of all training pairs \(=\). For a given patch \(x_{i}\), the thresholds \(\) and \(\) define a positive and a negative region around the associated 3D point \(p_{i}\). All other patches that observe points inside the radius-\(\) sphere centred at \(p_{i}\) will form a positive patch pair with \(x_{i}\). Likewise, all other patches that observe points outside this sphere but inside the radius-\(\) sphere centred at \(p_{i}\) will form a negative patch pair with \(x_{i}\). The features of the positive pairs are encouraged to be more similar than those of the negative pairs.
+
+It should also be noted that the finite size of these regions means that the training is robust to noise in the depth maps and camera poses used to compute the patch locations in 3D. Noisy patch locations effectively only slightly change the size of these regions and so we expect them not to fundamentally alter the learning algorithm. This could open the door to using less accurate estimates for depth and camera poses in future, which may be easier to obtain, in particular for large-scale datasets.
+
+### A Ranking Loss Function for Patch Retrieval
+
+The smooth average precision (AP) loss function, originally introduced in Brown _et al_. , was adapted to the setting of patch retrieval around "tentative 3D landmarks" by Kloepfer _et al_. , resulting in a vectorised form of the loss function. We streamline this setting by eliminating the need for these landmarks, and instead focus exclusively on retrieving positive pairs of patches.
+
+The aforementioned vectorised smooth AP loss function can be rewritten in terms of patch pairs as
+
+\[(;,,) =-|}_{c_{}}\{c_{}\}}_{}(s_{}-s _{})}{1+_{c_{}\{c_{}\}}_{}(s _{}-s_{})}\] (2) \[=-|}_{c_{}}\{c_{}\}}_{}(s_{}-s _{})}{1+_{c_{}\{c_{}\}}_{ }(s_{}-s_{})+_{c_{}}_{}(s_{ }-s_{})},\]
+
+where \(_{}(x)=(1+(-x/))^{-1}\) is the sigmoid function with temperature \(\).
+
+This loss function computes a differentiable approximation to the average precision of a binary classifier that classifies pairs of patches as positive or negative based on the similarity of each pair. This approximation becomes exact as \( 0\) and the sigmoid approaches the indicator function. For each positive pair \(c_{}\), Eq. (2) calculates the ratio of the rank of \(c_{}\) among all positive pairs and its rank among all pairs (positive and negative) when ranking the pairs by decreasing similarity. More details can be found in Brown _et al_. .
+
+Compared with standard contrastive losses, like a triplet loss  or SimCLR , the gradient \(/ s_{}\) of this ranking loss with respect to the similarity of a positive pair \(c_{}\) will disappear as
+
+Figure 2: **(a)** The distance between 3D points \(p_{i}\) associated with patch pairs \((x_{i},x_{j})\) in the positive set is less than \(\), denoted by the green arrows connecting them. The distance between those in the negative set is in \((,]\), denoted by the red arrows connecting them. All unconnected 3D point pairs are in neither the positive nor negative set, since they are separated by a distance greater than \(\). **(b)** When the absolute similarity difference \(|s_{}-s_{}|\) between image pair \(\) and pair \(\) is large, the sigmoid in the loss function (blue curve) becomes saturated and does not impact learning. We can avoid the memory cost of back-propagation in these cases by separating the positive \(\) and negative \(\) pairs into 3 subsets: saturated below, unsaturated, and saturated above. We choose the saturation threshold \(\) such that the sigmoid gradient there is 0.2% of its maximum value.
+
+soon as \(s_{}\) is higher than the similarities of all negative pairs. That is, it does not force \(s_{}+1\) for positive pairs and \(s_{}-1\) for negative pairs, it merely encourages some boundary to exist somewhere between positive and negative pair similarities. This "gentler" contrastive characteristic greatly aids training convergence .
+
+### Correction Terms for the Batched Loss Function
+
+The sums in Eq. (2) run over all pairs of (positive) patches in the training set. Clearly, computing the exact loss function is completely infeasible for large datasets. However, when sampling batches of positive and negative pairs, correction terms are needed to make the expectation value of the batched loss equal to the exact (unbatched) loss. In particular, some care needs to be taken since each term in the loss function depends on multiple different samples within the batch. Using the subscript \(B\) to refer to the batched versions of the sets \(_{B}\) and \(_{B}\) of positive and negative pairs, the batched version of our loss function becomes
+
+\[_{B}\,=\,-_{B}|}_{c_{}_{ B}}|}{|_{B}|}_{c_{}_{B} \{c_{}\}}\,_{}(s_{}-s_{})}{1+|}{|_{B}|}_{c_{}_{B}\{c_{ }\}}\,_{}(s_{}-s_{})+|}{|_{B}|}_{c_{}_{B}}_{}(s_{}-s_{})}.\] (3)
+
+The correction factors \(|}{|_{B}|}\) and \(|}{|_{B}|}\) are necessary to ensure that the expectation value of the batched loss is as close as possible to the loss computed across the entire dataset. This is automatically the case for standard loss functions that average over a per-sample loss, due to the linearity of the expected value. However, since the ranking loss computes the (non-linear) ratio of expectations over samples, this linearity is lost. Each loss term depends on multiple pairs, and the \(+1\) terms in numerator and denominator introduce additional complications for finding an unbiased estimator. For a detailed derivation of Eq. (3) we refer the reader to Appendix B, where we show that it is a ratio estimator  that is simple to calculate and consistent, but has a bias of order \(O(1/|_{B}|)\).
+
+We note here that neither Brown _et al_.  nor Kloepfer _et al_.  include these correction factors, which cause the losses in those works to deviate even further from the desired average precision approximation. We quantify this deviation in the appendix.
+
+### Improving the Memory Efficiency
+
+A key bottleneck of the loss in Eq. (3) is the memory consumption of the \(|_{B}|(|_{B}|+|_{B}|)\) matrix containing all the values of \(s_{}-s_{}\) and \(s_{}-s_{}\), and the associated computation graph. Since each occurrence of the similarity of a particular patch pair in the loss function only provides a supervision signal for the feature vectors of two individual patches, the batches of positive and negative patch pairs need to be quite large (Kloepfer _et al_.  use \(|_{B}| 13,000\) and \(|_{B}| 100,000\)).
+
+To alleviate this problem, we design two ways to significantly reduce the memory consumption of this matrix. First, we observe that the positive pairs \(c_{}\) in Eq. (3) do not need to be drawn from the same subset of all positive pairs as the ones in \(c_{}\). As long as both are sampled uniformly from the set of all positive pairs, the expected value of the batched loss continues to equal the non-batched loss of Eq. (2). Sampling \(c_{}\) from a small set of positive pairs \(^{}_{B}\) and \(c_{}\) from a large set \(_{B}\), with \(|^{}_{B}||_{B}|\), reduces the size of the matrix of similarity differences to \(|^{}_{B}|(|_{B}|+|_{B}|)\): only the second dimension is large, while previously both dimensions were large and of comparable size. At the same time, this still retains a supervision signal for a large number of feature vectors, namely those used to construct the larger sets \(_{B}\) and \(_{B}\).
+
+Second, we observe that, in practice, a large number of the computed similarity differences saturate the sigmoid function. That is, when \(|s_{}-s_{}| 0\), the gradient of the sigmoid \(_{}(s_{}-s_{})\) vanishes: these terms make no material difference to the loss gradient. We can use this fact to significantly reduce the number of similarity differences in the computation graph. To do so, we set a threshold \(>0\) and use the approximation, visualised in Fig. 2b,
+
+\[_{}(s_{}-s_{})1&s_{}-s_{}> \\ _{}(s_{}-s_{})&|s_{}-s_{}|\\ 0&s_{}-s_{}<-\] (4)to divide the uniformly sampled sets of patch pairs \(_{B}\) and \(_{B}\) into three subsets for each \(c_{}_{B}^{}\),
+
+\[_{B} =_{B}^{}_{B}^{}_{ B}^{}\] (5) \[_{B}^{} =\{c_{}_{B}:s_{}-s_{}>\},\] (6) \[_{B}^{} =\{c_{}_{B}:|s_{}-s_{}|\},\] (7) \[_{B}^{} =\{c_{}_{B}:s_{}-s_{}<-\},\] (8)
+
+and similarly for \(_{B}\). We can now significantly reduce the number of similarity differences in the computation graph by only including patch pairs from \(_{B}^{}\) and \(_{B}^{}\) in the loss computation, to \(_{c_{}|_{B}^{}|}(|_{B}^{}|+| _{B}^{}|)\) in total. Computing these subsets for each \(c_{}\) still requires us to calculate all \(|_{B}^{}|(|_{B}|+|_{B}|)\) similarity differences, but because most pairs' gradients are close to 0 they are not used to compute the loss or any gradients, so these parts of the computational graph can be deleted, leading to substantial memory savings.
+
+To compensate for the non-uniform sampling of \(_{B}^{}\) and \(_{B}^{}\), we also need to add additional correction terms to our loss function. Our final memory-efficient, batched loss function is given by
+
+\[_{B} =\] (9)
+
+with the correction terms given by
+
+\[_{}^{+}=|_{B}^{}||}{| _{B}|}_{}^{-}=|_{B}^{}||}{|_{B}|}.\] (10)
+
+For a detailed derivation of these correction terms, as well as a derivation of an upper bound on the error due to the approximation in Eq. (4), we refer the reader to Appendix C.
+
+Restricting our sampling of patch pairs to those whose similarities fall within a certain range is reminiscent of hard negative mining, as previously employed in the context of contrastive learning by, _e.g._, Robinson _et al._. However, standard approaches are not easily applicable to our loss function since it operates on _pairs_ rather than individual samples. Furthermore, both motivation and effect of our approach differs from hard negative mining methods. We discuss this further in Appendix E, where we also compare empirically with standard contrastive learning and hard negative mining.
+
+## 4 Experiments
+
+In this section, we present our experiments, where we evaluate the performance of LoCo features at a multi-view consistency task and at scene-stable panoptic segmentation.
+
+### Experimental Setup
+
+The training dataset we use comprises 59 environments of the Matterport3D dataset, resizing the images to \(256 320\) pixels. The Matterport3D dataset is particularly suitable for our task of enforcing multi-view consistency due to its diversity and the way it captures varied viewpoints of the same scene through panorama cropping. Datasets such as ScanNet  provide less viewpoint variation per scene due to their trajectory-based data collection. Contrary to Kloepfer _et al_. , we use all available images in the Matterport3D training scenes instead of restricting to images taken in the horizontal plane.
+
+Due to limited computational resources, we were unable to use our loss function to train a full foundation model from scratch. Instead, we adapt the architecture used by DINO-Tracker , keeping pre-trained DINO  features frozen and training a convolutional neural network to learn additive residuals to those features. We use values of \(=0.5\)m for the positive radius, \(=5.0\)m for the negative radius, \(=0.01\) for the sigmoid temperature, and \(=0.076\) for the saturation threshold. With these values, \(_{}()=0.9995\) and the gradient is \(0.2\%\) of the maximum gradient of the sigmoid function, making this a conservative choice with little impact on the training dynamics. The threshold \(\) is a hyperparameter that can be decreased to obtain further memory savings, at the expense of some performance decrease. We provide further implementation details regarding the efficient sampling of patch pairs in Appendix D, and will publicly release our training code.
+
+### Baselines
+
+We compare our LoCo features to those from several state-of-the-art feature extractors, as well as models specialised to the downstream segmentation task.
+
+**DINO .** We use the pre-trained ViT-base model and extract 768-dimensional features for each patch of \(8 8\) pixels by discarding the class token and reshaping the output of the final Transformer-Block into a feature map.
+
+**DINOv2 .** We use the pre-trained ViT-base model and extract 768-dimensional features for each patch of \(14 14\) pixels by again discarding the class token and reshaping the output of the final Transformer-Block. We generally use higher-resolution images as inputs for this model to extract feature maps of the same shape as for LoCo and DINO features.
+
+**CroCo-v2 .** We use the ViT-base encoder that was pre-trained with the Base-Decoder and extract 768-dimensional features for each patch of \(16 16\) pixels, again using higher-resolution as inputs.
+
+**LoCUS .** We use the pre-trained LoCUS weights that are publicly available for a landmark-radius of 0.2m. We use it to extract 64-dimensional feature vectors for each patch of \(8 8\) pixels.
+
+**MaskDINO .** For the scene-stable object segmentation task (Section 4.4) we also compare with MaskDINO, a state-of-the-art specialised panoptic segmentation algorithm. It however is not designed to recognise the same object in different images. We therefore match the per-image object indices produced by the algorithm to the ground-truth per-scene object index whose mask has the highest IoU with the object mask in question.
+
+### Multi-View Consistency
+
+We first directly evaluate the location consistency of the features extracted by different models across different views. To do so, we follow the protocol introduced by El Banani _et al_.  to test the multi-view consistency of feature extractors on a pixel correspondence estimation task. Briefly, given a pair of images, we extract a fixed number of pixel matches by filtering the nearest neighbour matches using a ratio test. For more details, the reader is referred to the original paper .
+
+Like El Banani _et al_., we evaluate on the Paired ScanNet  split proposed by Sarlin _et al_. , reporting the recall at a reprojection error threshold of 10 pixels for different viewpoint changes in Table 1. As we can see, our model outperforms the baselines by a significant margin. We also see that DINOv2  performs worse than the original DINO . This situation is somewhat reversed when sourcing the features from the first six Transformer blocks (instead of the final feature map). This suggests that while earlier layers of DINOv2 are still reasonably location-consistent, later layers create more semantically meaningful features that accordingly do not vary much by the patches' location in 3D space, explaining why they perform worse in this setting. CroCo-v2  performs relatively poorly on this task, despite its training objective being explicitly designed for multi-view
+
+   Model & GPU & \(0^{}\)–\(15^{}\) & \(15^{}\)–\(30^{}\) & \(30^{}\)–\(60^{}\) & \(60^{}\)–\(180^{}\) \\  & Memory & & & & \\  LoCUS\({}^{}\) & 11GB & 23.5 & 18.8 & 13.5 & 7.5 \\ DINO  & & 45.0 & 34.3 & 22.6 & 10.7 \\ DINOv2  & & 37.0 & 27.5 & 19.7 & **11.2** \\ DINOv2 , Blocks 1–6 & & 47.1 & 36.4 & 22.4 & 8.4 \\ CroCo-v2  & & 16.8 & 12.4 & 7.4 & 3.7 \\  LoCo (\(=0.076\)) (Ours) & 48GB & **61.8** & **52.7** & **31.8** & 10.3 \\ LoCo (\(=0.053\)) & 42GB & 59.9 & 49.8 & 29.1 & 9.5 \\ LoCo (\(=0.029\)) & 40GB & 57.9 & 47.5 & 28.1 & 9.6 \\ LoCo (w/ DINOv2 backbone) & 38GB & 58.2 & 49.2 & 30.0 & 10.5 \\ LoCo (w/ LoCUS architecture)\({}^{}\) & 6GB & 27.8 & 18.0 & 12.1 & 6.9 \\   
+
+Table 1: Results on the pixel correspondence task on the Paired split  of ScanNet , as introduced by El Banani _et al_. . We report the recall of accurate pixel correspondences at a reprojection error threshold of 10 pixels, for image pairs with the respective viewpoint changes. We also report the GPU Memory required for training LoCUS-based and LoCo models (for LoCUS we use the authors’ values). \({}^{}\) uses 64-dimensional feature vectors.
+
+tasks. However, when training CroCo, the encoder features are first used by a transformer-based decoder module before a loss function is applied. This means that there is no incentive for CroCo features to be location-consistent under a simple and interpretable cosine-similarity operation, and would require a more complex adapter to support similarity-based operations.
+
+### Scene-Stable Panoptic Segmentation
+
+The task of scene-stable panoptic segmentation was originally introduced by Kloepfer _et al_. . Given a set of images of a single scene, the goal is to create a segmentation mask for the objects in each of these images, where, crucially, different views of the same individual object are labelled consistently with the same identity.
+
+Formally, for a set \(=\{I_{i}\}\) of images of the same scene, a set \(=\{0,,L-1\}=^{}^{}\) of _semantic_ classes that is split into'stuff' (amorphous classes such as floor, walls, etc) and 'things' (clearly distinct objects) subsets \(^{}\) and \(^{}\) respectively. The latter are also split into a set \(=\{0,,N-1\}\) of object instance IDs within the scene. The goal is to map each pixel \(p_{j}\) to its semantic class \(c_{j}\) if \(c_{j}^{}\), and to its scene-wide object instance \(o_{j}\) if \(c_{j}^{}\). This is similar to the standard panoptic segmentation task  with the crucial difference that the object instance indices are consistent across different images of the same scene.
+
+This task requires the algorithm to not just differentiate between multiple object instances of the same object class as in the conventional instance segmentation task, but also to recognise when different images show the same object, which requires a broader understanding of the scene geometry. The need to retain consistent object identities across different images is reminiscent of panoptic video segmentation . However, in our task the images are unordered and have much larger viewpoint changes, so methods cannot rely on pixel tracking or optical flow to keep object identities consistent. As is standard in self-supervised learning [5; 16; 26; 31], we train a linear probe to predict class labels from the feature vectors for every image patch.
+
+#### 4.4.1 Datasets.
+
+Both the Matterport3D  and ScanNet  datasets provide 3D-mesh reconstructions of their constituent environments, segmented into individual objects. This allows us to generate ground-truth segmentation masks for scene-consistent object segmentation by finding the individual objects in each scene that a ray through a given pixel intersects. Scripts to generate this data will be included in our code release. For the Matterport3D dataset, we evaluate on 18 unseen scenes, and for ScanNet we evaluate on 21 unseen scenes selected to show a range of different types of environments.
+
+#### 4.4.2 Results.
+
+We report our results on the Matterport3D dataset and on the ScanNet dataset in Section 4.4.1. We measure the scene-stable panoptic segmentation performance using three metrics, which we calculate for each object instance individually (for each object instance treating the segmentation masks as
+
+    &  &  &  \\  & & Jac & IoU & AP & Jac & IoU & AP \\  LoCUS  & 64 & 28.6 & 29.6 & 40.5 & 68.9 & 59.2 & 68.7 \\ DINO  & 768 & 65.2 & 65.5 & 81.6 & 81.8 & 73.7 & 84.9 \\ DINOv2  & 768 & 65.9 & 60.0 & 80.5 & 79.7 & 71.1 & 82.1 \\ CroCo-v2  & 768 & 65.5 & 67.0 & **87.0** & 81.5 & 73.8 & **89.4** \\ MaskDINO\({}^{}\) & 768 & 54.8 & 38.3 & 35.0 & 58.7 & 39.7 & 36.5 \\  LoCo (Ours) & 768 & **66.5** & **67.5** & 84.5 & **83.5** & **76.3** & 88.8 \\ LoCo (w/ DINOv2 backbone) & 768 & 61.1 & 58.5 & 80.4 & 80.4 & 71.0 & 83.8 \\ LoCo (w/ LoCUS architecture) & 64 & 10.5 & 7.3 & 11.2 & 58.9 & 47.3 & 58.1 \\   
+
+Table 2: Scene-stable panoptic segmentation results on unseen Matterport3D  and ScanNet  environments. Except for MaskDINO, each method extracts \(d\)-dimensional feature vectors for \(30 40\) patches that are then classified into a scene-wide object index using a linear probe. The feature dimension is \(d=768\), except for LoCUS (\(d=64\)) due to its high memory consumption. \({}^{}\)Per-image instance indices are matched to the ground-truth per-scene indices based on mask IoU.
+
+binary) and then average first across object instances in each scene and then across scenes. The Jaccard index (Jac) for each object instance is calculated by \(/(+)\), given the counts for True Positive (TP), False Positive (FP), and False Negative (FN) predictions. The Intersection-over-Union (IoU) is the intersection-over-union with the ground-truth masks. The Average Precision (AP) is that of the linear classifier in a one-vs-all mode, taking all other pixels as negative labels.
+
+Our LoCo-trained features perform better than all baselines, and have comparable performance to CroCo-v2 , which also makes use of multi-view supervision. However, ours has far fewer trainable parameters (only 28.9 million), since we only train a comparatively small CNN. In contrast, CroCo trains the entire network (85 million parameters) with a multi-view loss and on significantly larger datasets with greater computational resources (8 A100 GPUs _vs._ 1 RTX8000 GPU). We note also the strong performance of the original DINO compared to the newer DINOv2 method. As in the pixel correspondence task, this might be due to the final DINOv2 features focusing on semantic meaning, and so struggling to differentiate between, _e.g._, different chairs.
+
+### Ablations
+
+#### 4.5.1 DINOv2 Backbone.
+
+We also train our method using a frozen DINOv2  backbone, again training a convolutional neural network to learn additive residuals and keeping other hyperparameters the same.
+
+The resulting features significantly outperform the original pre-trained DINOv2 features for finding accurate pixel correspondences (Table 1), showing the advantage of LoCo-training in tasks that require location-consistent features. However, it slightly underperforms the LoCo model trained with the DINO-ViT-Base8 backbone. We hypothesize that this arises from the coarser feature map of the DINOv2-ViT-Base14 backbone (with a patch size of 14 instead of 8).
+
+On the panoptic scene-stable segmentation task (Section 4.4.1), the LoCo model trained with the DINOv2 backbone only outperforms the original DINOv2 feature extractor on some of the metrics. This is likely attributable to the coarser feature map of this backbone, which leads to less fine-grained patch-level supervision during training.
+
+#### 4.5.2 LoCUS Architecture.
+
+To further investigate the impact of our alterations to the loss function and training algorithm compared to Kloepfer _et al_. , we train the original LoCUS architecture with the LoCo loss function and algorithm.
+
+On the multi-view consistency task (Table 1), this model outperforms the original LoCUS model for small viewpoint changes, but underperforms for image pairs with larger viewpoint changes.
+
+In fact, the LoCUS architecture trained with the LoCo-algorithm performs worse than the original LoCUS model on the panoptic scene-stable segmentation task (Section 4.4.1).
+
+For this ablation, we trained for the same number of epochs as our other LoCo models, so it is possible that the vision transformer blocks in the LoCUS architecture require longer training times than the
+
+Figure 3: Scene-stable object segmentations for three images drawn from the Matterport3D  dataset. Ground-truth segmentations in the top row, predicted segmentations in the bottom row. The object identities and segmentation masks remain stable across significant viewpoint changes.
+
+convolutional layers of the LoCo models. In any case, this ablation illustrates that the improvements in memory efficiency do not by themselves lead to improvements in performance. Their advantage is that they allow for the training of larger models and higher-dimensional feature vectors with the same computational budget, the effect of which far outweighs any performance decrease due to our loss function and training algorithm changes.
+
+**Effect of \(\).** We analyse the impact of restricting further the range of similarities from which \(_{B}^{}\) and \(_{B}^{}\) are sampled by decreasing the saturation threshold \(\). The results of are shown in the last two rows of Table 1. We see that while there is a small decrease in performance as the threshold decreases, overall, the training is remarkably robust to more aggressive filtering of patch pairs. This confirms the intuition that only a small number of patch pairs contribute meaningfully to the gradient and that most patch pairs can be discarded without significantly impacting the training behaviour.
+
+### Memory Efficiency Analysis
+
+Using their training code, we find that the hyperparameters used in Kloepfer _et al_.  result in positive and negative pair set sizes of \(|_{B}| 13,000\) and \(|_{B}| 98,000\). The resulting matrix size, using single-precision floating point numbers, of \(|_{B}|(|_{B}|+|_{B}|) 51\)GB exceeds most computational limits, so the authors subsample \(10\%\) of the negative pairs to reduce the matrix size to \(5.7\)GB for a matrix with \(1.4\) billion entries. We instead use a value of \(|_{B}^{}|=32\) and find empirically that even with the conservative value \(\), roughly \(80\%\) of the pair differences are well-approximated as having zero-gradient. This means that \(|_{B}^{}|(1-0.8)|_{B}|\) and \(|_{B}^{}|(1-0.8)|_{B}|\). Assuming the same computational budget of \(5.7\)GB, our method can therefore use batches \(_{B}\) and \(_{B}\) that are larger by a factor of \( 2000\). In our experiments, we limit \(|_{B}^{}|<800\) and \(|_{B}^{}|<3,000\), resulting in the matrix occupying only \(500\)KB of memory, thereby freeening up GPU memory to train models with more parameters and with substantially larger feature vectors.
+
+## 5 Conclusion
+
+In this paper, we have proposed a method for the memory-efficient learning of location-consistent features. In particular, we present a reformulation of the smooth average precision ranking loss that corrects for biases induced by batching, and introduce an approximation that facilitates significant memory reductions without distorting the training signal. This mitigated a key memory bottleneck, allowing larger models to be trained with the same computational resources. Equipped with this novel retrieval-based objective function, we are able to efficiently learn to modulate DINO [5; 31] ViT features towards location-consistency.
+
+Our feature extractor demonstrates compelling performance on the downstream tasks of scene-stable panoptic segmentation and visual place recognition, outperforming previous state-of-the-art feature extractors. This work goes some way towards scaling up the training pipeline; however, there is significant scope for applying these techniques on truly large scale image or video data in an entirely self-supervised manner by estimating depth maps and camera poses using off-the-shelf methods.
+
+**Acknowledgements.** The authors acknowledge the generous support of the Royal Academy of Engineering (RF20181918163), and EPSRC (VisualAI, EP/T028572/1).

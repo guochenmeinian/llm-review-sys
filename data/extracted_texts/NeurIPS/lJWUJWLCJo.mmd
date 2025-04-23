@@ -1,0 +1,209 @@
+# Unlimiformer: Long-Range Transformers with
+
+Unlimited Length Input
+
+ Amanda Bertsch
+
+Uri Alon
+
+Mathrew R. Gormley
+
+Carnegie Mellon University, USA
+
+{abertsch,ualon,gneubig,mgormley}@cs.cmu.edu
+
+Row Research Center for Computational Science, University of California, Berkeley, CA 94720-1195
+
+###### Abstract
+
+Since the proposal of transformers (Vaswani et al., 2017), these models have been limited to bounded input lengths, because of their need to attend to every token in the input. In this work, we propose Unlimiformer: a general approach that wraps any existing pretrained encoder-decoder transformer, and offloads the cross-attention computation to a single \(k\)-nearest-neighbor (\(k\)NN) index, while the returned \(k\)NN distances are the attention dot-product scores. This \(k\)NN index can be kept on either the GPU or CPU memory and queried in sub-linear time; this way, we can index practically unlimited input sequences, while every attention head in every decoder layer retrieves its top-\(k\) keys, instead of attending to every key. We evaluate Unlimiformer on several long-document and book-summarization benchmarks, showing that it can process even 500k token-long inputs from the BookSum dataset, without any input truncation at test time. We demonstrate that Unlimiformer improves pretrained models such as BART (Lewis et al., 2020) and Longformer (Beltagy et al., 2020) by extending them to unlimited inputs without additional learned weights and without modifying their code. Our code and models are publicly available, and support LLaMA-2 as well2.
+
+## 1 Introduction
+
+Transformers (Vaswani et al., 2017) have risen as the dominant sequence-to-sequence architecture. Pretrained transformers generally have a context window of 512 (e.g. BERT (Devlin et al., 2019), T5 (Raffel et al., 2020)) or 1024 tokens (e.g. BART (Lewis et al., 2020)), which are sufficient lengths for many current conditional generation datasets (XSum; Narayan et al., 2018) (CNN/DM; Nallapati et al., 2016). To address inputs between 1024 and 16,384 tokens, specialized long-context models sparsify or approximate attention (e.g. Longformer (Beltagy et al., 2020), Performers (Choromanski et al., 2020)), allowing the maximum input length to quadruple while remaining computationally feasible. Most long-document summarization and question-answering datasets, such as SCROLLS (Shaham et al., 2022), are included in this range.
+
+Yet tasks that involve long narratives, such as book summarization (Kryscinski et al., 2021), can contain inputs _exceeding 500k tokens_. Figure 1 shows the input lengths of several popular summarization and question-answering datasets, plotted against common context window lengths; the longest inputs are more than 34 times longer than Longformer's context window.
+
+In these extremely-long-input cases, vanilla transformers cannot be simply scaled, as naive self-attention has quadratic complexity. Long-input transformers usually _modify the base architecture_, and thus necessitate re-pre-training the model from scratch, which requires significant computationalresources. Other architectures such as Longformer-Encoder-Decoder (LED; Beltagy et al., 2020) leverage pretrained models, but they still need to further train new position embeddings or global attention weights, which is computationally and environmentally costly.
+
+We introduce Unlimiformer, a retrieval-based approach to augment pretrained language models to accept inputs of unbounded length at test time. Given a long input sequence, Unlimiformer constructs a \(k\)-nearest-neighbor (\(k\)NN) index over the hidden states of all input tokens. Then, every standard cross-attention head in every decoder layer queries the \(k\)NN index, such that the \(k\)NN distances are the attention dot-product scores, and attends only to the top-\(k\) input tokens. In preliminary experiments, we found that the top-\(k\) attention keys cover more than 99% of the attention mass, and thus attending only to the top-\(k\) keys is an accurate approximation of the full, exact, attention. Unlimformer can be injected into any existing encoder-decoder transformer to permit unbounded inputs. The index can be stored in either GPU or CPU memory, needs to hold only _a single vector per input token_, and can be queried in sublinear time. Unlimiformer is illustrated in Figure 2.
+
+Unlimiformer is a _generic_ approach: it can be applied to trained models and improve existing checkpoints without adding weights and without further training. When _finetuning_ Unlimiformer, performance is even further improved: across a variety of long-range datasets, not only that Unlimiformer performs better than strong long-range transformers such as LED (Beltagy et al., 2020), PRIMERA (Xiao et al., 2022), SLED (Ivgi et al., 2022) and Memorizing Transformers (Wu et al., 2022), but Unlimiformer can be applied _on top of_ such models to further improve them.
+
+## 2 Unlimiformer
+
+Given a trained encoder-decoder transformer, Unlimiformer allows each cross-attention head to choose separate keys to attend to from the full-length input, at each decoding step. We inject a \(k\)NN
+
+Figure 1: Long-range transformers can avoid input truncation in some datasets; however, there are datasets with inputs many times longer than these models’ maximum input length. The dotted lines represent three common maximum input lengths for models; the bars are the average or maximum input length in each dataset, as indicated. Averages for datasets from Koh et al. (2022).
+
+Figure 2: In this example, a given LM’s encoder’s maximum input length is 2 tokens. A 6-token input is encoded in chunks and indexed in an index. We inject Unlimiformer into each decoder layer prior to cross-attention. In Unlimiformer, we perform \(k\)NN search to select a 2-token context for each attention head from the index. This makes cross-attention attend to tokens from the entire input sequence, without adding parameters and without changing the given LM’s architecture.
+
+search into each decoder layer: prior to cross-attention, the model performs a nearest-neighbor search in a \(k\)NN index to choose a set of per-decoder-layer per-attention-head tokens to attend to.
+
+### Encoding
+
+To encode an input sequence that is longer than the model's context window, we use the given model's encoder to encode overlapping chunks of the input, following Iygi et al. (2022). We keep only the middle half of the encoded vectors from each chunk, to ensure that the encodings have sufficient context on both sides. Finally, we index the encoded inputs in a \(k\)NN index, using a library such as Faiss (Johnson et al., 2019), using dot-product as the index's nearest-neighbor similarity metric.
+
+### Retrieval-augmented Cross-Attention
+
+In standard cross-attention, a transformer decoder attends to the encoder's top-layer hidden states, where the encoder usually truncates the input and encodes only the \(k\) first tokens in the input sequence.
+
+Instead of attending only to this \(k\)-token prefix of the input, we retrieve the top-\(k\) hidden states from the \(k\)NN index for each cross-attention head, and attend _only to these top-\(k\)_. This allows retrieval from the _entire_ input sequence instead of truncating. Our approach is also cheaper, in computation and GPU-memory, than attending to all input tokens; and because softmax is dominated by the largest values, retrieving the most-attended tokens preserves the vast majority of attention mass.
+
+Figure 2 illustrates our generic changes to any sequence-to-sequence transformer's architecture. The full input is encoded using the encoder in chunks and indexed in a \(k\)NN index; then, the index of encoded hidden states is queried at each decoding step. The \(k\)NN search step is non-parametric and can be injected into any pretrained seq2seq transformer. The search step reformulates attention for space efficiency, as detailed below.
+
+### Attention reformulation
+
+Let \(_{d}\) be the decoder hidden state and \(_{e}\) be an encoder's last layer hidden state. The standard cross-attention computation for a single head in a transformer is:
+
+\[(Q,K,V)=(}{}})V\] (1)
+
+where \(Q=_{d}W_{q}\) is the product of the decoder states \(_{d}\) and the query weight matrix \(W_{q}\); the keys \(K=_{e}W_{k}\) are the product of the last encoder hidden states \(_{e}\) with the key weight matrix \(W_{k}\); and \(V=_{e}W_{v}\) is similarly the product of \(_{e}\) with the value weight matrix \(W_{v}\). Our goal is to retrieve a set of keys \(K_{best}\) that maximize \(QK_{best}^{T}\), with the size of \(K_{best}\) fixed to the size of the model's context window, and then compute the standard attention over \(K_{best}\) only.
+
+Note that the linear layers \(W_{q}\), \(W_{k}\), and \(W_{v}\) are layer-specific and head-specific. Thus, naively creating an index from the keys \(K=_{e}W_{k}\) and querying this index using the query vectors will require constructing separate indexes for the keys and values at each layer and each head, for a total of \(2 L H\) indexes, where \(L\) is the number of decoder layers and \(H\) is the number of attention heads. In fact, this exact naive approach was taken by Memorizing Transformers (Wu et al., 2022), who pioneered the use of a \(k\)NN index for previously encoded inputs.3 A separate index for each attention head in each decoder layer is both time-intensive to create and space-intensive to store. So, not surprisingly, Wu et al. (2022) apply their memory layer to only a _single_ decoder layer.
+
+Instead, we present a different order of computing the well-known transformer attention formula, which allows us to store a _single_ index across _all_ attention heads and all decoder layers, _without changing_ the mathematical definition of the transformer's standard dot-product attention. The dot-product part of the transformer's attention computation can be rewritten as follows:4
+
+\[QK^{T} =(_{d}W_{q})(_{e}W_{k})^{}\] (2) \[=(_{d}W_{q})W_{k}^{}_{e}^{}\] \[=(_{d}W_{q}W_{k}^{})_{e}^{}\]
+
+Thus, the retrieval step can be formulated as choosing the encoder hidden states \(_{e}\) that maximize \((_{d}W_{q}W_{k}^{})_{e}^{}\). This rewriting has two major advantages: first, _there is no need to index the keys for each head and layer separately_: we can create a _single_ index of the hidden states \(_{e}\) only, and just project the queries to \(_{d}W_{q}W_{k}^{}\) using head-specific and layer-specific \(W_{q}\) and \(W_{k}\); second, the _values_ can be calculated trivially given \(_{e}\), so there is no need to store the values in a separate index from the keys before decoding. Thus, instead of constructing \(2 L H\) indexes and retrieving from all indexes during each decoding step, we construct a _single_ index from \(_{e}\) and retrieve from it by just projecting the decoder hidden states to per-head per-layer \(_{d}W_{q}W_{k}^{}\).
+
+Using our reformulation, the index stores only a _single_ vector per input token. Using 16-bit floats and hidden states of size 1024, this requires only 2GB of memory for 1,000,000 input tokens. Since indexes can be offloaded to the CPU memory, Unlimformer's input length is practically unlimited.
+
+## 3 Training Unlimformer
+
+Unlimformer can be used, at test time, with an already-trained model, and lead to gains without further training, as we show later in Table 3. Next, we turn our focus to training approaches to further improve the performance of Unlimformer. Table 1 summarizes and contrasts the training approaches described below, and Appendix A contains further implementation details.
+
+### Low (additional-) Cost Training Methods: Applying Unlimformer at validation or test-time only
+
+We first consider training approaches that do not require significant additional compute as compared to the standard finetuning regime.
+
+#### 3.1.1 +_test Unlimformer:_
+
+As the simplest case, we use a standard fine-tuning regime, where the input is truncated during training. At inference time only, we inject Unlimformer into the trained model to process full-length inputs.
+
+#### 3.1.2 +_early stop w/ Unlimformer:_
+
+We train without Unlimformer, but when we evaluate the model for early stopping, we use Unlimformer for generation on the validation set. This results in choosing a slightly different checkpoint to stop training at; the additional computational cost here is minor, and comes only from the application of Unlimformer over the validation set.
+
+    &  & total \# tokens in &   } & Validation input \\  & & example seen at & (early stopping) & Test input \\  Baseline & 1024 & 1024 & 1024 & 1024 \\ +test Unlimformer & 1024 & 1024 & 1024 & unlimited \\ +early stop w/ Unlimformer & 1024 & 1024 & unlimited & unlimited \\ Train chunked +test Unlimformer & 1024 & all & unlimited & unlimited \\  SLED (Ivgi et al., 2022) & 16k & 16k & 16k & 16k \\ Longformer (Beltagy et al., 2020) & 16k & 16k & 16k & 16k \\ Random-encoded training & 8-16k & 8-16k & unlimited & unlimited \\ Retrieval training & 8-16k & 8-16k & unlimited & unlimited \\ Alternating training & 8-16k & 8-16k & unlimited & unlimited \\   
+
+Table 1: A comparison of the training approaches using BART (context window size 1024) as a running example. The dashed line separates methods that are approximately the same training-time cost as the baseline, from those that require significant additional compute.
+
+_Train chunked +test Unilimformer:_: As a data augmentation approach, we split each training example into non-overlapping chunks of the context-window size, and treat each chunk as its own training example. Then, we finetune the model as normal, with this augmented set of examples as the training data. This is orthogonal to the Unilimformer model, but has the advantage that all tokens from the full-length training example are observed during training instead of truncated--albeit across several examples. We apply early stopping with Unilimformer on the validation set; when validating, we do not chunk inputs.
+
+### Long-range Training Methods: Applying Unilimformer at training time
+
+We also consider training Unilimformer directly, which introduces additional computational cost.
+
+_Random-encoded training:_: At each training step, the full (longer-than-context-window) training example is encoded in chunks; then, the keys for each decoder layer are chosen randomly from the encoded hidden states. This weakly simulates a nearest-neighbors search, but is computationally cheaper.
+
+_Retrieval training:_: At each training step, the keys for each decoder head and layer are selected using a \(k\)NN search. When inputs are longer than 16k tokens, we truncated the input to 16k tokens at training time due to GPU memory requirements. This training approach is the closest to the test-time computation.
+
+_Alternating training:_: In this approach we alternate batches of _Random-encoded training_ and _Retrieval training_. _Retrieval training_ is identical to the test-time setting, while _Random-encoded_ introduces regularization that makes the model attend to non-top-\(k\) keys as well.
+
+## 4 Experimental Settings
+
+### Datasets
+
+We experiment with two long-document- and one book-summarization datasets from varying domains. Table 2 summarizes statistics for each dataset. GovReport and SummScreen were taken from the SCROLLS benchmark (Shaham et al., 2022). **GovReport**(Huang et al., 2021) is a long-document summarization dataset where the task is to write the executive summary of a US government report. **SummScreen**(Chen et al., 2022) is a long-document summarization dataset where the task is to write the recap of a TV show episode (such as "Friends"), given the transcript of the entire episode. **BookSum**(Kryscinski et al., 2021) is a book-summarization dataset of entire books. BookSum has paragraph, chapter, and book-level settings; we consider the hardest BookSum-Book setting, where the task is to generate a book-level summary given the full text of the novel as input.
+
+MetricsWe report ROUGE 1/2/L (Lin, 2004) and BERTScore F1 (Zhang et al., 2019). Following Zhang et al. (2021), in BookSum we also used Entity Mention Recall ("EntMent") as a proxy for the informativeness of the candidate summaries. EntMent measured the fraction of gold entities mentioned in the candidate summary. Additional evaluation details are provided in Appendix C.
+
+### Baselines
+
+**BART** (base) (Lewis et al., 2020) is a pretrained seq2seq model (139M parameters), commonly used for summarization tasks. Its maximum input sequence length is 1024 tokens.
+
+    &  & \\ Dataset & Domain & \# examples & Input & Output & Input length distribution \\  GovReport & Government & 19,402 & 9,616 & 597 & 74 & 303192 \\ SummScreen & TV shows & 4,348 & 8,987 & 137 & 2365 & 22635 \\ BookSum & Literature & 436 & 143,301 & 1294 & 8388 & 642376 \\   
+
+Table 2: Dataset statistics. The last column is a visualization of the distribution of input example lengths in each dataset; the histogram is binned by powers of 2, with the minimum and maximum input size displayed on either end. The dotted line indicates the mean length.
+
+**PRIMERA**(Xiao et al., 2022) is a Longformer-Encoder-Decoder (LED\({}_{}\); Beltagy et al., 2020) (447M parameters), pretrained specifically for multi-document summarization, with maximum input length of 4096 tokens.
+
+**SLED**(Ivgi et al., 2022) extends encoder-decoder models for longer contexts by applying fusion in-decoder (Izacard and Grave, 2021): the long input is encoded in chunks, and the decoder then attends to _all_ input tokens. This allows the use of pretrained models, albeit with expensive fine-tuning. The input sequence length is eventually memory bounded.
+
+**Memorizing Transformers**(Wu et al., 2022) is the most similar work to ours; they propose extending a transformer with a trainable attention gate that moderates between the standard cross-attention and attention over retrieved keys from a datastore. Since their public implementation5 is "not officially supported" and is not fully reproducible, we approximated it by using attention over the index in only a _single_ decoder layer; this is equivalent to their setting with the learned interpolation parameter \(g\) set to 1.6 Our work differs from Memorizing Transformers in several key ways: Wu et al. (2022) added additional weights, and thus cannot easily leverage pretrained LMs, while Unilimformer is fully non-parametric and can improve performance without fine-tuning; further, Wu et al. (2022) applies retrieval attention to only a _single_ layer because of computational constraints, while our attention reformulation enables the use of Unlimiformer in _every_ decoder layer with individualized retrieval per-head, while still being more efficient than Memorizing Transformers, as we detail in Section 2.3.
+
+## 5 Results
+
+### Long Document Summarization
+
+Low-cost trainingTable 3 shows the results in the long-document summarization datasets. First, we can see that applying Unilimformer on an existing checkpoint without any training (_+test Unlimformer_) improves BART\({}_{}\) by, for example, 1.8 ROUGE-1 points on both datasets, and improves PRIMERA by 1-1.4 ROUGE-1 points. In contrast, without additional training, SLED decreases performance. Thus, Unilimformer is the only model that can provide benefits without further training.
+
+_Early stop w/ Unilimformer_ further improves the base model without any special training: it provides, for example, 3.3 ROUGE-1 points gain on GovReport, while the training computational cost is identical to standard finetuning. _Train chunked_ does not provide benefits on its own; however injecting Unilimformer applied at test time results in the most significant gains: 7.2 ROUGE-1 and 3 BERTScore points improvements, while training is as computationally cheap as standard finetuning.
+
+   Base model & Training method &  \\  & & GovReport & SummScreen \\   _{}\)} & Standard finetuning & 48.7 / 19.2 / **22.8** / 64.3 & 29.7 / 6.2 / 17.7 / 56.3 \\  & +test SLED (Ivgi et al., 2022) & 45.8 / 16.1 / 20.2 / 62.7 & 27.5 / 5.5 / 16.7 / 55.9 \\  & +test Unilimformer & 49.7 / 19.6 / 22.0 / 64.8 & 30.9 / 6.5 / 18.2 / 57.5 \\  & +early stop w/ Unilimformer & **51.0** / **20.5** / 21.5 / **65.1** & **32.1** / **6.8** / **18.6** / **57.6** \\  _{}\)} & Train chunked & 46.2 / 17.8 / 21.7 / 63.3 & 28.1 / 5.6 / 17.0 / 55.6 \\  & +test Unilimformer & **53.4** / **22.5** / **22.5** / **66.0** & **29.3** / **6.6** / **17.6** / **57.0** \\  \)} & Standard finetuning & 55.1 / 23.9 / 25.9 / 67.0 & 32.3 / 7.1 / 18.3 / 57.1 \\  & +test Unilimformer & **56.5** / **24.8** / **26.3** / **67.7** & **33.3** / **7.7** / **19.1** / **57.6** \\   
+
+Table 3: Results on long-document summarization, low-cost training methods: the training costs are no higher than standard finetuning that truncates the inputs to the model’s max input size. The best metric in every training category is marked in **bold**. PRIMERA (Xiao et al., 2022) is a Longformer-Encoder-Decoder (Beltagy et al., 2020) with additional summarization-specific pretraining.
+
+Long-range trainingTable 4 shows results when allowing computationally expensive training approaches. As shown, in almost all metrics and datasets, Unlimiformter outperforms the SLED and Memorizing Transformers baselines when using the same base model.
+
+The PRIMERA experiments in Table 4 highlight two important points: first, Unlimiformer+BART\({}_{}\) performs better than the base PRIMERA across all metrics and datasets, even though PRIMERA is larger and was pretrained on much more data, using a pretraining objective that was designed for summarization; second, not only can Unlimformer outperform Longformer-based models such as PRIMERA, Unlimformer can also be applied _on top_ of existing long-range transformers and further improve them: Unlimformer+PRIMERA improves over PRIMERA across all metrics and datasets. Additional results on the validation set are provided in Appendix E.
+
+### Book Summarization
+
+Table 5 shows the result on BookSum. As shown, Unlimformer improves both base models BART\({}_{}\) and PRIMERA, in both low-cost training approaches such as _Early stop w/ Unlimformer_, as well as in the long-range training approaches. _Random-encoded-_, _Retrieval-_, and _Alternating-_ training show competitive performance, with the best method varying across datasets and models.
+
+We found that although Unlimformer outperforms all base models on BookSum (Table 5), the base BART (_Standard finetuning_, which truncates the input to the first 1024 tokens) shows competitive ROUGE and BERTScore metrics. This is strongly counterintuitive for book summarization, where
+
+   Base model & Training method &  \\  & & GovReport & SummScreen \\  \(_{}\) & Standard finetuning & 48.7 / 19.2 / 22.8 / 64.3 & 29.7 / 6.2 / 17.7 / 56.3 \\ \(_{}\) & SLED (Ivgi et al., 2022) & 54.7 / 24.4 / 25.4 / 67.0 & 32.7 / 7.9 / 19.1 / 58.4 \\ \(_{}\) & Memorizing transformers & 55.2 / 25.1 / 26.4 / 67.5 & 32.7 / 7.4 / 19.2 / 57.4 \\ \(_{}\) & Unlimformer (this work) & **56.6** / **26.3** / **27.6** / **68.2** & **34.7** / **8.5** / **19.9** / **58.5** \\  PRIMERA & Standard finetuning & 55.1 / 23.9 / 25.9 / 67.0 & 32.3 / 7.1 / 18.3 / 57.1 \\ PRIMERA & Memorizing transformers & 57.0 / 25.3 / 26.5 / 67.7 & 33.0 / 7.3 / 18.4 / 57.3 \\ PRIMERA & Unlimformer (this work) & **57.4** / **26.2** / **28.0** / **68.1** & **33.3** / **7.6** / **18.9** / **57.7** \\   
+
+Table 4: Test results on long-document datasets, when allowing compute-costly, long-range training methods, using different base models. The best metric in every dataset and every training category is marked in **bold**. The Unlimformer results in this table are from using the _alternating training_ strategy.
+
+   Base model & Training method & ROUGE 1 / 2 / L & EntMent \\  \(_{}\) & Hierarchical (Krysčinski et al., 2021) & 30.0 / 6.0 / 11.0 & - \\ \(_{}\) & Standard finetuning & 36.4 / 7.6 / 15.3 & 10.0 \\ \(_{}\) & +test Unlimformer & 35.5 / **7.7** / 15.4 & **21.9** \\ \(_{}\) & +early stop w/ Unlimformer & 35.5 / **7.7** / 15.4 & **21.9** \\ \(_{}\) & Memorizing Transformers & 35.6 / 6.4 / 14.6 & 10.1 \\ \(_{}\) & Unlimformer (retrieval training) & 36.8 / 8.3 / 15.7 & 20.3 \\ \(_{}\) & Unlimformer (random-encoded training) & **37.3** / 6.7 / 15.2 & 20.8 \\ \(_{}\) & Unlimformer (alternating training) & 36.7 / 7.3 / **15.5** & 20.3 \\  PRIMERA & Standard finetuning & 38.6 / 7.2 / 15.6 & 11.6 \\ PRIMERA & +test Unlimformer & 38.3 / 7.5 / 15.9 & 18.9 \\ PRIMERA & +early stop w/ Unlimformer & **39.5** / 7.3 / 15.8 & 22.2 \\ PRIMERA & Unlimformer (retrieval training) & 37.9 / **8.2** / **16.3** & **25.5** \\ PRIMERA & Unlimformer (random-encoded training) & **39.5** / 7.1 / 15.9 & 19.7 \\ PRIMERA & Unlimformer (alternating training) & 38.2 / 7.1 / 16.0 & 23.4 \\   
+
+Table 5: Results on BookSum (average input length \(\)**143k** tokens). _EntMent_ is entity recall. Hierarchical summarization is a baseline reported by Krysčński et al. (2021), where chapter summaries are condensed to form a book summary. The best metric in every dataset is marked in **bold**.
+
+the book's plot should not be apparent from reading only the first pages. In the outputs from this base model, we observe limited coherence and a high rate of hallucination (see Appendix F for an example with analysis). However, this is not reflected in n-gram-based overlaps, and BERTScore does not strongly distinguish between any of the BookSum models.
+
+Nonetheless, the ability to attend to unlimited inputs at test time allows Unlimiformer to achieve significantly better Entity Mention Recall (EntMent): the Unlimiformer models exhibit far higher EntMent, and even adding Unlimformer only at test time without costly training (_Early stop w/ Unlimformer) doubles_ the entity recall compared to the base model. Further, Unlimiformer improves EntMent in the base PRIMERA from 11.6 to 25.5 in Unlimiformer+PRIMERA.
+
+## 6 Analysis
+
+Is the long input really needed?As found in various recent papers (Shaham et al., 2022; Kedzie et al., 2018), many text generation datasets do not require long-range modeling, since most of the needed information is concentrated at the beginning of the input. To evaluate whether Unlimiformer really utilizes long inputs, we experimented with limiting the input length in BookSum. Figure 3 shows the performance of Unlimiformer in BookSum: EntMent increases almost monotonically with input length, suggesting Unlimiformer exploits the longer inputs to generate better outputs.
+
+Other work (Jiang and Bansal, 2019) has found that in some datasets, the needed information is concentrated in only part of the input, which is not necessarily the beginning. We observed this trend in WikiSum, a multi-document summarization dataset where the inputs are all references of a Wikipedia article and the output summary is the intro paragraph of the article (Liu* et al., 2018)7. As a strong baseline, we followed Liu* et al. (2018), and ranked the input paragraphs according to TF-IDF. Unlimiformer did not improve over a baseline that uses only the first 1024 tokens of this sorted input, suggesting that the full input is not necessary to produce the summary on this dataset8.
+
+**Computational cost** Although Unlimformer does not introduce additional trained parameters, the encoding of the full input, index construction, and index search increase the processing time during both training and inference. We plot the computational cost of inference with respect to the input length in Figure 4. When all inputs are restricted to 1,024 tokens, Unlimiformer requires a small additional time overhead relative to the baseline for indexing and search. However, the benefits of Unlimiformer are clear as input length increases: the total GPU-time required increases _sublinearly_ with input length9. Additional GPU-time measurements are reported in in Appendix D.
+
+**Performance on other tasks** We measure the performance of Unlimiformer relative to the base model on 4 additional datasets: QASPER (Dasigi et al., 2021), a question-answering dataset over NLP papers; Contract NLI (Koreeda and Manning, 2021), a natural language inference dataset over legal contracts; QMSum (Zhong et al., 2021), a query-based summarization dataset over meeting transcripts; and NarrativeQA (Kocisky et al., 2018), a reading comprehension dataset over narratives10.
+
+Table 6 shows the performance of BART-Unlimiformer (with alternating training) relative to base BART. On three of the four datasets, applying Unlimiformer improves over the base model.
+
+**What is attended to?**
+
+We plotted the frequency of retrieval for keys across the full decoding process for the test set of BookSum, the dataset with the longest inputs. The average number of input embeddings retrieved at least once varied by method, from 43.5% of all tokens for the test-time-only Unlimiformer to 64.5% of all tokens for the alternating-training model11.
+
+Figure 5 shows the retrieval locations for the alternating-training model. We found no specific skew or pattern in the retrieved keys, and keys from the entire input were used by the model; for all models, the median location of a retrieved key was between 49.73% and 49.87% of the way through the input document.
+
+## 7 Related Work
+
+**Long-range transformers** Previous long-range transformers change the transformer architecture to reduce its space or time requirements (Tay et al., 2020). Most solutions achieve this reduction through sparsifying the attention mechanism (Child et al., 2019; Kitaev et al., 2020; Beltagy et al., 2020; Roy et al., 2020; Ainslie et al., 2020; Zaheer et al., 2020). Other works approximate or replace the attention mechanism entirely (Wang et al., 2020; Katharopoulos et al., 2020; Choromanski et al., 2020; Lee-Thorp et al., 2021). All these approaches change the standard transformer architecture or its training objective (Zhong et al., 2022), and thus require pretraining the model from scratch, which does not allow to leverage existing pretrained models. In contrast, Unlimiformer is _generic_, can be injected into any encoder-decoder transformer, and improve it either without training or with merely fine-tuning. This way, Unlimiformer can leverage any already-pretrained model.
+
+**Comparison to Wu et al. (2022)** The closest work to ours is Memorizing Transformers (Wu et al., 2022). Memorizing Transformers construct two datastores for each attention head in each layer,
+
+    &  &  QASPER \\ F1 \\  } &  &  & Narrative QA \\  & & F1 & Exact Match & ROUGE 1 / 2 / L & F1 \\  _{}\)} &  Standard finetuning \\ Unlimformer \\  } & 22.0 & 77.5 & 30.8 / **8.7** / **20.8** & 15.5 \\  & & **27.5** & **77.7** & **30.9** / 8.0 / 19.9 & **18.5** \\   
+
+Table 6: Results on question answering, query-based summarization, and NLI datasets.
+
+Figure 5: Histogram of location of retrieved embeddings in the original document (averaged over the BookSum test set). There is a slight bump at the beginning (first 10% of the book), but otherwise no strong trend, with tokens retrieved quite uniformly from the entire inputs.
+
+and due to memory constraints can thus apply their approach only to a single decoder layer. In contrast, thanks to our attention reformulation (Section 2.3) Unlimiformer can use a _single_ index for all decoder layers, and thus allow _all_ cross-attention heads in all decoder layers retrieve from the long context. As we show in Section 5, this results in significant empirical gains over retrieving only at a single layer. Further, Memorizing Transformers introduce additional learned weights, thus they _must_ be trained to incorporate their memory, and thus cannot easily leverage pretrained models; as we show in Section 5 Unlimiformer can improve existing models without any training, and thus can be applied to any existing transformer. Additionally, Memorizing Transformers focused on decoder-only models; while our approach could also be applied to decoder-only models (and would provide a space efficiency boost there as well), we focus on encoder-decoder models in this work.
+
+**Comparison to Ivyi et al. (2022)** Another related work to ours is SLED (Ivyi et al., 2022). SLED encodes long inputs in chunks, similarly to Unlimiformer, but the decoder in SLED attends to _all_ inputs at the same time. This in practice limits SLED to only about 16k token-long inputs on a single GPU; in contrast, instead of attending to _all_ input tokens, Unlimiformer attends only to the top-\(k\) input tokens for every attention head, and thus can process unlimited inputs in practice, while preserving more than 99% of the attention mass. Further, SLED requires computationally costly training, while Unlimiformer can provide benefits without any training.
+
+Additional related work is discussed in Appendix G.
+
+## 8 Conclusions
+
+We present Unlimiformer, an approach for augmenting pretrained encoder-decoders and offloading the cross-attention computation to a \(k\)NN index, to allow for unlimited length input. Instead of attending to all keys, this \(k\)NN index allows every cross-attention head in every decoder layer to retrieve and attend only to its top-\(k\) keys. We evaluate Unlimformer on several long-document and book-summarization benchmarks having inputs of up to 500K tokens, and show that Unlimformer improves existing models, even without further training. When _training_ with Unlimiformer, not only that Unlimiformer makes smaller models such as BART perform better than larger Longformer-based models, Unlimiformer can be applied on top of Longformer-based models and further improve them.
+
+Many real-world NLP tasks require processing large amounts of data or text. Yet pretraining large models incurs substantial carbon costs (Strubell et al., 2019), which increase with the length of the context window; by choosing instead to modify already-pretrained models to process longer inputs, we aim to gain the benefits of long contexts with less computational cost. We hope that our approach will allow the democratization of long-range transformers, especially for researchers and practitioners with low-compute resources. Toward this end, we release our code at https://github.com/abertsch72/unlimformer. Our code is based on HuggingFace Transformers (Wolf et al., 2020), without changing any individual architecture's code, and thus can be injected into any encoder-decoder model, and supports decoder models such as LLaMA-2 as well.
+
+## 9 Limitations
+
+In our experiments, we have only considered English-language datasets. While we have no reason to believe the method would suffer from the use of a different high-resourced language, the quality of the nearest-neighbors search depends on the quality of the indexed keys.
+
+The length of inputs that can be used at training time is limited by the GPU memory, as the embeddings and their computational graph must be stored for backpropagation. Multi-GPU training would allow longer inputs at training time.
+
+At inference time, Unlimformer can process the longest inputs when the index is offloaded to the CPU memory. In this case, Unlimiformer requires to index only a single vector per input token, which practically means unlimited inputs for any modern server and even small machines during inference. However, offloading the index to the CPU results in higher test-time latency compared to storing the encoded hidden states and the index on the GPU. In our experiments, we were able to use a GPU index for input examples exceeding 500k tokens (on GPUs no larger than 48 GBs), but this may be a concern when using smaller GPUs or larger models.

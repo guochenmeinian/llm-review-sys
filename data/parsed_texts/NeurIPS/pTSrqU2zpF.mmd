@@ -1,0 +1,716 @@
+# Posterior Sampling via Autoregressive Generation
+
+ Kelly W. Zhang
+
+Department of Mathematics
+
+Imperial College London
+
+&Tiffany (Tianhui) Cai
+
+Department of Statistics
+
+Columbia University
+
+&Hongseok Namkoong
+
+Decision, Risk, and Operations Division
+
+Columbia Business School
+
+&Daniel Russo
+
+Decision, Risk, and Operations Division
+
+Columbia Business School
+
+Co-first authors.
+
+###### Abstract
+
+Real-world decision-making requires grappling with a perpetual lack of data as environments change; intelligent agents must comprehend uncertainty and actively gather information to resolve it. We propose a new framework for learning bandit algorithms from massive historical data, which we demonstrate in a cold-start recommendation problem. First, we use historical data to pretrain an autoregressive model to predict a sequence of repeated feedback/rewards (e.g., click responses to news articles shown to sequences of users). In learning to make accurate predictions, the model implicitly learns an informed prior based on rich action features (e.g., article headlines) and how to sharpen beliefs as more rewards are gathered (e.g., clicks as each article is recommended). At decision-time, we autoregressively sample (impute) an imagined sequence of rewards for each action, and choose the action with the largest average imputed reward. Far from a heuristic, our approach is an implementation of Thompson sampling (with a learned prior), a prominent active exploration algorithm. We prove our pretraining loss directly controls online decision-making performance, and we demonstrate our framework on a news recommendation task where we integrate end-to-end fine-tuning of a pretrained language model to process news article headline text to improve performance.
+
+## 1 Introduction
+
+Real-world decision-making requires grappling with a perpetual lack of data as environments change; intelligent agents must comprehend uncertainty and actively gather information to resolve it. This is especially challenging with tasks involving unstructured inputs such as text and images. This paper offers a fresh perspective, casting the problem of balancing exploration and exploitation in online decision-making as a problem of training and sampling from an autoregressive generative sequence model, an area experiencing rapid innovation [2; 23; 50].
+
+**Problem setting.** We present our insights by deriving a novel solution to a meta-bandit problem [51; 8; 26; 3], in which an agent repeatedly encounters new tasks that require exploring to gather useful information. In real applications this meta-learning structure is common, and we illustrate our approach using a news article recommendation setting: Each day a batch of new articles is released, and upon release, the system observes each article's text but is uncertain about how engaging each article will be, as some articles may be surprise hits, or others may be less popular than expected. Models that solely rely on article text will eventually be outperformed by simple alternatives thatlearn from repeated user feedback. This example highlights the need to use rich features (e.g., article headline) and the need to acquire further information through active exploration.
+
+**Our Algorithm.** Our proposed solution proceeds in two phases. In the pre-training phase, the agent learns to model uncertainty by learning a simulator of user interactions using historical data on previously released articles. The simulator is an autoregressive sequence model that uses an article's attributes (e.g. headline text) to predict sequences of recommendation outcomes across users for that article. In the online decision-making phase, the agent models its uncertainty by simulating recommendation outcomes for new users with the pretrained sequence model. At each decision time, the agent uses the fitted simulator to autoregressively sample imagined/imputed recommendation outcomes for new users, conditioned on article features and on previously observed outcomes. The agent then takes the action with the greatest imputed average reward.
+
+**Formal Connections to Thompson Sampling (TS).** Far from a heuristic, our approach is a principled implementation of TS (with a learned prior), a prominent bandit algorithm with strong guarantees [49, 45].implementations of TS, our approach never performs explicit Bayesian inference regarding latent parameters, and instead relies only on predicting and generating observable quantities. This enables standard ML tools for training. The connection between autoregressive sampling and TS rests on a link between exchangeable sequence modeling and Bayesian inference that has been known since de Finetti's seminal work [14], and has appeared in several different literatures [17, 16, 21, 15, 38, 28].
+
+**Theoretical Guarantees and Empirical Evaluations.** We provide formal links between interactive decision-making and sequence prediction, including a novel regret bound that scales with the pre-training loss of the sequence model. Furthermore, we demonstrate that our theoretical insights bear out on a news recommendation task that incorporates a language model.
+
+## 2 Problem formulation
+
+**Online Decision-Making Problem.** Each online decision-making phase begins with new articles (actions) \(\mathcal{A}^{\text{new}}\) being released. Each article \(a\in\mathcal{A}^{\text{new}}\) is associated with attributes \(Z^{(a)}\); in our experiments these represent article headlines. Even with rich article headline features \(Z^{(a)}\), the system is uncertain about how engaging articles will be to readers. The system interacts sequentially with distinct users \(t\in\{1,2,\dots,T\}\) and can adapt future recommendations based on initial user feedback. To the \(t^{\text{th}}\) user, it recommends \(A_{t}\in\mathcal{A}^{\text{new}}\), observes an outcome \(Y_{t}\), and constructs a reward \(R(Y_{t})\in[0,1]\) by applying a fixed, known function \(R(\cdot)\). The vector of outcomes \(Y_{t}\) could include a variety of user feedback like whether the user clicked or shared the recommended article.
+
+Each action \(a\) has \(T\) potential outcomes \(Y^{(a)}_{1:T}=(Y^{(a)}_{1},...,Y^{(a)}_{T})\). The observed outcome is \(Y_{t}\gets Y^{(A_{t})}_{t}\) if article \(A_{t}\) is recommended to the \(t^{\text{th}}\) user. We assume articles are drawn independently from some fixed article distribution, i.e., \(\{Z^{(a)},Y^{(a)}_{1:T}\}\) are drawn i.i.d. across articles \(a\). This assumption precludes resolving uncertainty about the effectiveness of one article by gathering feedback on a different article in the online decision-making phase. Conditioned on the article features \(Z^{(a)}\), potential outcomes are drawn from a fixed and unknown distribution \(p^{*}\):
+
+\[Y^{(a)}_{1:T}\mid Z^{(a)}\sim p^{*}\big{(}\cdot\mid Z^{(a)}\big{)}.\] (1)
+
+Finally, we assume \(p^{*}\) is exchangeable, meaning that for any permutation \(\sigma\) over \(\{1,\dots,T\}\), any \(z\), and any outcomes \((y_{1},\dots,y_{T})\),
+
+\[p^{*}(y_{1},\dots,y_{T}\mid z)=p^{*}(y_{\sigma(1)},\dots,y_{\sigma(T)}\mid z).\] (2)
+
+Exchangeability means outcomes from recommendations made to a large subset of \(m<T\) users is likely to be representative of outcomes that would have been observed among all \(T\) users (Appendix J).
+
+Our goal is to develop an adaptive algorithm \(\pi\) for recommending articles that maximizes the expected average reward \(\mathbb{E}_{p^{*},\pi}\big{[}\frac{1}{T}\sum_{t=1}^{T}R(Y^{(A_{t})}_{t})\big{]}\) (where the expectation is taken over draws of \(\mathcal{A}^{\text{new}}\) in addition to the randomness in \(p^{*}\) and \(\pi\)), or equivalently, minimizes the per-user Bayesian regret,
+
+\[\Delta(\pi;p^{*}):=\mathbb{E}_{p^{*},\pi}\bigg{[}\max_{a\in\mathcal{A}^{\text{ new}}}\bigg{\{}\frac{1}{T}\sum_{t=1}^{T}R(Y^{(a)}_{t})\bigg{\}}-\frac{1}{T} \sum_{t=1}^{T}R(Y^{(A_{t})}_{t})\bigg{]}.\] (3)In (3), we calculate the gap in reward relative to a baseline that always recommends the action with best performance in the (finite) population.
+
+**Pretraining Phase.** The goal of the pre-training phase is to learn a good active exploration algorithm to deploy in the online decision-making phase. We have access to a historical dataset \(\mathcal{\bar{D}}^{\text{hist}}:=\left\{Z^{(a)},Y^{(a)}_{1:n}:a\in\mathcal{A}^{ \text{hist}}\right\}\), with action attributes \(Z^{(a)}\) and observed outcomes \(Y^{(a)}_{1:n}\) from previous articles (actions) \(a\in\mathcal{A}^{\text{hist}}\), for some \(n\leq T\). We assume this dataset is drawn from the same data generating distribution as in the online decision-making phase: Across \(a\in\mathcal{A}^{\text{hist}}\), \(Z^{(a)}\overset{i,i,d}{\sim}P_{Z}\) and \(Y^{(a)}_{1:n}\) is a completely random subset of size \(n\) of \(Y^{(a)}_{1:T}\), where \(Y^{(a)}_{1:T}\mid Z^{(a)}\sim p^{*}(\cdot\mid Z^{(a)})\).
+
+## 3 Posterior Sampling via Autoregressive Generation
+
+This work considers _unobserved outcome data_ as the source of a decision-maker's uncertainty (Figure 1): for a given article, we only have responses from some users, and there is residual uncertainty in how future users would respond. Inspired by this viewpoint, our method proceeds in two steps:
+
+**Phase 1: Pretraining an Autoregressive Model.** We train an autoregressive sequence model \(p_{\theta}\), with parameter \(\theta\in\Theta\), that can predict missing outcomes, conditioned on article (action) attributes, and limited previously observed outcomes. This enables us to generate hypothetical completions of the potential outcome table in Figure 1. Formally, this model specifies a probability \(p_{\theta}(Y^{(a)}_{t}\mid Z^{(a)},Y^{(a)}_{1:t-1})\) of observing outcome \(Y^{(a)}_{t}\) in the next interaction given article attributes \(Z^{(a)}\) and previous outcomes \(Y^{(a)}_{1:t-1}\). We minimize the following loss on the historical dataset \(\mathcal{D}^{\text{hist}}\):
+
+\[\ell(p_{\theta};\mathcal{D}^{\text{hist}})=-\sum_{a\in\mathcal{A}^{\text{hist }}}\log p_{\theta}(Y^{(a)}_{1:n}\mid Z^{(a)})=-\sum_{a\in\mathcal{A}^{\text{ ini}}}\sum_{t=1}^{n}\log p_{\theta}(Y^{(a)}_{t}\mid Z^{(a)},Y^{(a)}_{1:t-1}).\] (4)
+
+Our approach to pre-training an approximate exchangeable sequence model can also be thought of as empirical Bayes (Appendix C). Our approach also mirrors recent work on neural processes [20; 25; 35; 28] and prior-data fitted networks [33]. Our main contribution is linking this pretrained sequence model to online decision-making, which we present next.
+
+**Phase 2: Online Decision-Making via Autoregressive Generation.** After a sequence model \(p_{\theta}\) is trained on historical data, it is deployed and used for decision-making. No additional training of \(p_{\theta}\) is needed. At each decision time, our algorithm uses \(p_{\theta}\) to autoregressively generate imputed values of missing outcomes for each candidate action \(a\in\mathcal{A}^{\text{new}}\), as seen in Figure 2. At decision time \(t\), let \(\mathcal{T}^{(a)}_{\text{miss}}\) denote indices of the users \(\tau\in[1:T]\) for which article/action \(a\) has not been recommended so far. The algorithm samples (imputes) outcomes \(\hat{Y}^{(a)}_{\tau}\) for each \(\tau\in\mathcal{T}^{(a)}_{\text{miss}}\) conditional on article attributes \(Z^{(a)}\), as well as previously observed and generated outcomes for article \(a\). It then uses both the observed and generated outcomes to compute an imputed mean reward for action \(a\):
+
+\[\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t. }\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)} \bigg{\}}.\] (5)
+
+Finally, the algorithm selects action \(A_{t}=\text{argmax}_{a\in\mathcal{A}^{\text{new}}}\big{\{}\hat{\mu}^{(a)}_{t}\big{\}}\). Then the real outcome \(Y^{(A_{t})}_{t}\) is observed. The process is repeated at the next decision time. See Algorithm 2 for further details.
+
+```
+1:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t. }\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)}\bigg{\}}\)
+2:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t. }\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)}\bigg{\}}\)
+3:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t. }\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)}\bigg{\}}\)
+4:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t.}\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)}\bigg{\}}\)
+5:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t.}\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)}\bigg{\}}\)
+6:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t.}\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)}\bigg{\}}\)
+7:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t.}\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)}\bigg{\}}\)
+8:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t.}\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)} \bigg{\}}\)
+9:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t.}\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)}\bigg{\}}\)
+10:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t.}\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)}\bigg{\}}\)
+11:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t.}\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}+\sum_{ \tau\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{\tau}\big{)}\bigg{\}}\)
+12:\(\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in[1:T]\text{ s.t.}\tau\not\in\mathcal{T}^{(a)}_{\text{miss}}}R\big{(}Y^{(a)}_{could result in an action being optimal, it is essentially written off. Good performance of the algorithm relies on the model \(p_{\theta}\) matching the data generating process closely.
+
+### Interpreting our Decision-Making Algorithm as Thompson Sampling (TS)
+
+We now formalize how the generated/imputed outcomes faithfully represent uncertainty and that PS-AR is akin to Thompson (posterior) sampling, which selects actions proportionally to the probability that actions are optimal. Lemma 1 shows that the imputed mean \(\hat{\mu}_{t}^{(a)}\) from PS-AR is a posterior sample of the mean reward \(\mu^{(a)}\), and the action \(A_{t}\) selected by PS-AR is a posterior sample of the optimal action \(A^{*}:=\text{argmax}_{a\in\mathcal{A}^{\text{new}}}\big{\{}\mu^{(a)}\big{\}}\) where \(:=\frac{1}{T}\sum_{t=1}^{T}R(Y_{t}^{(a)})\). For simplicity, Lemma 1 is stated under the assumption that PS-AR uses the optimal sequence model \(p^{*}\) (see E.2 for result for _approximate_ models \(p_{\theta}\)). Let \(\mathcal{H}_{t}:=(\{Z^{(a)}\}_{a\in\mathcal{A}^{\text{new}}},\;A_{1},Y_{1}, \ldots,A_{t},Y_{t})\) denote history up to time \(t\).
+
+**Lemma 1**.: _Under Algorithm 2 applied with \(p_{\theta}=p^{*}\), for all \(a\in\mathcal{A}^{\text{new}}\), with probability \(1\),_
+
+\[\mathbb{P}\big{(}\hat{\mu}_{t}^{(a)}=\cdot\mid\mathcal{H}_{t-1}\big{)}= \mathbb{P}\big{(}\mu^{(a)}=\cdot\mid\mathcal{H}_{t-1}\big{)}\quad\text{ and }\quad\mathbb{P}\left(A_{t}=a\mid\mathcal{H}_{t-1}\right)=\mathbb{P}_{p_{ \theta}}\left(A^{*}=a\mid\mathcal{H}_{t-1}\right).\]
+
+Corollary 1 formalizes how expected loss of the learned sequence model \(p_{\theta}\) controls the regret of PS-AR, reducing a sequential decision-making problem to loss minimization. Proofs in Appendix E.
+
+**Corollary 1**.: _For PS-AR (Algorithm 2) applied with \(p_{\theta}\), which we denote as \(\pi_{\text{PS-AR}}(p_{\theta})\),_
+
+\[\Delta\big{(}\pi_{\text{PS-AR}}(p_{\theta});\,p^{*}\big{)}\leq\underbrace{ \sqrt{\frac{|\mathcal{A}^{\text{new}}|\log(|\mathcal{A}^{\text{new}}|)}{2T}}}_ {\text{Regret bound for Thompson sampling}}\quad+\underbrace{\sqrt{\frac{|\mathcal{A}^{ \text{new}}|}{2}\big{\{}\ell_{T}(p_{\theta})-\ell_{T}(p^{*})\big{\}}}}_{ \text{Penalty for sub-optimal prediction}}.\]
+
+**Advantages of the Autoregressive Approach.** Since our approach focuses on predicting missing outcomes, the learned model only needs to model _observable_ quantities, and can be learned via loss minimization (4). In contrast, a more standard perspective on TS requires specifying a model for latent variables and performing explicit Bayesian inference; for large scale problems this often involves simplifying modeling assumptions, expensive MCMC, or heuristic posterior approximations.
+
+### News Recommendation Experiments
+
+We build a news recommendation task using the MIcrosoft News Dataset (MIND) [53] where we demonstrate how PS-AR easily integrates with pretrained language models. Rewards are binary (click/no-click). We consider three types of sequence models. Flexible NN (Text) and Beta-Bernoulli NN (Text) are neural network models that incorporate article headlines using DistilBERT [46]. Flexible NN (Category) uses only category information (e.g. "Sports"). See Appendix F.1 for synthetic experiments, and Appendix G for experiment details.
+
+## References
+
+* Abbasi-Yadkori et al. [2011] Yasin Abbasi-Yadkori, David Pal, and Csaba Szepesvari. Improved algorithms for linear stochastic bandits. In _Advances in Neural Information Processing Systems_, pages 2312-2320, 2011.
+
+Figure 2: **Posterior Sampling via Autoregressive Generation (PS-AR).**
+
+* [2] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report. _arXiv preprint arXiv:2303.08774_, 2023.
+* [3] Hamsa Bastani, David Simchi-Levi, and Ruihao Zhu. Meta dynamic pricing: Transfer learning across experiments. _Management Science_, 68(3):1865-1881, 2022.
+* [4] David Brandfonbrener, Alberto Bietti, Jacob Buckman, Romain Laroche, and Joan Bruna. When does return-conditioned supervised learning work for offline reinforcement learning? _Advances in Neural Information Processing Systems_, 35:1542-1553, 2022.
+* [5] Sebastien Bubeck and Ronen Eldan. Multi-scale exploration of convex functions and bandit convex optimization. In _Conference on Learning Theory_, pages 583-589. PMLR, 2016.
+* [6] Sebastien Bubeck, Ofer Dekel, Tomer Koren, and Yuval Peres. Bandit convex optimization:\(\backslash\)sqrtt regret in one dimension. In _Conference on Learning Theory_, pages 266-278. PMLR, 2015.
+* [7] George Casella. An introduction to empirical bayes data analysis. _The American Statistician_, 39(2):83-87, 1985.
+* [8] Leonardo Cella, Alessandro Lazaric, and Massimiliano Pontil. Meta-learning with stochastic linear bandits. In _International Conference on Machine Learning_, pages 1360-1370. PMLR, 2020.
+* [9] Lili Chen, Kevin Lu, Aravind Rajeswaran, Kimin Lee, Aditya Grover, Misha Laskin, Pieter Abbeel, Aravind Srinivas, and Igor Mordatch. Decision transformer: Reinforcement learning via sequence modeling. In M. Ranzato, A. Beygelzimer, Y. Dauphin, P.S. Liang, and J. Wortman Vaughan, editors, _Advances in Neural Information Processing Systems_, volume 34, pages 15084-15097. Curran Associates, Inc., 2021. URL https://proceedings.neurips.cc/paper_files/paper/2021/file/77489f642a0ddb10272b5c31057f0663-Paper.pdf.
+* [10] Bruno De Finetti. Funzione caratteristica di un fenomeno aleatorio. In _Atti del Congresso Internazionale dei Matematici: Bologna del 3 al 10 de settembre di 1928_, pages 179-190, 1929.
+* [11] Bruno De Finetti. La prevision: ses lois logiques, ses sources subjectives. In _Annales de l'institut Henri Poincare_, volume 7, pages 1-68, 1937.
+* [12] Yiming Ding, Carlos Florensa, Pieter Abbeel, and Mariano Phielipp. Goal-conditioned imitation learning. _Advances in neural information processing systems_, 32, 2019.
+* [13] Scott Emmons, Benjamin Eysenbach, Ilya Kostrikov, and Sergey Levine. Rvs: What is essential for offline rl via supervised learning? _arXiv preprint arXiv:2112.10751_, 2021.
+* [14] B de Finetti. Classi di numeri aleatori equivalentti. la legge dei grandi numeri nel caso dei numeri aleatori equivalentti. sulla legge di distribuzione dei valori in una successione di numeri aleatori equivalenti. _R. Accad. Naz. Lincei, Rf S 6a_, 18:107-110, 1933.
+* [15] Edwin Fong, Chris Holmes, and Stephen G Walker. Martingale posterior distributions. _Journal of the Royal Statistical Society, Series B_, 2023.
+
+Figure 3: **Evaluation on news data. Left: PS-AR with \(p_{\theta}\) incorporating text features outperform all other methods in terms of cumulative regret. Right: We form credible intervals intervals for \(\mu_{1}^{(a)}\) on the validation set. All PS-AR models have intervals with correct coverage, but text-based models have narrower intervals. Error bars are \(\pm 1\) s.e. See Appendix G for experiment details.**
+
+* Fortini and Petrone [2014] Sandra Fortini and Sonia Petrone. Predictive distribution (de f inetti's view). _Wiley StatsRef: Statistics Reference Online_, pages 1-9, 2014.
+* Fortini et al. [2000] Sandra Fortini, Lucia Ladelli, and Eugenio Regazzini. Exchangeability, predictive distributions and parametric models. _Sankhya: The Indian Journal of Statistics, Series A_, pages 86-109, 2000.
+* Foster and Rakhlin [2020] Dylan Foster and Alexander Rakhlin. Beyond ucb: Optimal and efficient contextual bandits with regression oracles. In _International Conference on Machine Learning_, pages 3199-3210. PMLR, 2020.
+* Foster et al. [2020] Dylan J Foster, Alexander Rakhlin, David Simchi-Levi, and Yunzong Xu. Instance-dependent complexity of contextual bandits and reinforcement learning: A disagreement-based perspective. _arXiv preprint arXiv:2010.03104_, 2020.
+* Garnelo et al. [2018] Marta Garnelo, Jonathan Schwarz, Dan Rosenbaum, Fabio Viola, Danilo J Rezende, SM Eslami, and Yee Whye Teh. Neural processes. _arXiv preprint arXiv:1807.01622_, 2018.
+* Hahn et al. [2018] P Richard Hahn, Ryan Martin, and Stephen G Walker. On recursive bayesian predictive distributions. _Journal of the American Statistical Association_, 113(523):1085-1093, 2018.
+* Heath and Sudderth [1976] David Heath and William Sudderth. De finetti's theorem on exchangeable variables. _The American Statistician_, 30(4):188-189, 1976.
+* Henighan et al. [2020] Tom Henighan, Jared Kaplan, Mor Katz, Mark Chen, Christopher Hesse, Jacob Jackson, Heewoo Jun, Tom B Brown, Prafulla Dhariwal, Scott Gray, et al. Scaling laws for autoregressive generative modeling. _arXiv preprint arXiv:2010.14701_, 2020.
+* Janner et al. [2021] Michael Janner, Qiyang Li, and Sergey Levine. Offline reinforcement learning as one big sequence modeling problem. _Advances in neural information processing systems_, 34:1273-1286, 2021.
+* Jha et al. [2022] Saurav Jha, Dong Gong, Xuesong Wang, Richard E Turner, and Lina Yao. The neural process family: Survey, applications and perspectives. _arXiv preprint arXiv:2209.00517_, 2022.
+* Kveton et al. [2021] Branislav Kveton, Mikhail Konobeev, Manzil Zaheer, Chih-wei Hsu, Martin Mladenov, Craig Boutilier, and Csaba Szepesvari. Meta-thompson sampling. In _International Conference on Machine Learning_, pages 5884-5893. PMLR, 2021.
+* Lattimore and Szepesvari [2019] Tor Lattimore and Csaba Szepesvari. _Bandit algorithms_. Cambridge, 2019.
+* Lee et al. [2023] Hyungi Lee, Eunggu Yun, Giung Nam, Edwin Fong, and Juho Lee. Martingale posterior neural processes, 2023.
+* Lee et al. [2023] Jonathan Lee, Annie Xie, Aldo Pacchiano, Yash Chandak, Chelsea Finn, Ofir Nachum, and Emma Brunskill. In-context decision-making from supervised pretraining. In _ICML Workshop on New Frontiers in Learning, Control, and Dynamical Systems_, 2023. URL https://openreview.net/forum?id=WIzyLD6j6E.
+* Lin et al. [2024] Licong Lin, Yu Bai, and Song Mei. Transformers as decision makers: Provable in-context reinforcement learning via supervised pretraining. In _The Twelfth International Conference on Learning Representations_, 2024. URL https://openreview.net/forum?id=wYlAWv17ss3.
+* Lu and Van Roy [2017] Xiuyuan Lu and Benjamin Van Roy. Ensemble sampling. _Advances in neural information processing systems_, 30, 2017.
+* Malenica and Murphy [2023] Ivana Malenica and Susan Murphy. Causality in goal conditioned rl: Return to no future? In _NeurIPS 2023 Workshop on Goal-Conditioned Reinforcement Learning_, 2023.
+* Muller et al. [2022a] Samuel Muller, Noah Hollmann, Sebastian Pineda Arango, Josif Grabocka, and Frank Hutter. Transformers can do bayesian inference. In _Proceedings of the Tenth International Conference on Learning Representations_, 2022a.
+* Murphy [2022b] Kevin P. Murphy. _Probabilistic Machine Learning: An introduction_. MIT Press, 2022b. URL probml.ai.
+* Nguyen and Grover [2022] Tung Nguyen and Aditya Grover. Transformer neural processes: Uncertainty-aware meta learning via sequence modeling. In _Proceedings of the 39th International Conference on Machine Learning_, 2022.
+* Normand [1999] Sharon-Lise T Normand. Meta-analysis: formulating, evaluating, combining, and reporting. _Statistics in medicine_, 18(3):321-359, 1999.
+
+* Osband et al. [2018] Ian Osband, John Aslanides, and Albin Cassirer. Randomized prior functions for deep reinforcement learning. _Advances in Neural Information Processing Systems_, 31, 2018.
+* Osband et al. [2022] Ian Osband, Zheng Wen, Seyed Mohammad Asghari, Vikranth Dwaracherla, Xiuyuan Lu, Morteza Ibrahimi, Dieterich Lawson, Botao Hao, Brendan O'Donoghue, and Benjamin Van Roy. The neural testbed: Evaluating joint predictions. _Advances in Neural Information Processing Systems_, 35:12554-12565, 2022.
+* Osband et al. [2023] Ian Osband, Zheng Wen, Seyed Mohammad Asghari, Vikranth Dwaracherla, Morteza Ibrahimi, Xiuyuan Lu, and Benjamin Van Roy. Approximate thompson sampling via epistemic neural networks. In _Uncertainty in Artificial Intelligence_, pages 1586-1595. PMLR, 2023.
+* Osband et al. [2024] Ian Osband, Zheng Wen, Seyed Mohammad Asghari, Vikranth Dwaracherla, Morteza Ibrahimi, Xiuyuan Lu, and Benjamin Van Roy. Epistemic neural networks. _Advances in Neural Information Processing Systems_, 36, 2024.
+* Qin et al. [2022] Chao Qin, Zheng Wen, Xiuyuan Lu, and Benjamin Van Roy. An analysis of ensemble sampling. In S. Koyejo, S. Mohamed, A. Agarwal, D. Belgrave, K. Cho, and A. Oh, editors, _Advances in Neural Information Processing Systems_, volume 35, pages 21602-21614. Curran Associates, Inc., 2022. URL https://proceedings.neurips.cc/paper_files/paper/2022/file/874f5e53d7ce44f65fbf27a7b9406983-Paper-Conference.pdf.
+* Ramachandran and Tsokos [2020] Kandethody M Ramachandran and Chris P Tsokos. _Mathematical statistics with applications in R_. Academic Press, 2020.
+* Riquelme et al. [2018] Carlos Riquelme, George Tucker, and Jasper Snoek. Deep bayesian bandits showdown: An empirical comparison of bayesian deep networks for thompson sampling. In _International Conference on Learning Representations_, 2018.
+* Russo and Van Roy [2016] Daniel Russo and Benjamin Van Roy. An information-theoretic analysis of thompson sampling. _Journal of Machine Learning Research_, 17(68):1-30, 2016.
+* Russo et al. [2020] Daniel Russo, Benjamin Van Roy, Abbas Kazerouni, Ian Osband, and Zheng Wen. A tutorial on thompson sampling, 2020.
+* Sanh et al. [2019] Victor Sanh, Lysandre Debut, Julien Chaumond, and Thomas Wolf. Distilbert, a distilled version of bert: smaller, faster, cheaper and lighter. _arXiv preprint arXiv:1910.01108_, 2019.
+* Simchowitz et al. [2021] Max Simchowitz, Christopher Tosh, Akshay Krishnamurthy, Daniel J Hsu, Thodoris Lykouris, Miro Dudik, and Robert E Schapire. Bayesian decision-making under misspecified priors with applications to meta-learning. _Advances in Neural Information Processing Systems_, 34:26382-26394, 2021.
+* Snoek et al. [2015] Jasper Snoek, Oren Rippel, Kevin Swersky, Ryan Kiros, Nadathur Satish, Narayanan Sundaram, Mostofa Patwary, Mr Prabhat, and Ryan Adams. Scalable bayesian optimization using deep neural networks. In _International conference on machine learning_, pages 2171-2180. PMLR, 2015.
+* Thompson [1933] William R Thompson. On the likelihood that one unknown probability exceeds another in view of the evidence of two samples. _Biometrika_, 25(3-4):285-294, 1933.
+* Vaswani et al. [2017] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, L ukasz Kaiser, and Illia Polosukhin. Attention is all you need. In I. Guyon, U. Von Luxburg, S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett, editors, _Advances in Neural Information Processing Systems_, volume 30. Curran Associates, Inc., 2017. URL https://proceedings.neurips.cc/paper_files/paper/2017/file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf.
+* Wan et al. [2023] Runzhe Wan, Lin Ge, and Rui Song. Towards scalable and robust structured bandits: A meta-learning framework. In Francisco Ruiz, Jennifer Dy, and Jan-Willem van de Meent, editors, _Proceedings of The 26th International Conference on Artificial Intelligence and Statistics_, volume 206 of _Proceedings of Machine Learning Research_, pages 1144-1173. PMLR, 25-27 Apr 2023. URL https://proceedings.mlr.press/v206/wan23a.html.
+* Wang et al. [2022] Chunyang Wang, Yanmin Zhu, Haobing Liu, Tianzi Zang, Jiadi Yu, and Feilong Tang. Deep meta-learning in recommendation systems: A survey. _arXiv preprint arXiv:2206.04415_, 2022.
+* Wu et al. [2020] Fangzhao Wu, Ying Qiao, Jiun-Hung Chen, Chuhan Wu, Tao Qi, Jianxun Lian, Danyang Liu, Xing Xie, Jianfeng Gao, Winnie Wu, et al. Mind: A large-scale dataset for news recommendation.
+
+In _Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics_, pages 3597-3606, 2020.
+* [54] Sherry Yang, Ofir Nachum, Yilun Du, Jason Wei, Pieter Abbeel, and Dale Schuurmans. Foundation models for decision making: Problems, methods, and opportunities. _arXiv preprint arXiv:2303.04129_, 2023.
+* [55] Weitong Zhang, Dongruo Zhou, Lihong Li, and Quanquan Gu. Neural thompson sampling. _arXiv preprint arXiv:2010.00827_, 2020.
+* [56] Yin Zhang, Derek Zhiyuan Cheng, Tiansheng Yao, Xinyang Yi, Lichan Hong, and Ed H Chi. A model of two tales: Dual transfer learning framework for improved long-tail item recommendation. In _Proceedings of the web conference 2021_, pages 2220-2231, 2021.
+* [57] Yujia Zheng, Siyi Liu, Zekun Li, and Shu Wu. Cold-start sequential recommendation via meta learner. In _Proceedings of the AAAI Conference on Artificial Intelligence_, volume 35, pages 4706-4713, 2021.
+* [58] Zheqing Zhu and Benjamin Van Roy. Scalable neural contextual bandit for recommender systems. In _Proceedings of the 32nd ACM International Conference on Information and Knowledge Management_, pages 3636-3646, 2023.
+
+Posterior Sampling via Autoregressive Generation (PS-AR) Algorithm
+
+We present pseudo-code for the two phases of our method: pre-training (Algorithm 1) and online decision-making (Algorithm 2).
+
+```
+1:Training data \(\mathcal{D}^{\text{hist}}\), model class \(\{p_{\theta}\}_{\theta\in\Theta}\), batch size \(b\)
+2:while not converged do
+3: Sample a minibatch \(\mathcal{D}=\{Z^{(a)},Y^{(a)}_{1:n}\}_{a\in\mathcal{A}}\) where \(\mathcal{A}\subset\mathcal{A}^{\text{hist}}\), \(|\mathcal{A}|=b\)
+4: For each \(a\in\mathcal{A}\), sample outcomes with replacement: \[\tilde{Y}^{(a)}_{1},\tilde{Y}^{(a)}_{2},\ldots\tilde{Y}^{(a)}_{T}\mid\{Z^{(a )},Y^{(a)}_{1:n}\}\stackrel{{ i.i.d.}}{{\sim}}\frac{1}{n}\sum_{i=1 }^{n}\delta_{Y^{(a)}_{i}}\] Above, \(\frac{1}{n}\sum_{i=1}^{n}\delta_{Y^{(a)}_{i}}\) denotes the empirical distribution of \(Y^{(a)}_{1:n}\)
+5: Define bootstrap-resampled minibatch \(\tilde{\mathcal{D}}\leftarrow\{Z^{(a)},\tilde{Y}^{(a)}_{1:T}\}_{a\in\mathcal{ A}}\)
+6: Compute loss \(\ell(p_{\theta};\tilde{\mathcal{D}})\) as defined in (4)
+7: Backpropagate and take a gradient step to update \(\theta\)
+8:endwhile
+9:return\(p_{\theta}\) ```
+
+**Algorithm 1**: Pretraining an autoregressive model
+
+**Practical Considerations for the Pre-Training Step (Algorithm 1)**
+
+* In Algorithm 1 line 3, instead of bootstrapping sequences of length \(T\), for practical purposes we sometimes bootstrap samples sequences of length \(T_{\text{train}}<T\) if training to length \(T\) is very computationally expensive (we do this for our news recommendation experiments).
+* While we have been assuming that \(\mathcal{D}^{\text{hist}}\) has sequences all of the same length \(n\), in practice, this may not always be the case. Let \(n^{(a)}\) refer to the number of observations for article \(a\in\mathcal{A}^{\text{hist}}\). In this case, we can easily replace \(n\) with \(n^{(a)}\) in line \(3\) of Algorithm (2) (we do this for our news recommendation experiments). ```
+
+**Require:** Autoregressive generative model \(p_{\theta}\), evaluation actions \(\mathcal{A}^{\text{new}}\) with attributes \(\{Z^{(a)}\}_{a\in\mathcal{A}^{\text{new}}}\)
+1: Initialize observed user indices list \(\mathcal{T}^{(a)}_{\text{obs}}\leftarrow[\;]\) for each \(a\in\mathcal{A}^{\text{new}}\)
+2:for\(t=1,\ldots,T\)do
+3:for\(a\in\mathcal{A}^{\text{new}}\)do
+4: Initialize list of generated user indices \(\mathcal{T}^{(a)}_{\text{gen}}\leftarrow[\;]\)
+5:for\(\tau\in[1:T]\) such that \(\tau\not\in\mathcal{T}^{(a)}_{\text{obs}}\)do
+6: Autoregressively sample hypothetical outcomes for missing values \[\hat{Y}^{(a)}_{\tau}\sim p_{\theta}\big{(}\cdot\mid Z^{(a)},\,\big{(}Y_{i}:i \in\mathcal{T}^{(a)}_{\text{obs}}\big{)},\,\big{(}\hat{Y}^{(a)}_{i}:i\in \mathcal{T}^{(a)}_{\text{gen}}\big{)}\big{)}\]
+7: Update generated set \(\mathcal{T}^{(a)}_{\text{gen}}\leftarrow\text{append}\big{(}\mathcal{T}^{(a)}_ {\text{gen}},\,\tau\big{)}\)
+8:endfor
+9: Form imputed average reward using observed and generated outcomes \[\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{T}\bigg{\{}\sum_{\tau\in\mathcal{T}^{(a )}_{\text{obs}}}R\big{(}Y_{\tau}\big{)}+\sum_{\tau\in\mathcal{T}^{(a)}_{\text {obs}}}R\big{(}\hat{Y}^{(a)}_{\tau}\big{)}\bigg{\}}\]
+10:endfor
+11: Select action \(A_{t}\leftarrow\text{argmax}_{a\in\mathcal{A}^{\text{new}}}\big{\{}\hat{\mu}^ {(a)}_{t}\big{\}}\), breaking ties deterministically.
+12: Update observed user lists \(\mathcal{T}^{(A_{t})}_{\text{obs}}\leftarrow\text{append}\big{(}\mathcal{T}^{( A_{t})}_{\text{obs}},\,t\big{)}\)
+13: Observe outcome \(Y_{t}\) from action \(A_{t}\).
+14:endfor ```
+
+**Algorithm 2**Posterior Sampling via Autoregressive Generation (PS-AR)
+
+**Remark 1** (Including Observed Rewards in the Average).: _In Algorithm 2 we average over both observed rewards and imputed values of unobserved rewards. Including observed rewards helps sharpen theoretical understanding: it lets us say the algorithm is exactly a finite population (i.e. a very large group of \(T\) users) version of Thompson sampling that is used in the online learning literature [6, 5]. However, it has little practical bearing on performance if \(T\) is large. See Fig 4 in Appendix A._
+
+**Practical Considerations for the Online Step (Algorithm 2)**
+
+* For practical purposes, we may generate \(m\) outcomes rather than imputing all unobserved outcomes in \([1:T]\) to save computation. Specifically, replace lines 4-9 in Algorithm 2 with Algorithm 3 below.
+
+```
+0: Autoregressive generative model \(p_{\theta}\), timestep \(t\), generation length \(m\), action attribute \(Z^{(a)}\), previously observed outcomes \((Y_{i}:i\in\mathcal{T}^{(a)}_{\text{obs}})\) for that action
+1:for\(t^{\prime}=1,2,\dots m\)do
+2: Autoregressively sample hypothetical outcomes for missing values \[\hat{Y}^{(a)}_{t^{\prime}}\sim p_{\theta}\big{(}\cdot\ |\ Z^{(a)}\,,\ \big{(}Y_{i}:i\in\mathcal{T}^{(a)}_{\text{obs}} \big{)},\hat{Y}^{(a)}_{1:t^{\prime}-1}\big{)}\]
+3:endfor
+4: Form imputed average reward using \(m\) generated outcomes \[\hat{\mu}^{(a)}_{t}\leftarrow\sum_{t^{\prime}=1}^{m}R\big{(}\hat{Y}^{(a)}_{t^ {\prime}}\big{)}\] ```
+
+**Algorithm 3** Truncated Autoregressive Posterior Generation
+
+### Empirical Comparisons of PS-AR Variants
+
+Examining Full Imputation vs Truncated Generation (Figure 4)We empirically compare PS-AR (Algorithm 2), i.e., "full imputation", with the computationally cheaper version of PS-AR that truncates generation to a maximum of length of \(m\) (Algorithm 2 with lines 4-9 replaced with Algorithm 3). We find that both versions of PS-AR perform well in practice and that the original PS-AR (Algorithm 2) and the \(m\)-truncated version (with \(m=500\)) have similar performance.
+
+Figure 4: **Full imputation vs. truncated generation of future rewards. Error bars are \(\pm 1\) s.e. averaged over \(500\) runs.**Specifically in Figure 4 we compare both versions of PS-AR on a news recommendation setting. In our experimental setup, use two versions of the pretrained autoregressive sequence model \(p_{\theta}\): Flexible NN (text) and Flexible NN (category) (see Appendix G.3 for more details). We run both versions of PS-AR with each of these two \(p_{\theta}\) models. We use \(T=1000\), \(|\mathcal{A}^{\text{new}}|=10\), and the truncated version of PS-AR uses \(m=500\). We follow the procedure described Appendix G.3 in forming the regret plots: we run \(500\) repetitions of each bandit algorithm and in each repetition we draw a new set of \(10\) actions/articles from the validation set to represent a "new task". Regret is calculated with respect to \(\mu^{(a)}\) in Equation (6) below:
+
+\[\mu^{(a)}:=\frac{1}{T}\sum_{t=1}^{T}R(Y_{t}^{(a)})\qquad\quad\text{ and}\qquad\quad A^{*}:=\text{argmax}_{a\in\mathcal{A}^{\text{new}}}\big{\{}\mu^{(a)} \big{\}}.\] (6)
+
+As discussed in Remark 1, the version of the algorithm that performs full imputation averages over both previously observed rewards and hypothetical samples of unobserved rewards when computing the imputed mean (5). The \(m\)-truncated version averages solely over generated rewards. This difference does not have a practically significant impact on performance in Figure 4.
+
+Examining Truncating Generation Length (Figure 5)We examine the performance of our PS-AR algorithm for different generation truncation lengths \(m\) (Algorithm 2 with lines 4-9 replaced with Algorithm 3). Throughout all our previous experiments we use \(m=500\). In Figure 5, we examine the impact of varying \(m\) on the regret of the PS-AR with the Flexible NN (text) sequence model in the news recommendation setting. We follow the procedure described Appendix G.3 in forming the regret plots: we run \(500\) repetitions of each bandit algorithm and in each repetition we draw a new set of \(10\) actions/articles from the validation set to represent a "new task". We find that that increasing \(m\) reduces the regret of the algorithm; however, when \(m\) is sufficiently large, the benefit of increasing \(m\) further is negligible.
+
+## Appendix B Finite vs infinite population formulations and Thompson sampling variants
+
+This section discusses the intimate connections between (large) finite-population formulations that were discussed in the main body of the paper and infinite-population formulations that are more common in the Bayesian bandit literature. We do this in the special case of the mixture model of Example 1.
+
+We emphasize that **from our perspective, the main advantages or disadvantages of the finite population view are conceptual.** In terms of advantages: (1) the definitions do not require any explicit assumptions around mixture modeling or latent variables. and (2) The finite nature of the problem lets us visualize the procedure as in Figure 2, without abstract reference to limits across infinite sequences.
+
+Figure 5: **Examining Truncating Generation Length (\(|\mathcal{A}^{\text{new}}|=10\)). Error bars are \(\pm 1\) s.e. averaged over \(500\) runs.**
+
+### Review of Thompson sampling in infinite populations, with mixture models.
+
+Thompson sampling is most often defined for a mixture model as in Example 1. Following that example, we consider in the subsection the canonical example of exchangeable sequences: a mixture model wherein the outcomes are i.i.d conditioned on a latent variable \(U^{(a)}\). That is, \(p^{*}(Y_{1}^{(a)},\ldots,Y_{T}^{(a)}\mid Z^{(a)})=\int\prod_{t=1}^{T}P(Y_{t}^{( a)}\mid Z^{(a)},U^{(a)}=u)P(U^{(a)}=u)du\). The unknown latent variable represents the decision-maker's uncertainty about an action's performance.
+
+The literature typically defines the "true arm means" as
+
+\[\mu_{\infty}^{(a)}=\int R(y)P(y\mid Z^{(a)},U^{(a)})dy.\]
+
+The subscript highlights that this has the interpretation of a long-run average reward across an infinite population of users (or infinite set of rounds). By the law of large numbers (applied conditional on \((Z^{(a)},U^{(a)})\), one has
+
+\[\mu_{\infty}^{(a)}=\lim_{T\to\infty}\frac{1}{T}\sum_{t=1}^{T}R(Y_{t}^{(a)}).\]
+
+The true best arm is defined as
+
+\[A_{\infty}^{*}\in\text{argmax}_{a\in\mathcal{A}^{\text{new}}}\mu_{\infty}^{( a)}\]
+
+Randomness in the latent parameters \((U^{(a)})\) means \(\mu_{\infty}^{(a)}\) and \(A_{\infty}^{*}\) are random variables whose realizations are uncertain even given the history \(\mathcal{H}_{t-1}\). Thompson sampling selects an action by probability matching on \(A_{\infty}^{*}\), defined by the property
+
+\[\mathbb{P}(A_{t}=a\mid\mathcal{H}_{t-1})=\mathbb{P}(A_{\infty}^{*}=a\mid \mathcal{H}_{t-1})\quad\text{for all }a\in\mathcal{A}^{\text{new}}.\] (7)
+
+Per-period Bayesian regret over \(T\) periods is defined as
+
+\[\mathbb{E}\left[\frac{1}{T}\sum_{t=1}^{T}\left(R\left(Y_{t}^{(A^{*})}\right)- R\left(Y_{t}^{(A_{t})}\right)\right)\right]\] (8)
+
+### Thompson sampling in finite populations
+
+One can define the true mean of a finite population as
+
+\[\mu_{T}^{(a)}=\frac{1}{T}\sum_{t=1}^{T}R(Y_{t}^{(a)}).\]
+
+The true best arm for this finite population is defined as
+
+\[A_{T}^{*}\in\text{argmax}_{a\in\mathcal{A}^{\text{new}}}\mu_{T}^{(a)}\]
+
+As in Lemma 1, Thompson sampling selects an action by probability matching on the (finite-population) optimal action \(A_{T}^{*}\), defined by the property
+
+\[\mathbb{P}(A_{t}=a\mid\mathcal{H}_{t-1})=\mathbb{P}(A_{T}^{*}=a\mid\mathcal{H }_{t-1})\quad\text{for all }a\in\mathcal{A}^{\text{new}}.\] (9)
+
+Per-period Bayesian regret over \(T\) periods is defined as
+
+\[\mathbb{E}\left[\frac{1}{T}\sum_{t=1}^{T}\left(R\left(Y_{t}^{(A_{T}^{*})} \right)-R\left(Y_{t}^{(A_{t})}\right)\right)\right]\] (10)
+
+It is not hard to show that (10) is a more stringent notion of regret than in (8), since \(\frac{1}{T}\sum_{t=1}^{T}R\left(Y_{t}^{(A_{T}^{*})}\right)\geq\frac{1}{T}\sum_ {t=1}^{T}R\left(Y_{t}^{(A_{\infty}^{*})}\right)\) by definition of \(A_{T}^{*}\). Both definitions are widely used, with the more stringent finite-population version being more common in the adversarial bandit literature; see [27].
+
+### The gap between finite and infinite population formulations is small
+
+We analyze the gap between the two formulations in the case of a mixture model. Let \(\mathcal{U}^{\text{new}}=\{U^{(a)}:a\in\mathcal{A}^{\text{new}}\}\) and recall \(\mathcal{Z}^{\text{new}}=\{Z^{(a)}:a\in\mathcal{A}^{\text{new}}\}\). By a sub-Gaussian maximal inequality
+
+\[\mathbb{E}\left[\max_{a\in\mathcal{A}^{\text{new}}}\left|\mu_{\infty}^{(a)}-\mu _{T}^{(a)}\right|\right]=\mathbb{E}\left[\mathbb{E}\left[\max_{a\in\mathcal{A }^{\text{new}}}\left|\mu_{\infty}^{(a)}-\mu_{T}^{(a)}\right|\mid\mathcal{Z}^{ \text{new}},\mathcal{U}^{\text{new}}\right]\right]\leq\sqrt{\frac{2\log(| \mathcal{A}^{\text{new}}|)}{T}},\]
+
+To justify the last inequality, note that since the function \(R\) takes values in \([0,1]\), \(R(Y_{t}^{(a)})-\mu_{\infty}^{(a)}\) is subgaussian with variance proxy \(1\), conditional on \(\mathcal{Z}^{\text{new}},\mathcal{U}^{\text{new}}\) (by Hoeffing's Lemma). Since it is the average of independent sub-Gaussian random variables, \(\mu_{\infty}^{(a)}-\mu_{T}^{(a)}\) is subgaussian with variance proxy \(\frac{1}{T}\), conditional on \(\mathcal{Z}^{\text{new}},\mathcal{U}^{\text{new}}\). The last step follows then from applying the subgaussian maximal inequality, conditional on \(\mathcal{Z}^{\text{new}},\mathcal{U}^{\text{new}}\).
+
+It follows easily that the infinite population optimum \(A_{\infty}^{*}\) is near optimal for finite populations:
+
+\[0\leq\mathbb{E}\left[\max_{a\in\mathcal{A}^{\text{new}}}\mu_{T}^{(a)}-\mu_{T}^ {(A_{\infty}^{*})}\right]\leq 2\sqrt{\frac{2\log(|\mathcal{A}^{\text{new}}|)}{T}}.\]
+
+Analogously, the finite population optimum is near-optimal in infinite populations:
+
+\[0\leq\mathbb{E}\left[\max_{a\in\mathcal{A}^{\text{new}}}\mu_{\infty}^{(a)}-\mu _{\infty}^{(A_{T}^{*})}\right]\leq 2\sqrt{\frac{2\log(|\mathcal{A}^{\text{ new}}|)}{T}}.\]
+
+Supported by this theory, we do not focus on the distinction between \(A_{T}^{*}\) and \(A_{\infty}^{*}\) in our developments.
+
+### Similar Insights in Empirical Results
+
+Some empirical insight can also be gleaned from Figure 4 in Appndix B. The implementation that performs full imputation can be interpreted as Thompson sampling for a finite population. As discussed in Remark 1, averages over both past observed rewards and samples of hypothetical unobserved rewards when sampling hypthetical population means.
+
+The implementation that performs forward generation of fixed-length \(m\) does not include past observed rewards in the average. For very large \(m\), it is a direct approximation to infinite-horizon Thompson sampling. We can see in Figure 4 the these implementations have very similar performance.
+
+## Appendix C Interpreting our Training Loss
+
+Define the The expected analogue of the training loss (4) (and averaged over the draw of news articles) is
+
+\[\ell_{n}(p_{\theta}):=\mathbb{E}\bigg{[}-\sum_{t=1}^{n}\log p_{\theta}\big{(} Y_{t}^{(a)}\mid Z^{(a)},Y_{1:t-1}^{(a)}\big{)}\bigg{]}.\] (11)
+
+The next lemma is a standard result connecting the excess expected loss of a sequence model \(p_{\theta}\) to its KL divergence from the true sequence model \(p^{*}\). To (nearly) minimize loss, \(p_{\theta}\) the learner needs to closely approximate the true sequence model.
+
+**Lemma 2**.: _For any sequence model \(p_{\theta}\),_
+
+\[\ell_{n}(p_{\theta})=\ell_{n}(p^{*})+\mathbb{E}_{Z^{(a)}\sim P_{\mathbb{Z}}} \left[D_{\mathrm{KL}}\left(p^{*}\big{(}Y_{1}^{(a)},\ldots,Y_{n}^{(a)}\mid Z^{( a)}\big{)}\ \bigg{\|}\ p_{\theta}\big{(}Y_{1}^{(a)},\ldots,Y_{n}^{(a)}\mid Z^{(a)}\big{)} \right)\right].\]
+
+Following the lemma, we provide an example that notes connections to ideas in Bayesian statistics.
+
+**Example 1** (Exchangeability and mixture models).: _The canonical example of exchangeable sequences is mixture models, where the outcomes are i.i.d conditioned on a latent variable \(U^{(a)}\). That is, \(p^{*}(Y_{1}^{(a)},\ldots,Y_{T}^{(a)}\mid Z^{(a)})=\int\prod_{t=1}^{T}P(Y_{t}^{( a)}\mid Z^{(a)},U^{(a)}=u)P(U^{(a)}=u)du\). The unknown latent variable represents the decision-maker's uncertainty about an action's performance._
+
+**Example 2** (Empirical Bayes).: _Under the mixture model from Example 1, \(p^{*}\) is called a posterior predictive distribution in Bayesian statistics. Consider the case where \(p_{\theta}\) is a posterior predictive_induced by prior hyper-parameters \(\theta\). For ease of exposition, imagine a setting with no \(Z\)'s and a conjugate Bayesian model where \(\mu^{(a)}\sim\text{Beta}(\alpha,\beta)\) and \(Y_{1}^{(a)},Y_{2}^{(a)},\cdots\mid\mu^{(a)}\overset{i.i.d.}{\sim}\text{Bernoulli}( \mu^{(a)})\). By Bayes rule, the posterior predictive distribution is_
+
+\[p_{\theta}\big{(}Y_{t+1}^{(a)}=1\mid Y_{1:t}^{(a)}\big{)}=\frac{\alpha+\sum_{i =1}^{t}Y_{i}^{(a)}}{\alpha+\beta+t}\quad\text{where}\quad\theta=(\alpha,\beta).\] (12)
+
+_For this choice of \(p_{\theta}\), our training criterion (4) is equivalent to that used in Empirical Bayes (Type-II maximum likelihood) to fit prior distributions to observed data [34, 7, 36]. We empirically observe that training on our sequence loss can recover the true Bayesian prior (Appendix G.5). Our pretraining procedure can be viewed as learning an approximate posterior predictive by gradient descent._
+
+We discuss connections between our pretraining procedure and empirical Bayes (12) in Appendix G.5.
+
+## Appendix D Extension to the Contextual Setting
+
+In this section we discuss a preliminary approach to extend our algorithm to the setting with context features. In the news recommendation setting, the context features would represent user features.
+
+Data Generating Process.In this setting, article features \(Z^{(a)}\) are drawn independently from \(P_{Z}\) over \(a\in\mathcal{A}^{\text{new}}\). Independently of that, user contexts \(X_{t}\) are discrete and drawn i.i.d. from an unknown distribution \(P_{X}\), i.e., \(X_{1},X_{2},\ldots,X_{T}\overset{i.i.d.}{\sim}P_{X}\). Then,
+
+\[Y_{t}^{(a)}\mid Z^{(a)},\,(X_{t^{\prime}},Y_{t^{\prime}}^{(a)})_{t^{\prime}=t }^{t-1},\,X_{t}\sim p^{*}\big{(}\cdot\mid Z^{(a)},\,(X_{t^{\prime}},Y_{t^{ \prime}})_{t^{\prime}=t}^{t-1},\,X_{t}\big{)}.\] (13)
+
+Moreover, \(p^{*}\) is such that for any \(z\) and any permutation \(\sigma\) over \(\{1,\ldots,T\}\),
+
+\[\big{(}X_{1},Y_{1}^{(a)}\big{)},\ldots,\big{(}X_{T},Y_{T}^{(a)}\big{)}\mid(Z^ {(a)}=z)\ \overset{D}{=}\ \big{(}X_{\sigma(1)},Y_{\sigma(1)}^{(a)}\big{)},\ldots,\big{(}X_{\sigma(T)},Y_{\sigma(T)}^{(a)}\big{)}\mid(Z^{(a)}=z),\]
+
+where above we use \(\overset{D}{=}\) to denote equality in distribution.
+
+The historical dataset follows the same data generating process. For shorthand, we use \((X,Y^{(a)})_{1:n}:=\big{(}(X_{1},Y_{1}^{(a)}),\ldots,(X_{n},Y_{n}^{(a)})\big{)}\) to denote sequences of tuples. We denote the training set \(\mathcal{D}^{\text{hist}}=\big{\{}Z^{(a)},\big{(}X,Y^{(a)}\big{)}_{1:n}\big{\}}\) (for some \(n\leq T\)). For each \(a\in\mathcal{A}^{\text{hist}}\), we assume \((X,Y^{(a)})_{1:n}\) is a completely at random subset of the tuples \((X,Y^{(a)})_{1:T}\) where \(X_{1},X_{2},\ldots,X_{T}\overset{i.i.d.}{\sim}P_{X}\) and \(Y_{1:T}^{(a)}\) are sampled according to (13).
+
+Phase 1: Pretraining an auto-regressive model.We train a sequence model analogously to Algorithm 1, however replace the training loss (4) with the following loss:
+
+\[\ell(p_{\theta};\mathcal{D}^{\text{hist}})=\sum_{a\in\mathcal{A}^{\text{hist} }}\bigg{[}-\sum_{t=1}^{n}\log p_{\theta}\left(Y_{t}^{(a)}\mid Z^{(a)},\big{(} X,Y^{(a)}\big{)}_{1:t-1},X_{t}^{(a)}\right)\bigg{]}.\] (14)
+
+In the contextual case, transformers are a natural choice for the sequence model architecture for \(p_{\theta}\).
+
+Phase 2: Online decision-making via autoregressive generationOnline decision-making with the pre-trained \(p_{\theta}\) sequence model can be made using Algorithm 5 below. Similar to the version without context, it generates missing outcomes.
+
+```
+0: Autoregressive generative model \(p_{\theta}\), evaluation actions \(\mathcal{A}^{\text{new}}\) with attributes \(Z^{(a)}\)
+1: Initialize observed user indices list \(\mathcal{T}^{(a)}_{\text{obs}}\leftarrow[\;]\) for each \(a\in\mathcal{A}^{\text{new}}\)
+2:for\(t=1,\dots,T\)do
+3: Observe user context \(X_{t}\) and set \(x\gets X_{t}\)
+4:for\(a\in\mathcal{A}^{\text{new}}\)do
+5: Initializes list of generated user indices \(\mathcal{T}^{(a)}_{\text{gen}}\leftarrow[\;]\)
+6:for\(\tau\in[1:T]\) such that \(\tau\not\in\mathcal{T}^{(a)}_{\text{obs}}\)do
+7: Autoregressively sample hypothetical outcomes for missing values \[\hat{Y}^{(a)}_{\tau}\sim p_{\theta}\big{(}\cdot\;|\;Z^{(a)}\,,\,\big{(}X^{(a)} _{i},Y^{(a)}_{i}:i\in\mathcal{T}^{(a)}_{\text{obs}}\big{)},\,\big{(}x,\hat{Y}^ {(a)}_{i}:i\in\mathcal{T}^{(a)}_{\text{gen}}\big{)},X_{\tau}=x\big{)}\]
+8: Update generated set \(\mathcal{T}^{(a)}_{\text{gen}}\leftarrow\text{append}\big{(}\mathcal{T}^{(a)}_{ \text{gen}},\,\tau\big{)}\)
+9:endfor
+10: Form hypothetical average reward using observed and generated (imputed) outcomes \[\hat{\mu}^{(a)}_{t}\leftarrow\frac{1}{|\mathcal{T}^{(a)}_{\text{gen}}|+|\sum _{\tau\in\mathcal{T}^{(a)}_{\text{obs}}}1_{X_{\tau}=x}|}\bigg{\{}\sum_{\tau\in \mathcal{T}^{(a)}_{\text{obs}}}R\big{(}Y^{(a)}_{\tau}\big{)}\mathds{1}_{X_{\tau }=x}+\sum_{\tau\in\mathcal{T}^{(a)}_{\text{gen}}}R\big{(}\hat{Y}^{(a)}_{\tau} \big{)}\bigg{\}}\]
+11:endfor
+12: Select action \(A_{t}\leftarrow\text{argmax}_{a\in\mathcal{A}^{\text{new}}}\big{\{}\hat{\mu}^{( a)}_{t}\big{\}}\), breaking ties deterministically.
+13: Update observed user lists \(\mathcal{T}^{(A_{t})}_{\text{obs}}\leftarrow\text{append}\big{(}\mathcal{T}^{(A _{t})}_{\text{obs}},\,t\big{)}\)
+14: Observe outcome \(Y_{t}\) from action \(A_{t}\).
+15:endfor ```
+
+**Algorithm 5**Posterior Sampling via Autoregressive Generation (PS-AR) with ContextTheoretical Results
+
+Corollary 1 relies on Theorem 1, which is a result that may be of independent interest that bounds the regret of _any_ policy \(\pi\) in terms of the regret of \(\pi\) on the simulated environment and the gap in sequence loss between the simulated environment and the true data generating environment, \(\ell_{T}(p_{\theta})-\ell_{T}(p^{*})\).
+
+Below we use \(\Delta\big{(}\pi;p_{\theta}\big{)}\) to denote the regret of \(\pi\) when the potential outcomes \(Y^{(a)}_{1:T}\) are generated autoregressively from \(p_{\theta}\) given \(Z^{(a)}\) for each \(a\in\mathcal{A}^{\text{new}}\) (see Appendix E.3 for more details).
+
+**Theorem 1**.: _For **any** policy \(\pi\),_
+
+Theorem 1, a novel result, states that the regret achieved by any algorithm \(\pi\) under the fitted environment simulator \(p_{\theta}\) is close to the regret \(\pi\) will achieve when deployed in the true environment \(p^{*}\), so long as the loss achieved by \(p_{\theta}\) is close to that of \(p^{*}\). Theorem 1 thus characterizes the regret of any algorithm, including TS, that uses a misspecified prior. To see this, pick \(\pi\) to be Thompson sampling with a misspecified prior and pick \(p_{\theta}\) to be the data generating distribution under the misspecified prior; then \(\Delta\big{(}\pi;p_{\theta}\big{)}\) will have the typical regret bound for Thompson sampling and the second term on the RHS of (1) characterizes the penalty for having a misspecified prior. Our result can be thought of in some ways as a generalization of [47], which only applied to a "k-shot" version of Thompson sampling.
+
+See proofs in the rest of this section.
+
+### Proof of Lemma 2
+
+Proof.: By the definition of the expected loss in (11), and the chain rule of KL divergence:
+
+\[\ell_{n}(p_{\theta})-\ell_{n}(p^{*})\] \[=\mathbb{E}\left[-\sum_{t=1}^{n}\log p_{\theta}\big{(}Y^{(a)}_{t} \mid Z^{(a)},Y^{(a)}_{1:t-1}\big{)}\right]-\mathbb{E}\left[-\sum_{t=1}^{n}\log p ^{*}\big{(}Y^{(a)}_{t}\mid Z^{(a)},Y^{(a)}_{1:t-1}\big{)}\right]\] \[=\text{KL}\big{(}\mathbb{P}_{p^{*}}(Y^{(a)}_{1},\dots,Y^{(a)}_{n }\mid Z^{(a)})\parallel\mathbb{P}_{p_{\theta}}(Y^{(a)}_{1},\dots,Y^{(a)}_{n} \mid Z^{(a)})\big{)}\] \[=\mathbb{E}_{Z^{(a)}\sim P_{Z}}\left[\text{KL}\big{(}\mathbb{P}_ {p^{*}}(Y^{(a)}_{1},\dots,Y^{(a)}_{n}\mid Z^{(a)})\big{)}\parallel\mathbb{P}_ {p_{\theta}}(Y^{(a)}_{1},\dots,Y^{(a)}_{n}\mid Z^{(a)})\big{)}\right].\]
+
+The final equality is the definition of the KL divergence between conditional distributions. 
+
+### Posterior sampling interpretation: proof of Lemma 1
+
+Proof.: At decision time \(t\), suppose in the history \(\mathcal{H}_{t-1}\) a particular action \(a\in\mathcal{A}^{\text{new}}\) has been shown to users \(\mathcal{T}^{(a)}_{\text{obs}}\subseteq\{1,2,\dots,t-1\}\). For the function \(f(\{y_{i}\}_{i=1}^{T})=T^{-1}\sum_{i=1}^{T}R(y_{i})\), one has
+
+\[\mu^{(a)}=f\big{(}\big{\{}Y^{(a)}_{i}\big{\}}_{i=1}^{T}\big{)}\qquad\text{and} \qquad\hat{\mu}^{(a)}_{i}=f\big{(}\big{\{}Y^{(a)}_{i}:i\in\mathcal{T}^{(a)}_{ \text{obs}}\big{\}}\cup\big{\{}\hat{Y}^{(a)}_{i}:i\in\mathcal{T}^{(a)}_{\text {gen}}\big{\}}\big{)}\]
+
+where \(\{\hat{Y}^{(a)}_{i}:i\in\mathcal{T}^{(a)}_{\text{gen}}\}\) are drawn according to Algorithm 2 applied with sequence model \(p_{\theta}=p^{*}\). The result that
+
+\[\mathbb{P}\big{(}\hat{\mu}^{(a)}_{t}=\cdot\mid\mathcal{H}_{t-1}\big{)}= \mathbb{P}_{p_{\theta}}\big{(}\mu^{(a)}=\cdot\mid\mathcal{H}_{t-1}\big{)}\]
+
+follows immediately since \(\{Y^{(a)}_{i}:i\in\mathcal{T}^{(a)}_{\text{obs}}\}\) are non-random conditioned on \(\mathcal{H}_{i-1}\) and \(\mathbb{P}\big{(}(\hat{Y}^{(a)}_{t}:i\in\mathcal{T}^{(a)}_{\text{gen}})=\cdot \mid\mathcal{H}_{t-1}\big{)}=\mathbb{P}\big{(}(Y^{(a)}_{t}:t\in\mathcal{T}^{(a) }_{\text{gen}}=\cdot\mid\mathcal{H}_{t-1}\big{)}\) with probability \(1\). The proof of the analogous result for \(A^{*}\) is identical. 
+
+Interpreting the data-generating process corresponding to a mispecified non-exchangeable sequence model
+
+Our model assumes the true sequence model \(p^{*}\) is exchangeable. To derive our theory, we want to view posterior sampling by auto-regressive sampling (Algorithm 2) as a proper implementation of Thompson sampling, with approximation coming solely from the incorrect use of a sequence model \(p_{\theta}\). To make this rigorous, we need to correctly interpret the data-generating process under when \(p_{\theta}\) is not exchangeable. Under what data-generating process would the algorithmic generation procedure in Figure 2 still be correct? The definition below turns out to be the right one.
+
+**Definition 1** (Outcome revelation order under non-exchangeable sequence models).: _A (possibly non-exchangeable) sequence model \(p_{\theta}\) introduces an alternative data-generating process as follows. First, independently for each arm \(a\in\mathcal{A}^{\text{new}}\), nature samples arm features \(Z^{(a)}\sim P_{Z}\); then it samples \(Y^{(a)}_{1:T}\mid Z^{(a)}\sim p_{\theta}(\cdot\mid Z^{(a)})\). If arm \(A_{t}=a\) is selected at time \(t\) and this is the \(k^{\mathrm{th}}\) time that arm is chosen, then \(Y_{t}\gets Y^{(A_{t})}_{k}\)._
+
+We note that this data generating process is simply specifying the order in which outcomes from the sequence model are revealed to the decision-maker. Namely, we view \(Y^{(a)}_{t}\) as the potential outcome of the \(t^{\mathrm{th}}\) play of arm \(a\) whereas the main body of the paper views \(Y^{(a)}_{t}\) as the potential outcome for the \(t^{\mathrm{th}}\) user/period. Under an exchangeable sequence models, order is irrelevant and the two data generating processes are mathematically equivalent. **Note that this alternative data generating processes is a proof technique, and not part of the model of the problem.**
+
+### Posterior sampling interpretation: generalization of Lemma 1
+
+The next result generalizes Lemma 1. The proof is the same, but we use the indexing convention in Definition 2.
+
+**Lemma 3**.: _Under Algorithm 2 applied with \(p_{\theta}\),_
+
+\[\mathbb{P}\big{(}\hat{\mu}^{(a)}_{t}=\cdot\mid\mathcal{H}_{t-1}\big{)}= \mathbb{P}_{p_{\theta}}\big{(}\mu^{(a)}=\cdot\mid\mathcal{H}_{t-1}\big{)}\] (15)
+
+_and for all \(a\in\mathcal{A}^{\text{new}}\),_
+
+\[\mathbb{P}\left(A_{t}=a\mid\mathcal{H}_{t-1}\right)=\mathbb{P}_{p_{\theta}} \left(A^{*}=a\mid\mathcal{H}_{t-1}\right).\] (16)
+
+Proof.: We use the notation of Definition 1. Let \(N^{(a)}_{t}=\sum_{i=1}^{t}\mathbbm{1}(A_{t}=a)\) denote the number of times arm \(a\) was played upto and including period \(t\). Then, the observation at time \(t\) is
+
+\[Y_{t}\gets Y^{(A_{t})}_{N^{(A_{t})}_{t}}.\]
+
+For the function \(f(\{y_{i}\}_{i=1}^{T})=T^{-1}\sum_{i=1}^{T}R(y_{i})\), one has
+
+\[\mu^{(a)}=f\big{(}\big{\{}Y^{(a)}_{i}\big{\}}_{i=1}^{T}\big{)}\qquad\text{and} \qquad\hat{\mu}^{(a)}_{t}=f\big{(}\big{\{}Y^{(a)}_{1},\dots,Y^{(a)}_{N^{(a)}_ {t}-1}\big{\}}\cup\big{\{}Y^{(a)}_{N^{(a)}_{t}},\dots,Y^{(a)}_{T}\big{\}} \big{)}\]
+
+where \((Y^{(a)}_{N^{(a)}_{t}},\dots,Y^{(a)}_{T})\sim p_{\theta}\big{(}\cdot\mid Z^{( a)},Y^{(a)}_{1:N^{(a)}_{t}-1}\big{)}\) represent the generated outcomes drawn according to Algorithm 2 applied with sequence model \(p_{\theta}\). Property (15) follows immediately since \(\{Y^{(a)}_{1},\dots,Y^{(a)}_{N^{(a)}_{t}-1}\}\) are non-random conditioned on the history \(\mathcal{H}_{t-1}\) and \(\mathbb{P}\big{(}(Y^{(a)}_{N^{(a)}_{t}},\dots,Y^{(a)}_{T})=\cdot\mid\mathcal{ H}_{t-1}\big{)}=\mathbb{P}\big{(}(Y^{(a)}_{N^{(a)}_{t}},\dots,Y^{(a)}_{T})= \cdot\mid\mathcal{H}_{t-1}\big{)}\) with probability \(1\). The proof of (16) is identical. 
+
+### Proof of Theorem 1
+
+We continue to use the indexing convention in Definition 1 of Subsection E.3. Formally, any policy \(\pi\) can be expressed a function that maps a history \(\mathcal{H}_{t-1}\) and an exogenous random seed \(\xi\) to an action as
+
+\[A_{t}=\pi(\mathcal{H}_{t-1},\xi).\] (17)
+
+The random seed allows for algorithmic randomness in action selection and is assumed to be independent of the draws of article features and potential outcomes \((Z^{(a)},Y^{(a)}_{1:T})_{a\in\mathcal{A}^{\text{new}}}\).
+
+The essence of the proof is to recognize that one could write a simulator that first randomly drew the environment "sample path" \((Z^{(a)},Y^{(a)}_{1:T})_{a\in\mathcal{A}^{\text{new}}}\) and the algorithm seed \(\xi\), and then implemented a completely deterministic sequence of operations to calculate the regret an algorithm incurs with that sample path and seed. Mathematically, the simulator is a function, (written as \(g(\cdot)\) in the proof). We can view mis-specification of the sequence model as mis-specifying the distribution of the sample path draws used in the the simulator. We use information-theoretic tools to bound the impact this distributional change on the inputs to the simulator can have on the distribution of outputs of the simulator (e.g. regret).
+
+Proof.: Since this proof requires analyzes regret under the mis-specified and possibly non-exchangeable model \(p_{\theta}\), we must be precise about the order in which potentail outcomes are revealed. See Definition 2 for discussion of our indexing convention.
+
+This proof will show that for any policy \(\pi\),
+
+\[\Delta\big{(}\pi;p^{*}\big{)}\leq\Delta\big{(}\pi;p_{\theta}\big{)}+\sqrt{ \frac{|\mathcal{A}^{\text{new}}|}{2}\left\{\ell_{T}(p_{\theta})-\ell_{T}(p^{*} )\right\}}.\]
+
+Note for any policy \(\pi\), by the triangle inequality,
+
+\[\Delta\big{(}\pi;p^{*}\big{)}\leq|\Delta(\pi;p^{*})-\Delta(\pi;p_{\theta})|+| \Delta(\pi;p_{\theta})|\]
+
+The remainder of the proof will focus on bounding the first term above. Let \(S^{\text{new}}:=\big{\{}Z^{(a)},Y^{(a)}_{1:T}:\,a\in\mathcal{A}^{\text{new}} \big{\}}\) denote a draw of all article features and potential outcomes.
+
+The absolute difference in regret can be written as
+
+\[|\Delta(\pi;p_{\theta})-\Delta(\pi;p^{*})|\] \[=\] \[=\] \[=\]
+
+where \(g\) is a function that determines the algorithm's regret as a function of the potential outcomes and the external seed \(\xi\) that used to induce randomness in action actions. That is, \(g\big{(}\big{\{}Z^{(a)},Y^{(a)}_{1:T}\big{\}}_{a\in\mathcal{A}^{\text{new}} },\xi\big{)}:=\frac{1}{T}\sum_{t=1}^{T}\Big{\{}R\big{(}Y^{(A^{*})}_{t}\big{)} -R\big{(}Y^{(A_{t})}_{t}\big{)}\Big{\}}\).
+
+This implies
+
+\[|\Delta(\pi;p_{\theta})-\Delta(\pi;p^{*})|\] \[\underbrace{\leq}_{(i)}\sup_{f:\|f\|_{\infty}\leq 1}\bigg{\{} \mathbb{E}_{p^{*}}\big{[}f\left(S^{\text{new}},\xi\right)\big{]}-\mathbb{E}_{p _{\theta}}\big{[}f\left(S^{\text{new}},\xi\right)\big{]}\bigg{\}}\] \[\underbrace{\leq}_{(ii)}\sqrt{\frac{1}{2}\text{KL}\big{(}\mathbb{ P}_{p^{*}}(S^{\text{new}},\xi)\parallel\mathbb{P}_{p_{\theta}}(S^{\text{new}},\xi) \big{)}}\] \[\underbrace{=}_{(iii)}\sqrt{\frac{1}{2}\text{KL}\big{(}\mathbb{ P}_{p^{*}}(\xi)\parallel\mathbb{P}_{p_{\theta}}(\xi)\big{)}}+\frac{1}{2}\text{KL} \big{(}\mathbb{P}_{p^{*}}(S^{\text{new}}\mid\xi)\parallel\mathbb{P}_{p_{\theta }}(S^{\text{new}}\mid\xi)\big{)}}\] \[\underbrace{=}_{(iv)}\sqrt{\frac{1}{2}\cdot\text{KL}\big{(} \mathbb{P}_{p^{*}}(S^{\text{new}})\parallel\mathbb{P}_{p_{\theta}}(S^{\text{ new}})\big{)}}\] \[\underbrace{=}_{(v)}\sqrt{\frac{|\mathcal{A}^{\text{new}}|}{2} \cdot\text{KL}\big{(}\mathbb{P}_{p^{*}}(Z^{(a)},Y^{(a)}_{1:T})\parallel \mathbb{P}_{p_{\theta}}(Z^{(a)},Y^{(a)}_{1:T})\big{)}}\] \[\underbrace{=}_{(vi)}\sqrt{\frac{|\mathcal{A}^{\text{new}}|}{2} \cdot\sqrt{\underbrace{\text{KL}\big{(}\mathbb{P}_{p^{*}}(Z^{(a)})\parallel \mathbb{P}_{p_{\theta}}(Z^{(a)})\big{)}}_{=0}+\text{KL}\big{(}\mathbb{P}_{p^{* }}(Y^{(a)}_{1:T}\mid Z^{(a)})\parallel\mathbb{P}_{p_{\theta}}(Y^{(a)}_{1:T} \mid Z^{(a)})\big{)}}}\] \[\underbrace{=}_{(vii)}\sqrt{\frac{|\mathcal{A}^{\text{new}}|}{2} \left\{\ell_{T}(p_{\theta})-\ell_{T}(p^{*})\right\}}\]
+
+* (i) holds because \(g\) is a function that takes values in \([-1,1]\), so \(\|g\|_{\infty}\leq 1\).
+* (ii) holds by Fact 9 in [44] (which uses Pinsker's inequality).
+* (iii) holds the chain rule for Kullback Liebler Divergence.
+
+* (iv) holds because \(\xi\) is and \(S^{\text{new}}\) are independent.
+* (v) and (vi) hold again because the \((Z^{(a)},Y^{(a)}_{1:T})\) are i.i.d. across \(a\in\mathcal{A}^{\text{new}}\) and the chain rule for Kullback Liebler Divergence.
+* (viii) holds by Lemma 2.
+
+### Proof of Corollary 1
+
+This proof is largely review of an information-theoretic analysis of Thompson sampling due to [44]. It was observed by [6, 5] that this analysis applied without modification to analyze regret with respect to the best fixed action (\(A^{*}\)) even in nonstationary environments (e.g. non-exchangeable models \(p_{\theta}\) as in Definition 1.)
+
+Proof.: We continue to use the indexing convention in Definition 1. This proof will show that for any sequence model \(p_{\theta}\),
+
+\[\Delta\big{(}\pi_{\text{PS-AR}}(p_{\theta});p^{*}\big{)}\leq\sqrt{\frac{| \mathcal{A}^{\text{new}}|\log(|\mathcal{A}^{\text{new}}|)}{2T}}+\sqrt{\frac{| \mathcal{A}^{\text{new}}|}{2}\big{\{}\ell_{T}(p_{\theta})-\ell_{T}(p^{*}) \big{\}}}.\]
+
+By Theorem 1,
+
+\[\Delta\big{(}\pi_{\text{PS-AR}}(p_{\theta});p^{*}\big{)}\leq\Delta\big{(}\pi_{ \text{PS-AR}}(p_{\theta});p_{\theta}\big{)}+\sqrt{\frac{|\mathcal{A}^{\text{ new}}|}{2}\left\{\ell_{T}(p_{\theta})-\ell_{T}(p^{*})\right\}}.\]
+
+We bound \(\Delta\big{(}\pi_{\text{PS-AR}}(p_{\theta});p_{\theta}\big{)}\) by combining the probability matching result of Lemma 1 with Thompson sampling regret bound techniques from Russo and Van Roy [44]. Define the regret for the \(t^{\text{th}}\) action as
+
+\[\Delta_{t}:=R\left(Y^{(A^{*})}_{N^{(A^{*})}_{t}}\right)-R\left(Y^{(A_{t})}_{N ^{(A_{t})}_{t}}\right).\]
+
+The notation \(Y^{(A^{*})}_{N^{(A^{*})}_{t}}\) is discussed in Definition 1 and refers to the outcome of playing arm \(A^{*}\) for the \(N^{(A^{*})}_{t}\)-th time. With this definition,
+
+\[\Delta\big{(}\pi_{\text{PS-AR}}(p_{\theta});p_{\theta}\big{)}=\mathbb{E}_{p_{ \theta},\pi_{\text{PS-AR}}(p_{\theta})}\left[\frac{1}{T}\sum_{t=1}^{T}\Delta_ {t}\right].\]
+
+By the proof of Proposition 1 of [44] (which is general and applies to all algorithms),
+
+\[\mathbb{E}_{p_{\theta},\pi_{\text{PS-AR}}(p_{\theta})}\left[\frac {1}{T}\sum_{t=1}^{T}\Delta_{t}\bigg{|}\mathcal{Z}^{\text{new}}=z\right] \leq\sqrt{\frac{H_{p_{\theta}}\big{(}A^{*}\mid\mathcal{Z}^{\text{ new}}=z\big{)}\cdot\Gamma}{T}}\] \[\leq\sqrt{\frac{\log(|\mathcal{A}^{\text{new}}|)\cdot\Gamma}{T}}\]
+
+where \(H_{p_{\theta}}(A^{*}\mid\mathcal{Z}^{\text{new}}=z)\leq\log(|\mathcal{A}^{ \text{new}}|)\) refers to the conditional Shannon entropy of \(A^{*}\) given \(\mathcal{Z}^{\text{new}}:=(Z^{(a)})_{a\in\mathcal{A}^{\text{new}}}=z\) under the data generating process defined by \(p_{\theta}\), and \(\Gamma\) is a constant upper bound on the "information ratio" such that
+
+\[\Gamma\geq\max_{t\in[1:\,T]}\left\{\frac{\big{(}\mathbb{E}_{t}\big{[}\Delta_ {t}\big{]}\big{)}^{2}}{I_{t}\big{(}A^{*};(A_{t},Y_{t})\mid\big{)}}\right\} \quad\text{w.p. }1.\]
+
+Above we use \(\mathbb{E}_{t}[\cdot]=\mathbb{E}_{t}[\cdot\mid\mathcal{H}_{t-1}]\) to denote that expectations are conditioned on the history and \(I_{t}\big{(}A^{*};(A_{t},Y_{t})\big{)}\) to denote the mutual information between \(A^{*}\) and \((A_{t},Y_{t})\) conditional evaluated under a base measure that conditions on \(\mathcal{H}_{t-1}\). (Recall that the history also includes the information in \(\mathcal{Z}^{\text{new}}\)).
+
+The proof of Proposition 5 of [44] shows that one can choose \(\Gamma\leq|\mathcal{A}^{\text{new}}|/2\) w.p. \(1\). As observed in [6, 5], this proof relies only on the probability matching property in Lemma 3 and hence applies in our setting.
+
+Combining our results implies
+
+\[\mathbb{E}_{p_{\theta},\,\pi_{\text{FS-AR}}(p_{\theta})}\left[\frac{1}{T}\sum_{t =1}^{T}\Delta_{t}\bigg{|}\mathcal{Z}^{\text{new}}=z\right]\leq\sqrt{\frac{ \log(|\mathcal{A}^{\text{new}}|)\cdot|\mathcal{A}^{\text{new}}|}{2T}},\]
+
+so the result follows by the law of iterated expectations.
+
+Additional Experiment Results
+
+### Synthetic Setting: Mixture Beta-Bernoulli
+
+Our synthetic experiments use a mixture model (Example 1) where \(Z^{(a)}\in\mathbb{R}^{2}\) and the prior is a mixture of two Betas and the likelihood is Bernoulli. See Appendix G.2 for more details.
+
+**Models.** We consider two sequence model \(p_{\theta}\) variants. (i) Flexible NN is a neural network that takes \(Z^{(a)}\) and a summary of the past outcomes for action \(a\) as input. (ii) Beta-Bernoulli NN, is the closed-form posterior predictive for the Beta-Bernoulli model from (12); its hyperparameters \(\alpha_{\theta}(Z^{(a)})\) and \(\beta_{\theta}(Z^{(a)})\) are parameterized by neural networks that take \(Z^{(a)}\) as input.
+
+**Regret: Figure 6 (Left).** PS Oracle, which implements Thompson (posterior) sampling with a prior that matches the data generating process, has the lowest regret. PS-AR Flexible NN closely matches the performance of PS Oracle. PS-AR Beta-Bernoulli NN which uses a sequence model with a misspecified, unimodal Beta prior performs similarly to PS Beta-Bernoulli (Uniform Prior) which performs exact Thompson sampling with a uniform prior. All these mentioned Thompson sampling-based algorithms outperform the UCB algorithm [1] and PS Neural Linear, Thompson sampling with a linear Gaussian bayesian model with an uninformative prior on top of learned text embeddings. See more on baseline algorithms in Appendix G.4.
+
+**Uncertainty Quantification: Figure 6 (Right).** For 1000 actions \(a\) not seen in training, we form \(250\) posterior samples \(\hat{\mu}_{1}^{(a)}\) by autoregressively generating outcomes conditional on \(Z^{(a)}\) using \(p_{\theta}\). We use the percentiles of the sampled \(\hat{\mu}_{1}^{(a)}\)'s to form intervals and evaluate how often the true \(\mu_{1}^{(a)}\) is within these intervals; ideally, an 80% interval contains \(\mu_{1}^{(a)}\) 80% of the time. The intervals generated by the Flexible NN sequence model have excellent coverage; moreover, the width of the intervals are the narrowest that have correct coverage (matching PS Oracle). In contrast, the Beta-Bernoulli NN sequence model which has a unimodal (misspecified) Beta prior has worse coverage.
+
+## Appendix G Experiment Details
+
+In this appendix we discuss general implementation techniques in Appendix G.1, synthetic experiments in Appendix G.2, news article recommendation experiments in Appendix G.3, and bandit algorithms in Appendix G.4.
+
+### General Implementation Techniques
+
+**(1) Bootstrapping Training Data.** The sequence length \(n\) in the training set \(\mathcal{D}^{\text{hist}}:=\{Z^{(a)},Y_{1:n}^{(a)}:a\in\mathcal{A}^{\text{hist}}\}\) may be smaller than the decision horizon \(T\). To ensure the learned sequence model \(p_{\theta}\) has
+
+Figure 6: **Evaluation in mixture Beta-Bernoulli Setting. Left: cumulative regret with \(|\mathcal{A}^{\text{new}}|=10\), averaged over \(500\) repetitions. Right: evaluating uncertainty quantification (coverage and interval width) averaged over \(1000\) actions not seen in training. Error bars are \(\pm 1\) s.e.**
+
+low prediction loss, \(\ell_{T}(p_{\theta})\), for longer sequences, we bootstrap the data in training by computing the loss with \(\tilde{Y}^{(a)}_{1:T}\) where \(\tilde{Y}^{(a)}_{1:T}\) are sampled with replacement from \(Y^{(a)}_{1:n}\) (see Appendix A for details).
+
+**(2) Truncating Generation Lengths.** When the population size \(T\) is large, generating missing outcomes for the entire population can be costly. To save computation, we implement a slightly modified version of PS-AR that instead generates only \(m\) missing outcomes per action and averages those \(m\) outcomes to form \(\hat{\mu}^{(a)}_{t}\); by (21) this is a good approximation when \(m\) is relatively large. This is further supported by our simulation results where we vary \(m\) (see Figure 5 in Appendix A).
+
+### Synthetic Experiments: Mixture Beta-Bernoulli
+
+Data generating processIn this setting, we use article attributes be \(Z^{(a)}=\big{(}Z^{(a)}_{1},Z^{(a)}_{2}\big{)}\in\mathbb{R}^{2}\) where \(Z^{(a)}_{1},Z^{(a)}_{2}\overset{i.i.d.}{\sim}\text{Uniform}(0,0.25)\). We sample \(Y^{(a)}_{1:T}\) by first sampling \(\mu^{(a)}_{\infty}\in[0,1]\) from a mixture:
+
+\[\mu^{(a)}_{\infty}\mid Z^{(a)}\sim\begin{cases}\text{Beta}\big{(}25Z^{(a)}_{ 1}+1,\ 25(1-Z^{(a)}_{1})+1\big{)}&\text{w.p.}\ 1/2\\ \text{Beta}\big{(}25(1-Z^{(a)}_{2})+1,\ 25Z^{(a)}_{2}+1\big{)}&\text{w.p.}\ 1/2 \end{cases}\]
+
+Then, outcomes are sampled as \(Y^{(a)}_{1},\dots,Y^{(a)}_{T}\mid\mu^{(a)}_{\infty},Z^{(a)}\overset{i.i.d.}{ \sim}\text{Bernoulli}(\mu^{(a)}_{\infty})\).
+
+Here, \(\mu^{(a)}_{\infty}\) corresponds to the success rate in the data generating process, in contrast to \(\mu^{(a)}\) in the main text of the paper, which corresponds to the mean (or success rate) in the finite-sample population of size \(T\). Note that \(\mu^{(a)}\) converges to \(\mu^{(a)}_{\infty}\) as \(T\) goes to infinity.
+
+Training and Validation DatasetsThe training and validation datasets contain 2500 and 1000 articles each, respectively. During training (Algorithm 1), we use \(T_{\text{train}}=500\). Hyperparameters and early stopping epochs are chosen using the validation dataset.
+
+Additional model and training details
+* Flexible NN. This model implements the autoregressive model as a neural network that takes as input the action/article attribute \(Z^{(a)}\) (a vector in \(\mathbb{R}^{2}\)) and summary statistics of observations for this action, and outputs a value (probability) in \([0,1]\). The summary statistic we use is simple because outcomes \(Y^{(a)}_{t}\) are binary; specifically it consistes of a tuple with the mean of outcomes from action \(a\), and the reciprocal of 1 plus the total number of outcome observations for action \(a\), i.e. \(\big{(}\frac{1}{N^{(a)}}\sum_{t^{\prime}=1}^{t-1}Y_{t^{\prime}}\mathbbm{1}_{A _{t^{\prime}}=a},\ \frac{1}{1+N^{(a)}}\big{)}\), where \(N^{(a)}:=\sum_{t^{\prime}=1}^{t-1}\mathbbm{1}_{A_{t^{\prime}}=a}\). (In practice, we found that repeating the summary tuple input \(10\) improved performance, so the model took as input vectors in \(\mathbb{R}^{22}\) which consisted of a \(2\)-dimensional \(Z^{(a)}\) and \(10\) copies of the sufficient statistic tuple). Note that this entire \(p_{\theta}\) could alternatively be implemented as a transformer. The MLP we use has three linear layers, each of width 50. After the first and second linear layers, we apply a ReLU activation. After the last linear layer, we apply a sigmoid function, so that the output is in \((0,1)\). The models are trained for 1000 epochs with learning rate 0.001, batch size 500, and weight decay 0.01 using the AdamW optimizer.
+* Beta-Bernoulli NN. This is a sequential model that is the (closed-form) posterior predictive for a Beta-Bernoulli. The prior parameters for the Beta distribution, \(\alpha_{\theta}(Z^{(a)})\) and \(\beta_{\theta}(Z^{(a)})\), are each parameterized by separate neural network MLP models that take in \(Z^{(a)}\). The MLPs we use has three linear layers, each of width 50. After the first and second linear layers, we apply ReLU activations. After the last linear layer, we also apply a ReLU activation, so that the final output is in \([0,\infty)\). We initialize weights so that the bias term for both \(\alpha_{\theta}(Z^{(a)})\) and \(\beta_{\theta}(Z^{(a)})\) to 1, so that we avoid starting with Beta parameters of value 0, as Beta parameters need to be positive. The models are trained for 1000 epochs with learning rate 0.001, batch size 500, and weight decay 0.01 using the AdamW optimizer.
+
+Additional details on Figure 6In our uncertainty quantification plots Figure 6 (right), we evaluate over all \(1000\) actions in the validation set. We form \(250\) samples of \(\hat{\mu}^{(a)}_{1}\) for each action in the validation set using Algorithm 3 with \(m=500\). To generate posterior samples for Beta-Bernoulli NN, we use the closed-form posterior (i.e., \(m=\infty\)).
+
+In our regret plots Figure 6 (left), we run \(500\) runs. In each run we randomly choose \(|\mathcal{A}^{\text{new}}|=10\) actions randomly with replacement from the validation set, and all algorithms are evaluated on these same sampled actions in each run. Regret is calculated relative to \(\mu_{\infty}^{(a)}\) from the data generating process.
+
+### News Recommendation Experiment Details
+
+Additional data detailsThe training and validation datasets contain 9122 and 2280 distinct actions/articles each, respectively. During training, we use \(T_{\text{train}}=500\) As in Appendix G.2, hyperparameters and early stopping epochs are chosen using the validation dataset.
+
+We now discuss the news data preprocessing process. This dataset is free to download for research purposes at https://msnews.github.io/. It is under a Microsoft Research License at https://github.com/msnews/MIND/blob/master/MSR%20License_Data.pdf, which we comply with. The terms of use are at https://www.microsoft.com/en-us/legal/terms-of-use.
+
+Our preprocessing procedure is as follows:
+
+1. Collect all articles from the MIND "large" dataset (training split only) [53].
+2. Remove any article with fewer than 100 total impressions.
+3. Normalize the success probabilities to be centered around 0.5 in a way that preserves the ranking of \(\mu^{(a)}\). We do this transformation to speed up the learning procedure (since it requires more data to learn small true Bernoulli success probabilities accurately). We leave simulations without this transformation to future work. Our transformation procedures as follows: Let \(\mu_{0}^{(1)},\ldots,\mu_{0}^{(|\mathcal{A}|)}\) be the original empirical success probabilities (average click rate). We use \(\mathcal{A}\) to denote all articles in the MIND large dataset. The new success probabilities are defined as follows for each \(a\in\mathcal{A}\): \[\mu_{\infty}^{(a)}\leftarrow\begin{cases}\mu_{0}^{(a)}&\text{if }\mu_{0}^{(a)}\in\{0,1\}\\ \text{logit}^{-1}\left(\text{logit}(\mu_{0}^{(a)})-\bar{\mu}_{0}\right)& \text{otherwise}\end{cases}.\] Above, \(\bar{\mu}_{0}\triangleq\frac{1}{|\mathcal{A}|}\sum_{a^{\prime}\in\mathcal{A}} \text{logit}(\mu_{0}^{(a^{\prime})})\) and \(\text{logit}(x)\triangleq\log\frac{x}{1-x}\). See Figure 7 for comparison of the success probabilities (click rates) before and after the transformation.
+4. Randomly select 20% of the remaining articles to be in the validation set; the rest are in the training set.
+
+Additional model details
+
+* Flexible NN (text). This model very similar to the Flexible NN model in Appendix G.2, with the exception that in place of a two-dimensional \(Z^{(a)}\), the MLP head of the neural network from before is fed as input a DistilBERT [46] embedding of text data \(Z^{(a)}\).
+
+Figure 7: Original and transformed click rates. Note the spike at \(0\) for transformed click rates: only click rates that were not 0 or 1 are transformed.
+
+Also, the MLP linear layers have width 100 instead of 50, and the sufficient statistics are repeated 100 times instead of 10 times. All other architecture details are the same. The model is trained for 500 epochs with learning rate 1e-5 on MLP heads, 1e-8 on the DistilBERT weights, batch size 500, and weight decay 0.01 using the AdamW optimizer.
+* Beta-Bernoulli NN (text). This is very similar to the Beta-Bernoulli posterior predictive sequence model in Appendix G.2, with the exception that in place of a two-dimensional \(Z^{(a)}\), the MLP head of the neural network from before is fed as input a DistilBERT [46] embedding of text data \(Z^{(a)}\). On top of the one DistilBERT embedding are two separate MLP heads for \(\alpha(Z^{(a)})\) and \(\beta(Z^{(a)})\), which are trained together. Also, the MLP linear layers have width 100 instead of 50, and the sufficient statistics are repeated 100 times instead of 10 times. All other architecture details are the same. The model is trained for 500 epochs with learning rate 1e-5 on MLP heads, 1e-8 on the DistilBERT weights, batch size 500, and weight decay 0.01 using the AdamW optimizer.
+* Flexible NN (category). This is very similar to the flexible neural network model in Appendix G.2, but it uses a one-hot new category vector for \(Z^{(a)}\) instead of a two-dimensional \(Z^{(a)}\). The model architecture and training parameters are also the same.
+* **DistilBERT.** Our two text models use DistilBERT [46] from https://huggingface.co/distilbert/distilbert-base-uncased. It has an apache-2.0 license, with license and terms of use at https://huggingface.co/datasets/choosealicense/licenses/blob/main/markdown/apache-2.0.md.
+
+Additional details on Figure 3In our uncertainty quantification plots Figure 3 (right), we evaluate over all \(2280\) articles/actions in the validation set. For our Flexible NN \(p_{\theta}\) model, we form \(250\) samples of \(\hat{\mu}_{1}^{(a)}\) for each action in the validation set using Algorithm 3 with \(m=500\). For our Beta-Bernoulli NN \(p_{\theta}\) model we use samples from the closed-form posterior.
+
+In our regret plots Figure 3 (left), we run \(500\) runs. In each run we randomly choose \(|\mathcal{A}^{\text{new}}|=10\) actions randomly with replacement from the validation set, and all algorithms are evaluated on these same sampled actions in each run. Regret is calculated relative to \(\mu_{\infty}^{(a)}\) as described above.
+
+EnsembleWe describe the ensembling approach used in the uncertainty quantification plots in Figure 3 (right). To construct ensembles, we first train a DistilBERT model with an MLP head (MLP width 100, 3 layers, batch size 100, 500 epochs, learning rate 1e-5 on the head and 1e-8 on DistilBERT, weight decay 0.01, AdamW optimizer) to predict \(Y_{t}^{(a)}\), using action/article features \(Z^{(a)}\)(headlines). Then, we freeze the DistilBERT weights, and train 50 MLP heads from scratch with random initialization and bootstrapped training data to create the ensemble (50 epochs, fixed DistilBERT embedding; other params the same as before).
+
+### Bandit Algorithms
+
+We compare our method with several baseline bandit methods.
+
+PS Beta Bernoulli (Uniform Prior)We model success rate \(\mu_{\infty}^{(a)}\) and potential outcomes \(Y_{t}^{(a)}\) using a conjugate Beta-Bernoulli model:
+
+\[\mu_{\infty}^{(a)}\sim\text{Beta}(\alpha,\beta)\] (18) \[Y_{1}^{(a)},\dots,Y_{T}^{(a)}\mid\mu_{\infty}^{(a)\;\;\;i.i.d. \;\;\text{Bernoulli}(\mu^{(a)})\] (19)
+
+We also use reward mappings \(R(Y_{t}^{(a)}):=Y_{t}^{(a)}\). In our experiments, we use Beta-Bernoulli with a uniform prior, so \(\alpha=\beta=1\). Note that unlike the Beta-Bernoulli NN, the prior here does not depend on action attributes \(Z^{(a)}\).
+
+Online decision-making uses Thompson sampling, as described in in Algorithm 6.
+
+PS Neural LinearWe implement a very simple variant of "neural linear" as in Riquelme et al. [43], Snoek et al. [48]. Here, we model each arm reward as a Gaussian-Gaussian model. We fit the prior mean using item features \(Z^{(a)}\), but set a shared prior variance across articles. Specifically,
+
+\[\mu^{(a)}\sim N\left(g(Z^{(a)}),\sigma^{2}\right)\] \[R_{1}^{(a)},\ldots,R_{T}^{(a)}\overset{i.i.d.}{\sim}N\left(\mu^{ (a)},s^{2}\right).\]
+
+First we address the choice of \(g,\sigma^{2},s^{2}\), which are chosen during pre-training, and then the bandit evaluation, which is standard Thompson sampling with a Gaussian-Gaussian model. We address these one at a time.
+
+Parameters
+1. First, \(g\) is obtained by training a model to predict \(\mu^{(a)}\) from just \(Z^{(a)}\) (no history of past rewards), using the training set. For synthetic experiments, for \(g\), we used a neural network with almost the same architecture as for the autoregressive model we use for this dataset. However, the model only takes \(Z^{(a)}\) (and not previous rewards for \(a\)). We use all of the same hyperparameters as we did to train the autoregressive model for this dataset. For news datasets, we trained a DistilBERT model with a MLP on top that takes the embedded article headlines \(Z^{(a)}\) as input (and not previous rewards for \(a\)). We use the same hyperparameters as we did to train the autoregressive model for this dataset, except for learning rates, which were chosen to be the best out of several (for synthetic, 1e-2; for news setting, 1e-5 for both the MLP head and the DistilBERT weights).
+2. \(\sigma^{2},s^{2}\) were chosen to be reasonable values, which in our experiments were 0.25 for \(s^{2}\) (which corresponds to maximum variance of a Bernoulli), and 1 for \(\sigma^{2}\).
+
+UcBr For UCB we use the multi-arm bandit algorithm described in Section 6 of [1]. We set the failure probability \(\delta=0.1\) and use sub-Gaussian parameter \(0.5\) (since we have binary rewards).
+
+SquareCBIn these experiments, we use the flexible neural network \(p_{\theta}\) with text attributes, but instead of using Thompson sampling, we use SquareCB [18], which is a bandit algorithm that uses a regression oracle to predict the value of each action. Note that our setting differs from the setting of SquareCB [18], as SquareCB assumes that the prediction model for action value is being learned online, while our prediction model has been pretrained on historical data and is not learned online.
+
+For setting the learning rate \(\gamma\) in SquareCB [18], we follow Foster et al. [19] and consider a time-varying learning rate \(\gamma_{t}=\gamma_{0}t^{\rho}\), where \(\gamma_{0}\in\{10,100\}\) (a subset of those suggested in Foster et al. [19]), and \(\rho\in\{0.25,0.5\}\) are hyperparameters. While some hyperparameter combinations for SquareCB perform almost as well PS-AR Flexible NN (Text), we remark that there is no principled approach to choosing the learning rate provided in existing works (besides grid search by deploying the algorithm many times).
+
+### Additional Synthetic Experiments: Recovering the True Prior / Empirical Bayes
+
+Here, we demonstrate in practice an setting where we perform "empirical Bayes" using our pretraining procedure (Algorithm 1). We find that we recover the true prior fairly well.
+
+Data generationWe use a synthetic Beta-Binomial data generating process. We consider one-dimensional action features \(Z^{(a)}\stackrel{{ i.i.d.}}{{\sim}}\text{Uniform}(0,1)\). We then sample \(\mu^{(a)}\) from a Beta distribution, where
+
+\[\mu^{(a)}\mid Z^{(a)}\sim\text{Beta}\big{(}Z^{(a)}\cdot 5+1,\ (1-Z^{(a)})\cdot 5+1 \big{)}.\] (20)
+
+Then, \(Y^{(a)}\mid\mu^{(a)},Z^{(a)}\sim\text{Bernoulli}(\mu^{(a)})\). We use \(R(y):=y\). We use a training dataset of size 25,000 actions and a validation set of size 10,000 actions; both datasets have observation sequences of length \(n=500\).
+
+Autoregressive modelWe use \(p_{\theta}\) which matches the posterior predictive of a Beta-Bernoulli distribution, akin to (12). To accomodate \(Z^{(a)}\) features, we parameterize the prior hyperparameters: \(\alpha_{\theta}(Z^{(a)}),\beta_{\theta}(Z^{(a)})\) (we follow the procedure described in Appendix G.2 for Beta-Bernoulli NN). The neural network model architecture used in \(\alpha_{\theta}(Z^{(a)}),\beta_{\theta}(Z^{(a)})\) and the training procedure are also the same as described for Beta-Bernoulli NN in Appendix G.2 (except that the MLP widths are 100).
+
+Recovering the Prior: Figure 9We show in Figure 9 that through our pretraining procedure Algorithm 1 with our particular choice of \(p_{\theta}\) model class, that we (approximately) recover the true prior. We show this by comparing means and standard deviations of samples from our learned prior (using \(p_{\theta}\)) vs. the true prior (according to the data generating process), for different draws of \(Z^{(a)}\). In the scatter plots, each point corresponds to one \(Z^{(a)}\).
+
+Specifically, in these plots we use \(100\) actions sampled uniformly from the validation set. For each of these \(100\) actions we form \(10,000\) samples of \(\hat{\mu}_{1}^{(a)}\) using Algorithm 3 using our learned \(p_{\theta}\) model. We also form \(10,000\) samples from the true data generating prior (20) for each of the \(100\) actions. Then for each action, we compute the mean and standard deviations of the samples on the "prior" samples \(\hat{\mu}_{1}^{(a)}\) from \(p_{\theta}\); we also compute the mean and standard deviations of the samples from the true prior. We then plot these in a scatter plot; for each action, we have the prior mean according to \(p_{\theta}\) vs the prior mean according to the data generating process--this forms one point on the scatter plot. A similar procedure is plotted on the right. There, instead of computing the mean of the prior samples, we compute a measure of the spread of the prior samples: let \(\hat{\mu}_{1,1}^{(a)},\hat{\mu}_{1,2}^{(a)}\dots,\hat{\mu}_{1,10000}^{(a)}\) be the prior samples. Let \(\bar{\mu}_{1}^{(a)}=\frac{1}{10000}\sum_{i=1}^{10000}\hat{\mu}_{1,i}^{(a)}\). Then we compute the mean absolute deviation \(\frac{1}{10000}\sum_{i=1}^{10000}\left|\hat{\mu}_{1,i}^{(a)}-\hat{\mu}_{1}^{(a )}\right|\) for this set of prior samples.
+
+Figure 8: Regret comparison on news dataset for SquareCB and posterior sampling, both using the flexible neural network sequence model using text attributes in 3.2.
+
+### Compute resources
+
+Unless otherwise specified, computational experiments were run on an internal CPU cluster at Columbia GSB, where for any individual run we request at most 50GB of memory, and each individual training run takes at most an hour or two.
+
+We train on a GPU only for text models that fine-tune DistilBERT, which applies to learning sequence models for the MIND news setting (Section 3.2, Appendix G.3). In these cases, each run uses a single NVIDIA A40 GPU, and a single training run of the slowest variant Flexible NN (text) takes about 16 hours to complete. We ran hyperparameter sweeps and tried several architecture variations, so we estimate the total compute to be an order of magnitude or two larger than that of a single run. Note that we use the CPU cluster for e.g. ensembling, where we freeze the DistilBERT part of the model and train MLP heads with random initializations on bootstrap-resampled subsets of the data.
+
+## Appendix H Related Work
+
+**Meta-Learning in Bandits.** There are a variety of bandit algorithms for meta-learning problems [51, 8, 26, 3]; these methods primarily focus on simpler settings (e.g. Gaussian or linear reward models). There are also deep meta-learning methods developed for recommendation systems and the cold-start problem [52, 56, 57]. These works primarily focus on more complex recommendation settings (e.g. tracking the same user over time) and not on uncertainty. In contrast, our goal is to showcase our uncertainty quantification method for decision making in a semi-realistic setting.
+
+**Reinforcement Learning (RL) with Pre-Trained Autoregressive Models.** Many recent works in RL leverage sequence models that are pretrained on a large volume of data collected by an expert policy. [29, 30] relate sampling from a model that predicts the next expert action to Thompson sampling. Other works apply goal-conditioned sampling of expert actions to improve over average expert behavior [54, 24, 9, 12, 13]; this works well in some settings but is provably sub-optimal others [4, 32]. Our work is different: we use sequence models to imagine plausible trajectories of future rewards, and use this to drive intelligent decision-making without requiring expert demonstrations.
+
+**Thompson Sampling with Deep Learning Models.** Several classes of approaches that have emerged to scale Thompson sampling to modern large scale decision-making problems that utilize neural network. The first class places a Bayesian prior on the weights of the neural network itself. These methods include those that form a Bayesian linear regression model from the last layer of a trained neural network [43, 48], as well as Bayesian neural networks [55]. A second class of approaches involves forming using an ensemble of neural networks to simulate samples from a posterior distribution [37, 31, 41]. This class also includes algorithms that build on Epinets [40, 58, 39], which attempt to retain the performance of the ensembling with lower computational cost. Notably, [40] uses sequence prediction loss to _evaluate_ the quality of ("epistemic") uncertainty quantification, inspiring our efforts to construct bandit algorithms using sequence models.
+
+Figure 9: **Comparing oracle prior vs prior learned through our method (empirical bayes) in a synthetic setting. Error bars represent \(\pm 1\) standard error; the error bars on the left plot are present but small enough to not be visible.**Discussion
+
+We formulate a loss minimization problem that implicitly learns an informed prior using historical data, in order to model the posterior distribution of action rewards for decision-making. This connection enables using modern ML tools to learn rich representations to comprehend uncertainty, in an actionable way. Our formulation introduces a fresh approach to the longstanding challenge of scaling Thompson sampling to incorporate neural networks that incorporate unstructured inputs such as images and text [43]. The main ideas behind our algorithm generalize to _contextual_ settings where user-specific contexts \(X_{t}\) can be used to tailor recommendation decisions. We describe generalizing our method to this setting in Appendix D and leave a deeper dive to future work.
+
+**Limitations.** We assume articles are i.i.d. between pretraining and online evaluation, and user outcomes for each action are exchangeable. Such assumptions may not be appropriate in practice, e.g., if user preferences are nonstationary. In conducting this work, we struggled to find publicly available datasets on which to evaluate our method, which led us to build our news recommendation setting. Building public benchmarks for bandit problems that require using complex inputs (e.g. text and/or images) for best performance is an important open direction. A limitation of this work is we do not provide a thorough answer as to the quality of the historical data (e.g., amount of data and/or how data was collected) necessary to ensure learning good sequence models.
+
+## Appendix J Additional exchangeability comment
+
+We elaborate on a comment made in the text. Exchangeability means that outcomes from recommendations made to a large subset of \(m<T\) users is likely to be representative of outcomes that would have been observed among all \(T\) users.
+
+It is not hard to formalize results of this type. For instance, for any permutation \(\sigma\) over \(\{1,\ldots,T\}\),
+
+\[\left(\mathbb{E}\bigg{[}\bigg{(}\frac{1}{m}\sum_{i=1}^{m}R(Y_{\sigma(i)}^{(a)} )-\frac{1}{T}\sum_{t=1}^{T}R(Y_{t}^{(a)})\bigg{)}^{2}\bigg{]}\right)^{1/2} \leq\sqrt{\frac{1/4}{m}}\times\sqrt{1-\frac{m}{T}}\] (21)
+
+The term \(\sqrt{1-\frac{m}{T}}\) is the finite population correction to the standard error of the sample mean [42, Ch 4.5]
+
+## Appendix K When is an Autoregressive Sequence Model a Valid Posterior Predictive?
+
+In Algorithm 1, we learn an autoregressive model to use in place of a posterior predictive in Algorithm 2. We make this connection in Section 3.1 and establish a regret bound for Algorithm 2 that holds whenever \(p_{\theta}\) has low loss.
+
+In this section, we address the following question: _When is \(p_{\theta}\) a valid posterior predictive, for some underlying Bayesian model?_
+
+In order for an autoregressive generative sequence model to be a valid posterior predictive distribution, the sequence model to be _infinitely exchangeable_. We say that a sequence model is an infinitely exchangeable sequence model if it generates infinitely exchangeable random variables (Definition 2).
+
+**Definition 2** (Exchangeablity).: _A sequence of random variables \(Y_{1},Y_{2},\ldots,Y_{n}\) is exchangeable if for any permutation \(\pi\), the following are equal in distribution:_
+
+\[\big{(}Y_{1},Y_{2},\ldots,Y_{n}\big{)}\overset{D}{=}\big{(}Y_{\pi(1)},Y_{\pi( 2)},\ldots,Y_{\pi(n)}\big{)}.\]
+
+_An infinite sequence of random variables is infinitely exchangeable if any finite subset is exchangeable._
+
+Practically, this means that the models we train need to be invariant to the _order_ in which previous outcomes are fed into the model. The key insight behind why infinitely exchangeable sequence models are valid posterior predictives is De Finetti's Representation Theorem (Theorem 2 below). We state this Theorem for binary outcomes for simplicity [10, 22], but it generalizes to real-valued outcomes [11].
+
+**Theorem 2** (De Finetti's Representation Theorem for Binary Outcomes).: _If a sequence of binary random variables \(\{Y_{i}\}_{i\in\mathbb{N}}\) is infinitely exchangeable, then there exists a unique distribution \(P(\mu)\) on \([0,1]\) such that for some \(\mu\sim P(\mu\in\,\cdot\,)\),_
+
+\[Y_{1},Y_{2},Y_{3},\cdots\mid\mu\stackrel{{ i.i.d.}}{{\sim}}\text{ Bernoulli}(\mu).\]
+
+The implication of Theorem 2 is that _any_ infinitely exchangeable sequence of binary random variables \(\{Y_{i}\}_{i\in\mathbb{N}}\) can equivalently be described as being generated by a particular Bayesian model with a Bernoulli likelihood. Above, \(\mu\) is a latent success probability that is drawn from some prior distribution \(P(\mu\in\,\cdot\,)\).
+
+In practice note that our bootstrap training procedure in Algorithm 1 helps ensure our sequence model \(p_{\theta}\) is approximately exchangeable.
+
+## Appendix L Broader Impacts
+
+Although our contribution is largely conceptual/theoretical, we list some potential positive and negative societal impacts.
+
+Positive impactsOur method could potentially enable better decision making in a variety of settings, including areas of clear social good like personalized healthcare. By incorporating historical data, including with complex features (e.g. text or images), in a flexible way, we enable more historical data to be used more effectively.
+
+Negative impactsOur method proposes learning recommendation algorithms using historical data. It is possible that historical data contains biases that can be harmful when perpetuated. We urge researchers to be thoughtful when curating and using historical data for this purpose. We also urge researchers to be thoughtful about the rewards \(R(\cdot)\) they are aiming to maximize, as e.g. it is not always best for the user to maximize the user's time spent on a recommendation platform.

@@ -2,7 +2,7 @@ import os
 import json
 from tqdm import tqdm
 
-def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, min_input_length=1000):
+def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, min_input_length=10000):
     """将数据集格式化为Llama Factory所需的格式，并过滤掉过长或过短的输入"""
     # 加载数据集
     with open(dataset_path, 'r', encoding='utf-8') as f:
@@ -21,7 +21,18 @@ def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, 
         confidence = item.get('avg_confidence', 0)
         
         # 构建提示和回复
-        prompt = f"""Please provide a comprehensive review of the following academic paper. Your review should be structured into four main sections:
+        prompt = f"""Paper Details:
+- Title: {item['title']}
+
+- Conference: {item['conference']} {item['year']}
+
+- Content: {item['paper_content']}"""
+
+        # 构建标准化的输出格式
+        response = f"{item['aggregated_review']}\n### Rating\nOverall Quality: {rating:.1f}\nReview Confidence: {confidence:.1f}"
+        
+        llama_factory_item = {
+            "instruction": f"""You are an academic paper reviewer. Please provide a comprehensive review of the following academic paper. Your review should be structured into four main sections:
 
 ### Key Points
 Summarize the main contributions and key ideas of the paper.
@@ -36,21 +47,9 @@ Weaknesses:
 Provide specific recommendations for enhancing the paper.
 
 ### Rating
-Overall Quality (1-10)
-Review Confidence (1-5)
-
-Paper Details:
-Title: {item['title']}
-Conference: {item['conference']} {item['year']}
-
-Content:
-{item['paper_content']}"""
-        
-        # 构建标准化的输出格式
-        response = f"{item['aggregated_review']}\n### Rating\nOverall Quality: {rating:.1f}\nReview Confidence: {confidence:.1f}"
-        
-        llama_factory_item = {
-            "instruction": "You are an academic paper reviewer. Please provide a comprehensive review with ratings for the given paper.",
+Overall Quality: (1-10)
+Review Confidence: (1-5)
+""",
             "input": prompt,
             "output": response
         }
@@ -106,7 +105,7 @@ def create_train_val_split(dataset_path, train_path, val_path, val_ratio=0.1):
     
     return train_data, val_data
 
-def create_train_val_test_split(dataset_path, train_path, val_path, test_path, val_ratio=0.1, test_ratio=0.1):
+def create_train_val_test_split(dataset_path, train_path, val_path, test_path, val_ratio=0.05, test_ratio=0.05):
     """创建训练集、验证集和测试集分割"""
     # 加载完整数据集
     with open(dataset_path, 'r', encoding='utf-8') as f:

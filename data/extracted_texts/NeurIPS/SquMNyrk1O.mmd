@@ -1,0 +1,169 @@
+# Winner-Take-All Column Row Sampling for Memory Efficient Adaptation of Language Model
+
+Zirui Liu\({}^{1}\), Guanchu Wang\({}^{1}\), Shaochen Zhong\({}^{1}\), Zhaozhuo Xu\({}^{2}\), Daochen Zha\({}^{1}\), Ruixiang Tang\({}^{1}\), Zhimeng Jiang\({}^{3}\), Kaixiong Zhou\({}^{1}\), Vipin Chaudhary\({}^{4}\), Shuai Xu\({}^{4}\), Xia Hu\({}^{1}\)
+
+\({}^{1}\)Rice University, \({}^{2}\)Stevens Institute of Technology, \({}^{3}\)Texas A&M University,
+
+\({}^{4}\)Case Western Reserve University
+
+{zl105,gw22,hz88,daochen.zha,ruixiang.tang,kaixiong.zhou,xia.hu}@rice.edu; zxu79@stevens.edu; zhimengj@tamu.edu; {vipin, sxx214}@case.edu
+
+Equal contribution. The order of authors is determined by flipping a coin.
+
+###### Abstract
+
+As the model size grows rapidly, fine-tuning the large pre-trained language model has become increasingly difficult due to its extensive memory usage. Previous works usually focus on reducing the number of trainable parameters in the network. While the model parameters do contribute to memory usage, the primary memory bottleneck during training arises from storing feature maps, also known as activations, as they are crucial for gradient calculation. Notably, machine learning models are typically trained using stochastic gradient descent. We argue that in stochastic optimization, models can handle noisy gradients as long as the gradient estimator is unbiased with reasonable variance. Following this motivation, we propose a new family of unbiased estimators called WTA-CRS, for matrix production with reduced variance, which only requires storing the sub-sampled activations for calculating the gradient. Our work provides both theoretical and experimental evidence that, in the context of tuning transformers, our proposed estimators exhibit lower variance compared to existing ones. By replacing the linear operation with our approximated one in transformers, we can achieve up to 2.7\(\) peak memory reduction with almost no accuracy drop and enables up to \(6.4\) larger batch size. Under the same hardware, WTA-CRS enables better down-streaming task performance by applying larger models and/or faster training speed with larger batch sizes. The code is available at https://github.com/zirui-ray-liu/WTACRS/.
+
+## 1 Introduction
+
+Pre-trained language models (LMs) with transformer architecture have achieved remarkable success in numerous natural language processing (NLP) tasks . Specifically, these models are trained on vast text corpora to acquire general-purpose representations, which are then adapted to a specific task by fine-tuning on task-specific data. In recent studies, it has been convincingly demonstrated that significantly increasing the number of parameters in pre-trained LMs leads to remarkable improvements in performance . As a result, there is now an urgent necessity to effectively adapt these models, equipped with billion-scale parameters, to a wide range of tasks.
+
+However, a significant disparity exists between the memory requirements of pre-trained LMs and the capacity of current hardware, particularly GPUs. For example, even a GPU with 24GB memory cannot accommodate the fine-tuning process of the T5-3B model  with batch size one, which boasts three billion parameters. Without additional techniques, attempting to fine-tune billion-scale LMs on a single GPU is impossible. Although model-parallel fine-tuning is feasible, the majority of the time, we cannot bear the expense of acquiring multiple GPUs or the communication overheadinvolved. To ensure the smooth deployment of language models during the fine-tuning process, it is crucial to adapt them for operation on a single GPU.
+
+To address this issue, several parameter-efficient tuning methods are proposed . Specifically, adapters  insert a small module into the transformer blocks and only update it while keeping other parameters fixed. Similarly, prompt tuning  introduces a small vector that is concatenated with the input embeddings and updated during the tuning process. LoRA  injects trainable rank decomposition matrices into the transformer block, updating them while freezing the others. Parameter-efficient tuning methods mainly reduce the memory taken by the optimizer states . Although the optimizer states contribute to the memory footprint, _storing activations (or feature maps) is the main memory bottleneck during training_ (often \(>70\%\)) . Thus, parameter-efficient methods often do not reduce memory usage by much .
+
+In parallel, we can reduce the main memory bottleneck by reducing the activation storage in fine-tuning. Since transformer-based models are mainly built based on the linear layer, a less-explored direction is to replace the expensive matrix multiplication operation with its memory-efficient estimations using column-row sampling (CRS) . The key idea of CRS is to sub-sample tensors onto low-dimensional spaces and perform the original operations here. Specifically, for the linear operation between two matrices \(^{n m}\) and \(^{m q}\) (in the context of machine learning, \(\) is often activations), **we first sample \(k\)** (\(k<m\)) **column-row pairs according to a pre-defined distribution.** Then we obtain \(^{}^{n k}\) and \(^{}^{k q}\) (\(k<m\)) by picking \(k\) columns of \(\) and the corresponding rows of \(\) according to the sampled column-row pairs . Finally, we estimate \(^{}^{}\). In this way, we only need to store the sub-matrix \(^{}\) and \(^{}\) in GPU memory to perform the computation. Moreover, transformer-based models training/tuning are performed with the first-order stochastic optimizer, e.g., Adam . In stochastic optimization, models can work with noisy gradients, _as long as the gradient estimator is unbiased and has a reasonable variance._ In view of such, we ask: **why spend resources on obtaining exact gradients when we are using stochastic optimization?** Motivated by this, we focus on obtaining unbiased gradients cheaply with approximated matrix multiplication.
+
+The approximation method reduces the memory usage at the cost of giving outputs with variance. Thus there naturally exists an accuracy-memory trade-off. The main challenge is how to integrate the approximated matrix multiplication into transformer with minimal gradient variance. In this paper, we propose a new family of unbiased estimator for matrix multiplication with reduced variance, dubbed Winner-Take-All Column-Row Sampling (WTA-CRS ). Compared to CRS, WTA-CRS reduces the variance of an estimator by focusing more on high-probability regions of the sampling distribution. Moreover, WTA-CRS can serve as a drop-in replacement for the linear operation in transformers, providing an unbiased weight gradient with reduced memory usage. As shown in Figure 1, our method achieves better accuracy-memory trade-off than state-of-the-art memory-efficient tuning methods, e.g., LST  and LoRA . Moreover, since WTA-CRS executed at the operation level, it is orthogonal to most of the existing parameter-efficient tuning methods. Our contributions are highlighted as follows:
+
+* We design a new family of unbiased estimator for matrix multiplication with reduced variance. We theoretically and experimentally verify that it has smaller variance than the established one under the context of tuning transformer.
+* By replacing the linear operation with WTA-CRS in transformers, we can achieve up to 2.7\(\) peak memory reduction with almost no accuracy drop, and enables up to \(6.4\) larger batch size. For example, to fully tune T5-3B, it requires 66.4GB of memory for in a mini-batch size of \(32\), which relies on A100 GPUs with a capacity of 80GB. With WTA-CRS, it only requires 21.6GB of memory for fine-tuning, which can run on a GPU with 24GB memory, e.g. RTX3090Ti.
+* We implement WTA-CRS as a ready-to-use extension for Pytorch with an easy-to-use API that can also be combined with other memory-saving techniques.
+
+Fig. 1: Accuracy-memory trade-off of WTA-CRS and other memory-efficient tuning methods. Unless specially stated, we use the T5-Large in the figure.
+
+Background and Preliminary
+
+In this section, we first analyze the memory usage of transformers. Then we introduce the background on the approximated matrix multiplication.
+
+### The Memory Usage of Transformers
+
+In each training step of backpropagation, it has exactly two phases, i.e., one forward phase and one backward phase. Transformer-based models are mainly built based on the linear operation, which can be written as:
+
+Forward Pass \[ =(,),\] (1a) Backward Pass \[ =(,^{}),\] (1b) \[ =(^{},),\] (1c)
+
+where \((,)\) is the General Matrix Multiplication operation, \(\) and \(\) are the activation (or input feature maps) and output feature maps, respectively. \(\) is the weight of the linear layer. \(\), \(\), and \(\) are the gradient of \(\), \(\), and \(\), respectively. From Equation (1c), activations \(\) are used in the backward phase. In commonly used deep learning framework [24; 25], it requires storing \(\) in GPU memory during the forward pass, for calculating the weight gradient \(\) in the backward pass.
+
+Previous works show that although the model parameters contribute to the memory footprint, activations (e.g., storing \(\)) are the main memory bottleneck during training [16; 17; 18; 19]. To get a sense of the scale, we show in Figure 2 that for popular transformer models like T5, activations may take roughly \(73 88\%\) of the total memory, depending on the batch size \(B\) and sequential length \(S\).
+
+### Approximated \(\) With Sampling
+
+Let \(^{n m}\), \(^{m q}\) be two matrices. The goal is to efficiently estimate the matrix production \(\). Singular Value Decomposition (SVD) outputs provably optimal low-rank estimation of \(\). However, SVD is almost as expensive as matrix production itself. Instead, the sampling algorithm is proposed to approximate the matrix product \(\) by sampling \(k\) columns of \(\) and corresponding rows of \(\) to form smaller matrices, which are then multiplied as usual [22; 26]:
+
+\[(,)=_{i=1}^{m}_{:,i} _{i,:}_{t=1}^{k}}}_{:,i_{t}} _{i_{t},:}=^{}^{},\] (2)
+
+where \(_{:,i}^{n 1}\) and \(_{i,:}^{1 q}\) are the \(i^{}\) column and row of \(\) and \(\), respectively. **In this paper, we call \((_{:,i},_{i,:})\)**the \(i^{}\) **column-row pair.**\(k\) is the number of sampled pairs (\(1 k m\)). \(=\{p_{i}\}_{i=1}^{m}\) is a probability distribution over the column-row pairs. \(i_{t}\{1, m\}\) is the index of the sampled column-row pair at the \(t^{}\) trial. \(s_{t}\) is the scale factor. \(^{}^{n k}\) and \(^{}^{k q}\) are the normalized sub-matrices sliced according to the sampled column-row pairs.
+
+Existing work  shows \(^{}^{}\) is an unbiased estimation of \(\), i.e., \([^{}^{}]=\). Furthermore, the approximation error \([\|-^{}^{}\|_{ F}]\) is minimized when the probabilities \(\{p_{i}\}_{i=1}^{m}\) are proportional to the product of the column-row Euclidean norms  (Proof in Appendix C):
+
+\[p_{i}=_{:,i}||_{2}\ ||_{:,i}||_{2}}{_{j=1}^{m}|| _{:,j}||_{2}\ ||_{j,:}||_{2}}.\] (3)
+
+As we analyzed in Section 2.1, storing the activation \(\) is the major memory bottleneck. **If we can replace \((^{},)\) in Equation (1c) with \(^{}^{}\) following the paradigm of Equation (2), then we only need \(^{}\) instead of \(\) in GPU memory to compute the gradient, which significantly decreases the memory usage of activations.** This estimation linearly reduces the memory complexity from \((nm)\) to \((nk)\). Also, the total number of floating point operations (FLOPs) is reduced as
+
+Fig. 2: The GPU memory usage breakdown for fine-tuning T5 , where the batch size \(B\) is 64 and sequential length \(S\) is 128 or 256.
+
+well since the computation is executed on two smaller matrices. _For the ease of illustration, in this paper we call the distribution in Equation (3) the **column-row index distribution**_. In the next section, we explore how to reduce memory usage via sampling-based matrix multiplication.
+
+## 3 Methodology
+
+In recent years, we have observed that deep neural network training can be performed almost entirely with first-order _stochastic optimization_. Thus intuitively, _in stochastic optimization we can reduce the resources spent on obtaining gradients, as long as the estimated gradient is unbiased with reasonable variance_[27; 28; 29]. Following this motivation, we first design a new unbiased estimator for matrix multiplication with reduced variance compared to the one in Equation (2) (Section 3.1 ). Then we introduce how to replace the GEMM in Transformer with its approximated version to reduce the memory usage (Section 3.2).
+
+### Winner-Take-All Column-Row Sampling: A New Unbiased Estimator for GEMM
+
+In this section, we mathematically design a new unbiased estimator for GEMM with reduced variance called WTA-CRS (Winner-Take-All Column-Row Sampling). Following the notation in Section 2.2, let \(^{n m}\), \(^{m q}\) be two matrices. \(=\{p_{i}\}_{i=1}^{m}\) is the column-row index distribution in Equation (3)2. We first define the variable \(f(i)\) as \(f(i)=_{i}_{i}}{p_{i}}\).
+
+\(f(i)\) is an unbiased estimation for the matrix production between \(\) and \(\). To see this,
+
+\[_{j}[f(j)]=_{i=1}^{m}p_{i}_{:,i} _{:i}}{p_{i}}=.\]
+
+We note that the prior approximated matrix multiplication in Equation (2) is the direct extension of \(f(i)\) by taking the average of \(\{f(i_{t})\}_{t=1}^{k}\) among \(k\) independent random trials to reduce the variance. Here we explore an alternative approach to reduce the variance of \(f(i)\) beyond simple averaging. Our core idea is to partition the column-row index distribution \(=\{p_{i}\}_{i=1}^{m}\) into two complementary regions based on the probability mass: a high-probability region \(^{}\) and a low-probability region \(^{}\), where \(=\{1,,m\}\) is the whole set and \(\) is the set of the column-row index with the largest probability. **Let \(\) be the set of column-row pair indices associated with \(||\) largest \(p_{i}\).** We define WTA-CRS estimator for \(\) as follows:
+
+\[_{j^{}}_{c }f(c)p_{c}+(1-_{c}p_{c})f(j).\] (4)
+
+We note that **the random variable in Equation (4) is the column-row pair index \(j\), and is only sampled from \(\)**. The estimator defined in Equation (4) contains two parts. The first part \(_{c}f(c)p_{c}\) has no relationship with the random variable \(j\) and is summed deterministically. The second part \(f(j)\) is sampled stochastically, but scaled by the factor \((1-_{c}p_{c})\). When \(=\{p_{i}\}_{i=1}^{m}\) is concentrated on a small number of atoms, the scaling factor \((1-_{c}p_{c})\) for the stochastic term should be small. Therefore, we intuitively expect the estimator to have a small variance in this case due to a small scaling factor. In this way, we reduce the variance of an estimator by focusing more on high-probability regions of the distribution (winner-take-all). Below we formalize this intuition by showing the statistical property of our estimator regarding the bias and variance, respectively.
+
+**Theorem 1** (Proof in Appendix C.2).: _The estimator defined in Equation (4) is an unbiased estimator for matrix production \(\), i.e, \(_{j^{}}[_{c }f(c)p_{c}+(1-_{c}p_{c})f(j)]=\)._
+
+Theorem 1 states that our proposed estimator in Equation (4) is unbiased. Below we compare our proposed estimator to the CRS estimator in Equation (2) in terms of the variance. Suppose we have the budget of only utilizing \(k\) column-row pairs for approximating the matrix production. From the implementation perspective, the estimator defined in Equation (2) estimates GEMM\((,)\) as:
+
+\[ g(,)=_{t=1}^{k}f(i_{ t}),\;\;\;i_{1},,i_{k}}}}{{ }}.\] (5)Our estimator defined in Equation (4) splits the budget \(k\) into two parts. Namely, the first part explicitly sums the expectation terms for the largest probability group \(\) (\(||<k\)), while stochastically average \(k-||\) samples drawn from \(\) to estimate the remaining terms, up to scale:
+
+\[()&( ,)=_{c}f(c)p(c)+}p_{c}}{k-||}_{j=1}^{k-||}f(j),\ \ i_{1},,i_{k-||}}}{{}}^{}.\] (6)
+
+**Theorem 2** (Proof in Appendix C.3).: _Suppose the total budget of column-row pairs is \(k\). If \(\) satisfies_
+
+\[_{c}p_{c}>|}{k},\] (7)
+
+_then we have \([(,)]<[g(, )]\). Moreover, \([(,)]\) is minimized when \(||=_{||\{0,,k\}}}p_{c}}{k-||}\)._
+
+Both the left- and right-hand sides of Equation (7) depend on the size of the highest probability group \(||\), which controls the number of high probability column-row pairs that are directly added without sampling. Below we experimentally investigate whether Equation (7) holds under the context of fine-tuning the transformer-based model with varying \(||\).
+
+**Experimental analysis.** As shown in Figure 3, we visualize the two terms in Equation (3) for the column-row index distribution of query, key, and value projection in the self-attention module, respectively . Specifically, we fix the total column-row pair budget \(k=0.3||\) and change the size of the highest probability group \(||\) from \(0\) to \(k\). We conclude that Equation (7) holds for most of the layers when fine-tuning transformers. Thus, we expect our WTA-CRS has better performance than CRS for adapting transformer-based models, which is later experimentally verified in Section 5.
+
+### Compress GEMM in Transformers with WTA-CRS
+
+Previous work has shown that unbiasedness of the estimated gradient is crucial for the proper convergence of stochastic gradient descent . As shown in Section 2.1, we have three GEMM in the linear layer. Below we investigate how to replace GEMM with its approximated version in a way that the estimated gradient is unbiased.
+
+**Unbiasedness.** Previous work has shown that to ensure the unbiasedness of the gradient, the approximation can only be applied during the backward pass . The rationale behind this conclusion is that we have \([f(x)] f([x])\) for any non-linear function \(f()\), e.g., \([x^{2}]^{2}[x]\). Thus if we replace the forward GEMM in Equation (1a), even when the approximation method gives an unbiased estimation, i.e., \([(,)]==\), the output activations (e.g., \(()\)) are still biased since the activation function is non-linear, namely,
+
+\[((,))=([])[()].\]
+
+Figure 4: The illustration of how to deploy WTA-CRS to linear layers. We only replace GEMM in Equation (1c) with its approximated version using WTA-CRS. The pseudocode is given in Appendix D Algorithm 1.
+
+Figure 3: The probability mass \(_{c}p_{c}\) versus \(|}{k}\) in Equation (7) at \(k=0.3||\). Here we visualize the column-row index distribution of query/key/value projection layer in the T5-base model, which is fine-tuned on RTE dataset. More similar results can be found in Appendix E.1.
+
+To ensure the unbiasness of gradient and reduce the memory usage of storing \(\), as shown in the example of Figure 4, **we only replace** GEMM **in the backward pass with its approximation (e.g., Equation (1c)), while leaving the forward one unchanged (e.g., Equation (1a)). We show in Appendix B that the estimated weight gradient is unbiased in this case.**
+
+System Implementation.Here we present how we implement \(\)-\(\) in Equation (6) in practice. For the linear layer, as we analyzed, we only replace GEMM in Equation (1c) with its approximated version. In this case, \(\) and \(\) in Equation (6) are activation \(^{}\) and output gradient \(\), respectively. Given the total column-row pair budget \(k\), the **first** step is to build the deterministic index set \(\), where each element is summed explicitly without sampling. Note that \(\) is a set of indices with the highest probabilities in Equation (3). Thus, to build \(\), we only need to determine its size, denoted as \(||\), which minimizes the variance of the estimator. As Theorem 2 suggested, we set \(||=_{||\{0,,k\}}}p_{c}}{k-||}\). The **second** step is to sample \(k-||\) column-row indices from the remaining distribution \(^{}\) to obtain the set \(_{}\), where \(|_{}|=k-||\). The **third** step is to build sub-sampled \(^{}\) with only rows from \(_{}\). Note that for rows in \(^{}\) from \(_{}\), we need to normalize it by \(}p_{c}}{k-||}\) according to Equation (6). We illustrate the above process in Figure 4. The pseudocode to Appendix D Algorithm 1.
+
+Scope.Here we show which operation can be replaced with its approximation version. As shown in Figure 5, the transformer is mainly consisted of linear layer, TensorMul, and other operations (e.g., GeLU, Dropout, LayerNorm). TensorFlowMul in Figure 5 refers to the multiplication between two four-dimensional tensors. Our \(\)-\(\)_can be applied to Linear-Q, -K, -V, -O, -U, -D, TensorMul-1, and TensorMul-2 (in green)_. The activations of Dropout and GELU operations (in blue) can be losslessly compressed. The Softmax and LayerNorm operators (in gray) remain unchanged.
+
+## 4 Related Work and Discussion
+
+Due to the page limit, we discuss the related work on approximated matrix multiplication and aproximation in LLM inference. Other related topics, e.g., parameter-efficient fine-tuning, activation quantization, and gradient checkpointing, can be found in Appendix A. We also discuss the limitation and potential negative social impact in Appendix A.
+
+Approximated Matrix Multiplication.In the context of neural networks, approximated matrix multiplication methods can be broadly categorized into two main groups: (1) Butterfly-based methods [33; 34] replace dense weight matrices with butterfly matrices. We note that they focus on the weight matrix and are orthogonal to our research, as we concentrate on sub-sampling the activation matrix. (2) Column-row sampling (CRS) methods[22; 21; 31] select important rows and columns from the input matrices and perform the multiplication on the sampled matrix. Our work is closely aligned
+
+Figure 5: The diagram of a single Transformer block. The shape of activations is annotated, where \(B,S,D_{}\), \(N_{}\), and \(D_{}\) are the batch size, sequence length, hidden size, number of attention heads, and head dimension, respectively. \(\)-\(\) can be applied to the operators in green; the activation maps of operators in blue can be losslessly compressed; and those in gray are not compressed in this paper. The idea of this figure is inspired by .
+
+with this second research line. [21; 31] share similarities with our research in terms of utilizing CRS for approximating matrix multiplication within neural networks. The main distinction lies in how to select the column-row pairs. Specifically,  deterministically selects column-row pairs without scaling, whereas our estimator divides the column-row pairs into a deterministic component and a stochastic component. As we analyzed, selecting column-row pairs deterministically is biased. Later we show that this approach may cause a significant accuracy drop (**"Deterministic" in Figure 12**).
+
+**Approximation in Inference** There are two approximation techniques to reduce inference latency. (1) Sparse Modeling, which only involve a subset of weights during computation to reduce both computational and memory I/O demands [35; 36; 37]. (2) Quantization, which compresses the trained weight into lower numerical precision [38; 39; 40]. All these approximation techniques trade-off model quality in return for improved efficiency. Besides approximation technique itself, researchers also propose methods to recover the accuracy drop of compressed models [41; 42], e.g., by prompting compressed models. These methods can greatly improve the accuracy-efficiency trade-off of LLMs.
+
+## 5 Experiments
+
+In this section, we design experiments to answer the following research questions: **RQ1:** How effective is WTA-CRS in terms of accuracy with reduced memory usage? **RQ2:** How sensitive is WTA-CRS affected by its key hyper-parameters? **RQ3:** WTA-CRS contains two parts, i.e., the deterministic summation part and the statistical sampling part. Are they both necessary? **RQ4:** How is the fine-tuning speed affected by WTA-CRS?
+
+### Experiment Setup
+
+Datasets and Evaluation Protocol.Following most of the previous work, we adopt GLUE benchmark  to evaluate the effectiveness of different methods, including the CoLA, SST-2, MRPC, QQP, MNLI, QNLI, RTE, and STS-B datasets. To evaluate the memory usage, we report the peak GPU memory usage and compression rate during the fine-tuning process with Huggingface API .
+
+**Compared Methods and Adopted Models.** We consider three methods to compare in this paper: Full fine-tuning (Full), LoRA , and Ladder Side-tuning (LST) . Specifically, **Full** tunes all of the parameters in the model to provide an upper bound of accuracy; **LoRA** inserts trainable low-rank matrices into the model to parameterize the weights' changes; **LST** injects a trainable ladder side structure. Since WTA-CRS essentially replace the linear operation with approximated one, **we emphasize that our** WTA-CRS **is compatible with all these three compared methods, i.e., they can be combined together towards smaller memory usage.** For the backbone model, we follow the previous work [9; 14; 12] to adopt the OPT , Bert-Base , Bert-Large, T5-Base, T5-Large, and T5-3B  for evaluating the effectiveness of different methods.
+
+**Hyperparameter Settings.** For WTA-CRS, it only has one hyperparameter \(k\), which controls the column-row pair budget. We assign the same \(k\) to all replaceable linear operations in the model. We consider the normalized column-row pair budget \(k/||\{0.3,0.1\}\), which are denoted as WTA-CRS @0.3 and WTA-CRS@0.1, respectively. We also consider the combination of WTA-CRS and LoRA to further reduce the memory cost of both optimizer and activations. The detailed hyperparameters are given in Appendix F. All reported results are averaged over three random trials.
+
+### Accuracy versus Memory Usage (RQ1)
+
+To answer **RQ1**, we first analyze the trade-off between the model performance and memory saving. The evaluation results and peak memory usage are given in Tables 1 and 2, respectively. We observe:
+
+\(\)_WTA-CRS achieves a superior trade-off between accuracy and memory usage compared to baselines. Specifically, WTA-CRS has negligible accuracy drop, while the peak memory usage is reduced by \(2.1 2.7\)_(when combined with LoRA).
+
+[MISSING_PAGE_FAIL:8]
+
+sample the row-column pairs. All methods are deployed to GEMM in the backward pass, while leaving the forward one unchanged. The experiments are conducted on the training of T5-base language model on the SST2, MNLI, and QQP datasets; The column-row pair budget takes \(k/||=0.1\) for all methods. The validation accuracy versus training epoch is given in Figure 12. We observe:
+
+\(\) _VTA-CRS outperforms all compared methods, especially as the training epoch grows._ The deterministic selection of top \(k\) column-row pairs suffers from accumulation of bias error that ultimately results in a failure of convergence. For CRS, it also enables the unbiased weight gradient. However, as we theoretically and experimentally analyzed in Theorem 7 and Figure 3, it is worse than WTA-CRS due to larger variance. In summary, both the deterministic and stochastic parts contribute to the effectiveness of WTA-CRS, which is consistent with our theoretical analysis.
+
+The speed of WTA-CRS (RQ4).The configuration of computational infrastructure is given in Appendix F.1. We note that WTA-CRS does not add any extra parameters to the model. Thus, WTA-CRS only affect the fine-tuning speed, without affecting the inference speed. Below we analyze how the fine-tuning speed affected by WTA-CRS. As we analyzed in Appendix A limitation, the current implementation is not heavily optimized and thus the execution time of WTA-CRS is still slower than the original linear operation (details are shown in Appendix E.2). However, under the same hardware, a reduction in activation memory enables the use of larger batch sizes, thereby improving training speed due to increased GPU utilization . As we analyzed in Figure 6, WTA-CRS can enlarge the available batch size by up to \(4.8\) larger. This enhancement is expected to result in a acceleration of the training speed. To illustrate, Figure 8 presents a visualization of batch size against training throughput (sentences per second) for both T5-Large and T5-3B models. We observe that \(\) _VTA-CRS enables faster training speed under the same hardware._ Specifically, on the T5-Large model, WTA-CRS@0.1 shows \(1.08\) higher training throughput; and on the T5-3B model, WTA-CRS @0.3 and WTA-CRS@0.1 achieve \(1.14\) and \(1.21\) higher training throughput, respectively.
+
+## 6 Acknowledgements
+
+The authors thank the anonymous reviewers for their helpful comments. The work is in part supported by NSF grants NSF IIS-1849085, IIS-2224843, and NSF Awards 2117439 and 2112606. This work made use of the High Performance Computing Resource in the Core Facility for Advanced Research Computing at Case Western Reserve University.
+
+## 7 Conclusion
+
+In this paper, we propose WTA-CRS, a new unbiased estimator for matrix production with reduced variance. We theoretically and experimentally show when and why the estimator is better than the traditional unbiased estimator in terms of the variance. In the context of adapting transformers, it almost has no accuracy drop while reducing the peak memory usage by up to \(2.7\), and it enables a \(6.4\) larger batch size, which in return resulting in \(1.2\) higher training throughput.
+
+Figure 8: Batch size versus training throughput (sentences/sec) with different methods, where the sequential length is 128. The hardware is one single NVIDIA-A100 (80GB).
+
+Figure 7: Average validation results on GLUE dataset of WTA-CRS with varying budgets.

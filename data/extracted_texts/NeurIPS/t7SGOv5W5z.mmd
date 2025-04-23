@@ -1,0 +1,293 @@
+# UQE: A Query Engine for Unstructured Databases
+
+Hanjun Dai\({}^{}\), Bethany Yixin Wang\({}^{}\), Xingchen Wan\({}^{}\), Bo Dai\({}^{}\), Sherry Yang\({}^{}\),
+
+Azade Nova\({}^{}\), Pengcheng Yin\({}^{}\), Phitchaya Mangpo Phothilimthana\({}^{}\),
+
+Charles Sutton\({}^{}\), Dale Schuurmans\({}^{@sectionsign}\)
+
+\({}^{}\) Google DeepMind \({}^{}\) Google Cloud \({}^{@sectionsign}\) University of Alberta Georgia Institute of Technology
+
+work done while Phitchaya Mangpo Phothilimthana was at Google DeepMind.Correspondence to hadai@google.com and wyixin@google.com.38th Conference on Neural Information Processing Systems (NeurIPS 2024).
+
+###### Abstract
+
+Analytics on structured data is a mature field with many successful methods. However, most real world data exists in unstructured form, such as images and conversations. We investigate the potential of Large Language Models (LLMs) to enable _unstructured_ data analytics. In particular, we propose a new Universal Query Engine (UQE) that directly interrogates and draws insights from unstructured data collections. This engine accepts queries in a Universal Query Language (UQL), a dialect of SQL that provides full natural language flexibility in specifying conditions and operators. The new engine leverages the ability of LLMs to conduct analysis of unstructured data, while also allowing us to exploit advances in sampling and optimization techniques to achieve efficient and accurate query execution. In addition, we borrow techniques from classical compiler theory to better orchestrate the workflow between sampling methods and foundation model calls. We demonstrate the efficiency of UQE on data analytics across different modalities, including images, dialogs and reviews, across a range of useful query types, including conditional aggregation, semantic retrieval and abstraction aggregation.
+
+## 1 Introduction
+
+Data analysis  is essential for making well founded decisions and enabling businesses and society to function more effectively. Relational databases  and the Structured Query Language (SQL)  have delivered huge successes in _structured data_ management and analysis. Typically, such data is collected and organized in a pre-defined schema , where the data properties and relationships have been pre-specified, and downstream analysis is restricted to this schema.
+
+In most real-world applications, however, data exists in unstructured formats, such as images, documents and audio recordings. Without preprocessing such data into structured forms, traditional SQL engines can only support limited queries. Preprocessing, including document entity retreival  and form understanding , also require training on downstream tasks given a predefined taxonomy. This naturally motivates the question we consider in this paper:
+
+_How can one perform unstructured data analysis in a_ **flexible** _and_ **efficient** _way?_
+
+In the literature, full-text search engines  support scalable regexp-matching search on unstructured data, but this becomes infeasible for more complex semantic reasoning queries. Retrieval-Augmented Generation (RAG)  allows question answering on a subset of related data, but is not directly applicable to generic analytical tasks with aggregation and semantic queries that spans over an entire large database. Recent advances in Large Language Models (LLMs) unlock the ability to perform flexible question answering, especially with recent long-context models . However, setting aside the cost per query, data analytics can still be challenging for LLMs without fine-tuning  or few-shot demonstrations , even given structured tables.
+
+Recently, a promising line of work considered marrying LLMs with programming frameworks , where logical or arithmetic operations are offloaded to program interpreters . A most relevant example for analytics and table understanding tasks is Cheng et al. , which augments classical SQL semantics with LLMs as user-defined functions (UDF). While promising, the execution of such SQL programs that embed LLM calls still requires sweeping over the entire database, which is too costly for large collections of unstructured content. To overcome this barrier, we leverage the synergy between LLMs and programmatic execution to define an Unstructured Query Language (UQL) that augments SQL for flexible semantic queries, with a focus on improving scalability and efficiency.
+
+A key observation is that the efficiency of classical SQL engines relies on (1) indexing structures that avoid the need to scan the entire database, and (2) a compilation system that determines the best execution order for operations. Based on these ideas, we propose the Unstructured Query Engine (UQE), which refines and extends this design principle to unstructured data analytics. To achieve similar effect to indexing, UQE casts the problem as learning to search or sample, seeking to avoid a full database scan with statistically sound methods. Additionally, a compilation system is developed that determines the best execution order and operator combination for different clauses in a UQL query, with the goal of minimizing LLM calls while preserving query semantics.
+
+As part of this project, we have created four new benchmark datasets, with both text and image modalities, along with three common analytic tasks. Compared to baseline methods, such as long-context LLMs and embedding based retrieval, UQE achieves significant improvements in terms of the accuracy and cost reduction on these benchmarks.
+
+## 2 Problem
+
+Before defining the problem we are solving, we first establish the terminology and notation we will use throughout the paper. A concrete illustration of the following terms is given in Figure 1.
+
+* **Table / database**: We define a table \(=\{_{i}\}_{i=1}^{N}\) as an unordered set of \(||=N\) rows, where each row \(_{i}=[_{i,1},_{i,2},,_{i,M}]\) is an array of \(M\) elements such that \(M\) is the total number of columns in the table. Each row can consist of elements \(_{i,}\) of heterogeneous types (_e.g._, datetime, float, enum) with different modalities (_e.g._, text, image), while elements in each column \(_{,j}\) must be of the same format and modality.
+* **Structured data**: A column \(_{,j}\) is structured w.r.t. a query if it can be accessed quantitatively, such as by algebraic operations over numeric data, comparison over string labels with predefined vocabulary (_e.g._, categorical labels), datetime functions, _etc._.
+* **Unstructured data**: A column \(_{,j}\) is unstructured if a query cannot access it using standard quantitative access. Typically, such a column does not belong to a predefined taxonomy. Examples include text (_e.g._, dialogs), images, videos, and other forms of data that usually require semantic understanding and preprocessing before performing any algebraic operations.
+* **Concrete column**: A column is concrete if it already exists in the table.
+* **Virtual column**: A column is virtual if it does not already exist in the table, but a query is able to operate on it. Conceptually, one needs to derive (partial rows of) these columns by processing the data from concrete columns. In our work, we bypass this step by creating such columns lazily and selectively, which is the key to achieving efficiency and performance gains.
+
+SQL engines can perform analytic queries on databases by manipulating _structured_ data in _concrete_ columns. The focus of this paper is to propose a new query engine that can perform analytics on databases with both _structured_ and _unstructured_ data, with queries that operate over both _concrete_ and _virtual_ columns. Standard analytics tasks that we seek to enable over unstructured data are:
+
+Figure 1: Illustration of unstructured data analysis defined in Section 2.
+
+* **Conditional aggregation**: perform aggregation operations on a sub-table filtered by a condition.
+* **Semantic retrieval**: collect relevant rows specified by semantic filters.
+* **Abstraction and aggregation**: group the rows based on abstractions and then performs aggregation.
+
+Since optimizing queries on structured data within concrete columns is well-studied, we focus instead on techniques for handling queries on _unstructured_ data over _virtual_ columns. However, the UQE implementation also supports operations over structured data within concrete columns. In the following, unless stated otherwise, the term _unstructured_ databases refer to databases containing _both_ structured and unstructured data.
+
+## 3 Unstructured query language
+
+First, we need to formally define the query language, UQL, that talks to the unstructured databases. The idea of defining a natural query language for unstructured data is not completely new (_e.g._, Cheng et al. , even though UQL has richer semantics), nor is the specific syntax or design of UQL the main focus of this paper. However, we need to define the scope of queries that the engine can handle, and breakdown the semantic meaning of each clause.
+
+### UQL semantics
+
+We assume a basic familiarity of SQL, upon which UQL is based. UQL can be considered to be a dialect of SQL that has augmented functionalities for handling unstructured and virtual column queries. The SQL clauses that we support in UQL, along with necessary modifications to support unstructured semantic queries, are described as follows.
+
+**SELECT** is a mapping function that maps the operand (usually a row or collection of rows in a grouped query) to a new row of elements. In traditional SQL, this mapping is usually a subset selection over concrete columns, or algebraic operators over those columns. UQL provides additional semantic mapping capability as:
+
+SELECT "the attribute specified by natural language" AS attribute_name
+
+For example, one can write SELECT "the sentiment of the movie review" over an unstructured movie review column, and retrieve "positive" or "negative" as a structured output.
+
+**FROM** specifies the source of the table. In SQL one can additionally specify table joins, but we limit our attention to sourcing from a single table in this paper.
+
+**WHERE** intrinsically specifies a binary classifier over rows, which is used to retrieve a subset of the database. In addition to comparator operators on structured columns, we also allow semantic specifications in the form of:
+
+WHERE "the row satisfies some natural language specifications"
+
+The predicates in WHERE are organized in disjunctive normal form (DNF) with AND and OR syntax, so a user can arbitrarily express predicates over concrete and virtual columns.
+
+**GROUP BY** partitions the table into groups, where rows within each group share the same attributes over the keys being grouped by. UQL allows partitioning over virtual columns via natural language:
+
+GROUP BY "the abstraction criteria specified in natural language"
+
+Similar to WHERE, one can GROUP BY over both concrete and virtual columns by concatenating multiple criteria, with the resulting partition corresponding to grouping by a tuple of these keys.
+
+We also reuse other clauses from SQL including: **ORDER BY**, which simply inherits the SQL semantics to rank the resulting rows according to a specific _concrete_ column. In most analytics tasks, sorting is applied over structured columns with well defined ordering comparators. **LIMIT** is applied during processing in the form of LIMIT num_rows, which limits the number of output rows.
+
+**Assumptions:** We rely on the ability of an LLM to perform _intra-row_ semantic understanding and analysis tasks. For example, we assume that LLMs are able to correctly judge the specification in WHERE for a _single_ row. Similarly, LLMs should be able to extract the information specified by SELECT or GROUP BY for a _single_ row. We build programmatic functionality on top of this fundamental ability of LLMs to handle analytics for large databases.
+
+### UQL queries
+
+A UQL query is a composition of clauses that can be categorized as an aggregation or a non-aggregation, as illustrated in Figure 2. **Aggregation** queries perform a summary on groups of aggregated rows, such as COUNT the number of rows, or summarize a common attribute in a group of rows (as defined in GROUP BY above). **Non-aggregation** queries perform operations on individual rows, which usually means the rows can be processed in parallel. A UQL query will only belong to one of the above two types and we do not consider nested queries for now. The query type determines how UQE will optimize and execute the query.
+
+## 4 Unstructured Query Engine
+
+One straightforward way to run UQL is to use an interpreter that executes queries imperatively. Cheng et al.  implements an engine in this form, which is able to handle tables of relatively small size. By analogy, this is similar to executing an SQL program using a linear database scan. While it is valid, the latency and cost are prohibitive and generally prevent scaling to real world scenarios.
+
+There are (at least) two key techniques in SQL databases for making query execution efficient:
+
+* **Indexing**, which organizes concrete columns via data structures for fast search with sublinear cost.
+* **Compilation**, which considers alternative query plans and executes the most efficient one.
+
+UQL queries over virtual columns pose challenges in both indexing and compilation. In this section, we present effective approaches to indexing (Section 4.1) and compilation (Section 4.2) for unstructured databases, along with the implementation details of low-level primitives (Section 4.2.2).
+
+### Indexing
+
+Executing traditional SQL queries over indexed columns can be made efficient by avoiding an entire database scan to find the relevant rows to process. However, for UQL queries over virtual columns, it is hard to predict or predefine an index that can enable efficient searching, since these columns are not concrete and defined via arbitrary natural language specifications.
+
+Our first key contribution is to introduce a proxy for "indexing" that allows one to leverage the intrinsic semantic content of a virtual column to efficiently execute queries without scanning the entire database. The main idea is to use statistically sound sampling techniques to approximately retrieve relevant rows for processing. Based on the two types of queries defined in Section 3.2, we develop corresponding "indexing" counterparts.
+
+#### 4.1.1 Unbiased estimation for aggregation queries
+
+We use a simple query to illustrate the idea of unbiased estimation to obtain a query result without scanning over an entire virtual column.
+
+ SELECT COUNT(*) as count FROM movie_reviews WHERE "the review is positive"
+
+Given a row \(_{i}\) (a natural language movie review), it is relatively easy for an LLM to tell whether it satisfies the WHERE condition. If we use \(f:(_{i},)\{0,1\}\) to represent the LLM's classification of whether row \(_{i}\) satisfies the conditions specified in \(\), then the goal is to estimate the quantity
+
+\[_{i=1}^{N}f(_{i},)=N_{i=1}^{N}f( _{i},)=N_{i\{1 N\}}[f(_{i},)]\] (1)
+
+There are many approaches that can be used to estimate the finite sum in the above equation, with different tradeoffs between bias and variance. One unbiased but potentially high variance estimator is to simply use Monte Carlo samples from a uniform distribution over \(1 N\). A typical technique for reducing variance is to use importance sampling with a proposal \(p\), according to
+
+\[_{i\{1 N\}}[f(_{i},)]= _{i=1}^{N}}{Np_{i}}f(_{i},)=_{i p}[}f(_{i},)]\] (2)
+
+A theoretically optimal proposal \(p\) is given as follows:
+
+Figure 2: Aggregation (left) v.s. Non-aggregation (right) queries written in UQL.
+
+* Embed each row \(_{i}\) as \(_{i}\), using a multi-modal embedding over the unstructured columns of \(_{i}\).
+* Cluster the embeddings \(\{_{i}\}_{i=1}^{N}\) into \(K\) disjoint groups \(\{C_{k}\}_{k=1}^{K}\,,C_{k}\{1 N\}\), where \(k\) can be a predefined constant or automatically selected . Each group has size \(|C_{k}|\) and \(_{k=1}^{K}|C_{k}|=N\). We use \(c:\{1 N\}\{1 K\}\) to denote the cluster index of each row.
+* Perform stratified sampling over these groups and obtain samples \(S\{1 N\}\).
+
+Then we can obtain the following estimator for the expectation:
+
+\[_{i\{1 N\}}[f(_{i},)] |S|_{i S}}{_{j S}w_{j}}f(_{i}, )w_{i}=|}{_{j S} [c(j)=c(i)]}\] (3)
+
+1. Embed each row \(_{i}\) as \(_{i}\), using multi-modal embedding over the unstructured columns of \(_{i}\).
+2. Maintain \((i)\) that approximates \(f(_{i},)\). Initialize \((i) U(0,1)\) uniformly.
+3. Maintain the collection of sampled rows \(S=\) at step \(t=0\).
+4. At step \(t\), obtain a batch \(S_{t}\) of samples where \(S_{t}=_{S_{t}\{1 N\} S}_{i S_{t}} {g}(i)+_{t,i}\); observe \(f(_{i},)\) for each sample \(i S_{t}\); Update \(S S S_{t}\).
+5. Fit \(\) with samples and corresponding observations from \(S\). Go to step 4 if \(|S|<B\) or return the positive samples found in \(S\).
+
+**Proposition 1**: _The optimal proposal distribution \(p\) that minimizes the variance of estimation in Eq 2 is \(p_{i} f(_{i},)\), which achieves zero variance._
+
+Prop 1 indicates that an ideal proposal should sample rows that have positive \(f\) with equal probability, while sampling negative rows with zero probability. However, given that \(f\) is the response of an LLM it is expensive to execute over all rows, forcing us to consider efficient approximations.
+
+**Stratified sampling** leverages the ability to partition a population into homogeneous subpopulations. As shown in Prop 1, a good proposal \(p_{i}\) should predict whether a row \(_{i}\) satisfies the target property \(\). To trade-off between cost and variance reduction, we propose Algorithm 1. In Eq 3 we normalize the importance weights \(w_{i}\) to further reduce the estimation variance.
+
+**Extension** The above estimator can be used for other aggregation operations such as \(\) and \(\), including GROUP BY, and allowing concrete columns as operands as well. However, some aggregations such as MAX does not admit such an estimator. UQE in this case can only provide estimates with greater effort. We discuss limitations in Section 7.
+
+#### 4.1.2 Online learning for non-aggregation queries
+
+A non-aggregation query can be viewed as a search problem where we want to find a relevant subset of rows to process. As before, we begin with a concrete example:
+
+```
+
+[MISSING_PAGE_POST]
+
+#### 4.2.1 Planning
+
+Lowering a query into sequences of concrete execution units is a planning problem: The action space includes the order of clause execution, as well as ways to fuse clauses to execute together. The objective is to minimize the (estimated) LLM cost. Figuring out the best decomposition and combination is usually an NP-hard problem. Fortunately, the number of clauses is very limited for a single query, so we can enumerate possible combinations of ordering and fusions with little overhead.
+
+The outcome of planning is a specification of a sequence of kernel executions. The input and output of each kernel can be one of the following:
+
+* **Concrete table**: a standard table with only concrete columns.
+* **Stochastic table**: the outcome of unbiased sampling of a table. Importance weights will be attached to each row of the table, and the operation (_e.g._, SUM, AVG) on this table takes weights into account.
+
+In the following 3 sections we will explain the building blocks of the compiler, including the kernel implementation, the cost estimation and final instantiation in detail.
+
+#### 4.2.2 Kernel implementation
+
+Each kernel is an standalone execution unit that reads and produces a (stochastic) table.
+
+**SELECT** on structured columns is straightforward. When operating on unstructured columns, we prompt the LLM to extract semantic attributes from the input data. If several extractions share the same source column, we can also group these together into a single prompt to reduce cost.
+
+**WHERE** takes a logical formula in disjunctive normal form, such that each conjunction can contain predicates over both unstructured and structured columns. One optimization we make in this case is to perform evaluations over the structured columns first, then simplify (_e.g._, remove a conjunction if any of the structured column evaluates to false) the logical formula. Any remaining predicates over unstructured columns are then executed on the table filtered by predicates over structured columns.
+
+**GROUP BY** first gathers a representative subset of rows from the table, then calls an LLM to extract a taxonomy (_i.e._, the description of each cluster) for a cluster abstraction. Then the taxonomy is used to classify rows sampled according to the methods defined in Section 4.1. Finally, each row is classified into one of the clusters with the corresponding cluster description in the taxonomy.
+
+**Other standard kernels** like ORDER BY are implemented as-is since they are efficient to execute.
+
+**Kernel fusion:** Certain clauses can be fused together to achieve significant efficiency gains.
+
+* WHERE + LIMIT can be terminated earlier for non-aggregation queries, once the number of rows specified by LIMIT are retrieved. This is particularly useful for rare event finding.
+* SELECT + GROUPBY when executed together, the semantic attribute extraction of SELECT and taxonomy classification in GROUPBY can be done in the same LLM call to save cost.
+* GROUPBY + WHERE can share the same sampling proposal for the aggregation queries.
+
+When and how to fuse clauses relies on the planning technique introduced in Section 4.2.1.
+
+Figure 3: UQL compiler, in analogy to a typical C++ program compiler.
+
+#### 4.2.3 Cost estimation for each kernel
+
+We only consider the cost of calling the LLM, as this dominates the overall cost per query. Assuming the length of each row in the unstructured data is more or less uniform across rows, then the cost is proportional to the number of rows that fed to the LLM, which we use as the surrogate for estimation.
+
+* SELECT maps each row, hence the cost is \(||\) for the table \(\) fed to SELECT.
+* GROUP BY consists of two steps, where taxonomy construction consumes a subset of the input table \(\), and classification runs \(||\) LLM calls in parallel.
+* WHERE depends on the proposal \(p\). In practice we set a budget \(B\) and try to minimize the variance of unbiased estimator or maximize the recall in online learning, as explained in Section 4.1.
+* Whenever clauses are fused together, each implementation is responsible for providing a reasonable cost estimate. For example when SELECT and GROUP BY are fused, the estimated cost is the same as GROUP BY alone, as the classification stage of GROUP BY shares the input tokens with SELECT.
+
+#### 4.2.4 Instantiation of kernels
+
+The last step of compilation is to generate the machine specific code (_e.g._, x86 assembly code) from the intermediate representations (IR). For UQE, this is the process of generating the LLM-specific prompts. For example, when GPT is deployed as the "machine", a system prompt like "You are a helpful assistant" will be added to the queries. This step also sets the correct context (_e.g._, the correct structured/unstructured column to associate to, the description of the databases) for the LLM. When such information is not available, one can also leverage the LLM to provide a good suggestion.
+
+## 5 Related work
+
+While the unstructured data analytics engine is relatively new, there are several related works in the context of unstructured data query and analysis. Approaches like pattern or regexp matching  is scalable but not feasible for complex semantic reasoning. RAG [24; 18] based approaches rely on the retrieval quality and is not directly suitable for aggregation queries over entire database. LLMs [4; 2; 33] depict the ability of table analytics  to some extent [9; 25], but are still not reliable for large unstructured database analytics yet.
+
+Our work is closely related to neural symboilic approaches for unstructured data analytics. Early attempts in this line aim to design specialized neural architectures with inductive biases (e.g., attention) to capture a particular form of operation (e.g., filtering a list of objects based on a natural language predicate by their attention scores) [43; 29; 3]. Those differentiable neural "operators" can then be chained together to model more compositional queries, and trained end-to-end using gradient descent. Another direction, in line with our work, is to augment symbolic programs with learnable operators parameterized by neural networks . Those programs are often modeled as discrete latent variables, which can be hard to optimize. In contrast, UQE leverages predictions from LLMs as supervision to train an efficient proxy query model in an online fashion. Similar to UQE, some recent work [11; 38] also adopts LLMs as fuzzy query operators. However, the generated programs treat LLMs as an UDF in a SQL program, which can be very expensive to execute on large databases. Our UQE implements similar but augmented semantics with the focus on the cost efficiency and scalability. Liu et al.  optimizes a similar query engine from the system perspective like cache optimization and deduplication, while our work mainly considers algorithmic improvements and is considered as an approximate query engine . These system and algorithm optimizations are actually orthogonal and can be beneficial to jointly consider both for future works.
+
+In a distantly related topic, text2SQL [47; 46; 21; 35] also leverages models talking to databases, but is mainly for semantic parsing purpose. While it also leverages the advances in LLMs [44; 16; 31; 37], the execution is still on pure SQL and thus is not suitable for unstructured databases. There are also works on leveraging formal query languages to better query LLMs [34; 6], with the focus on controllability of the LLM itself rather than performing analytics on external unstructured data.
+
+## 6 Experiments
+
+We benchmark the accuracy and incurred cost of UQE on multimodal unstructured data analytics tasks, with the goal to show and understand when and why UQE can improve accuracy while keeping the cost low. Since the unstructured database analytics is a relatively new task, we construct and compare against several baseline approaches, on a set of tasks created from existing datasets.
+
+**Baselines:** We design the following baselines for comparison
+
+* **lc-LLM** denotes the long-context LLMs that can directly take a subset of database and a natural language question as input, and produce the desired analysis. We mainly evaluate against several model families, including GPT-4  and Claude-3 . Of course, when evaluating the lc-LLM based approaches, we use the natural language instead of UQL as the prompt.
+* **RAG-based** can be applied to some non-aggregation queries, such as semantic retrieval. For the retrieval part we use max inner-product search (MIPS) on top of the same embeddings that are used by UQE, for a controlled experiment.
+* **UDF** simply treats the LLM calls as User-defined function of an SQL engine, with the same budget as UQE by default. This approach will not have the advanced sampling / search algorithm as used in UQE, which also serves as an ablation for the effectiveness of our UQE.
+
+**Datasets:** We evaluate different approaches on common analytical tasks in three widely used application domains. We use the datasets that were previously created for discriminative tasks, as these datasets contain both the unstructured columns and the structured ones (the labels in the corresponding dataset). We then hide these structured label columns and perform analytical tasks on the unstructured columns, where these hidden structured columns will be used to compute the ground-truth. The text based tasks include IMDB  movie reviews, customer service dialogs including Action-Based Conversations Dataset (ABCD ) and AirDialog , and image based Clevr  dataset. Please refer to Appendix C.1 for more information.
+
+**Setup:** We use voyage-2  to embed the text-based unstructured columns, and Vertex  for multimodal embeddings. For budget constraint queries, we allow different approaches to access at most 128 rows in the database by default.
+
+   Benchmarks & Conditions &  \\   & & lc-gpt-4-turbo & lc-claude-3-opus & UDF & UQE \({}^{}\) \\  IMDB & sentiment\_positive & \(0.397 0.041\) & \(0.556 0.066\) & \(0.505 0.030\) & \(0.875 0.003\) \\ Average cost per query & & \(50.38\) & \(50.63\) & \(50.02\) & \(50.502\) \\   ABCD & account\_access & \(0.045 0.033\) & \(0.080 0.023\) & \(0.076 0.017\) & \(0.964 0.019\) \\ single\_item\_query & \(0.023 0.021\) & \(0.082 0.030\) & \(0.065 0.017\) & \(0.266\) & \(0.935 0.006\) \\ Average cost per query & & \(50.76\) & \(51.23\) & \(50.03\) & \( 80\) & \(50.03\) \\    & book & \(0.327 0.0667\) & \(0.585 0.025\) & \(0.342 0.031\) & \(0.930\) & \(\) \\ AirDialog & no\_flight & \(0.066 0.037\) & \(0.228 0.068\) & \(0.144 0.034\) & \(0.867\) & \(\) \\ no\_reservation & \(0.156 0.075\) & \(0.297 0.043\) & \(0.145 0.042\) & \(0.965\) & \(\) \\ cancel & \(0.006 0.009\) & \(0.013 0.008\) & \(0.013 0.009\) & \(0.066\) & \(\) \\ Average cost per query & & \(50.43\) & \(5\) \(0.74\) & \(50.01\) & \( 80\) & \(50.01\) \\   Clevr & obj\_count \(<4\) & \(0.058 0.026\) & \(0.066 0.023\) & \(0.093 0.031\) & \(0.023\) & \(\) \\ \# spheres \(>3\) & \(0.037 0.027\) & \(0.099 0.023\) & \(0.089 0.017\) & \(0.145\) & \(\) \\ Average cost per query & & \(50.38\) & \(50.21\) & \(50.08\) & \( 80\) & \(50.08\) \\   
+
+Table 2: Semantic retrieval results on several benchmark dataset. We report the F1 score of the retrieved rows and the average cost per query. We run 8 independent queries and report the average F1 and its standard deviation. The result of MIPS is deterministic, so no standard deviation is reported.
+
+   Benchmarks & Conditions &  \\   & & lc-gpt-4-turbo & lc-claude-3-opus & UDF & MIPS & UQE \\  IMDB & sentiment\_positive & \(0.397 0.041\) & \(0.556 0.066\) & \(0.505 0.030\) & \(0.875\) & \(\) \\ Average cost per query & & \(50.38\) & \(50.63\) & \(50.02\) & \( 80\) & \(50.02\) \\   ABCD & account\_access & \(0.045 0.033\) & \(0.080 0.023\) & \(0.076 0.017\) & \(\) & \(0.940 0.019\) \\ single\_item\_query & \(0.023 0.021\) & \(0.082 0.030\) & \(0.065 0.017\) & \(0.266\) & \(\) \\ Average cost per query & & \(5\) \(0.76\) & \(51.23\) & \(50.03\) & \( 80\) & \(50.03\) \\    & book & \(0.327 0.0667\) & \(0.585 0.025\) & \(0.342 0.031\) & \(0.930\) & \(\) \\ AirDialog & no\_flight & \(0.066 0.037\) & \(0.228 0.068\) & \(0.144 0.034\) & \(0.867\) & \(\) \\  & no\_reservation & \(0.156 0.075\) & \(0.297 0.043\) & \(0.145 0.042\) & \(0.965\) & \(\) \\ cancel & \(0.006 0.009\) & \(0.013 0.008\) & \(0.013 0.009\) & \(0.066\) & \(\) \\ Average cost per query & & \(50.43\) & \(5\) \(0.74\) & \(50.01\) & \( 80\) & \(50.01\) \\   Clevr & obj\_count \(<4\) & \(0.058 0.026\) & \(0.066 0.023\) & \(0.093 0.031\) & \(0.023\) & \(\) \\  & \# spheres \(>3\) & \(0.037 0.027\) & \(0.099 0.023\) & \(0.089 0.017\) & \(0.145\) & \(\) \\ Average cost per query & & \(50.38\) & \(50.21\) & \(50.08\) & \( 80\) & \(50.08\) \\   
+
+Table 1: Conditional aggregation results on benchmark datasets. We report the relative error and the average cost per query. *gpt-4-turbo is 50% cheaper than gpt-4-turbo so we double its budget of tokens; \({}^{}\) we use claude-3-haiku as the backend LLM.
+
+### Main results
+
+We run queries on different datasets by instantiating the template shown in each of the sections below. The exact natural language and UQL queries can be found in Appendix D and more information including statistics of conditions we used for query and hyperparameters (for UQE we simply use the default hyperparameters for sampling and online learning) can be found in Appendix C.
+
+#### 6.1.1 Conditional aggregation
+
+This task provides aggregated statistics over databases with specified conditions, with the template as:
+
+SELECTCOUNT(*) FROM[table]WHERE["satisfies natural language specified condition"]
+
+We report the relative estimation error (_i.e._, \(|-|/\)) and its standard deviation in Table 1. For lc-LLM baselines we estimate the count based on groups of unbiased data samples that fed into the prompt.
+
+For text based aggregation we use claude-3-haiku as the backbone model, where UQE deploys \(10\) reduction in relative errors while reducing the cost by a factor of \(20\) or more. For the image dataset, since only limited set of LLMs are capable right now, we use gpt-4o as the backbone, and compare with lc-LLM baselines. Thanks to the improved sampling method in UQE, the same gpt-4o consistently achieves improved performance out-of-the-box. To verify this, we feed one image at a time to gpt-4o and manually aggregate the count, the estimation error would be 17.10% \(\) 13.95 and 19.35% \(\) 13.81% for the two queries of Clevr, which is twice higher than UQE in the worst case.
+
+#### 6.1.2 Semantic retrieval
+
+This task filters rows in databases that satisfy specified conditions, with the template as:
+
+SELECT* FROM[table]WHERE["satisfies natural language specified condition"]
+
+LimitB While we limit the output size to be B = 256 to keep the total cost within a reasonable budget. The challenging scenarios are when the number of rows that satisfy the predicate is few (_i.e._, "rare event finding"). Table 2 shows similar sets of comparison, but the metric is F1 score which evaluates the quality of SELECT-ed rows. Overall UQE (with Claude-3-haiku as backbone LLM) consistently achieves comparable or better performance than the baseline methods. MIPS which uses the same embedding of unstructured data as UQE, has high variance across different types of queries. The queries such as "dialogs with account access issues" would be very suitable for MIPS as the embedding similarity is able to capture that well. For queries involving reasoning (_e.g._, find the images with less than 4 objects), it is pretty hard for pretrained embeddings to express this.
+
+#### 6.1.3 Abstraction and aggregation
+
+This task abstracts the intrinsics of each row, and then performs semantics-based GROUP BY, grouping the common intrinsics across all rows. Finally, it provides aggregated statistics over each group:
+
+SELECTderivedattribute,COUNT(*) FROM[table]GROUP BY["extract an abstract intrinsic attribute specified in natural language"]
+
+ASderivedattributeLIMIT10 The challenging problems in this task are (i) building a taxonomy with good coverage, and (2) bias and variance reduction for groups with small population. The result of this query is a list of
+
+    &  &  \\   & & lc-gpt-4-turbo & lc-claud-3-opus & UQE-claud-3-haiku \\   & EMD[] & 0.143 \(\) 0.034 & 0.121 \(\) 0.014 & **0.111 \(\) 0.019** \\  & cost & 50.21 & 50.37 & **50.04** \\   & account\_access-EMD[] & 0.154 \(\) 0.031 & 0.113 \(\) 0.010 & **0.110 \(\) 0.016** \\  & single\_item\_query-EMD[] & 0.031 \(\) 0.034 & 0.011 \(\) 0.006 & **0.005 \(\) 0.002** \\   & cost & 50.34 & 5 0.56 & 5 0.07 \\   
+
+Table 3: Conditional abstraction and aggregation.
+
+Figure 4: Variance of different sampling approaches for aggregation queries over 3 text datasets.
+
+tuples of derived attributes and their number of occurrences in the dataset. We use the earth mover's distance (EMD ) as the evaluation metric to compare the extracted tuples and ground-truth tuples. The distance between a pair of attributes is defined by one minus the cosine similarity of their text embeddings. We can see from Table 3 that UQE consistently outperforms baselines while achieving much lower cost. We also show in Appendix C with more qualitative results comparisons.
+
+### Ablation studies
+
+We study the effectiveness of UQE for aggregation queries in Section 6.2.1 and non-aggregation queries in Section 6.2.2, and the quality/cost trade-off of UQE in Section 6.2.3. In appendix we provide more results on other modalities C.3, consistency C.4 and latency C.5.
+
+#### 6.2.1 Variance of different sampling approaches for aggregation queries
+
+To decouple the variance introduced by the algorithm and the bias introduced by the LLM based predictors, here we use the ground-truth label as the predictive result and focus on the effectiveness of variance reduction. Figure 4 shows the box plot of different sampling methods. We can see using stratified sampling over the embeddings of unstructured content achieves significant lower variance compared to the uniform random sampling. Also both of these achieve similar expected values, which also justifies the correctness or unbiasedness.
+
+#### 6.2.2 Efficiency of online learning for non-aggregation queries
+
+We show the effectiveness of the online learning in terms of the recall as a function of the iteration steps in Figure 5. Compared to the dashed line in the figure which indicates the results of uniform random sampling, the online learning can achieve significant boost in terms of the recall. While for some queries the variance at early iterations can be high, these all converge well in the end.
+
+#### 6.2.3 Trade-off between cost/latency and accuracy
+
+Generally the larger compute budget \(B\) the better quality UQE will get, and we verify this in Table 4 5. UQE can achieve pretty good quality even with very low budget, and notably compared to the baseline, it achieves similar quality with 16x reduction of the compute needed. We show more results in Section C.5 regarding the compute efficiency.
+
+## 7 Conclusion
+
+This paper proposed an unstructured query engine that leverages 1) the flexibility of LLMs for data understanding; 2) the advances in sampling and online learning for efficient data scanning; 3) and the compiler that bridges these algorithmic workflows with LLMs. We demonstrated its efficiency and accuracy over three analytic tasks on four datasets with two different modalities. However the current work is still very limited in terms of 1) the semantics it lacks, including table join and other types of aggregations; 2) an automated selection of LLMs and sampling configurations; 3) and scaling to even larger databases. We hope to investigate these further in future works.
+
+    & Budget \(B\) & 256 & 128 & 64 & 32 & Budget \(B\) & 512 & 256 & 128 & 64 & 32 \\  Retrieval &  latency(s) \\ F1 score \\  & 38.08 & 21.61 & 11.11 & 5.84 &  budget \(B\) \\  & 5.07 &  budget \(B\) \\  & 5.08 & 12.61 & 11.11 & 5.84 \\  Aggregation &  latency(s) \\ Error \\  & - & 5.78 & 0.978 & 0.974 & 0.921 & 0.828 &  budget \(B\) \\  \\  Aggregation &  latency(s) \\ Error \\  & - & 5.83 & 4.28 & 2.93 & 
+ budget \(B\) \\  & 5.07 & 12.68 & 64 & 32 \\   
+
+Table 4: Quality at different compute budget \(B\).
+
+Figure 5: Recall (moving average with window size 16) against the number of iterations on (from left to right) AirDiago with condition {\(\)} and \(\) with {\(\) < 4, \(\) > 3}. Colored lines and shades denote median and interquartile ranges across 8 independent queries and gray lines denote individual queries. The gray dashed lines denote the fraction of the positive population in the entire dataset.

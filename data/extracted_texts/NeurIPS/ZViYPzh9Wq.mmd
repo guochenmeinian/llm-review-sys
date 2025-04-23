@@ -1,0 +1,165 @@
+# Reconstructing the Image Stitching Pipeline:
+
+Integrating Fusion and Rectangling into a Unified Inpainting Model
+
+ Ziqi Xie\({}^{1}\), Weidong Zhao\({}^{1,2*}\), Xianhui Liu\({}^{1,2}\), Jian Zhao\({}^{1}\), Ning Jia\({}^{1,2}\)
+
+\({}^{1}\) College of Computer Science and Technology, Tongji University
+
+\({}^{2}\) College of Electronics and Information Engineering, Tongji University
+
+{xieziqi, wd, lxh, zjtju1919, jianing7072}@tongji.edu.cn
+
+###### Abstract
+
+Deep learning-based image stitching pipelines are typically divided into three cascading stages: registration, fusion, and rectangling. Each stage requires its own network training and is tightly coupled to the others, leading to error propagation and posing significant challenges to parameter tuning and system stability. This paper proposes the Simple and Robust Stitcher (SRStitcher), which revolutionizes the image stitching pipeline by simplifying the fusion and rectangling stages into a unified inpainting model, requiring no model training or fine-tuning. We reformulate the problem definitions of the fusion and rectangling stages and demonstrate that they can be effectively integrated into an inpainting task. Furthermore, we design the weighted masks to guide the reverse process in a pre-trained large-scale diffusion model, implementing this integrated inpainting task in a single inference. Through extensive experimentation, we verify the interpretability and generalization capabilities of this unified model, demonstrating that SRStitcher outperforms state-of-the-art methods in both performance and stability. Code: https://github.com/yayoyo66/SRStitcher
+
+## 1 Introduction
+
+Image stitching is a fundamental problem in computer vision, which aims to obtain a larger field of view by merging multiple overlapping images . As illustrated in Figure 1(a), the current deep learning-based image stitching pipeline is typically structured into three sequential stages: (1) **Registration Stage**. The first stage takes the original image pairs to estimate warping matrices, which are then used to align images. Current learning-based methods focus on designing the homography estimation networks to address the registration problem [22; 21; 7]. (2) **Fusion Stage**. The second stage merges the aligned images into a single fusion image. Present research in this domain is generally classified into reconstruction-based (recon-based) and seam-based methods. Recon-based methods [32; 36; 33] typically use the encoder-decoder networks to perform pixel-wise reconstruction of the fusion image. While seam-based methods [35; 11] focus on identifying the optimal seams to eliminate the fusion ghosting. (3) **Rectangling Stage**. The final stage transforms the irregularly shaped fusion image into a standard rectangular format. There are only a few deep learning-based studies for this stage [34; 56], and they are all supervised methods with requirements for labeling data.
+
+Annoyingly, the cascaded structure of current image stitching pipelines poses significant challenges for training optimization and parameter tuning. Furthermore, errors from early stages tend to propagate to later stages, significantly degrading the performance of later processes. The representativeimage stitching methods UDIS and UDIS++  both struggle to effectively fuse images with registration errors, as shown in Figure 1 and 2. In the rectangling stage (Figure 1 3), the prominent rectangling method DeepRectangling (DR)  also fails to adequately fill gaps, leaving visible black spaces at image boundaries.
+
+As shown in Figure 1(a), the errors originating in the registration stage persist through to the final stitched image, and the existing methods lack effective mechanisms to address these errors (detailed in Appendix A.6). The recon-based  methods are proven to inevitably introduce artifacts in the stitched image in the presence of registration errors. Furthermore, the seam-based  methods rely on the assumption that there is a perfect seam between the aligned images. When this assumption is not met, the UDIS++  forcibly distorts the images to create a _perfect seam_, resulting in distortion in the stitched image. Therefore, current fusion methods are unable to effectively handle the registration errors shown in Figure 1.
+
+To address the error propagation problem, we identify image fusion as the key point for improvement. We reconsider the problem definition of the fusion challenge and hypothesize that _By determining the appropriate modification region and introducing an inpainting model with strong generalization ability, the abnormal image content caused by registration error can be effectively corrected_. We propose to reformulate the fusion problem by overlaying the less distorted aligned image over the more distorted one, and inpainting the seam area between the images to correct the inappropriate image content.
+
+Building on reframing the fusion problem, we also revisit the rectangling challenge. The core of the rectangling problem is to fill in the missing rectangling area, which is also essentially an image inpainting problem. Therefore, we question _whether fusion and rectangling are truly distinct challenges or if they could be addressed as a unified inpainting task_. We recognize that handling fusion and rectangling tasks simultaneously is not a simple matter of determining the inpainting area. More importantly, it requires precise control of the inpainting process. Specifically, the fusion task involves the preservation of original image semantics to the greatest extent possible, while the rectangle task requires more heavy inpainting to fill the missing regions. To effectively manage
+
+Figure 1: Comparison between existing pipeline and SRStitcher. Process 1 is implemented by UDIS , process 2 by UDIS++ , process 3 by DeepRectangling (DR) , process 4 by Eq. 10 and Eq. 11. The corresponding partial images, \(l\) and _l_/, illustrate how SRStitcher effectively corrects the apparent misalignment of a pillar. Similarly, the partial images _l_/ and _l_/ demonstrate how SRStitcher repairs the blurry coarse rectangling areas. SRStitcher can be applied to both UDIS and UDIS++ aligned images and get similar stitched results.
+
+these varying demands, we introduce weighted masks to guide the reverse process in a pre-trained large-scale diffusion model. This method allows for the adjustment of inpainting intensity across different regions during the reverse process, enabling both tasks to be completed within a single inference.
+
+The main contributions of this paper are: (1) We propose SRStitcher, which reformulates the problem definitions of the fusion and rectangling stages to construct a more streamlined and robust image stitching pipeline. (2) SRStitcher is the first to introduce the concept of inpainting to address the image fusion problem. It incorporates prior knowledge from large-scale pre-trained models into the image stitching pipeline, enhancing the robustness of image fusion against registration errors. (3) Without additional fine-tuning or supervision, SRStitcher improves the generalization of the rectangling method in the zero-shot scenario, opening up new possibilities for unsupervised image rectangling research. (4) We conduct extensive experiments to verify the interpretability and generalization of the proposed unified model. The results show that SRStitcher significantly outperforms the state-of-the-art methods in both quantitative and qualitative evaluations.
+
+## 2 Background
+
+**Registration parameterization**. The goal of the registration stage is to obtain the aligned images based on a transformation matrix. Given inputs \(I_{l}(x,y),I_{r}(x,y)^{H W}\), where \(x\) and \(y\) represent the pixel coordinates, \(H\), \(W\) are the height and width, respectively. And \(\) donates a \(3 3\) homography matrix between \(I_{l}(x,y)\) and \(I_{r}(x,y)\), which maps the input images to an uniform plane. To clarify the process of image registration, take the example of the four vertex coordinates \((x_{k},y_{k}),k\{1,2,3,4\}\) of the input image. The new image stitching-domain \(^{H^{} W^{*}}\) can be obtained by Eq. 1.
+
+\[W^{*} =_{k(1,2,3,4)}\{x_{k}^{w},x_{k}^{l}\}-_{k(1,2,3,4)} \{x_{k}^{w},x_{k}^{l}\},\] (1a) \[H^{*} =_{k(1,2,3,4)}\{y_{k}^{w},y_{k}^{l}\}-_{k(1,2,3,4)} \{y_{k}^{w},y_{k}^{l}\},\] (1b)
+
+where, \((x_{k}^{w},y_{k}^{w})=[x_{k}^{r},y_{k}^{r},1]^{T}\). Then, the input images are mapped into this new image stitching-domain by warping operation \(()\) to get the aligned images \(I_{wl}(x,y),I_{wr}(x,y)^{H^{} W^{*}}\), as shown in Eq. 2.
+
+\[I_{wl}(x,y),I_{wr}(x,y)=(I_{l}(x,y),),(I_{r}(x,y), ),\] (2)
+
+where, \(\) is an identity matrix. The masks \(M_{wl}(x,y),M_{wr}(x,y)\) corresponding to the aligned images can be obtained in a similar way by Eq. 2, except that the inputs \(I_{l}(x,y),I_{r}(x,y)\) are replaced with two all-one matrixes. The specific design of \(()\) vary slightly among different stitching methods [33; 35], but the aligned image generation of these methods all follows the architecture of Eq. 2.
+
+**Diffusion model**. The proposed work is based on the Diffusion Model . Since our method does not include the forward process, we only briefly introduce the reverse process. Suppose the \(_{1},...,_{T}\) are latents of the same dimensionality as the \(_{0} q(_{0})\), where \(q()\) is the a Gaussian Markov chain forward process with \(T\) steps. And, \(_{0}=(I_{0}(x,y))\), where \(()\) is the image encoder and \(I_{0}(x,y)\) is the input image. The joint distribution of \(t\)-th inversion step is defined as Eq. 3.
+
+\[p_{}(_{t-1}|_{t})=(_{t-1};_ {}(_{t},t),_{}(_{t},t)),t(1,T),\] (3)
+
+where, \(_{}(_{t},t)\) and \(_{}(_{t},t)\) are parameters of the Gaussian Markov chain in \(t\)-th inversion step.
+
+## 3 Methodology
+
+### Unified inpainting model
+
+**Fusion parameterization**. Unlike previous methods, our method reconceptualizes the image fusion problem to enhance its robustness against registration errors. Precisely, as shown in Eq. 2, the distortion degree of \(I_{wl}(x,y)\) is relatively low because it involves only minor warping based on \(\).
+
+This means that even in the presence of registration errors, \(I_{wl}(x,y)\) does not introduce large-scale distortions. Therefore, we propose to construct a coarse fusion image \(I_{CF}(x,y)\) via Eq. 4.
+
+\[I_{CF}(x,y)=I_{wl}(x,y)+I_{wr}(x,y)(1-(M_{wl}(x,y)\&M_{wr}(x,y))),\] (4)
+
+where, \(\&\) and \(\) denote the bitwise AND operators and element-wise multiplication operator. The coarse fusion image has noticeable seams, as shown in Figure 1(b). Also, with registration errors, incoherent image content appears around the seams. To solve this problem, we propose to focus on inpainting the image content around the seam, ensuring cohesion and coherence. Therefore, we use the seam mask \(M_{seam}(x,y)\) to define the area in the fusion image that needs to be inpainted, as detailed in Eq. 5.
+
+\[M_{seam}(x,y)=(M_{wl}(x,y),K_{s}) M_{wl}( x,y)\] \[((M_{wl}(x,y),K_{s}) M_{wl}(x,y)\&M_{wr} (x,y),\] (5)
+
+where, \(()\) and \(()\) denote the dilation and erosion operations , \(K_{s}\) is the kernel sizes, \(\), \(\) denote bitwise OR and XOR operators. Then, we inpaint \(I_{CF}(x,y)\) based on seam mask \(M_{seam}(x,y)\) and the inpainting function \(f_{}()\) to obtain inpainted fusion image \(_{CF}(x,y)\), as detailed in Eq. 6.
+
+\[_{CF}(x,y)=I_{CF}(x,y)(1-M_{seam}(x,y))+f_{}(I_{CF}(x,y))  M_{seam}(x,y).\] (6)
+
+**Rectangling parameterization**. Our method also defines the rectangling challenge as an inpainting problem based on the content mask \(M_{content}(x,y)\). We use Eq. 7 to obtain the inpainted rectangling image \(_{CR}(x,y)\).
+
+\[_{CR}(x,y)=I_{CF}(x,y)(1-M_{content}(x,y))+f_{}(I_{CF}(x,y))  M_{content}(x,y),\] (7)
+
+where, \(M_{content}(x,y)=M_{wl}(x,y) M_{wr}(x,y)\).
+
+**Unified model**. Integrating Eq. 6 and Eq. 7, we obtain a unified inpainting model for fusion and rectangling, as shown in Eq. 8.
+
+\[_{CFR}(x,y)=I_{CF}(x,y)(1-M_{inpaint}(x,y))+f_{}(I_{CF}(x,y )) M_{inpaint}(x,y),\] (8)
+
+where, \(M_{inpaint}(x,y)=M_{seam}(x,y) M_{content}(x,y)\). By combining equations Eq. 3 and Eq. 8, this inpainting problem can be solved by a diffusion model, as detailed in Eq. 9.
+
+\[}_{t-1}=_{0}(1-M_{inpaint}(x,y))+_{ t-1} M_{inpaint}(x,y),\] (9)
+
+where, \(_{0}=(I_{CF}(x,y))\), and \(_{t-1}(_{}(_{t},t),_{ }(_{t},t))\).
+
+### Weighted mask guided reverse process
+
+After defining the unified inpainting model for the fusion and rectangling tasks in the previous subsection, we discuss the method to control the inpainting strength in different regions during the reverse process, ensuring that both tasks can be accomplished in a single inference. Specifically, regions under the mask \(M_{seam}(x,y)\) that contain the semantics of the original image are preserved as much as possible. In contrast, regions under \(M_{content}(x,y)\) may require more powerful inpainting. We propose weighted masks to guide the reverse process to achieve this varying inpainting strength.
+
+**Weighted masks**. Weighted masks are constructed from the weighted initial mask \(_{init}(x,y)\) and inpainting mask \(_{inpaint}(x,y)\).
+
+The weighted initial mask \(_{init}(x,y)\) assigns different fidelity levels to each pixel of the fusion image, determining how much to modify each pixel based on its fidelity during the reverse process. The formula of \(_{init}(x,y)\) is given by Eq.10, which is composed of two parts. The left part determines the fidelity levels of pixels in \(M_{seam}(x,y)\) region, and the right part determines the fidelity levels of pixels in \(M_{content}(x,y)\) region.
+
+\[_{init}(x,y)=(M_{seam}(x,y),K_{g}) _{1}}{(M_{seam}(x,y),K_{g})}(M_{content }(x,y),K_{g})_{2}}{(M_{content}(x,y),K_{g})},\] (10)
+
+where, \(()\) is the distance transform operation  with kernel size \(K_{g}\), \(_{1}\) and \(_{2}\) are hyper-parameters.
+
+The weighted inpainting mask \(_{inpaint}(x,y)\), as described in Eq.11, is inspired by the suffix principle . During the reverse process, \(_{inpaint}(x,y)\) is mapped into multiple sub-masks to define the modified regions at each step \(t\). The region corresponding to \(M_{content}(x,y)\) contains no image content, so its size remains constant across all sub-masks, ensuring it is repainted throughout the entire process. Conversely, the region corresponding to \(M_{seam}(x,y)\) contains a substantial quantity of original image information, and its size gradually increases with each step \(t\), indicating that this region requires progressive modification. This gradual modification method facilitates a more seamless blending of the inpainting content with the original image content.
+
+\[_{inpaint}(x,y)=M_{content}(x,y)(1-(M_{seam}(x,y),K_{g})).\] (11)
+
+**Guided reverse process**. We observe that when the missing region of the fusion image is large, the diffusion model very easily generates abnormal content, such as abnormal textures and words. To mitigate this issue, we introduce coarse rectangling. To be specific, we employ the Alexandru Telea Algorithm \(()\) to generate the coarse rectangling image: \(I_{CFR}(x,y)=(I_{CF}(x,y),M_{content}(x,y),R)\), where \(R\) is the radius of a circular neighborhood of each point inpainted. The \(()\) algorithm introduces a weak prior without any specific semantic information to the image \(I_{CF}(x,y)\). As shown in the partial image / of Figure 1, the image of the coarse rectangling region is completely blurred. The experimental result shows that generating images with weak priors significantly reduces the likelihood of producing anomalous content compared to leaving blank areas entirely black. More details regarding the advantages of coarse rectangling can be found in the Appendix A.1.
+
+The specific steps of the reverse process are detailed in Algorithm 1. Although this algorithm is based on the Stable Diffusion Inpainting model [41; 3], which differs slightly from the original Stable Diffusion model , the underlying principles remain consistent. In addition, our method works without the need for prompt, effectively reducing dataset requirements.
+
+Appendix A.2 provide more detailed explanation and visualization of the weighted masks and WMGRP algorithm.
+
+## 4 Experiments
+
+### Experimental setup
+
+**Dataset**. To validate the performance of our method, we conducted experiments on the large public dataset UDIS-D . To the best of our knowledge, UDIS-D is the only publicly available large-scale dataset in this field. Appendix D.4 provides more results of our method on other traditional small datasets.
+
+**Baselines**. To our knowledge, no open-source solutions simultaneously address the fusion and rectangle stages of the image-stitching pipeline as comprehensively as our method. Table 1(a) gives brief statistics of related works, and more related work details provided in Appendix B. Therefore, we have to establish the comparison baselines by combining several existing methods. For the registration and fusion stage, we employ pre-trained models from UDIS  and UDIS++ . For the rectangling stage, we utilize pre-trained models from DeepRectangling (DR) , Lama , Stable-Diffusion-v1-5-inpainting (SD1.5) , and Stable-Diffusion-v2-inpainting (SD2) . Table 1(b) presents the detailed configurations of baselines.
+
+**Variants**. In this paper, we mainly present SRStitcher based on Stable Diffusion Inpainting model . However, our method is versatile and can be readily adapted to other diffusion-based models with only minor modifications. In the experiments, we also compare the SRStitcher variants, including: SRStitcher-S based on the Stable Diffusion 2 model , SRStitcher-U based on Stable Diffusion 2 Unclip model , SRStitcher-C based on Controlnet Inpainting model . For further information on SRStitcher variants, please refer to Appendix D.3.
+
+**Metrics**. (1) **Stitched image quality**. Since UDIS-D is an unsupervised dataset, we use the No-Reference Image Quality Assessment (NR-IQA) metrics to evaluate the image quality. Specifically, we use the HIQA  and CLIPIQA . (2) **Content consistency**. We develop a new metric to evaluate the content consistency between the input images and the stitched image. Specifically, we introduce the \(()\) model and \(()\) model to extract text from the images and generate text embeddings. The similarity between these embeddings is measured by the cosine similarity \(()\). We design the Content Consistency Score (CCS) metric:
+
+Table 1: Statistics of related works and details of comparison baselines.
+
+\[CCS=(CCS_{n}+CCS_{g})/2\] (12)
+
+\(CCS_{n}\) measures the local consistency, which compares the stitched image \(I_{Stitched}(x,y)\) and the fusion image \(I_{Fusion}(x,y)\). Both images are split into \(n\) equal parts for detailed comparison: \(CCS_{n}=(((I_{Stitched}(x,y),n)),( (I_{Fusion}(x,y),n)))\), where \(()=(())\), and for this test, \(n=4\). In addition, \(CCS_{g}\) assesses the overall content consistency between the \(I_{Stitched}(x,y)\) and original input images: \(CCS_{g}=((I_{Stitched}(x,y),(I_{l}(x,y),I_{r}(x,y)))\). Please refer to Appendix C for further information on the metrics.
+
+**Implement details**. All experiments are performed on a single NVIDIA 4090 GPU. In addition, all experiments of SRStitcher described in this paper are based on these pre-aligned images made by UDIS++ . For hyper-parameters, the guidance scale and inference steps \(N\) are set to 7.5 and 50; The \(K_{s}\) in Eq. 5 is set to \( W^{*}/\), where \(=200\) and \(=10\); The \(K_{g}\) in Eq. 10 and Eq. 11 are set to 3; The \(R\) in \(()\) is set to 20. The \(_{1}\) and \(_{2}\) in Eq. 10 are set to 128 and 128.
+
+### Quantitative evaluation
+
+We perform a comprehensive quantitative analysis by comparing the results of 10,440 sample pairs from the UDIS-D training set \(UDIS-D_{train}\) and 1,106 sample pairs from the testing set \(UDIS-D_{test}\). Notably, our method does not require training, so to provide a broader base of comparison, the training set of UDIS-D is also included in the comparison experiments. The comparative results are presented in Table 2, which illustrates the significant advantages of SRStitcher in terms of the stitched image quality and content consistency.
+
+    & \)} & \)} \\  Method & HIQA \(\) & CLIPIQA \(\) & CCS(\%)\(\) & HIQA \(\) & CLIPIQA \(\) & CCS(\%) \(\) \\  UDIS+DR\(\) & 42.53 & 28.33 & 89.35 & 45.31 & 31.29 & 90.02 \\ UDISplus+DR\(\) & 45.98 & 31.24 & 88.45 & 49.87 & 33.47 & 90.69 \\ UDIS+Lama\(\) & 42.55 & 27.17 & 84.99 & 45.63 & 30.15 & 86.70 \\ UDISplus+Lama\(\) & 46.57 & 31.48 & 87.73 & 51.28 & 33.29 & 86.12 \\ UDIS+SD1.5\(\) & 42.60 & 28.03 & 87.42 & 48.59 & 28.57 & 87.74 \\  & \(\) 2.24 & \(\) 2.84 & \(\) 1.08 & \(\) 1.18 & \(\) 0.89 & \(\) 1.36 \\ UDISplus+SD1.5\(\) & 46.45 & 27.13 & 87.16 & 50.89 & 30.16 & 88.12 \\  & \(\) 1.11 & \(\) 1.85 & \(\) 1.61 & \(\) 2.20 & \(\) 1.46 & \(\) 1.35 \\ UDIS+SD2\(\) & 42.84 & 28.00 & 85.97 & 47.15 & 34.31 & 85.72 \\  & \(\) 1.05 & \(\) 0.89 & \(\) 1.33 & \(\) 1.33 & \(\) 0.95 & \(\) 1.55 \\ UDISplus+SD2\(\) & 46.98 & 31.23 & 89.37 & 51.49 & 34.26 & 91.18 \\  & \(\) 1.43 & \(\) 2.18 & \(\) 1.23 & \(\) 1.74 & \(\) 1.24 & \(\) 1.35 \\   \\  SRStitcher-S\(\) & 45.66 & 32.08 & 85.91 & 51.73 & 35.23 & 87.32 \\  & \(\) 0.89 & \(\) 0.91 & \(\) 0.74 & \(\) 0.56 & \(\) 0.79 & \(\) 0.81 \\  & 43.89 & 28.35 & 85.81 & 48.18 & 31.38 & 86.33 \\  & \(\) 1.01 & \(\) 0.66 & \(\) 1.01 & \(\) 0.55 & \(\) 0.74 & \(\) 0.53 \\  & 46.57 & 31.34 & 89.47 & 52.73 & 34.53 & 91.41 \\  & \(\) 0.89 & \(\) 0.76 & \(\) 0.71 & \(\) 0.74 & \(\) 0.85 & \(\) 0.84 \\  & **47.82** & **33.25** & **91.15** & **54.74** & **37.52** & **93.29** \\  & \(\) **0.55** & \(\) **0.57** & \(\) **0.52** & \(\) **0.63** & \(\) **0.68** & \(\) **0.45** \\   
+
+Table 2: Quantitative results. The best and second-best results are highlighted by **red** and blue.
+
+\(\) refers to the inference results of this method are not affected by seed. \(\) means the inference results of this method are affected by the seed. We tested the results five times by varying the seed, taking the average and standard deviation.
+
+### Qualitative evaluation
+
+We perform a quantitative evaluation of SRStitcher against other baseline methods, depicted in Figure 2. The first row of Figure 2 presents a challenging registration scenario involving soft and deformable objects, such as wires, which may have deformed unpredictably between two images. Current registration methods cannot accurately align such objects. Instead of attempting to register or fuse these deformed wires, our method opts to _inpaint incorrect wires_, effectively overcoming registration errors. A more detailed discussion on this is available in Appendix A.4. The second row of Figure 2 illustrates challenges associated with structured and extensive missing areas, where methods like DR and Lama struggle to accurately fill in the image content. The third row addresses the repeated pattern challenge, where a large number of bricks significantly complicates registration accuracy. The fourth row highlights the classic multi-depth layer problem, illustrating how objects like pillars and their backgrounds, being on different depth layers, result in registration inaccuracies. To enhance the clarity of presentation, the results of UDISplus+DR, UDIS+Lama, UDIS+SD1.5, and UDISplus+SD1.5 are omitted from this figure. Detailed qualitative evaluations for all comparison methods are provided in Appendix D.
+
+### User study
+
+We introduce a user study metric from UDIS . This method allows for a more subjective but insightful visual quality assessment through direct user feedback. For the user study, we display four images simultaneously on a single screen: the two input images, our stitched result, and the stitched result from one of the baseline methods. Participants are asked to determine which result is superior, _SRStitcher_ or _Another_ (comparison baseline). If a clear preference is not apparent, participants
+
+Figure 2: Qualitative evaluation results. All visual results are obtained with seed \(0\).
+
+can choose _Both Good_ or _Both Bad_. The study involves 20 participants: 10 researchers (computer vision background) and 10 volunteers (non-computer major). This diverse group ensures a balanced perspective, combining expert technical evaluation with general user impressions. The results are shown in Figure 3.
+
+### Ablation study
+
+**Hyper-parameter**. Figure 4 illustrates the ablation results in hyper-parameter of SRStitcher, demonstrating that these parameters are highly interpretable and easy to adjust. (1) \(\)**: **Controls the width of the region in \(M_{scan}\)**. A smaller \(\) increases the modification range and decreases the CCS. For stitched pictures with color differences, a lower \(\) value can better fuse the images. We set \(\) to 200, considering both image smoothness and CCS. (2) \(R\)**: **Controls the granularity of the coarse rectangular image**. A higher \(R\) value provides a higher quality weak prior for inpainting, reducing the likelihood of generating abnormal content. Ideally, a larger \(R\) is preferable, but due to the limitations in GPU acceleration with the \(()\), a very high \(R\) value can slow down the pipeline. Thus, we balance performance and speed by setting \(R\) to \(20\). (3) \(_{1}\)**: **Controls the inpainting strength of the seam area**. At \(_{1}=128\), the shape of the pillars appears more reasonable compared to \(_{1}=64\). However, increasing \(_{1}\) to 192 significantly alters the image content, so we set it to 128. (4) \(_{2}\)**: **Controls the inpainting strength of the rectangling area**. When \(_{2}\) is relatively low, the image structure remains largely intact, but increasing it to 192 leads to noticeable structural deficits. Therefore, we set \(_{2}\) to 128. Please see Appendix D.2 for more comprehensive hyper-parameters studies.
+
+**Weighted Masks**. Figure 5 illustrates the ablation results in different masks guided manners. Specifically, Figure 5(a) represents the different effects of using fixed mask and weighted mask in the fusion region. As shown in the red box, the weighted mask better smoothes the image content while preserving the original information of the image by gradually modifying the image content, while the fixed mask significantly modifies the original image content. In addition, Figure 5(b) illustrates the stitched images obtained by the gradually changing weighted masks in the rectangling region. Since the rectangling region contains no image content, the generator guided by the gradually changing masks repeatedly smoothes the empty region, resulting in blurred noise. Therefore, we use a fixed size mask in the rectangling region.
+
+## 5 Discussion and conclusion
+
+This paper introduces SRStitcher, which reconceptualizes the fusion and rectangling stages as a unified inpainting model. Through weighted masks, SRStitcher leverages the robust generalization capabilities of a pre-trained large-scale generation model to accomplish this complex inpainting task without additional fine-tuning or task-specific data annotations. Extensive experiments demonstrate that SRStitcher significantly outperforms existing state-of-the-art methods regarding the quality of the stitched images and its robustness to registration errors and abnormal content. Furthermore, the specific effects and adjustments of each hyper-parameter in SRStitcher are detailed in the ablation studies, illustrating its high interpretability and controllability.
+
+However, there are still some limitations and open issues in future research: (1)**Visible seam**. When input images exhibit significant color differences, visible seams may appear with the parameter settings described in the paper. Adjustments to \(_{1}\) and \(\) can partially mitigate this issue, but such modifications can compromise the preservation of original image information. We speculate that a more flexible and appropriately designed hyper-parameter selection scheme could solve this problem. (2) **Local blurring**. We use coarse rectangling and \(_{init}(x,y)\) to control the content generation. However, this approach introduces a side effect where some challenging scenes appear locally blurred (See Appendix D.5). This issue presents a dilemma: accept local blurring or risk producing anomalous images. We temporarily choose to tolerate local blurring. Future improvements will include a refined coarse rectangling approach or fine-tuning the model. (3) **Integrating registration**. Is it possible to integrate the registration stage into the unified model? According to Diffusion Features (DIFT) , it is possible. DIFT proves that the geometric correspondence between images can be effectively established by extracting feature maps from their intermediate layers at a specific timestep during the inverse process. Replacing the registration method used by SRStitcher with DIFT is straightforward. However, our ambitions extend beyond simple replacement. We believe there is potential for a more elegant and concise method to integrate concepts proposed by DIFT into our existing method.
+
+## 6 Acknowledgment
+
+This paper was supported by the National Key Research and Development Project of China (Grant No.2023YFB3408600) and Science and Technology Innovation Program of Shanghai (Grant No.18DZ2295100).
