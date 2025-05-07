@@ -32,7 +32,7 @@ def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, 
         response = f"{item['aggregated_review']}\n### Rating\nOverall Quality: {rating:.1f}\nReview Confidence: {confidence:.1f}"
         
         llama_factory_item = {
-            "instruction": f"""You are an academic paper reviewer. Please provide a comprehensive review of the following academic paper. Your review should be structured into four main sections:
+            "instruction": f"""You are an academic paper reviewer. Please write a structured review of the following paper, using only the four sections below. Keep your response concise, objective, and focused. Do not include any content beyond these four sections:
 
 ### Key Points
 Summarize the main contributions and key ideas of the paper.
@@ -68,7 +68,7 @@ Review Confidence: (1-5)
     # 保存Llama Factory格式数据
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(llama_factory_data, f, ensure_ascii=False, indent=2)
+       json.dump(llama_factory_data, f, ensure_ascii=False, indent=2)
     
     print(f"已创建Llama Factory格式数据集，包含 {len(llama_factory_data)} 条记录")
     if filtered_long_count > 0:
@@ -78,66 +78,38 @@ Review Confidence: (1-5)
     
     return llama_factory_data
 
-def create_train_val_split(dataset_path, train_path, val_path, val_ratio=0.1):
-    """创建训练集和验证集分割"""
-    # 加载完整数据集
+def create_train_dpo_test_split(dataset_path, train_path, dpo_path, test_path, train_ratio=0.75, dpo_ratio=0.23, test_ratio=0.02):
+    """按 75/23/2 划分训练集（QLoRA）、DPO集、测试集"""
     with open(dataset_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    
-    # 计算验证集大小
-    val_size = max(1, int(len(data) * val_ratio))
-    
-    # 分割数据
-    train_data = data[:-val_size] if val_size > 0 else data
-    val_data = data[-val_size:] if val_size > 0 else []
-    
-    # 保存训练集
-    os.makedirs(os.path.dirname(train_path), exist_ok=True)
-    with open(train_path, 'w', encoding='utf-8') as f:
-        json.dump(train_data, f, ensure_ascii=False, indent=2)
-    
-    # 保存验证集
-    os.makedirs(os.path.dirname(val_path), exist_ok=True)
-    with open(val_path, 'w', encoding='utf-8') as f:
-        json.dump(val_data, f, ensure_ascii=False, indent=2)
-    
-    print(f"已创建训练集 ({len(train_data)} 条记录) 和验证集 ({len(val_data)} 条记录)")
-    
-    return train_data, val_data
 
-def create_train_val_test_split(dataset_path, train_path, val_path, test_path, val_ratio=0.05, test_ratio=0.05):
-    """创建训练集、验证集和测试集分割"""
-    # 加载完整数据集
-    with open(dataset_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    # 计算验证集和测试集大小
-    test_size = max(1, int(len(data) * test_ratio))
-    val_size = max(1, int(len(data) * val_ratio))
-    
-    # 分割数据
-    test_data = data[-test_size:] if test_size > 0 else []
-    val_data = data[-(test_size+val_size):-test_size] if val_size > 0 else []
-    train_data = data[:-(test_size+val_size)] if (test_size+val_size) > 0 else data
-    
-    # 保存训练集
+    total = len(data)
+    test_size = max(1, int(total * test_ratio))
+    dpo_size = max(1, int(total * dpo_ratio))
+    train_size = total - dpo_size - test_size
+
+    # 顺序分配（如需随机可打乱）
+    train_data = data[:train_size]
+    dpo_data = data[train_size:train_size + dpo_size]
+    test_data = data[train_size + dpo_size:]
+
+    # 保存
     os.makedirs(os.path.dirname(train_path), exist_ok=True)
     with open(train_path, 'w', encoding='utf-8') as f:
         json.dump(train_data, f, ensure_ascii=False, indent=2)
-    
-    # 保存验证集
-    os.makedirs(os.path.dirname(val_path), exist_ok=True)
-    with open(val_path, 'w', encoding='utf-8') as f:
-        json.dump(val_data, f, ensure_ascii=False, indent=2)
-    
-    # 保存测试集
+
+    os.makedirs(os.path.dirname(dpo_path), exist_ok=True)
+    with open(dpo_path, 'w', encoding='utf-8') as f:
+        json.dump(dpo_data, f, ensure_ascii=False, indent=2)
+
     os.makedirs(os.path.dirname(test_path), exist_ok=True)
     with open(test_path, 'w', encoding='utf-8') as f:
         json.dump(test_data, f, ensure_ascii=False, indent=2)
-    
-    print(f"已创建训练集 ({len(train_data)} 条记录)、验证集 ({len(val_data)} 条记录)和测试集 ({len(test_data)} 条记录)")
-    
-    return train_data, val_data, test_data
+
+    print(f"已创建训练集 ({len(train_data)} 条记录)、DPO集 ({len(dpo_data)} 条记录)、测试集 ({len(test_data)} 条记录)")
+
+    return train_data, dpo_data, test_data
+
 
 def filter_long_inputs(input_path, output_path, max_length=150000):
     """过滤掉输入长度超过指定长度的数据集条目"""
@@ -200,18 +172,18 @@ if __name__ == "__main__":
     llama_factory_data = format_for_llama_factory(input_dataset_path, llama_factory_output)
     
     # 自动创建训练集、验证集和测试集分割
-    train_output = os.path.join(output_dir, "llama_factory_train.json")
-    val_output = os.path.join(output_dir, "llama_factory_val.json")
-    test_output = os.path.join(output_dir, "llama_factory_test.json")
-    
-    print("创建训练集、验证集和测试集分割...")
-    train_data, val_data, test_data = create_train_val_test_split(
-        llama_factory_output, train_output, val_output, test_output
+    qlora_output = os.path.join(output_dir, "llama_factory_qlora.json")
+    dpo_output = os.path.join(output_dir, "llama_factory_dpo.json")
+    eval_output = os.path.join(output_dir, "llama_factory_eval.json")
+
+    print("创建训练集、DPO集和测试集分割...")
+    qlora_data, dpo_data, eval_data = create_train_dpo_test_split(
+        llama_factory_output, qlora_output, dpo_output, eval_output
     )
     
-    print(f"Llama Factory格式数据已保存到: {llama_factory_output}")
-    print(f"训练集已保存到: {train_output} ({len(train_data)} 条记录)")
-    print(f"验证集已保存到: {val_output} ({len(val_data)} 条记录)")
-    print(f"测试集已保存到: {test_output} ({len(test_data)} 条记录)")
+    # print(f"Llama Factory格式数据已保存到: {llama_factory_output}")
+    print(f"QLora训练集已保存到: {qlora_output} ({len(qlora_data)} 条记录)")
+    print(f"DPO训练集已保存到: {dpo_output} ({len(dpo_data)} 条记录)")
+    print(f"测试集已保存到: {eval_output} ({len(eval_data)} 条记录)")
     
     print("转换完成！")
