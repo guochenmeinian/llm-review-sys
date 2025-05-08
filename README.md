@@ -11,7 +11,7 @@ This project uses LLM to auto-reviews the research paper.
 - We used [Nougat-OCR](https://github.com/facebookresearch/nougat) to parse the PDF. Here's a [usage](https://github.com/ad17171717/YouTube-Tutorials/blob/main/Machine%20Learning%20with%20Python/Optical_Character_Recognition_(OCR)_with_Meta's_Nougat!.ipynb) guide I found. With the raw dataset, We used GPT-4-mini to format/merge reviews to prepare the dataset for training.
 
 Here's a sample of the structured output we prepared for training:
-```w
+```markdown
 ### Key Points
 This paper presents an online learning framework for Markov Decision Processes (MDPs) with countably infinite states, utilizing a Bayesian perspective where MDP parameters follow a prior distribution. The authors propose a Thompson-sampling-like approach to solve the MDP, assuming access to an optimal policy oracle. The learning goal is Bayesian regret minimization, achieving a regret bound of \(\sqrt{TA}\) under certain assumptions. The paper contributes to theoretical reinforcement learning by providing near-optimal algorithms for unbounded state spaces and includes empirical simulations demonstrating the algorithm's performance.
 

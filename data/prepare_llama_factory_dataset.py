@@ -185,8 +185,8 @@ def filter_long_inputs(input_path, output_path, max_length=150000):
 if __name__ == "__main__":
     # 设置路径
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    input_dataset_path = os.path.join(base_dir, "data", "paper_review_dataset", "paper_review_dataset.json")
-    output_dir = os.path.join(base_dir, "model", "llama_factory_dataset")
+    input_dataset_path = os.path.join(base_dir, "data", "draft_dataset", "draft_dataset.json")
+    output_dir = os.path.join(base_dir, "data", "llama_factory_dataset")
     
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
@@ -220,16 +220,16 @@ if __name__ == "__main__":
     print(f"测试集已保存到: {eval_output} ({len(eval_data)} 条记录)")
     
     rejected_sources = {
-        # "qlora": "outputs/qlora_dpo_outputs.json",
-        # "llama3": "outputs/llama3_dpo_outputs.json",
-        # "gpt4o": "outputs/chatgpt4o_dpo_outputs.json"
+        # "qlora": "rejected_dataset/qlora_dpo_outputs.json",
+        # "llama3": "rejected_dataset/llama3_dpo_outputs.json",
+        # "gpt4o": "rejected_dataset/chatgpt4o_dpo_outputs.json"
     }
 
     for name, rejected_path in rejected_sources.items():
         output_path = os.path.join(output_dir, f"dpo_pair_{name}.json")
         build_dpo_dataset_from_split(dpo_output, rejected_path, output_path)
 
-    for path in [llama_factory_output, dpo_output]:
+    for path in [llama_factory_output]:
         if os.path.exists(path):
             os.remove(path)
             print(f"🧹 已删除中间文件: {path}")

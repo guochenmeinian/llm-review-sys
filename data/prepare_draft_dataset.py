@@ -202,7 +202,7 @@ if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     pdfs_dir = os.path.join(base_dir, "data", "extracted_texts")
     aggregated_reviews_path = os.path.join(base_dir, "data", "aggregated_reviews", "aggregated_reviews.json")
-    output_dataset_path = os.path.join(base_dir, "data", "paper_review_dataset", "paper_review_dataset.json")
+    output_dataset_path = os.path.join(base_dir, "data", "draft_dataset", "draft_dataset.json")
     
     # 确保输出目录存在
     os.makedirs(os.path.dirname(output_dataset_path), exist_ok=True)
