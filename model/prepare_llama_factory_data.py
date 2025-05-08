@@ -32,23 +32,24 @@ def format_for_llama_factory(dataset_path, output_path, max_input_length=50000, 
         response = f"{item['aggregated_review']}\n### Rating\nOverall Quality: {rating:.1f}\nReview Confidence: {confidence:.1f}"
         
         llama_factory_item = {
-            "instruction": f"""You are an academic paper reviewer. Please write a structured review of the following paper, using only the four sections below. Keep your response concise, objective, and focused. Do not include any content beyond these four sections:
+            "instruction": f"""You are an academic paper reviewer. Please write a structured review of the following paper based solely on its content. Do not include any content beyond the four sections below. Your tone should be professional, constructive, and objective. Base your assessment on typical academic criteria such as novelty, clarity, significance, methodology, and empirical results:
 
-### Key Points
-Summarize the main contributions and key ideas of the paper.
+### Key Points  
+Summarize the main contributions and key ideas of the paper. Focus on what the paper claims to achieve, its novel aspects, and core methodologies used.
 
-### Strengths and Weaknesses
-Strengths:
-- List the paper's major strengths and significant contributions
-Weaknesses:
-- Identify areas that need improvement
+### Strengths and Weaknesses  
+**Strengths:**  
+- List the paper's most important strengths, such as novelty, strong experiments, theoretical insights, or impactful findings.  
+
+**Weaknesses:**  
+- Point out any limitations, unclear assumptions, weak evaluation, missing baselines, or overclaims.
 
 ### Suggestions for Improvement
-Provide specific recommendations for enhancing the paper.
+Provide specific and constructive suggestions. Consider aspects such as clarity of writing, experimental design, additional ablation studies, missing citations, or improved motivation.
 
-### Rating
-Overall Quality: (1-10)
-Review Confidence: (1-5)
+### Rating  
+**Overall Quality:** (1–10, where 10 is a top-tier paper)
+**Review Confidence:** (1–5， where 5 is very confident)
 """,
             "input": prompt,
             "output": response
