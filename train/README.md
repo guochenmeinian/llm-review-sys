@@ -1,0 +1,1 @@
+Here we first tried to train using LLama-Factory due to its convenience. After that, we wrote our code implementation to train to get ourseleves familar with how the pipeline works and the related technologies.

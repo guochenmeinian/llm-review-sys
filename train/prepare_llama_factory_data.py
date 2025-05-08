@@ -112,6 +112,38 @@ def create_train_dpo_test_split(dataset_path, train_path, dpo_path, test_path, t
     return train_data, dpo_data, test_data
 
 
+def build_dpo_dataset_from_split(accepted_path, rejected_path, output_path):
+    """
+    构造 DPO 格式数据集：
+    - accepted_path: 已切分好的 dpo set，每条有 instruction/input/output
+    - rejected_path: 模型生成的 output，按顺序对齐
+    - output_path: 输出成 {prompt, chosen, rejected} 格式
+    """
+    with open(accepted_path, 'r', encoding='utf-8') as f:
+        accepted = json.load(f)
+
+    with open(rejected_path, 'r', encoding='utf-8') as f:
+        rejected = json.load(f)
+
+    assert len(accepted) == len(rejected), f"❌ Accepted({len(accepted)}) 和 Rejected({len(rejected)}) 数量不一致"
+
+    dpo_data = []
+    for a, r in tqdm(zip(accepted, rejected), total=len(accepted), desc="构造 DPO 对"):
+        prompt = f"{a['instruction']}\n\n{a['input']}".strip()
+        dpo_data.append({
+            "prompt": prompt,
+            "chosen": a["output"],
+            "rejected": r["output"]
+        })
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(dpo_data, f, ensure_ascii=False, indent=2)
+
+    print(f"✅ DPO 数据已保存到: {output_path}（共 {len(dpo_data)} 条）")
+
+
+
 def filter_long_inputs(input_path, output_path, max_length=150000):
     """过滤掉输入长度超过指定长度的数据集条目"""
     print(f"正在加载数据集: {input_path}")
@@ -187,4 +219,20 @@ if __name__ == "__main__":
     print(f"DPO训练集已保存到: {dpo_output} ({len(dpo_data)} 条记录)")
     print(f"测试集已保存到: {eval_output} ({len(eval_data)} 条记录)")
     
+    rejected_sources = {
+        # "qlora": "outputs/qlora_dpo_outputs.json",
+        # "llama3": "outputs/llama3_dpo_outputs.json",
+        # "gpt4o": "outputs/chatgpt4o_dpo_outputs.json"
+    }
+
+    for name, rejected_path in rejected_sources.items():
+        output_path = os.path.join(output_dir, f"dpo_pair_{name}.json")
+        build_dpo_dataset_from_split(dpo_output, rejected_path, output_path)
+
+    for path in [llama_factory_output, dpo_output]:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"🧹 已删除中间文件: {path}")
+
+
     print("转换完成！")
