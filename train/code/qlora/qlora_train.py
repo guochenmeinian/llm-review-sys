@@ -2,11 +2,17 @@ import os
 import argparse
 import yaml
 import torch
-import json
 from tqdm import tqdm
-from datasets import load_dataset, Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, BitsAndBytesConfig
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+    Trainer,
+    BitsAndBytesConfig
+)
 from peft import get_peft_model, prepare_model_for_kbit_training, LoraConfig
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 def load_config(config_path):
@@ -14,9 +20,9 @@ def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
-def load_dataset_from_hf(dataset_repo, file_name):
+def load_dataset_from_hf(dataset_repo, file_name, split="train"):
     print(f"📦 Loading HF dataset: {dataset_repo}/{file_name}")
-    dataset = load_dataset(dataset_repo, data_files=file_name, split="train")
+    dataset = load_dataset(dataset_repo, data_files=file_name, split=split)
     print(f"✅ Loaded {len(dataset)} examples.")
     return dataset
 
@@ -26,7 +32,8 @@ def build_prompt(example):
         "prompt": f"{example['instruction']}\n\n{example['input']}".strip(),
         "response": example["output"]
     }
-    
+
+# 拼接完整 prompt + response，并构造 label
 def preprocess_full_prompt(examples, tokenizer, max_length=18000):
     input_ids, attention_masks, labels = [], [], []
 
@@ -42,7 +49,6 @@ def preprocess_full_prompt(examples, tokenizer, max_length=18000):
             padding="max_length"
         )
 
-        # 使用同样的 truncation 限制计算 prompt 的实际长度，防止越界
         prompt_ids = tokenizer(
             prompt,
             truncation=True,
@@ -50,8 +56,7 @@ def preprocess_full_prompt(examples, tokenizer, max_length=18000):
             add_special_tokens=False
         )["input_ids"]
 
-        # prompt_len = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
-        prompt_len = min(len(prompt_ids), max_length)  # ✅ 限制长度，避免越界
+        prompt_len = min(len(prompt_ids), max_length)
         label_ids = encoding["input_ids"].copy()
         label_ids[:prompt_len] = [-100] * prompt_len
 
@@ -65,42 +70,71 @@ def preprocess_full_prompt(examples, tokenizer, max_length=18000):
         "labels": labels
     }
 
+def build_bnb_config(config):
+    return BitsAndBytesConfig(
+        load_in_4bit=config.get("load_in_4bit", True),
+        bnb_4bit_compute_dtype=getattr(torch, config.get("bnb_4bit_compute_dtype", "bfloat16")),
+        bnb_4bit_use_double_quant=config.get("bnb_4bit_use_double_quant", True)
+    )
+
+def build_lora_config(config):
+    return LoraConfig(
+        r=config.get("lora_rank", 8),
+        lora_alpha=config.get("lora_alpha", 32),
+        lora_dropout=config.get("lora_dropout", 0.05),
+        bias=config.get("lora_bias", "none"),
+        task_type="CAUSAL_LM"
+    )
+
+def build_training_args(config, output_dir):
+    return TrainingArguments(
+        output_dir=output_dir,
+        per_device_train_batch_size=config.get("per_device_train_batch_size", 1),
+        per_device_eval_batch_size=config.get("per_device_eval_batch_size", 1),
+        gradient_accumulation_steps=config.get("gradient_accumulation_steps", 4),
+        num_train_epochs=config.get("num_train_epochs", 3),
+        eval_strategy=config.get("eval_strategy", "steps"),
+        eval_steps=config.get("eval_steps", 100),
+        save_steps=config.get("save_steps", 100),
+        learning_rate=config.get("learning_rate", 2e-5),
+        bf16=config.get("bf16", True),
+        logging_steps=config.get("logging_steps", 10),
+        save_total_limit=config.get("save_total_limit", 2),
+        logging_dir=os.path.join(output_dir, "logs"),
+        report_to=config.get("report_to", "none"),
+        run_name=config.get("wandb_run_name", None),
+    )
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_file", type=str, default="qlora_train_config.yaml")
+    parser.add_argument("--local_rank", type=int, default=-1, help="deepspeed automatically sets this.")
     args = parser.parse_args()
 
     config = load_config(args.config_file)
-
     model_path = config["model_name_or_path"]
     output_dir = config["output_dir"]
+    cutoff_len = config.get("cutoff_len", 18000)
 
     print(f"🚀 Loading tokenizer and model from: {model_path}")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=True)
-    cutoff_len = tokenizer.model_max_length # 128k for LLaMA3.1 but we only use 18k
     tokenizer.pad_token = tokenizer.eos_token
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True
+    bnb_config = build_bnb_config(config)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, 
+        quantization_config=bnb_config, 
+        device_map="balanced_low_0",
+        low_cpu_mem_usage=True,  # ✅ 避免GPU预加载导致爆显存
+        torch_dtype=torch.bfloat16  # ✅ 确保量化阶段不默认 float32
     )
-    model = AutoModelForCausalLM.from_pretrained(model_path, quantization_config=bnb_config, device_map="auto")
     model = prepare_model_for_kbit_training(model)
 
     print("🔧 Applying LoRA configuration...")
-    lora_config = LoraConfig(
-        r=config.get("lora_rank", 8),
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM"
-    )
+    lora_config = build_lora_config(config)
     model = get_peft_model(model, lora_config)
-
-    # ✅ 添加以下两行
-    model.config.use_cache = False  # ⚠️ 关闭缓存，兼容 gradient checkpointing
-    model.gradient_checkpointing_enable()  # ⚠️ 启用 gradient checkpointing
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable()
 
     print("📊 Processing training and validation datasets...")
     train_dataset = load_dataset(config["hf_dataset_repo"], "qlora_train")["train"].map(build_prompt)
@@ -108,12 +142,12 @@ def main():
 
     print("✂️ Tokenizing datasets...")
     train_dataset = train_dataset.map(
-        lambda examples: preprocess_full_prompt(examples, tokenizer),
+        lambda examples: preprocess_full_prompt(examples, tokenizer, max_length=cutoff_len),
         batched=True,
         remove_columns=train_dataset.column_names
     )
     val_dataset = val_dataset.map(
-        lambda examples: preprocess_full_prompt(examples, tokenizer),
+        lambda examples: preprocess_full_prompt(examples, tokenizer, max_length=cutoff_len),
         batched=True,
         remove_columns=val_dataset.column_names
     )
@@ -121,23 +155,7 @@ def main():
     train_dataset.set_format(type="torch")
     val_dataset.set_format(type="torch")
 
-    print("⚙️ Preparing training arguments...")
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        per_device_train_batch_size=config.get("per_device_train_batch_size", 1),
-        per_device_eval_batch_size=config.get("per_device_eval_batch_size", 1),
-        gradient_accumulation_steps=config.get("gradient_accumulation_steps", 4),
-        num_train_epochs=config.get("num_train_epochs", 3),
-        eval_strategy="steps",
-        eval_steps=config.get("eval_steps", 100),
-        save_steps=config.get("save_steps", 100),
-        learning_rate=config.get("learning_rate", 2e-5),
-        bf16=True,
-        logging_steps=10,
-        save_total_limit=2,
-        report_to="none",
-        logging_dir=os.path.join(output_dir, "logs")
-    )
+    training_args = build_training_args(config, output_dir)
 
     print("🏋️ Starting training...")
     trainer = Trainer(
@@ -147,16 +165,12 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset
     )
-
     trainer.train()
 
     print(f"💾 Saving model and tokenizer to {output_dir}")
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-
     print("✅ Training complete.")
 
 if __name__ == "__main__":
     main()
-
-
