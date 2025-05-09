@@ -38,7 +38,7 @@ Review Confidence: 3.2
 
 ###  Model Training
 
-- We first used (LLaMA-Factory)[https://github.com/hiyouga/LLaMA-Factory] to fine-tune the **LLaMA 3.1-8B-Instruct-8K model** using **QLoRA**. We ran the training on two NVIDIA 4090 GPUs through AutoDL. LLaMA-Factory provided a convenient interface for quick experimentation. After that, we gradually moved to writing our own training and inference code, and explored key tools such as Hugging Face Transformers, Accelerate, and DeepSpeed, which deepened our understanding of model loading, memory optimization, and distributed training workflows.
+- We first used [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) to fine-tune the **LLaMA 3.1-8B-Instruct-8K model** using **QLoRA**. We ran the training on **five NVIDIA 4090 GPUs** through **AutoDL**. LLaMA-Factory provided a convenient interface for quick experimentation. After that, we gradually moved to writing our own training and inference code, and explored key tools such as **Hugging Face Transformers**, **Accelerate**, and **DeepSpeed**, which deepened our understanding of model loading, memory optimization, and distributed training workflows.
 
 - After supervised fine-tuning (SFT) with QLoRA, we are currently working on **Direct Preference Optimization** (DPO) to further align the model with human preferences. Our idea is: while QLoRA teaches the model to reproduce structured reviews, DPO will push the model to prefer higher-quality, better-structured responses by optimizing preferences between "good" and "bad" outputs. Our goal is to compare how different sources of "rejected" outputs affect model preference learning. Specifically, we plan to evaluate DPO results using negative samples from:
 - **Original LLaMA 3.1 outputs** (zero-shot)

@@ -2,7 +2,6 @@ import os
 import argparse
 import yaml
 import torch
-from tqdm import tqdm
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -12,21 +11,16 @@ from transformers import (
     BitsAndBytesConfig
 )
 from peft import get_peft_model, prepare_model_for_kbit_training, LoraConfig
+import torch.distributed.tensor.parallel._utils
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["TRANSFORMERS_CACHE"] = "/root/autodl-tmp/hf_cache"
-os.environ["HF_HOME"] = "/root/autodl-tmp/hf_home"
+
+torch.distributed.tensor.parallel._utils._DTensor_DispatchMode__enabled = False
 
 def load_config(config_path):
-    print(f"📄 Loading config from: {config_path}")
+    print(f"\U0001F4C4 Loading config from: {config_path}")
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
-
-def load_dataset_from_hf(dataset_repo, file_name, split="train"):
-    print(f"📦 Loading HF dataset: {dataset_repo}/{file_name}")
-    dataset = load_dataset(dataset_repo, data_files=file_name, split=split)
-    print(f"✅ Loaded {len(dataset)} examples.")
-    return dataset
 
 def build_prompt(example):
     return {
@@ -41,19 +35,8 @@ def preprocess_full_prompt(examples, tokenizer, max_length=4096):
         response = examples["response"][i].strip()
         full_text = f"{prompt}\n\n### Response:\n{response}"
 
-        encoding = tokenizer(
-            full_text,
-            truncation=True,
-            max_length=max_length,
-            padding="max_length"
-        )
-
-        prompt_ids = tokenizer(
-            prompt,
-            truncation=True,
-            max_length=max_length,
-            add_special_tokens=False
-        )["input_ids"]
+        encoding = tokenizer(full_text, truncation=True, max_length=max_length, padding="max_length")
+        prompt_ids = tokenizer(prompt, truncation=True, max_length=max_length, add_special_tokens=False)["input_ids"]
 
         prompt_len = min(len(prompt_ids), max_length)
         label_ids = encoding["input_ids"].copy()
@@ -68,13 +51,6 @@ def preprocess_full_prompt(examples, tokenizer, max_length=4096):
         "attention_mask": attention_masks,
         "labels": labels
     }
-
-def build_bnb_config(config):
-    return BitsAndBytesConfig(
-        load_in_4bit=config.get("load_in_4bit", True),
-        bnb_4bit_compute_dtype=getattr(torch, config.get("bnb_4bit_compute_dtype", "bfloat16")),
-        bnb_4bit_use_double_quant=config.get("bnb_4bit_use_double_quant", True)
-    )
 
 def build_lora_config(config):
     return LoraConfig(
@@ -102,19 +78,14 @@ def build_training_args(config, output_dir):
         logging_dir=os.path.join(output_dir, "logs"),
         report_to=config.get("report_to", "none"),
         run_name=config.get("wandb_run_name", None),
+        deepspeed=config.get("deepspeed", "ds_config.json")
     )
-
-class SmartTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        inputs = {
-            k: v.to(model.device) if isinstance(v, torch.Tensor) else v
-            for k, v in inputs.items()
-        }
-        return super().compute_loss(model, inputs, return_outputs)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_file", type=str, default="qlora_train_config.yaml")
+    parser.add_argument("--local_rank", type=int, default=-1)  # ⬅️ Deepspeed 需要这个参数
+    parser.add_argument("--deepspeed", type=str, default=None)  # ⬅️ 必须声明这个，否则会报错
     args = parser.parse_args()
 
     config = load_config(args.config_file)
@@ -122,31 +93,30 @@ def main():
     output_dir = config["output_dir"]
     cutoff_len = config.get("cutoff_len", 4096)
 
-    print(f"🚀 Loading tokenizer and model from: {model_path}")
+    print(f"\U0001F680 Loading tokenizer and model from: {model_path}")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    bnb_config = build_bnb_config(config)
+    device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        quantization_config=bnb_config,
+        # device_map=device_map, # device_map={"": 0}
         device_map="auto",
-        low_cpu_mem_usage=True,
-        torch_dtype=torch.bfloat16
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True
     )
     model = prepare_model_for_kbit_training(model)
 
-    print("🔧 Applying LoRA configuration...")
+    print("\U0001F527 Applying LoRA configuration...")
     lora_config = build_lora_config(config)
     model = get_peft_model(model, lora_config)
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
-    print("📊 Processing training and validation datasets...")
+    print("\U0001F4CA Processing datasets...")
     train_dataset = load_dataset(config["hf_dataset_repo"], "qlora_train")["train"].map(build_prompt)
     val_dataset = load_dataset(config["hf_dataset_repo"], "qlora_validation")["train"].map(build_prompt)
 
-    print("✂️ Tokenizing datasets...")
     train_dataset = train_dataset.map(
         lambda examples: preprocess_full_prompt(examples, tokenizer, max_length=cutoff_len),
         batched=True,
@@ -163,18 +133,17 @@ def main():
 
     training_args = build_training_args(config, output_dir)
 
-    print("🏋️ Starting training...")
-    trainer = SmartTrainer(
+    print("\U0001F3CB️ Starting training...")
+    trainer = Trainer(
         model=model,
-        tokenizer=tokenizer,
         args=training_args,
+        tokenizer=tokenizer,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
+        eval_dataset=val_dataset
     )
-
     trainer.train()
 
-    print(f"💾 Saving model and tokenizer to {output_dir}")
+    print(f"\U0001F4BE Saving model and tokenizer to {output_dir}")
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     print("✅ Training complete.")
