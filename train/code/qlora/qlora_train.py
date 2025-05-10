@@ -9,13 +9,14 @@ from transformers import (
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    DataCollatorForLanguageModeling
 )
 from peft import get_peft_model, prepare_model_for_kbit_training, LoraConfig
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["TRANSFORMERS_CACHE"] = "/root/autodl-tmp/hf_cache"
-os.environ["HF_HOME"] = "/root/autodl-tmp/hf_home"
+os.environ["TRANSFORMERS_CACHE"] = "/workspace/hf_cache"
+os.environ["HF_HOME"] = "/workspace/hf_home"
 
 def load_config(config_path):
     print(f"📄 Loading config from: {config_path}")
@@ -100,17 +101,8 @@ def build_training_args(config, output_dir):
         logging_steps=config.get("logging_steps", 10),
         save_total_limit=config.get("save_total_limit", 2),
         logging_dir=os.path.join(output_dir, "logs"),
-        report_to=config.get("report_to", "none"),
-        run_name=config.get("wandb_run_name", None),
+        report_to=config.get("report_to", "none")
     )
-
-class SmartTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        inputs = {
-            k: v.to(model.device) if isinstance(v, torch.Tensor) else v
-            for k, v in inputs.items()
-        }
-        return super().compute_loss(model, inputs, return_outputs)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -130,7 +122,6 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         quantization_config=bnb_config,
-        device_map="auto",
         low_cpu_mem_usage=True,
         torch_dtype=torch.bfloat16
     )
@@ -163,13 +154,16 @@ def main():
 
     training_args = build_training_args(config, output_dir)
 
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     print("🏋️ Starting training...")
-    trainer = SmartTrainer(
+
+    trainer = Trainer(
         model=model,
-        tokenizer=tokenizer,
         args=training_args,
+        tokenizer=tokenizer,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
+        data_collator=data_collator
     )
 
     trainer.train()
