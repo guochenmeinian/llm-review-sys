@@ -1,4 +1,4 @@
-Here we first tried to train using LLama-Factory due to its convenience. After that, we wrote our code implementation to train to get ourseleves familar with how the pipeline works and the related technologies.
+Here we learned to train the models using LLama-Factory and writing our own code implementation to train to get ourseleves familar with how the pipeline works and the related technologies.
 
 
 In case AutoDL has errors, use the following codes:

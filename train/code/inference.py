@@ -2,31 +2,31 @@ import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 from datasets import load_dataset
+from peft import PeftModel
 
-# 模型路径
-model_name = "meta-llama/Llama-3.1-8B-Instruct"  # 或者你的微调模型
+model_name = "meta-llama/Llama-3.1-8B-Instruct" 
+qlora_model_path = "../../models/ctx18000_model/outputs-1700/checkpoint-1700"
+
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=False)
 tokenizer.pad_token = tokenizer.eos_token
-model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)
+
+print("🔹 Loading QLoRA fine-tuned model...")
+base_for_qlora = AutoModelForCausalLM.from_pretrained(
+    model_name, torch_dtype=torch.float16, device_map="auto"
+).eval()
+qlora_model = PeftModel.from_pretrained(base_for_qlora, qlora_model_path).eval()
 
 
-data = load_dataset("guochenmeinian/openreview_dataset", "dpo")["train"]
+data = load_dataset("guochenmeinian/openreview_dataset", "dpo_base")["train"]
 print(f"📄 数据集中共有 {len(data)} 篇论文样本")
 
 
-def run_inference(instruction, input_text, max_input_tokens=128000, max_output_tokens=512):
-    # print(tokenizer.__class__)
-    # print(tokenizer.pad_token, tokenizer.pad_token_id)
-    # print(tokenizer.eos_token, tokenizer.eos_token_id)
-    # print(tokenizer.vocab_size)  # 对于 LLaMA3，应该是 128256
-    # print(tokenizer.special_tokens_map)
-
-
+def run_inference(instruction, input_text, max_input_tokens=18000, max_output_tokens=1500):
     prompt = f"{instruction.strip()}\n\n{input_text.strip()}\n\n### Response:"
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_input_tokens).to(model.device)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_input_tokens).to(qlora_model.device)
 
     with torch.no_grad():
-        output_ids = model.generate(
+        output_ids = qlora_model.generate(
             **inputs,
             max_new_tokens=max_output_tokens,
             do_sample=True,
@@ -41,7 +41,7 @@ def run_inference(instruction, input_text, max_input_tokens=128000, max_output_t
     return generated_text.strip()
 
 # 输出文件路径（.jsonl，每行一个完整 JSON 对象）
-output_path = "inference_results_from_dpo_dataset.jsonl"
+output_path = "model_dpo_results.jsonl"
 
 with open(output_path, "a", encoding="utf-8") as f_out:
     for i, example in enumerate(data):
