@@ -1,12 +1,11 @@
 import os
 import torch
+import wandb
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import DPOTrainer, DPOConfig
-from peft import PeftModel
-import wandb
 from transformers import BitsAndBytesConfig  
-from peft import prepare_model_for_kbit_training, get_peft_model, LoraConfig 
+from peft import PeftModel, prepare_model_for_kbit_training, get_peft_model, LoraConfig 
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -29,7 +28,7 @@ tokenizer = AutoTokenizer.from_pretrained(base_model_path, use_fast=False, trust
 tokenizer.pad_token = tokenizer.eos_token
 
 # ===== 配置 QLoRA 量化参数 =====
-print("🧬 加载 QLoRA 量化 base model...")
+print("🧬 加载 base model + QLoRA adapter...")
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_compute_dtype=torch.bfloat16,
@@ -43,7 +42,10 @@ base_model = AutoModelForCausalLM.from_pretrained(
     device_map="auto"
 )
 
-base_model = prepare_model_for_kbit_training(base_model)
+# ===== 加载 QLoRA 微调权重（adapter） =====
+qlora_model_path = "models/full_context_qlora_model"
+model = PeftModel.from_pretrained(base_model, qlora_model_path)
+print("✅ 成功加载 QLoRA 微调模型")
 
 lora_config = LoraConfig(
     r=8,
@@ -52,7 +54,6 @@ lora_config = LoraConfig(
     bias="none",
     task_type="CAUSAL_LM"
 )
-base_model = get_peft_model(base_model, lora_config)
 print("✅ QLoRA LoRA 配置完成")
 
 # ===== 加载 DPO 数据集 =====
@@ -80,11 +81,11 @@ dpo_config = DPOConfig(
 # ===== 创建 Trainer =====
 # 只使用必需的参数
 trainer = DPOTrainer(
-    model=base_model,
-    eval_dataset=None,
+    model=model,
+    eval_dataset=None, # we don't use eval_dataset here
     args=dpo_config,
     train_dataset=dataset,
-    ref_model=None,
+    ref_model=None, # DPO doesn't require a reference model
     processing_class=tokenizer
 )
 
