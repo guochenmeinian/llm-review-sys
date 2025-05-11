@@ -1,8 +1,13 @@
+import os
 import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 from datasets import load_dataset
 from peft import PeftModel
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TRANSFORMERS_CACHE"] = "/workspace/hf_cache"
+os.environ["HF_HOME"] = "/workspace/hf_home"
 
 model_name = "meta-llama/Llama-3.1-8B-Instruct" 
 qlora_model_path = "../../models/ctx18000_model/outputs-1700/checkpoint-1700"
