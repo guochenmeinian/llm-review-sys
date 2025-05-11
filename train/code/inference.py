@@ -10,7 +10,7 @@ os.environ["TRANSFORMERS_CACHE"] = "/workspace/hf_cache"
 os.environ["HF_HOME"] = "/workspace/hf_home"
 
 model_name = "meta-llama/Llama-3.1-8B-Instruct" 
-qlora_model_path = "../../models/ctx18000_model/outputs-1700/checkpoint-1700"
+qlora_model_path = "models/ctx18000_model/outputs-1700/checkpoint-1700"
 
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=False)
 tokenizer.pad_token = tokenizer.eos_token

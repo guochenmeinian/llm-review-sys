@@ -1,14 +1,16 @@
+import os
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import DPOTrainer, DPOConfig
 from peft import PeftModel
+import wandb
 
 # ===== 配置 =====
-qlora_model_path = "your-qlora-model"  # 替换为你的 QLoRA 模型路径
+qlora_model_path = "models/full_context_qlora_model"  # 替换为你的 QLoRA 模型路径
 dataset_repo = "guochenmeinian/openreview_dataset"
-dpo_split = "dpo"
-output_dir = "dpo_output"
+dpo_split = "dpo_base"
+output_dir = "models/dpo_model_base"
 
 # ===== 加载 tokenizer =====
 tokenizer = AutoTokenizer.from_pretrained(qlora_model_path, use_fast=False, trust_remote_code=True)
@@ -34,7 +36,7 @@ dpo_config = DPOConfig(
     per_device_train_batch_size=1,
     per_device_eval_batch_size=1,
     gradient_accumulation_steps=4,
-    learning_rate=5e-6,
+    learning_rate=2e-6,
     num_train_epochs=3,
     evaluation_strategy="steps",
     eval_steps=50,
@@ -44,7 +46,9 @@ dpo_config = DPOConfig(
     output_dir=output_dir,
     bf16=True,
     remove_unused_columns=False,
-    report_to="none"
+    report_to="none",
+    report_to="wandb",
+    run_name="qlora_full_context_llama3_vs_dataset"
 )
 
 # ===== 创建 Trainer =====
@@ -58,7 +62,12 @@ trainer = DPOTrainer(
 )
 
 # ===== 训练 =====
-trainer.train()
+checkpoint_dir = os.path.join(output_dir, "checkpoint-last")
+if os.path.isdir(checkpoint_dir):
+    print(f"🔄 发现已有 checkpoint，尝试从 {checkpoint_dir} 恢复训练...")
+    trainer.train(resume_from_checkpoint=True)
+else:
+    trainer.train()
 
 # ===== 保存结果 =====
 trainer.model.save_pretrained(output_dir)
