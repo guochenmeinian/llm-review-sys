@@ -12,15 +12,15 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # ===== 初始化 wandb =====
 print("📡 初始化 wandb...")
 wandb.init(
-    project="dpo_llama3_project",
-    name="qlora_full_context_llama3_vs_dataset"
+    project="dpo_llama3_qlora_project",
+    name="qlora_full_context model inference as rejected"
 )
 
 # ===== 配置 =====
 base_model_path = "meta-llama/Llama-3.1-8B-Instruct"
 dataset_repo = "guochenmeinian/openreview_dataset"
-dpo_split = "dpo_base"
-output_dir = "models/dpo_model_base"
+dpo_split = "dpo_qlora"
+output_dir = "models/full_context_qlora_as_rejected"
 
 # ===== 加载 tokenizer =====
 print("🔍 加载 tokenizer...")
@@ -43,18 +43,10 @@ base_model = AutoModelForCausalLM.from_pretrained(
 )
 
 # ===== 加载 QLoRA 微调权重（adapter） =====
-qlora_model_path = "models/full_context_qlora_model"
-model = PeftModel.from_pretrained(base_model, qlora_model_path)
+qlora_model_path = "models/full_context_qlora"
+model = PeftModel.from_pretrained(base_model, qlora_model_path, is_trainable=True)
+model.train()
 print("✅ 成功加载 QLoRA 微调模型")
-
-lora_config = LoraConfig(
-    r=8,
-    lora_alpha=32,
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM"
-)
-print("✅ QLoRA LoRA 配置完成")
 
 # ===== 加载 DPO 数据集 =====
 print(f"📦 加载数据集 `{dataset_repo}`, split=`{dpo_split}` ...")
@@ -63,7 +55,7 @@ print(f"✅ 数据集加载完成，共 {len(dataset)} 条样本")
 
 # ===== DPO Trainer 配置 =====
 dpo_config = DPOConfig(
-    beta=0.1,  # 偏好强度
+    beta=0.1,  
     max_length=18000,
     per_device_train_batch_size=1,
     per_device_eval_batch_size=1,

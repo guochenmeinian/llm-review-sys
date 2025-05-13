@@ -3,9 +3,11 @@ import json
 import argparse
 import numpy as np
 import os
+import glob
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from scipy.stats import pearsonr
+import evaluate
 
 def extract_ratings(text):
     overall_match = re.search(r'Overall Quality:\s*([\d\.]+)', text)
@@ -21,8 +23,8 @@ def evaluate_ratings(generated_path):
     with open(generated_path, 'r') as f:
         for line in f:
             item = json.loads(line)
-            pred_text = item.get('predict')
-            label_text = item.get('label')
+            pred_text = item.get('generated_output') or item.get('predict')
+            label_text = item.get('output') or item.get('label')
 
             if pred_text is None or label_text is None:
                 continue
@@ -30,14 +32,13 @@ def evaluate_ratings(generated_path):
             pred_overall, pred_confidence = extract_ratings(pred_text)
             true_overall, true_confidence = extract_ratings(label_text)
 
-            if pred_overall is not None and pred_confidence is not None and true_overall is not None and true_confidence is not None:
+            if None not in (pred_overall, pred_confidence, true_overall, true_confidence):
                 preds_oq.append(pred_overall)
                 trues_oq.append(true_overall)
                 preds_conf.append(pred_confidence)
                 trues_conf.append(true_confidence)
 
     results = {}
-
     for name, pred, true in [
         ('Overall Quality', preds_oq, trues_oq),
         ('Review Confidence', preds_conf, trues_conf)
@@ -46,48 +47,64 @@ def evaluate_ratings(generated_path):
         mse = mean_squared_error(true, pred)
         rmse = mse ** 0.5
         corr, _ = pearsonr(true, pred)
-
         results[name] = {
-            "MAE": mae,
-            "RMSE": rmse,
-            "Pearson": corr,
+            "MAE": round(mae, 4),
+            "RMSE": round(rmse, 4),
+            "Pearson": round(corr, 4),
         }
 
     return results
 
-def load_nlg_metrics(metrics_path):
-    if not os.path.exists(metrics_path):
+def evaluate_nlg_metrics(generated_path):
+    with open(generated_path, 'r') as f:
+        data = [json.loads(line) for line in f]
+
+    references = [item["output"] for item in data if item.get("output")]
+    predictions = [item.get("generated_output") or item.get("predict") for item in data if item.get("generated_output") or item.get("predict")]
+
+    if len(predictions) != len(references) or len(predictions) == 0:
+        print("⚠️ NLG评估数据不完整，跳过NLG指标")
         return {}
-    with open(metrics_path, 'r') as f:
-        metrics = json.load(f)
+
+    # BLEU
+    bleu = evaluate.load("bleu")
+    bleu_score = bleu.compute(predictions=predictions, references=[[ref] for ref in references])["bleu"]
+
+    # ROUGE
+    rouge = evaluate.load("rouge")
+    rouge_score = rouge.compute(predictions=predictions, references=references)
+
     return {
-        "BLEU-4": metrics.get("predict_bleu-4"),
-        "ROUGE-1": metrics.get("predict_rouge-1"),
-        "ROUGE-2": metrics.get("predict_rouge-2"),
-        "ROUGE-L": metrics.get("predict_rouge-l"),
-        "Samples/sec": metrics.get("predict_samples_per_second"),
-        "Steps/sec": metrics.get("predict_steps_per_second"),
-        "Predict Runtime (s)": metrics.get("predict_runtime")
+        "BLEU-4": round(bleu_score * 100, 2),
+        "ROUGE-1": round(rouge_score["rouge1"] * 100, 2),
+        "ROUGE-2": round(rouge_score["rouge2"] * 100, 2),
+        "ROUGE-L": round(rouge_score["rougeL"] * 100, 2),
     }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--generated', type=str, required=True, help='Path to generated_predictions.jsonl')
-    parser.add_argument('--model_name', type=str, required=True, help='Model name')
+    parser.add_argument('--model_name', type=str, required=True, help='Model name, e.g., full_context_qlora_dpo')
     parser.add_argument('--save_dir', type=str, default='eval_results', help='Directory to save evaluation results')
-    parser.add_argument('--metrics', type=str, default=None, help='Path to NLG metrics .json')
+    parser.add_argument('--metrics', type=str, default=None, help='Optional: path to NLG metrics .json')
     args = parser.parse_args()
+
+    # 自动寻找对应的 JSONL 文件
+    jsonl_candidates = glob.glob(f"eval/results_eval_{args.model_name}.jsonl") + \
+                       glob.glob(f"results_eval_{args.model_name}.jsonl")
+    if not jsonl_candidates:
+        raise FileNotFoundError(f"❌ Cannot find results_eval_{args.model_name}.jsonl in ./ or ./eval/")
+    generated_path = jsonl_candidates[0]
+    print(f"📄 Using generated file: {generated_path}")
 
     os.makedirs(args.save_dir, exist_ok=True)
     save_csv_path = os.path.join(args.save_dir, "summary.csv")
     save_json_path = os.path.join(args.save_dir, f"{args.model_name}_ratings_eval.json")
 
-    rating_results = evaluate_ratings(args.generated)
-    nlg_results = {}
-    if args.metrics:
-        nlg_results = load_nlg_metrics(args.metrics)
+    # 评分和生成评估
+    rating_results = evaluate_ratings(generated_path)
+    nlg_results = evaluate_nlg_metrics(generated_path)
 
-    # 汇总一行（用于csv）
+    # 汇总为一行（用于 summary.csv）
     row = {
         "Model": args.model_name,
         "OQ_MAE": rating_results['Overall Quality']['MAE'],
@@ -99,7 +116,7 @@ if __name__ == "__main__":
     }
     row.update(nlg_results)
 
-    # 保存summary.csv，只添加新模型
+    # 保存 summary.csv（增量）
     if os.path.exists(save_csv_path):
         df = pd.read_csv(save_csv_path)
         if args.model_name not in df['Model'].values:
@@ -109,11 +126,10 @@ if __name__ == "__main__":
         else:
             print(f"⚠️ Model {args.model_name} already exists in {save_csv_path}, skipping.")
     else:
-        df = pd.DataFrame([row])
-        df.to_csv(save_csv_path, index=False)
+        pd.DataFrame([row]).to_csv(save_csv_path, index=False)
         print(f"✅ Created {save_csv_path}")
 
-    # 保存详细单独json（包括BLEU/ROUGE）
+    # 保存详细 JSON 结果
     detailed_result = {
         "Overall Quality": rating_results['Overall Quality'],
         "Review Confidence": rating_results['Review Confidence'],
