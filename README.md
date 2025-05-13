@@ -83,7 +83,7 @@ These metrics assess the **fluency, relevance, and content preservation** of the
 By combining both **rating-based evaluation** and **generation quality evaluation**, we hope to comprehensively evaluate the model's ability to generate faithful, informative, and structured peer reviews.
 
 
-![evaluation_plot](!eval/eval_results/evaluation.png)
+![evaluation_plot](eval/eval_results/evaluation.png)
 
 
 ### Observations from Experiments
