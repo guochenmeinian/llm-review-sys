@@ -1,6 +1,8 @@
 # Automated LLM-Based Peer Review System
 
-This project uses LLM to auto-reviews the research paper.
+This is our course project for [NYU CSCIGA 2565](https://cs.nyu.edu/courses/spring25/CSCI-GA.2565-001/). In this project, we finetuned [Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) to review research papers.
+
+![model_arch](/model_architecture.jpg)
 
 ###  Data Preparation
 
@@ -98,9 +100,11 @@ We noticed that:
 - DPO does improve generation quality
 - QLoRA-based DPO leads to more effective learning
 When using LLaMA3.1 outputs as rejection, the model showed nearly zero loss most of the time—too trivial. However, with QLoRA outputs as rejection, DPO training produced non-zero loss curves and improvements.
-- Despite lacking full context (only 8192 tokens), the sliding-window QLoRA model can still generalize unexpected well. Meanwhile, the sliding-window QLoRA DPO model seems to have the best performance. There might be many factors that cause this. For example: for the sliding window model, each sample we feed multiple parts of the paper with overlaps instead of one whole paper just once due to the nature of the sliding window approach, so the sliding window model actually has been trained with much more data
+- Despite lacking full context (only 8192 tokens), the sliding-window QLoRA model can still generalize unexpected well. Meanwhile, the sliding-window QLoRA DPO model seems to have the best performance. There might be many factors that cause this. For example: for the sliding window model, each sample we feed multiple parts of the paper with overlaps instead of one whole paper just once due to the nature of the sliding window approach, so the sliding window model actually has been trained with much more data.
 
 
+## Poster
+![poster](/poster.jpg)
 
 
 
