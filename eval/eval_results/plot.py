@@ -6,7 +6,7 @@ df = pd.read_csv("summary.csv")
 plt.style.use("ggplot")
 fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-# 字体大小统一
+# fontsize
 label_fontsize = 10
 tick_fontsize = 10
 

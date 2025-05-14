@@ -6,12 +6,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 from peft import PeftModel
 
-# ===== 设置环境变量 =====
+# set environment variables
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TRANSFORMERS_CACHE"] = "/workspace/hf_cache"
 os.environ["HF_HOME"] = "/workspace/hf_home"
 
-# ===== 模型选择 =====
+# model selection
 MODEL_CHOICES = {
     "llama3___1": {
         "base": "meta-llama/Llama-3.1-8B-Instruct",
@@ -44,16 +44,15 @@ MODEL_CHOICES = {
     }
 }
 
-# ======= 选择模型（手动修改这个 key）=======
+# select model (manually modify this key)
 selected_model = "llama3___1"
-# ============================================
 
 config = MODEL_CHOICES[selected_model]
 base_model_name = config["base"]
 qlora_model_path = config["qlora_path"] if "qlora_path" in config else None
 output_path = config["output_file"]
 
-# ===== 加载 tokenizer 和模型 =====
+# load tokenizer and model
 tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True, use_fast=False)
 tokenizer.pad_token = tokenizer.eos_token
 
@@ -70,12 +69,12 @@ else:
         base_model_name, torch_dtype=torch.float16, device_map="auto"
     ).eval()
 
-# ===== 加载数据集 =====
+# load dataset
 dataset = load_dataset("guochenmeinian/openreview_dataset", "eval")["train"]
-print(f"📄 数据集中共有 {len(dataset)} 条样本")
+print(f"📄 loaded {len(dataset)} samples")
 
 
-# ===== 推理函数 =====
+# inference function
 def run_inference(instruction, input_text, max_input_tokens=18000, max_output_tokens=1500):
     prompt = f"{instruction.strip()}\n\n{input_text.strip()}\n\n### Response:"
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_input_tokens).to(model.device)
@@ -94,7 +93,7 @@ def run_inference(instruction, input_text, max_input_tokens=18000, max_output_to
 
 
 
-# ========= 获取已生成记录的唯一键 =========
+# get processed keys
 processed_keys = set()
 if os.path.exists(output_path):
     with open(output_path, "r", encoding="utf-8") as f:
@@ -104,26 +103,26 @@ if os.path.exists(output_path):
                 key = record["instruction"].strip() + "||" + record["input"].strip()
                 processed_keys.add(key)
             except Exception as e:
-                print(f"⚠️ 无法解析行，已跳过: {e}")
+                print(f"⚠️ failed to parse line, skipped: {e}")
 
-print(f"🔄 已存在 {len(processed_keys)} 条记录，将跳过这些样本")
+print(f"🔄 already processed {len(processed_keys)} samples, will skip these samples")
 
-# ========= 开始推理 =========
+# start inference
 with open(output_path, "a", encoding="utf-8") as f_out:
-    for i, example in enumerate(tqdm(dataset, desc="🚀 推理中", total=len(dataset))):
+    for i, example in enumerate(tqdm(dataset, desc="🚀 inferring", total=len(dataset))):
         try:
             key = example["instruction"].strip() + "||" + example["input"].strip()
         except Exception as e:
-            print(f"⚠️ 第 {i+1} 条样本格式错误: {e}")
+            print(f"⚠️ sample {i+1} format error: {e}")
             continue
 
         if key in processed_keys:
-            continue  # 跳过已处理记录
+            continue  # skip processed samples
 
         try:
             gen_output = run_inference(example["instruction"], example["input"])
         except Exception as e:
-            print(f"❌ 第 {i+1} 条推理失败: {e}")
+            print(f"❌ sample {i+1} inference failed: {e}")
             gen_output = "ERROR"
 
         result = {
@@ -136,4 +135,4 @@ with open(output_path, "a", encoding="utf-8") as f_out:
         f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
         f_out.flush()
 
-print(f"\n✅ 推理完成，结果保存至: {output_path}")
+print(f"\n✅ inference completed, results saved to: {output_path}")

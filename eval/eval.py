@@ -88,7 +88,7 @@ if __name__ == "__main__":
     parser.add_argument('--metrics', type=str, default=None, help='Optional: path to NLG metrics .json')
     args = parser.parse_args()
 
-    # 自动寻找对应的 JSONL 文件
+    # search JSONL file
     jsonl_candidates = glob.glob(f"eval/{args.model_name}.jsonl") + \
                        glob.glob(f"results_eval_{args.model_name}.jsonl")
     if not jsonl_candidates:
@@ -100,11 +100,11 @@ if __name__ == "__main__":
     save_csv_path = os.path.join(args.save_dir, "summary.csv")
     save_json_path = os.path.join(args.save_dir, f"{args.model_name}_ratings_eval.json")
 
-    # 评分和生成评估
+    # rating and generation evaluation
     rating_results = evaluate_ratings(generated_path)
     nlg_results = evaluate_nlg_metrics(generated_path)
 
-    # 汇总为一行（用于 summary.csv）
+    # summary for summary.csv
     row = {
         "Model": args.model_name,
         "OQ_MAE": rating_results['Overall Quality']['MAE'],
@@ -116,7 +116,7 @@ if __name__ == "__main__":
     }
     row.update(nlg_results)
 
-    # 保存 summary.csv（增量）
+    # save summary.csv (incrementally)
     if os.path.exists(save_csv_path):
         df = pd.read_csv(save_csv_path)
         if args.model_name not in df['Model'].values:
@@ -129,7 +129,7 @@ if __name__ == "__main__":
         pd.DataFrame([row]).to_csv(save_csv_path, index=False)
         print(f"✅ Created {save_csv_path}")
 
-    # 保存详细 JSON 结果
+    # save detailed JSON results
     detailed_result = {
         "Overall Quality": rating_results['Overall Quality'],
         "Review Confidence": rating_results['Review Confidence'],

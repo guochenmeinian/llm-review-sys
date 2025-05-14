@@ -9,25 +9,25 @@ from peft import PeftModel, prepare_model_for_kbit_training, get_peft_model, Lor
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# ===== 初始化 wandb =====
-print("📡 初始化 wandb...")
+# ===== initialize wandb =====
+print("📡 initialize wandb...")
 wandb.init(
     project="dpo_llama3_qlora_project",
     name="qlora_full_context model inference as rejected"
 )
 
-# ===== 配置 =====
+# ===== config =====
 base_model_path = "meta-llama/Llama-3.1-8B-Instruct"
 dataset_repo = "guochenmeinian/openreview_dataset"
 dpo_split = "dpo_qlora"
 output_dir = "models/full_context_qlora_as_rejected"
 
-# ===== 加载 tokenizer =====
-print("🔍 加载 tokenizer...")
+# ===== load tokenizer =====
+print("🔍 load tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(base_model_path, use_fast=False, trust_remote_code=True)
 tokenizer.pad_token = tokenizer.eos_token
 
-# ===== 配置 QLoRA 量化参数 =====
+# ===== configure QLoRA quantization parameters =====
 print("🧬 加载 base model + QLoRA adapter...")
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -42,18 +42,18 @@ base_model = AutoModelForCausalLM.from_pretrained(
     device_map="auto"
 )
 
-# ===== 加载 QLoRA 微调权重（adapter） =====
+# ===== load QLoRA micro-tuning weights (adapter) =====
 qlora_model_path = "models/full_context_qlora"
 model = PeftModel.from_pretrained(base_model, qlora_model_path, is_trainable=True)
 model.train()
-print("✅ 成功加载 QLoRA 微调模型")
+print("✅ successfully loaded QLoRA micro-tuning model")
 
-# ===== 加载 DPO 数据集 =====
-print(f"📦 加载数据集 `{dataset_repo}`, split=`{dpo_split}` ...")
+# ===== load DPO dataset =====
+print(f"📦 load dataset `{dataset_repo}`, split=`{dpo_split}` ...")
 dataset = load_dataset(dataset_repo, dpo_split)["train"]
-print(f"✅ 数据集加载完成，共 {len(dataset)} 条样本")
+print(f"✅ dataset loaded, total {len(dataset)} samples")
 
-# ===== DPO Trainer 配置 =====
+# ===== DPO Trainer config =====
 dpo_config = DPOConfig(
     beta=0.1,  
     max_length=18000,
@@ -70,8 +70,8 @@ dpo_config = DPOConfig(
     run_name="qlora_full_context_llama3_vs_dataset"
 )
 
-# ===== 创建 Trainer =====
-# 只使用必需的参数
+# ===== create trainer =====
+# only use necessary parameters
 trainer = DPOTrainer(
     model=model,
     eval_dataset=None, # we don't use eval_dataset here
@@ -81,21 +81,21 @@ trainer = DPOTrainer(
     processing_class=tokenizer
 )
 
-# ===== 训练 =====
+# ===== training =====
 checkpoint_dir = os.path.join(output_dir, "checkpoint-last")
 if os.path.isdir(checkpoint_dir):
-    print(f"🔄 发现已有 checkpoint，尝试从 {checkpoint_dir} 恢复训练...")
+    print(f"🔄 found existing checkpoint, trying to resume training from {checkpoint_dir}...")
     trainer.train(resume_from_checkpoint=True)
 else:
     try:
         trainer.train()
     except torch.cuda.OutOfMemoryError as e:
-        print("❌ CUDA OOM! 手动清理缓存中...")
+        print("❌ CUDA OOM! Manually clearing cache...")
         torch.cuda.empty_cache()
         raise e
 
-# ===== 保存结果 =====
+# ===== save result =====
 trainer.model.save_pretrained(output_dir)
 tokenizer.save_pretrained(output_dir)
 
-print("✨ 训练完成，模型已保存至", output_dir)
+print("✨ training complete, model saved to", output_dir)

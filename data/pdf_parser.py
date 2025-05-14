@@ -6,7 +6,7 @@ import threading, time
 
 def parse_pdfs(pdf_root_dir, output_root_dir, target_conferences=None):
     """
-    使用Nougat解析PDF文件
+    Use Nougat to parse PDF files
     """
     tasks = []
     all_conferences = [d for d in os.listdir(pdf_root_dir) if os.path.isdir(os.path.join(pdf_root_dir, d))]
