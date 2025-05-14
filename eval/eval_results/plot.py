@@ -1,7 +1,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
-df = pd.read_csv("eval/eval_results/summary.csv")
+df = pd.read_csv("summary.csv")
 
 plt.style.use("ggplot")
 fig, axes = plt.subplots(2, 2, figsize=(14, 10))

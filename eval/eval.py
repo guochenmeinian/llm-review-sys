@@ -89,7 +89,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # 自动寻找对应的 JSONL 文件
-    jsonl_candidates = glob.glob(f"eval/results_eval_{args.model_name}.jsonl") + \
+    jsonl_candidates = glob.glob(f"eval/{args.model_name}.jsonl") + \
                        glob.glob(f"results_eval_{args.model_name}.jsonl")
     if not jsonl_candidates:
         raise FileNotFoundError(f"❌ Cannot find results_eval_{args.model_name}.jsonl in ./ or ./eval/")

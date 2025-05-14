@@ -89,7 +89,7 @@ These metrics assess the **fluency, relevance, and content preservation** of the
 By combining both **rating-based evaluation** and **generation quality evaluation**, we hope to comprehensively evaluate the model's ability to generate faithful, informative, and structured peer reviews.
 
 
-![evaluation_plot](eval/eval_results/evaluation.png)
+![evaluation_plot](eval/eval_results/loss_comparison.png)
 
 
 ### Observations from Experiments
@@ -97,8 +97,7 @@ By combining both **rating-based evaluation** and **generation quality evaluatio
 We noticed that:
 - DPO does improve generation quality
 - QLoRA-based DPO leads to more effective learning
-When using LLaMA3.1 outputs as rejection, the model showed nearly zero loss most of the time—too trivial.
-But with QLoRA outputs as rejection, DPO training produced non-zero loss curves and improvements.
+When using LLaMA3.1 outputs as rejection, the model showed nearly zero loss most of the time—too trivial. However, with QLoRA outputs as rejection, DPO training produced non-zero loss curves and improvements.
 - Despite lacking full context (only 8192 tokens), the sliding-window QLoRA model can still generalize unexpected well. Meanwhile, the sliding-window QLoRA DPO model seems to have the best performance. There might be many factors that cause this. For example: for the sliding window model, each sample we feed multiple parts of the paper with overlaps instead of one whole paper just once due to the nature of the sliding window approach, so the sliding window model actually has been trained with much more data
 
 
